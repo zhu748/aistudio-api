@@ -22,7 +22,7 @@ Google AIStudio Playgroud 反代，支持 Google 会员（Pro/Ultra），支持 
 
 ```bash
 # 克隆项目
-git clone https://github.com/yourname/aistudio-api.git
+git clone https://github.com/chrysoljq/aistudio-api.git
 cd aistudio-api
 
 # 安装依赖
