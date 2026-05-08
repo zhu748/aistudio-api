@@ -49,6 +49,14 @@ class Settings:
     snapshot_cache_max: int = int(os.getenv("AISTUDIO_SNAPSHOT_CACHE_MAX", "100"))
     dump_raw_response: bool = os.getenv("AISTUDIO_DUMP_RAW_RESPONSE", "0") in ("1", "true", "True")
     dump_raw_response_dir: str = os.getenv("AISTUDIO_DUMP_RAW_RESPONSE_DIR", "/tmp")
+    accounts_dir: str = os.getenv("AISTUDIO_ACCOUNTS_DIR", "")
+    login_camoufox_port: int = int(os.getenv("AISTUDIO_LOGIN_CAMOUFOX_PORT", "9223"))
+    # 账号轮询配置
+    account_rotation_mode: str = os.getenv("AISTUDIO_ACCOUNT_ROTATION_MODE", "round_robin")  # round_robin, lru, least_rl
+    account_cooldown_seconds: int = int(os.getenv("AISTUDIO_ACCOUNT_COOLDOWN_SECONDS", "60"))
+    account_max_retries: int = int(os.getenv("AISTUDIO_ACCOUNT_MAX_RETRIES", "3"))
+    # Pure HTTP mode: no browser needed for snapshot generation
+    use_pure_http: bool = os.getenv("AISTUDIO_USE_PURE_HTTP", "0") in ("1", "true", "True")
 
 
 settings = Settings()

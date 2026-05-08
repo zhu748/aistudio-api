@@ -9,10 +9,11 @@ dist/
 build/
 *.egg-info/
 
-cache/
 /data/
 /tmp/
 stream_response.txt
 .vscode/
 docs/
 .env
+/test_*
+/capture_*

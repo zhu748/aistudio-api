@@ -12,7 +12,7 @@ logger = logging.getLogger("aistudio")
 
 
 class RequestReplayService:
-    def __init__(self, session: BrowserSession):
+    def __init__(self, session: BrowserSession | None):
         self._session = session
 
     async def replay(self, captured: CapturedRequest | None, body: str, timeout: int | None = None) -> tuple[int, bytes]:
@@ -22,19 +22,26 @@ class RequestReplayService:
         if timeout is None:
             timeout = settings.timeout_replay
 
-        ctx = await self._session.ensure_context()
         headers = {k: v for k, v in captured.headers.items() if k.lower() not in ("host", "content-length")}
 
         try:
-            resp = await ctx.request.post(
-                captured.url,
-                data=body,
-                headers=headers,
-                timeout=timeout * 1000,
-            )
-            raw = await resp.body()
-            return resp.status, raw
+            if self._session is not None:
+                return await self._session.send_hooked_request(
+                    body=body,
+                    timeout_ms=timeout * 1000,
+                )
+
+            import aiohttp
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    captured.url,
+                    data=body,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as resp:
+                    raw = await resp.read()
+                    return resp.status, raw
         except Exception as exc:
             logger.error("Replay error: %s", exc)
             return 0, str(exc).encode()
-

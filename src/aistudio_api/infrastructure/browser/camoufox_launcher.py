@@ -30,7 +30,7 @@ def _prune_none(value: Any) -> Any:
 
 
 def launch_camoufox_server(*, port: int, headless: bool):
-    cfg = launch_options(port=port, headless=headless)
+    cfg = launch_options(port=port, headless=headless, main_world_eval=True)
     cfg = _prune_none(cfg)
     nodejs = get_nodejs()
     data = orjson.dumps(to_camel_case_dict(cfg))

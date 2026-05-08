@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Studio 账号管理</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background-color: #f5f5f5;
+            color: #333;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            background-color: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            font-size: 24px;
+            color: #1a73e8;
+        }
+
+        .actions {
+            margin-bottom: 20px;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            text-decoration: none;
+            transition: background-color 0.2s;
+        }
+
+        .btn-primary {
+            background-color: #1a73e8;
+            color: #fff;
+        }
+
+        .btn-primary:hover {
+            background-color: #1557b0;
+        }
+
+        .btn-danger {
+            background-color: #dc3545;
+            color: #fff;
+        }
+
+        .btn-danger:hover {
+            background-color: #c82333;
+        }
+
+        .btn-secondary {
+            background-color: #6c757d;
+            color: #fff;
+        }
+
+        .btn-secondary:hover {
+            background-color: #545b62;
+        }
+
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+
+        .account-list {
+            background-color: #fff;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+
+        .account-item {
+            padding: 20px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .account-item:last-child {
+            border-bottom: none;
+        }
+
+        .account-item.active {
+            background-color: #e8f0fe;
+        }
+
+        .account-info {
+            flex: 1;
+        }
+
+        .account-name {
+            font-size: 16px;
+            font-weight: 500;
+            margin-bottom: 4px;
+        }
+
+        .account-email {
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 4px;
+        }
+
+        .account-meta {
+            font-size: 12px;
+            color: #999;
+        }
+
+        .account-status {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+            margin-left: 8px;
+        }
+
+        .status-active {
+            background-color: #d4edda;
+            color: #155724;
+        }
+
+        .account-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal.show {
+            display: flex;
+        }
+
+        .modal-content {
+            background-color: #fff;
+            padding: 24px;
+            border-radius: 8px;
+            max-width: 500px;
+            width: 90%;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+
+        .modal-title {
+            font-size: 18px;
+            font-weight: 500;
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            color: #666;
+        }
+
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+
+        .form-group input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+
+        .form-group input:focus {
+            outline: none;
+            border-color: #1a73e8;
+        }
+
+        .login-status {
+            margin-top: 16px;
+            padding: 12px;
+            border-radius: 4px;
+            display: none;
+        }
+
+        .login-status.pending {
+            background-color: #fff3cd;
+            color: #856404;
+            display: block;
+        }
+
+        .login-status.completed {
+            background-color: #d4edda;
+            color: #155724;
+            display: block;
+        }
+
+        .login-status.failed {
+            background-color: #f8d7da;
+            color: #721c24;
+            display: block;
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #856404;
+            border-radius: 50%;
+            border-top-color: transparent;
+            animation: spin 1s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+
+        .empty-state p {
+            margin-bottom: 16px;
+        }
+
+        .toast {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 12px 24px;
+            border-radius: 4px;
+            color: #fff;
+            font-size: 14px;
+            z-index: 2000;
+            opacity: 0;
+            transform: translateX(100%);
+            transition: all 0.3s ease;
+        }
+
+        .toast.show {
+            opacity: 1;
+            transform: translateX(0);
+        }
+
+        .toast.success {
+            background-color: #28a745;
+        }
+
+        .toast.error {
+            background-color: #dc3545;
+        }
+
+        .toast.info {
+            background-color: #17a2b8;
+        }
+    </style>
+</head>
+<body>
+    <div class="toast" id="toast"></div>
+
+    <div class="container">
+        <header>
+            <h1>AI Studio 账号管理</h1>
+        </header>
+
+        <div class="actions">
+            <button class="btn btn-primary" onclick="showLoginModal()">+ 登录新账号</button>
+            <button class="btn btn-secondary" onclick="loadAccounts()">刷新</button>
+        </div>
+
+        <div class="account-list" id="accountList">
+            <div class="empty-state">
+                <p>加载中...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- 登录模态框 -->
+    <div class="modal" id="loginModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 class="modal-title">登录新账号</h2>
+                <button class="modal-close" onclick="closeLoginModal()">&times;</button>
+            </div>
+            <div class="form-group">
+                <label for="accountName">账号名称（可选）</label>
+                <input type="text" id="accountName" placeholder="例如：工作账号、个人账号">
+            </div>
+            <button class="btn btn-primary" onclick="startLogin()">开始登录</button>
+            <div class="login-status" id="loginStatus"></div>
+        </div>
+    </div>
+
+    <!-- 编辑模态框 -->
+    <div class="modal" id="editModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 class="modal-title">编辑账号名称</h2>
+                <button class="modal-close" onclick="closeEditModal()">&times;</button>
+            </div>
+            <input type="hidden" id="editAccountId">
+            <div class="form-group">
+                <label for="editName">账号名称</label>
+                <input type="text" id="editName">
+            </div>
+            <button class="btn btn-primary" onclick="updateAccount()">保存</button>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = '/accounts';
+        let loginSessionId = null;
+        let loginPollInterval = null;
+
+        // 加载账号列表
+        async function loadAccounts() {
+            try {
+                const response = await fetch(API_BASE);
+                const accounts = await response.json();
+                renderAccounts(accounts);
+            } catch (error) {
+                console.error('加载账号失败:', error);
+                document.getElementById('accountList').innerHTML =
+                    '<div class="empty-state"><p>加载失败，请刷新页面</p></div>';
+            }
+        }
+
+        // 渲染账号列表
+        function renderAccounts(accounts) {
+            const container = document.getElementById('accountList');
+
+            if (accounts.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <p>还没有账号</p>
+                        <p>点击"登录新账号"开始使用</p>
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = accounts.map(account => `
+                <div class="account-item ${account.id === getActiveAccountId(accounts) ? 'active' : ''}">
+                    <div class="account-info">
+                        <div class="account-name">
+                            ${escapeHtml(account.name)}
+                            ${account.id === getActiveAccountId(accounts) ?
+                                '<span class="account-status status-active">活跃</span>' : ''}
+                        </div>
+                        <div class="account-email">${account.email || '未获取到邮箱'}</div>
+                        <div class="account-meta">
+                            创建: ${formatDate(account.created_at)}
+                            ${account.last_used ? ' | 最后使用: ' + formatDate(account.last_used) : ''}
+                        </div>
+                    </div>
+                    <div class="account-actions">
+                        ${account.id !== getActiveAccountId(accounts) ?
+                            `<button class="btn btn-secondary btn-sm" onclick="activateAccount('${account.id}')">切换</button>` : ''}
+                        <button class="btn btn-secondary btn-sm" onclick="showEditModal('${account.id}', '${escapeHtml(account.name)}')">编辑</button>
+                        <button class="btn btn-danger btn-sm" onclick="deleteAccount('${account.id}', '${escapeHtml(account.name)}')">删除</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // 获取活跃账号 ID
+        function getActiveAccountId(accounts) {
+            // 从 accounts 中找 active_account_id
+            // 由于 API 没有直接返回，我们通过 /accounts/active 获取
+            return window._activeAccountId || null;
+        }
+
+        // 加载活跃账号
+        async function loadActiveAccount() {
+            try {
+                const response = await fetch(`${API_BASE}/active`);
+                if (response.ok) {
+                    const account = await response.json();
+                    window._activeAccountId = account.id;
+                }
+            } catch (error) {
+                console.error('加载活跃账号失败:', error);
+            }
+        }
+
+        // 显示登录模态框
+        function showLoginModal() {
+            document.getElementById('loginModal').classList.add('show');
+            document.getElementById('accountName').value = '';
+            document.getElementById('loginStatus').className = 'login-status';
+            document.getElementById('loginStatus').textContent = '';
+            loginSessionId = null;
+            if (loginPollInterval) {
+                clearInterval(loginPollInterval);
+                loginPollInterval = null;
+            }
+        }
+
+        // 关闭登录模态框
+        function closeLoginModal() {
+            document.getElementById('loginModal').classList.remove('show');
+            if (loginPollInterval) {
+                clearInterval(loginPollInterval);
+                loginPollInterval = null;
+            }
+        }
+
+        // 开始登录
+        async function startLogin() {
+            const name = document.getElementById('accountName').value.trim();
+            const statusEl = document.getElementById('loginStatus');
+
+            try {
+                const response = await fetch(`${API_BASE}/login/start`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ name: name || null }),
+                });
+
+                const data = await response.json();
+                loginSessionId = data.session_id;
+
+                statusEl.className = 'login-status pending';
+                statusEl.innerHTML = '<span class="spinner"></span> 浏览器已打开，请在浏览器中完成登录...';
+
+                // 开始轮询登录状态
+                loginPollInterval = setInterval(checkLoginStatus, 2000);
+            } catch (error) {
+                statusEl.className = 'login-status failed';
+                statusEl.textContent = '启动登录失败: ' + error.message;
+            }
+        }
+
+        // 检查登录状态
+        async function checkLoginStatus() {
+            if (!loginSessionId) return;
+
+            try {
+                const response = await fetch(`${API_BASE}/login/status/${loginSessionId}`);
+                const data = await response.json();
+                const statusEl = document.getElementById('loginStatus');
+
+                if (data.status === 'completed') {
+                    statusEl.className = 'login-status completed';
+                    statusEl.textContent = `登录成功！邮箱: ${data.email || '未获取到'}`;
+                    clearInterval(loginPollInterval);
+                    loginPollInterval = null;
+                    // 刷新账号列表
+                    setTimeout(() => {
+                        loadActiveAccount();
+                        loadAccounts();
+                        closeLoginModal();
+                    }, 1500);
+                } else if (data.status === 'failed') {
+                    statusEl.className = 'login-status failed';
+                    statusEl.textContent = '登录失败: ' + (data.error || '未知错误');
+                    clearInterval(loginPollInterval);
+                    loginPollInterval = null;
+                }
+                // pending 状态继续轮询
+            } catch (error) {
+                console.error('检查登录状态失败:', error);
+            }
+        }
+
+        // 切换账号
+        async function activateAccount(accountId) {
+            try {
+                const response = await fetch(`${API_BASE}/${accountId}/activate`, {
+                    method: 'POST',
+                });
+
+                if (response.ok) {
+                    showToast('切换成功', 'success');
+                    window._activeAccountId = accountId;
+                    loadAccounts();
+                } else {
+                    const error = await response.json();
+                    showToast('切换失败: ' + (error.detail || '未知错误'), 'error');
+                }
+            } catch (error) {
+                showToast('切换失败: ' + error.message, 'error');
+            }
+        }
+
+        // 删除账号
+        async function deleteAccount(accountId, name) {
+            if (!confirm(`确定要删除"${name}"吗？`)) return;
+
+            try {
+                const response = await fetch(`${API_BASE}/${accountId}`, {
+                    method: 'DELETE',
+                });
+
+                if (response.ok) {
+                    showToast('删除成功', 'success');
+                    loadActiveAccount();
+                    loadAccounts();
+                } else {
+                    const error = await response.json();
+                    showToast('删除失败: ' + (error.detail || '未知错误'), 'error');
+                }
+            } catch (error) {
+                showToast('删除失败: ' + error.message, 'error');
+            }
+        }
+
+        // 显示编辑模态框
+        function showEditModal(accountId, name) {
+            document.getElementById('editAccountId').value = accountId;
+            document.getElementById('editName').value = name;
+            document.getElementById('editModal').classList.add('show');
+        }
+
+        // 关闭编辑模态框
+        function closeEditModal() {
+            document.getElementById('editModal').classList.remove('show');
+        }
+
+        // 更新账号
+        async function updateAccount() {
+            const accountId = document.getElementById('editAccountId').value;
+            const name = document.getElementById('editName').value.trim();
+
+            if (!name) {
+                showToast('请输入账号名称', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/${accountId}`, {
+                    method: 'PUT',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ name }),
+                });
+
+                if (response.ok) {
+                    showToast('更新成功', 'success');
+                    closeEditModal();
+                    loadAccounts();
+                } else {
+                    const error = await response.json();
+                    showToast('更新失败: ' + (error.detail || '未知错误'), 'error');
+                }
+            } catch (error) {
+                showToast('更新失败: ' + error.message, 'error');
+            }
+        }
+
+        // 格式化日期
+        function formatDate(dateStr) {
+            if (!dateStr) return '';
+            const date = new Date(dateStr);
+            return date.toLocaleString('zh-CN', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+            });
+        }
+
+        // HTML 转义
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // 显示 toast 通知
+        function showToast(message, type = 'info') {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = `toast ${type} show`;
+
+            setTimeout(() => {
+                toast.classList.remove('show');
+            }, 3000);
+        }
+
+        // 初始化
+        document.addEventListener('DOMContentLoaded', () => {
+            loadActiveAccount();
+            loadAccounts();
+        });
+    </script>
+</body>
+</html>

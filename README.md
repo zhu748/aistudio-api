@@ -1,70 +1,232 @@
 # AI Studio API
 
-一个面向 Google AI Studio 的 OpenAI 兼容 API 包装层。  
-这次重构先把项目从根目录脚本堆，整理成了可维护的 `src` 包结构，同时保留了旧入口兼容层。
+将 Google AI Studio 网页端转为自托管的 OpenAI 兼容 API 服务器。不需要 API Key，只需一个 Google 账号。
 
-## 当前结构
+[English](./README_EN.md)
 
-```text
-aistudio-api/
-├── pyproject.toml
-├── main.py                    # 统一入口
-├── server.py                  # 兼容入口
-├── client.py                  # 兼容入口
-├── proxy.py                   # 兼容入口
-├── src/
-│   └── aistudio_api/
-│       ├── api/               # FastAPI 边界层
-│       │   ├── app.py
-│       │   └── schemas.py
-│       ├── application/       # 请求编排与文件清理
-│       │   └── chat_service.py
-│       ├── domain/            # 纯类型与错误
-│       │   ├── errors.py
-│       │   └── models.py
-│       ├── infrastructure/    # 浏览器、缓存、协议改写、流解析
-│       │   ├── browser/
-│       │   ├── cache/
-│       │   ├── gateway/
-│       │   └── utils/
-│       └── config.py
-├── tests/
-│   └── unit/
-```
+## 功能
 
-## 设计意图
+- **OpenAI 兼容** — 支持 `/v1/chat/completions`、`/v1/models`、`/v1/images/generations`
+- **Gemini 原生 API** — 同时支持 `/v1beta/models/{model}:generateContent`
+- **流式输出** — SSE 流式返回
+- **多轮对话** — 正确的 user/model 交替结构
+- **图片输入** — 支持 base64 内联和 HTTP URL，单图/多图
+- **Google 搜索** — 通过 `googleSearchRetrieval` 实时联网搜索
+- **Thinking** — 返回模型思考过程（`thinking` 字段）
+- **图片生成** — 通过 Gemini 图片模型生成图片
+- **反检测** — 使用 Camoufox（反指纹 Firefox）避免被封
+- **BotGuard** — 自动特征匹配定位 snapshot 函数，无惧 Google 更新
+- **多账号轮询** — round-robin / LRU / 最少限流
 
-- `api` 只处理 HTTP 协议和 OpenAI 兼容输出。
-- `application` 负责把消息、图片、临时文件这些流程编排起来。
-- `domain` 放纯数据结构和异常，尽量不依赖 FastAPI / Playwright。
-- `infrastructure` 集中外部依赖，后面继续拆也有落点。
-- `main.py` 是新的统一入口。
-- `server.py`、`client.py` 这些根目录脚本现在主要是兼容层，不再是推荐主入口。
-
-## 运行
+## 快速开始
 
 ```bash
+# 克隆项目
+git clone https://github.com/yourname/aistudio-api.git
+cd aistudio-api
+
+# 安装依赖
+pip install -r requirements.txt
+
+# 登录 Google（打开浏览器，保存 cookies）
+python3 main.py login
+
+# 启动服务
 python3 main.py server --port 8080 --camoufox-port 9222
-python3 main.py client "你好"
-python3 main.py snapshot "测试 prompt"
 ```
 
-或者安装成包：
+### Docker
 
 ```bash
-pip install -e .
-aistudio-api server --port 8080 --camoufox-port 9222
-aistudio-api client "你好"
-aistudio-api-server --port 8080 --camoufox-port 9222
-aistudio-api-client "你好"
+docker build -t aistudio-api .
+docker run -p 8080:8080 -v ./data:/app/data aistudio-api
 ```
 
-## 下一步建议
+## 使用示例
 
-这次还是第一阶段，目标是先“立边界”，不是一次性洗到底。  
-接下来最值得继续做的是：
+### OpenAI 兼容接口
 
-- 把 `api/app.py` 再拆成 `routes` + `services`
-- 给 `request_rewriter`、`stream_parser`、`domain/models` 补完整单测
-- 把配置改成显式环境变量校验
-- 清理历史文档和实验脚本，把 `REVERSE.md`、`REQUEST_BODY.md` 收进单独文档目录
+```bash
+# 对话（流式）
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma-4-31b-it",
+    "messages": [{"role": "user", "content": "你好！"}],
+    "stream": true
+  }'
+
+# 图片理解
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3-flash-preview",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBOR..."}},
+        {"type": "text", "text": "这是什么？"}
+      ]
+    }]
+  }'
+
+# 查看模型列表
+curl http://localhost:8080/v1/models
+```
+
+### Gemini 原生接口
+
+```bash
+# 联网搜索
+curl http://localhost:8080/v1beta/models/gemini-3-flash-preview:generateContent \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [{"role": "user", "parts": [{"text": "今天上海天气怎么样？"}]}],
+    "tools": [{"googleSearchRetrieval": {}}]
+  }'
+```
+
+### Python（OpenAI SDK）
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="unused")
+
+# 流式对话
+response = client.chat.completions.create(
+    model="gemini-3-flash-preview",
+    messages=[{"role": "user", "content": "你好！"}],
+    stream=True,
+)
+for chunk in response:
+    print(chunk.choices[0].delta.content or "", end="")
+```
+
+### 命令行客户端
+
+```bash
+# 快速对话
+python3 main.py client "今天天气怎么样？" --search
+
+# 附带图片
+python3 main.py client "这张图是什么？" -a photo.jpg
+
+# 生图
+python3 main.py client "画一只猫" --image --save cat.png
+```
+
+## 支持的模型
+
+| 模型 | ID | 默认 Google Search | 说明 |
+|------|-----|-------------------|------|
+| Gemma 4 31B | `gemma-4-31b-it` | ❌ | 默认文本模型 |
+| Gemma 4 12B | `gemma-4-12b-it` | ✅ | |
+| Gemma 4 4B | `gemma-4-4b-it` | ✅ | |
+| Gemini 3 Flash | `gemini-3-flash-preview` | ❌ | 快速 |
+| Gemini 3.1 Flash Lite | `gemini-3.1-flash-lite-preview` | ❌ | |
+| Gemini 3.1 Flash Image | `gemini-3.1-flash-image-preview` | ❌ | 默认图片模型 |
+| Gemini 2.5 Flash | `gemini-2.5-flash-preview-05-20` | ❌ | |
+| Gemini 2.5 Pro | `gemini-2.5-pro-preview-05-06` | ❌ | |
+| Gemini 2.5 Flash Image | `gemini-2.5-flash-preview-image-generation` | ❌ | 图片生成 |
+
+所有模型默认开启 thinking（流式返回 `thinking` 字段）。Gemma 4 4B/12B 默认开启 Google Search。
+
+## 配置
+
+通过环境变量或 `.env` 文件配置：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `AISTUDIO_PORT` | `8080` | API 服务端口 |
+| `AISTUDIO_CAMOUFOX_PORT` | `9222` | Camoufox 调试端口 |
+| `AISTUDIO_DEFAULT_TEXT_MODEL` | `gemma-4-31b-it` | 默认对话模型 |
+| `AISTUDIO_DEFAULT_IMAGE_MODEL` | `gemini-3.1-flash-image-preview` | 默认图片模型 |
+| `AISTUDIO_CAMOUFOX_HEADLESS` | `1` | 无头模式运行浏览器 |
+| `AISTUDIO_TIMEOUT_REPLAY` | `120` | 请求超时（秒） |
+| `AISTUDIO_TIMEOUT_STREAM` | `120` | 流式超时（秒） |
+| `AISTUDIO_SNAPSHOT_CACHE_TTL` | `3600` | BotGuard snapshot 缓存时间 |
+| `AISTUDIO_ACCOUNT_ROTATION_MODE` | `round_robin` | 轮询模式：`round_robin`、`lru`、`least_rl` |
+| `AISTUDIO_ACCOUNT_COOLDOWN_SECONDS` | `60` | 限流后冷却时间 |
+| `AISTUDIO_USE_PURE_HTTP` | `0` | 纯 HTTP 模式（不用浏览器） |
+| `AISTUDIO_DUMP_RAW_RESPONSE` | `0` | 保存原始响应到磁盘 |
+
+## 架构
+
+```
+客户端（OpenAI SDK / curl）
+    │
+    ▼
+┌─────────────────────┐
+│   FastAPI 服务器      │  ← OpenAI + Gemini API 路由
+│   /v1/chat/...       │
+│   /v1beta/...        │
+└─────────┬───────────┘
+          │
+          ▼
+┌─────────────────────┐
+│   Wire Codec         │  ← API 格式 → AI Studio gRPC body
+│   + BotGuard         │     自动特征匹配 snapshot 函数
+└─────────┬───────────┘
+          │
+          ▼
+┌─────────────────────┐
+│   Camoufox 浏览器    │  ← 反指纹 Firefox，注入 cookies
+│   （无头模式）        │     通过 XHR hook 发送请求
+└─────────┬───────────┘
+          │
+          ▼
+    Google AI Studio
+```
+
+**工作原理：**
+1. API 请求进入，转换为 AI Studio 的 wire 格式
+2. 生成 BotGuard snapshot（自动检测函数，带缓存）
+3. 构造完整的 gRPC body，通过 XHR hook 注入浏览器
+4. 浏览器带 cookies + BotGuard 发送请求到 Google
+5. 解析响应，按请求的 API 格式返回
+
+## 多账号
+
+管理多个 Google 账号提高吞吐量：
+
+```bash
+# 添加账号
+python3 main.py account add --email user1@gmail.com
+python3 main.py account add --email user2@gmail.com
+
+# 查看
+python3 main.py account list
+
+# 启动时自动轮询
+AISTUDIO_ACCOUNT_ROTATION_MODE=round_robin python3 main.py server
+```
+
+轮询模式：
+- `round_robin` — 轮流使用
+- `lru` — 最久未使用
+- `least_rl` — 最少被限流
+
+## 开发
+
+```bash
+# 运行测试
+python3 -m pytest tests/
+
+# 抓取 snapshot（调试用）
+python3 main.py snapshot "测试prompt"
+```
+
+## BotGuard 原理
+
+Google 每次请求都要求一个 BotGuard "snapshot" —— 证明请求来自真实浏览器的加密凭证。本项目：
+
+1. 在运行时 hook 前端的 snapshot 生成函数
+2. 通过特征匹配自动定位（`.snapshot({` + `content` + `yield`），无惧 Google 更新
+3. 为每个请求生成合法的 snapshot
+
+snapshot 函数名随 Google bundle 更新持续变化（Mv → Ov → Sv → ...），但特征模式保持不变。
+
+## License
+
+MIT

@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse
 from aistudio_api.application.chat_service import cleanup_files, normalize_chat_request, normalize_gemini_request, normalize_openai_tools
 from aistudio_api.domain.errors import AistudioError, UsageLimitExceeded
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
+from aistudio_api.infrastructure.gateway.wire_types import AistudioContent, AistudioPart
 from aistudio_api.api.responses import (
     chat_completion_response,
     new_chat_id,
@@ -26,6 +27,34 @@ from aistudio_api.api.schemas import ChatRequest, GeminiGenerateContentRequest, 
 from aistudio_api.api.state import runtime_state
 
 logger = logging.getLogger("aistudio.server")
+
+
+async def _try_switch_account() -> bool:
+    """尝试切换到下一个可用账号。返回是否成功切换。"""
+    rotator = runtime_state.rotator
+    if rotator is None:
+        return False
+
+    # 获取下一个账号
+    next_account = await rotator.get_next_account()
+    if next_account is None:
+        return False
+
+    account_service = runtime_state.account_service
+    client = runtime_state.client
+
+    if not all([account_service, client]):
+        return False
+
+    # 切换账号（保留 snapshot 缓存，busy_lock 由外层 handle_chat 持有，不重复获取）
+    result = await account_service.activate_account(
+        next_account.id,
+        client._session,
+        runtime_state.snapshot_cache,
+        None,  # skip lock — caller already holds it
+        keep_snapshot_cache=True,
+    )
+    return result is not None
 
 
 def health_response() -> dict:
@@ -54,64 +83,118 @@ async def handle_chat(req: ChatRequest, client: AIStudioClient):
     if busy_lock.locked():
         raise HTTPException(429, detail={"message": "Server is busy", "type": "rate_limit_exceeded"})
 
-    async with busy_lock:
-        model = req.model
-        system_instruction, prompt, images = normalize_chat_request(req.messages, model)
-        tmp_files = list(images)
+    max_retries = 3  # 最多重试次数
+    last_error = None
 
-        try:
-            logger.info("Chat: model=%s, prompt=%s..., images=%s, stream=%s", model, prompt[:50], len(images), req.stream)
-            tools = normalize_openai_tools(req.tools)
+    for attempt in range(max_retries):
+        async with busy_lock:
+            normalized = normalize_chat_request(req.messages, req.model)
+            model = normalized["model"]
+            tmp_files = list(normalized["cleanup_paths"])
 
-            if req.stream:
-                return _build_streaming_response(
-                    client=client,
-                    prompt=prompt,
+            try:
+                logger.info(
+                    "Chat: model=%s, contents=%s, capture_prompt=%s..., images=%s, stream=%s, attempt=%d",
+                    model,
+                    len(normalized["contents"]),
+                    normalized["capture_prompt"][:50],
+                    len(normalized["capture_images"]),
+                    req.stream,
+                    attempt + 1,
+                )
+                tools = normalize_openai_tools(req.tools)
+
+                # Gemma 4 4B/12B 默认开启 Google Search
+                if tools is None and any(m in model for m in ("gemma-4-4b", "gemma-4-12b")):
+                    from aistudio_api.infrastructure.gateway.request_rewriter import TOOLS_TEMPLATES
+                    tools = [TOOLS_TEMPLATES["google_search"]]
+
+                if req.stream:
+                    return _build_streaming_response(
+                        client=client,
+                        capture_prompt=normalized["capture_prompt"],
+                        model=model,
+                        capture_images=normalized["capture_images"] if normalized["capture_images"] else None,
+                        contents=normalized["contents"],
+                        system_instruction=normalized["system_instruction"],
+                        cleanup_paths=tmp_files,
+                        include_usage=bool(req.stream_options and req.stream_options.include_usage),
+                        temperature=req.temperature,
+                        top_p=req.top_p,
+                        top_k=req.top_k,
+                        max_tokens=req.max_tokens,
+                        tools=tools,
+                    )
+
+                output = await client.generate_content(
                     model=model,
-                    images=images if images else None,
-                    system_instruction=system_instruction,
-                    cleanup_paths=tmp_files,
-                    include_usage=bool(req.stream_options and req.stream_options.include_usage),
+                    capture_prompt=normalized["capture_prompt"],
+                    capture_images=normalized["capture_images"] if normalized["capture_images"] else None,
+                    contents=normalized["contents"],
+                    system_instruction_content=(
+                        AistudioContent(role="user", parts=[AistudioPart(text=normalized["system_instruction"])])
+                        if normalized["system_instruction"]
+                        else None
+                    ),
                     temperature=req.temperature,
                     top_p=req.top_p,
                     top_k=req.top_k,
                     max_tokens=req.max_tokens,
                     tools=tools,
+                    sanitize_plain_text=True,
                 )
 
-            output = await client.chat(
-                prompt=prompt,
-                model=model,
-                system_instruction=system_instruction,
-                images=images if images else None,
-                temperature=req.temperature,
-                top_p=req.top_p,
-                top_k=req.top_k,
-                max_tokens=req.max_tokens,
-                tools=tools,
-            )
+                # 记录成功
+                rotator = runtime_state.rotator
+                if rotator:
+                    account = runtime_state.account_service.get_active_account() if runtime_state.account_service else None
+                    if account:
+                        rotator.record_success(account.id)
 
-            runtime_state.record(model, "success", output.usage)
-            return chat_completion_response(
-                model=model,
-                content=output.text,
-                thinking=output.thinking,
-                usage=output.usage,
-                function_calls=output.function_calls,
-            )
-        except UsageLimitExceeded as exc:
-            runtime_state.record(model, "rate_limited")
-            raise HTTPException(429, detail={"message": str(exc), "type": "rate_limit_exceeded"}) from exc
-        except AistudioError as exc:
-            runtime_state.record(model, "errors")
-            raise HTTPException(500, detail={"message": str(exc), "type": "server_error"}) from exc
-        except Exception as exc:
-            runtime_state.record(model, "errors")
-            logger.error("Chat error: %s", exc, exc_info=True)
-            raise HTTPException(500, detail={"message": str(exc), "type": "server_error"}) from exc
-        finally:
-            if not req.stream:
-                cleanup_files(tmp_files)
+                runtime_state.record(model, "success", output.usage)
+                return chat_completion_response(
+                    model=model,
+                    content=output.text,
+                    thinking=output.thinking,
+                    usage=output.usage,
+                    function_calls=output.function_calls,
+                )
+            except UsageLimitExceeded as exc:
+                runtime_state.record(model, "rate_limited")
+                last_error = exc
+
+                # 记录限流
+                rotator = runtime_state.rotator
+                if rotator:
+                    account = runtime_state.account_service.get_active_account() if runtime_state.account_service else None
+                    if account:
+                        rotator.record_rate_limited(account.id)
+
+                # 尝试切换账号
+                if await _try_switch_account():
+                    logger.info("429 限流，已切换账号，重试 %d/%d", attempt + 1, max_retries)
+                    continue
+                else:
+                    logger.warning("429 限流，无法切换账号")
+                    raise HTTPException(429, detail={"message": str(exc), "type": "rate_limit_exceeded"}) from exc
+            except AistudioError as exc:
+                runtime_state.record(model, "errors")
+                rotator = runtime_state.rotator
+                if rotator:
+                    account = runtime_state.account_service.get_active_account() if runtime_state.account_service else None
+                    if account:
+                        rotator.record_error(account.id)
+                raise HTTPException(500, detail={"message": str(exc), "type": "server_error"}) from exc
+            except Exception as exc:
+                runtime_state.record(model, "errors")
+                logger.error("Chat error: %s", exc, exc_info=True)
+                raise HTTPException(500, detail={"message": str(exc), "type": "server_error"}) from exc
+            finally:
+                if not req.stream:
+                    cleanup_files(tmp_files)
+
+    # 所有重试都失败
+    raise HTTPException(429, detail={"message": str(last_error), "type": "rate_limit_exceeded"}) from last_error
 
 
 async def handle_image_generation(req: ImageRequest, client: AIStudioClient):
@@ -121,36 +204,71 @@ async def handle_image_generation(req: ImageRequest, client: AIStudioClient):
     if busy_lock.locked():
         raise HTTPException(429, detail={"message": "Server is busy", "type": "rate_limit_exceeded"})
 
-    async with busy_lock:
-        try:
-            logger.info("Image: model=%s, prompt=%s...", req.model, req.prompt[:50])
-            output = await client.generate_image(prompt=req.prompt, model=req.model)
+    max_retries = 3
+    last_error = None
 
-            data = []
-            for img in output.images:
-                b64 = base64.b64encode(img.data).decode("ascii")
-                data.append({"b64_json": b64, "revised_prompt": output.text or ""})
+    for attempt in range(max_retries):
+        async with busy_lock:
+            try:
+                logger.info("Image: model=%s, prompt=%s..., attempt=%d", req.model, req.prompt[:50], attempt + 1)
+                output = await client.generate_image(prompt=req.prompt, model=req.model)
 
-            runtime_state.record(req.model, "success", output.usage)
-            return {"created": int(time.time()), "data": data}
-        except UsageLimitExceeded as exc:
-            runtime_state.record(req.model, "rate_limited")
-            raise HTTPException(429, detail={"message": str(exc), "type": "rate_limit_exceeded"}) from exc
-        except AistudioError as exc:
-            runtime_state.record(req.model, "errors")
-            raise HTTPException(500, detail={"message": str(exc), "type": "server_error"}) from exc
-        except Exception as exc:
-            runtime_state.record(req.model, "errors")
-            logger.error("Image error: %s", exc, exc_info=True)
-            raise HTTPException(500, detail={"message": str(exc), "type": "server_error"}) from exc
+                data = []
+                for img in output.images:
+                    b64 = base64.b64encode(img.data).decode("ascii")
+                    data.append({"b64_json": b64, "revised_prompt": output.text or ""})
+
+                # 记录成功
+                rotator = runtime_state.rotator
+                if rotator:
+                    account = runtime_state.account_service.get_active_account() if runtime_state.account_service else None
+                    if account:
+                        rotator.record_success(account.id)
+
+                runtime_state.record(req.model, "success", output.usage)
+                return {"created": int(time.time()), "data": data}
+            except UsageLimitExceeded as exc:
+                runtime_state.record(req.model, "rate_limited")
+                last_error = exc
+
+                # 记录限流
+                rotator = runtime_state.rotator
+                if rotator:
+                    account = runtime_state.account_service.get_active_account() if runtime_state.account_service else None
+                    if account:
+                        rotator.record_rate_limited(account.id)
+
+                # 尝试切换账号
+                if await _try_switch_account():
+                    logger.info("Image 429 限流，已切换账号，重试 %d/%d", attempt + 1, max_retries)
+                    continue
+                else:
+                    logger.warning("Image 429 限流，无法切换账号")
+                    raise HTTPException(429, detail={"message": str(exc), "type": "rate_limit_exceeded"}) from exc
+            except AistudioError as exc:
+                runtime_state.record(req.model, "errors")
+                rotator = runtime_state.rotator
+                if rotator:
+                    account = runtime_state.account_service.get_active_account() if runtime_state.account_service else None
+                    if account:
+                        rotator.record_error(account.id)
+                raise HTTPException(500, detail={"message": str(exc), "type": "server_error"}) from exc
+            except Exception as exc:
+                runtime_state.record(req.model, "errors")
+                logger.error("Image error: %s", exc, exc_info=True)
+                raise HTTPException(500, detail={"message": str(exc), "type": "server_error"}) from exc
+
+    # 所有重试都失败
+    raise HTTPException(429, detail={"message": str(last_error), "type": "rate_limit_exceeded"}) from last_error
 
 
 def _build_streaming_response(
     *,
     client: AIStudioClient,
-    prompt: str,
+    capture_prompt: str,
     model: str,
-    images: list[str] | None,
+    capture_images: list[str] | None,
+    contents: list[AistudioContent],
     system_instruction: str | None,
     cleanup_paths: list[str],
     include_usage: bool = False,
@@ -165,11 +283,16 @@ def _build_streaming_response(
             chat_id = new_chat_id()
             final_usage = None
             saw_tool_calls = False
-            async for event_type, text in client.stream_chat(
-                prompt=prompt,
+            async for event_type, text in client.stream_generate_content(
                 model=model,
-                images=images,
-                system_instruction=system_instruction,
+                capture_prompt=capture_prompt,
+                capture_images=capture_images,
+                contents=contents,
+                system_instruction_content=(
+                    AistudioContent(role="user", parts=[AistudioPart(text=system_instruction)])
+                    if system_instruction
+                    else None
+                ),
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,

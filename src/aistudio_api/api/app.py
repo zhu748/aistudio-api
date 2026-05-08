@@ -7,9 +7,12 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 
+from .routes_accounts import router as accounts_router
 from .routes_gemini import router as gemini_router
 from .routes_openai import router as openai_router
 from .routes_system import router as system_router
@@ -23,19 +26,64 @@ logger = logging.getLogger("aistudio.server")
 async def lifespan(app: FastAPI):
     import asyncio
 
-    runtime_state.client = AIStudioClient(port=runtime_state.camoufox_port)
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.account.account_store import AccountStore
+    from aistudio_api.infrastructure.account.login_service import LoginService
+    from aistudio_api.application.account_service import AccountService
+    from aistudio_api.application.account_rotator import init_rotator, RotationMode
+
+    runtime_state.client = AIStudioClient(
+        port=runtime_state.camoufox_port,
+        use_pure_http=settings.use_pure_http,
+    )
     runtime_state.busy_lock = asyncio.Lock()
-    logger.info("Client initialized (camoufox port=%s)", runtime_state.camoufox_port)
+
+    # 初始化账号管理服务
+    account_store = AccountStore()
+    login_service = LoginService(port=settings.login_camoufox_port)
+    account_service = AccountService(account_store, login_service)
+    runtime_state.account_service = account_service
+
+    # 初始化账号轮询器
+    rotation_mode = getattr(settings, "account_rotation_mode", "round_robin")
+    cooldown = getattr(settings, "account_cooldown_seconds", 60)
+    rotator = init_rotator(
+        account_store,
+        mode=RotationMode(rotation_mode),
+        cooldown_seconds=cooldown,
+    )
+    runtime_state.rotator = rotator
+
+    logger.info(
+        "Client initialized (camoufox port=%s, rotation=%s, accounts=%d)",
+        runtime_state.camoufox_port,
+        rotator.mode,
+        len(account_store.list_accounts()),
+    )
     yield
     logger.info("Shutting down")
     runtime_state.client = None
     runtime_state.busy_lock = None
+    runtime_state.account_service = None
+    runtime_state.rotator = None
 
 
 app = FastAPI(title="AI Studio API", lifespan=lifespan)
 app.include_router(system_router)
 app.include_router(gemini_router)
 app.include_router(openai_router)
+app.include_router(accounts_router)
+
+# 挂载静态文件
+import os
+static_dir = os.path.join(os.path.dirname(__file__), "..", "static")
+if os.path.isdir(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+
+@app.get("/")
+async def root():
+    return RedirectResponse(url="/static/index.html")
 
 
 def main():

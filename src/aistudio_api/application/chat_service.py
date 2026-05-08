@@ -48,34 +48,92 @@ def url_to_file(url: str, tmp_dir: str = "/tmp") -> str:
     return path
 
 
-def normalize_chat_request(messages, requested_model: str, tmp_dir: str = "/tmp") -> tuple[str, str, list[str]]:
-    system_instruction = None
-    prompt_parts = []
-    images = []
+def normalize_chat_request(messages, requested_model: str, tmp_dir: str = "/tmp") -> dict:
+    system_texts: list[str] = []
+    contents: list[AistudioContent] = []
+    capture_texts: list[str] = []
+    capture_images: list[str] = []
+    cleanup_paths: list[str] = []
+    saw_images = False
 
     for msg in messages:
-        if msg.role == "system":
-            if isinstance(msg.content, str):
-                system_instruction = msg.content
-        elif msg.role == "user":
-            if isinstance(msg.content, str):
-                prompt_parts.append(msg.content)
-            elif isinstance(msg.content, list):
-                for part in msg.content:
-                    if part.type == "text" and part.text:
-                        prompt_parts.append(part.text)
-                    elif part.type == "image_url" and part.image_url:
-                        url = part.image_url["url"] if isinstance(part.image_url, dict) else part.image_url.url
-                        if url.startswith("data:"):
-                            images.append(data_uri_to_file(url, tmp_dir=tmp_dir))
-                        elif url.startswith("http"):
-                            images.append(url_to_file(url, tmp_dir=tmp_dir))
+        role = (msg.role or "user").lower()
+        if role in ("system", "developer"):
+            text = _message_text_content(msg.content)
+            if text:
+                system_texts.append(text)
+                capture_texts.append(text)
+            continue
 
-    prompt = "\n".join(prompt_parts) if prompt_parts else "你好"
+        parts: list[AistudioPart] = []
+        text_parts: list[str] = []
+        image_paths: list[str] = []
+
+        if isinstance(msg.content, str):
+            if msg.content:
+                parts.append(AistudioPart(text=msg.content))
+                text_parts.append(msg.content)
+        elif isinstance(msg.content, list):
+            for part in msg.content:
+                if part.type == "text" and part.text:
+                    parts.append(AistudioPart(text=part.text))
+                    text_parts.append(part.text)
+                elif part.type == "image_url" and part.image_url:
+                    url = part.image_url["url"] if isinstance(part.image_url, dict) else part.image_url.url
+                    if url.startswith("data:"):
+                        path = data_uri_to_file(url, tmp_dir=tmp_dir)
+                        image_paths.append(path)
+                        cleanup_paths.append(path)
+                    elif url.startswith("http"):
+                        path = url_to_file(url, tmp_dir=tmp_dir)
+                        image_paths.append(path)
+                        cleanup_paths.append(path)
+
+        for image_path in image_paths:
+            parts.append(_image_path_to_part(image_path))
+
+        if not parts:
+            continue
+
+        mapped_role = "model" if role == "assistant" else "user"
+        contents.append(AistudioContent(role=mapped_role, parts=parts))
+        capture_texts.extend(text_parts)
+        if image_paths:
+            saw_images = True
+            capture_images.extend(image_paths)
+
+    capture_prompt = "\n".join(capture_texts) if capture_texts else "你好"
     model = requested_model
     if model.startswith("gpt-") or model.startswith("openai/"):
-        model = DEFAULT_IMAGE_MODEL if images else requested_model
-    return system_instruction, prompt, images
+        model = DEFAULT_IMAGE_MODEL if saw_images else requested_model
+
+    return {
+        "model": model,
+        "system_instruction": "\n".join(system_texts) if system_texts else None,
+        "contents": contents or [AistudioContent(role="user", parts=[AistudioPart(text="你好")])],
+        "capture_prompt": capture_prompt,
+        "capture_images": capture_images,
+        "cleanup_paths": cleanup_paths,
+    }
+
+
+def _message_text_content(content) -> str | None:
+    if isinstance(content, str):
+        return content or None
+    if isinstance(content, list):
+        texts = [part.text for part in content if part.type == "text" and part.text]
+        return "\n".join(texts) if texts else None
+    return None
+
+
+def _image_path_to_part(path: str) -> AistudioPart:
+    mime = "image/jpeg"
+    if path.endswith(".png"):
+        mime = "image/png"
+    elif path.endswith(".webp"):
+        mime = "image/webp"
+    with open(path, "rb") as file:
+        return AistudioPart(inline_data=(mime, base64.b64encode(file.read()).decode("ascii")))
 
 
 def cleanup_files(paths: list[str]):
@@ -112,9 +170,9 @@ def encode_schema_to_wire(schema: dict) -> list:
 
     required = schema.get("required")
     if isinstance(required, list):
-        while len(wire) <= 21:
+        while len(wire) <= 7:
             wire.append(None)
-        wire[21] = list(required)
+        wire[7] = list(required)
 
     property_ordering = schema.get("propertyOrdering")
     if isinstance(property_ordering, list):
@@ -230,6 +288,10 @@ def normalize_gemini_request(req, requested_model: str, tmp_dir: str = "/tmp") -
                 tools.append([None, [encode_function_declaration_to_wire(decl) for decl in tool.functionDeclarations]])
             if tool.googleSearch is not None or tool.googleSearchRetrieval is not None:
                 tools.append(TOOLS_TEMPLATES["google_search"])
+
+    # Gemma 4 4B/12B 默认开启 Google Search
+    if tools is None and any(m in model for m in ("gemma-4-26b-a4b-it", "gemma-4-26b-a4b-it")):
+        tools = [TOOLS_TEMPLATES["google_search"]]
 
     generation_config = req.generationConfig
     generation_config_overrides = None

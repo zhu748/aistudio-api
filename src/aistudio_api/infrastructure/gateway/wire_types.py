@@ -153,8 +153,11 @@ class AistudioGenerationConfig:
 class AistudioPart:
     text: str | None = None
     inline_data: tuple[str, str] | None = None
+    file_id: str | None = None
 
     def to_wire(self):
+        if self.file_id:
+            return [None, None, None, None, None, [self.file_id]]
         if self.inline_data:
             mime, b64 = self.inline_data
             return [None, None, [mime, b64]]

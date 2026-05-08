@@ -24,13 +24,33 @@ _snapshot_cache = SnapshotCache()
 
 
 class AIStudioClient:
-    def __init__(self, port: int = DEFAULT_CAMOUFOX_PORT):
+    def __init__(self, port: int = DEFAULT_CAMOUFOX_PORT, use_pure_http: bool = False):
         self.port = port
+        self._use_pure_http = use_pure_http
         self._captured: Optional[CapturedRequest] = None
-        self._session = BrowserSession(port=port)
-        self._capture_service = RequestCaptureService(self._session, _snapshot_cache)
-        self._replay_service = RequestReplayService(self._session)
-        self._streaming_gateway = StreamingGateway()
+        
+        if use_pure_http:
+            # Pure HTTP mode: no browser needed for capture
+            from aistudio_api.infrastructure.gateway.pure_capture import PureHttpCaptureService
+            self._capture_service = PureHttpCaptureService(_snapshot_cache)
+            self._session = None
+            self._replay_service = RequestReplayService(session=None)
+        else:
+            # Browser mode: uses browser for capture and replay
+            self._session = BrowserSession(port=port)
+            self._capture_service = RequestCaptureService(self._session, _snapshot_cache)
+            self._replay_service = RequestReplayService(session=self._session)
+        
+        self._streaming_gateway = StreamingGateway(session=self._session)
+
+    async def switch_auth(self, auth_file: str | None) -> None:
+        """切换账号的 auth 文件。"""
+        if self._session is not None:
+            await self._session.switch_auth(auth_file)
+
+    def clear_snapshot_cache(self) -> None:
+        """清除 snapshot 缓存。"""
+        _snapshot_cache.clear()
 
     def _dump_raw_exchange(
         self,
@@ -64,8 +84,9 @@ class AIStudioClient:
         prompt: str,
         model: str = DEFAULT_TEXT_MODEL,
         images: Optional[list[str]] = None,
+        contents: Optional[list[AistudioContent]] = None,
     ) -> Optional[CapturedRequest]:
-        return await self._capture_service.capture(prompt=prompt, model=model, images=images)
+        return await self._capture_service.capture(prompt=prompt, model=model, images=images, contents=contents)
 
     async def replay(self, body: str, timeout: int = 120) -> tuple[int, bytes]:
         return await self._replay_service.replay(self._captured, body=body, timeout=timeout)
@@ -118,7 +139,7 @@ class AIStudioClient:
         generation_config_overrides: dict | None = None,
         sanitize_plain_text: bool = True,
     ):
-        captured = await self.capture_request(prompt=capture_prompt, model=model, images=capture_images)
+        captured = await self.capture_request(prompt=capture_prompt, model=model, images=capture_images, contents=contents)
         async for event in self._streaming_gateway.stream_chat(
             captured=captured,
             model=model,
@@ -190,13 +211,13 @@ class AIStudioClient:
         sanitize_plain_text: bool = True,
     ) -> ModelOutput:
         logger.info("拦截请求: %r", f"{capture_prompt[:20]}...")
-        self._captured = await self.capture_request(capture_prompt, model=model, images=capture_images)
+        self._captured = await self.capture_request(capture_prompt, model=model, images=capture_images, contents=contents)
         if not self._captured:
             raise RequestError(0, "无法拦截请求")
 
         modified_body = modify_body(
             self._captured.body,
-            model=self._captured.model,
+            model=model,
             contents=contents,
             system_instruction_content=system_instruction_content,
             tools=tools,

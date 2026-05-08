@@ -84,6 +84,7 @@ class AistudioWireCodec:
         self,
         original_body: str,
         model: str = DEFAULT_TEXT_MODEL,
+        snapshot: str | None = None,
         prompt: str | None = None,
         contents: list[AistudioContent] | None = None,
         system_instruction: str | None = None,
@@ -100,6 +101,8 @@ class AistudioWireCodec:
     ) -> str:
         request = self.decode(original_body)
         request.model = model
+        if snapshot is not None:
+            request.snapshot = snapshot
 
         if contents is not None:
             request.contents = contents
@@ -127,13 +130,23 @@ class AistudioWireCodec:
             if value is None or not hasattr(request.generation_config, attr):
                 continue
             setattr(request.generation_config, attr, value)
+        # Gemma models: enable thinking by default for supported models
+        THINKING_MODELS = {"gemma-4-31b-it", "gemma-4-26b-a4b-it"}
         if "gemma" in model.lower():
-            request.generation_config.clear_gemma_thinking_budget()
+            if model in THINKING_MODELS:
+                # Keep or set default thinking config
+                if request.generation_config.thinking_config is None:
+                    request.generation_config.thinking_config = [1, None, None, 3]
+            else:
+                request.generation_config.clear_gemma_thinking_budget()
 
         # OpenAI chat compatibility should not inherit browser-side structured output
         # or explicit reasoning settings from a previously captured AI Studio request.
         if sanitize_plain_text and "image" not in model.lower():
             request.generation_config.sanitize_for_plain_text()
+            # Re-apply thinking for thinking models after sanitize
+            if model in THINKING_MODELS:
+                request.generation_config.thinking_config = [1, None, None, 3]
 
         if safety_off:
             request.safety_settings = [[None, None, cat, 4] for cat in [7, 8, 9, 10]]
@@ -168,6 +181,14 @@ class AistudioWireCodec:
     def _decode_part(self, raw_part) -> AistudioPart:
         if (
             isinstance(raw_part, list)
+            and len(raw_part) > 5
+            and isinstance(raw_part[5], list)
+            and len(raw_part[5]) >= 1
+            and isinstance(raw_part[5][0], str)
+        ):
+            return AistudioPart(file_id=raw_part[5][0])
+        if (
+            isinstance(raw_part, list)
             and len(raw_part) > 2
             and isinstance(raw_part[2], list)
             and len(raw_part[2]) >= 2
@@ -178,9 +199,15 @@ class AistudioWireCodec:
         return AistudioPart()
 
     def _decode_system_instruction(self, raw_instruction) -> AistudioContent | None:
-        if not raw_instruction or not isinstance(raw_instruction, list) or len(raw_instruction) < 2:
+        if not raw_instruction or not isinstance(raw_instruction, list):
             return None
-        return self._decode_contents([raw_instruction])[0]
+        if len(raw_instruction) >= 2 and isinstance(raw_instruction[1], str):
+            decoded = self._decode_contents([raw_instruction])
+            return decoded[0] if decoded else None
+        parts = [self._decode_part(raw_part) for raw_part in raw_instruction if isinstance(raw_part, list)]
+        if not parts:
+            return None
+        return AistudioContent(role="user", parts=parts)
 
     def _ensure_len(self, body: list, size: int):
         while len(body) < size:
@@ -193,6 +220,7 @@ _codec = AistudioWireCodec()
 def modify_body(
     original_body: str,
     model: str = DEFAULT_TEXT_MODEL,
+    snapshot: str | None = None,
     prompt: str | None = None,
     contents: list[AistudioContent] | None = None,
     system_instruction: str | None = None,
@@ -210,6 +238,7 @@ def modify_body(
     return _codec.rewrite(
         original_body=original_body,
         model=model,
+        snapshot=snapshot,
         prompt=prompt,
         contents=contents,
         system_instruction=system_instruction,
