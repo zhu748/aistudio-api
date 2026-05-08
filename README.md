@@ -1,6 +1,6 @@
 # AI Studio API
 
-将 Google AI Studio 网页端转为自托管的 OpenAI 兼容 API 服务器。不需要 API Key，只需一个 Google 账号。
+Google AIStudio Playgroud 反代，支持 Google 会员（Pro/Ultra），支持 Gemini 原生协议格式，包含生图、工具调用、Google搜索。
 
 [English](./README_EN.md)
 
@@ -14,8 +14,8 @@
 - **Google 搜索** — 通过 `googleSearchRetrieval` 实时联网搜索
 - **Thinking** — 返回模型思考过程（`thinking` 字段）
 - **图片生成** — 通过 Gemini 图片模型生成图片
-- **反检测** — 使用 Camoufox（反指纹 Firefox）避免被封
-- **BotGuard** — 自动特征匹配定位 snapshot 函数，无惧 Google 更新
+- **反检测** — 使用 Camoufox
+- **BotGuard** — 自动特征匹配定位 snapshot 函数
 - **多账号轮询** — round-robin / LRU / 最少限流
 
 ## 快速开始
@@ -33,13 +33,6 @@ python3 main.py login
 
 # 启动服务
 python3 main.py server --port 8080 --camoufox-port 9222
-```
-
-### Docker
-
-```bash
-docker build -t aistudio-api .
-docker run -p 8080:8080 -v ./data:/app/data aistudio-api
 ```
 
 ## 使用示例
@@ -120,17 +113,14 @@ python3 main.py client "画一只猫" --image --save cat.png
 
 | 模型 | ID | 默认 Google Search | 说明 |
 |------|-----|-------------------|------|
-| Gemma 4 31B | `gemma-4-31b-it` | ❌ | 默认文本模型 |
-| Gemma 4 12B | `gemma-4-12b-it` | ✅ | |
-| Gemma 4 4B | `gemma-4-4b-it` | ✅ | |
+| Gemma 4 31B | `gemma-4-31b-it` | ✅ | 默认文本模型 |
+| Gemma 4 26B A4B | `gemma-4-26b-a4b-it` | ✅ | MoE，4B 激活 |
 | Gemini 3 Flash | `gemini-3-flash-preview` | ❌ | 快速 |
-| Gemini 3.1 Flash Lite | `gemini-3.1-flash-lite-preview` | ❌ | |
-| Gemini 3.1 Flash Image | `gemini-3.1-flash-image-preview` | ❌ | 默认图片模型 |
-| Gemini 2.5 Flash | `gemini-2.5-flash-preview-05-20` | ❌ | |
-| Gemini 2.5 Pro | `gemini-2.5-pro-preview-05-06` | ❌ | |
-| Gemini 2.5 Flash Image | `gemini-2.5-flash-preview-image-generation` | ❌ | 图片生成 |
+| Gemini 3.1 Pro | `gemini-3.1-pro-preview` | ❌ | |
+| Gemini 3.1 Flash Lite | `gemini-3.1-flash-lite` | ❌ | |
+| Gemini 3.1 Flash Image | `gemini-3.1-flash-image-preview` | ❌ | 默认图片模型，仅限 Pro/Ultra |
+| Gemini 3 Pro Image | `gemini-3-pro-image-preview` | ❌ | |
 
-所有模型默认开启 thinking（流式返回 `thinking` 字段）。Gemma 4 4B/12B 默认开启 Google Search。
 
 ## 配置
 
@@ -226,6 +216,13 @@ Google 每次请求都要求一个 BotGuard "snapshot" —— 证明请求来自
 3. 为每个请求生成合法的 snapshot
 
 snapshot 函数名随 Google bundle 更新持续变化（Mv → Ov → Sv → ...），但特征模式保持不变。
+
+## TODO
+- [ ] 完整 webui 支持
+
+## 致谢
+- https://github.com/LuanRT/BgUtils
+- https://github.com/iBUHub/AIStudioToAPI
 
 ## License
 

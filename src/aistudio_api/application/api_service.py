@@ -104,8 +104,8 @@ async def handle_chat(req: ChatRequest, client: AIStudioClient):
                 )
                 tools = normalize_openai_tools(req.tools)
 
-                # Gemma 4 4B/12B 默认开启 Google Search
-                if tools is None and any(m in model for m in ("gemma-4-4b", "gemma-4-12b")):
+                # Gemma 4 默认开启 Google Search
+                if tools is None and any(m in model for m in ("gemma-4-26b-a4b-it", "gemma-4-31b-it")):
                     from aistudio_api.infrastructure.gateway.request_rewriter import TOOLS_TEMPLATES
                     tools = [TOOLS_TEMPLATES["google_search"]]
 
