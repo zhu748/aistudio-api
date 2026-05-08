@@ -88,6 +88,9 @@ async def handle_chat(req: ChatRequest, client: AIStudioClient):
 
     for attempt in range(max_retries):
         async with busy_lock:
+            # 首次尝试时轮询到下一个账号
+            if attempt == 0:
+                await _try_switch_account()
             normalized = normalize_chat_request(req.messages, req.model)
             model = normalized["model"]
             tmp_files = list(normalized["cleanup_paths"])
@@ -209,6 +212,9 @@ async def handle_image_generation(req: ImageRequest, client: AIStudioClient):
 
     for attempt in range(max_retries):
         async with busy_lock:
+            # 首次尝试时轮询到下一个账号
+            if attempt == 0:
+                await _try_switch_account()
             try:
                 logger.info("Image: model=%s, prompt=%s..., attempt=%d", req.model, req.prompt[:50], attempt + 1)
                 output = await client.generate_image(prompt=req.prompt, model=req.model)
@@ -351,66 +357,103 @@ async def handle_gemini_generate_content(
     if busy_lock.locked():
         raise HTTPException(429, detail={"message": "Server is busy", "type": "rate_limit_exceeded"})
 
-    async with busy_lock:
-        normalized = None
-        try:
-            normalized = normalize_gemini_request(req, model_path)
-            logger.info(
-                "Gemini: model=%s, contents=%s, stream=%s",
-                normalized["model"],
-                len(req.contents),
-                stream,
-            )
+    max_retries = 3
+    last_error = None
 
-            if stream:
-                return _build_gemini_streaming_response(client=client, normalized=normalized)
+    for attempt in range(max_retries):
+        async with busy_lock:
+            # 首次尝试时轮询到下一个账号
+            if attempt == 0:
+                await _try_switch_account()
+            normalized = None
+            try:
+                normalized = normalize_gemini_request(req, model_path)
+                logger.info(
+                    "Gemini: model=%s, contents=%s, stream=%s, attempt=%d",
+                    normalized["model"],
+                    len(req.contents),
+                    stream,
+                    attempt + 1,
+                )
 
-            output = await client.generate_content(
-                model=normalized["model"],
-                capture_prompt=normalized["capture_prompt"],
-                capture_images=normalized["capture_images"],
-                contents=normalized["contents"],
-                system_instruction_content=normalized["system_instruction"],
-                tools=normalized["tools"],
-                temperature=normalized["temperature"],
-                top_p=normalized["top_p"],
-                top_k=normalized["top_k"],
-                max_tokens=normalized["max_tokens"],
-                generation_config_overrides=normalized["generation_config_overrides"],
-                sanitize_plain_text=False,
-            )
+                if stream:
+                    return _build_gemini_streaming_response(client=client, normalized=normalized)
 
-            runtime_state.record(normalized["model"], "success", output.usage)
-            return {
-                "candidates": [
-                    {
-                        "content": {
-                            "role": "model",
-                            "parts": to_gemini_parts(
-                                output.text,
-                                function_calls=output.function_calls,
-                                function_responses=output.function_responses,
-                            ),
-                        },
-                        "finishReason": "STOP" if not output.function_calls else "FUNCTION_CALL",
-                    }
-                ]
-            }
-        except ValueError as exc:
-            raise HTTPException(400, detail={"message": str(exc), "type": "bad_request"}) from exc
-        except UsageLimitExceeded as exc:
-            runtime_state.record(model_path, "rate_limited")
-            raise HTTPException(429, detail={"message": str(exc), "type": "rate_limit_exceeded"}) from exc
-        except AistudioError as exc:
-            runtime_state.record(model_path, "errors")
-            raise HTTPException(500, detail={"message": str(exc), "type": "server_error"}) from exc
-        except Exception as exc:
-            runtime_state.record(model_path, "errors")
-            logger.error("Gemini error: %s", exc, exc_info=True)
-            raise HTTPException(500, detail={"message": str(exc), "type": "server_error"}) from exc
-        finally:
-            if normalized is not None and not stream:
-                cleanup_files(normalized["cleanup_paths"])
+                output = await client.generate_content(
+                    model=normalized["model"],
+                    capture_prompt=normalized["capture_prompt"],
+                    capture_images=normalized["capture_images"],
+                    contents=normalized["contents"],
+                    system_instruction_content=normalized["system_instruction"],
+                    tools=normalized["tools"],
+                    temperature=normalized["temperature"],
+                    top_p=normalized["top_p"],
+                    top_k=normalized["top_k"],
+                    max_tokens=normalized["max_tokens"],
+                    generation_config_overrides=normalized["generation_config_overrides"],
+                    sanitize_plain_text=False,
+                )
+
+                # 记录成功
+                rotator = runtime_state.rotator
+                if rotator:
+                    account = runtime_state.account_service.get_active_account() if runtime_state.account_service else None
+                    if account:
+                        rotator.record_success(account.id)
+
+                runtime_state.record(normalized["model"], "success", output.usage)
+                return {
+                    "candidates": [
+                        {
+                            "content": {
+                                "role": "model",
+                                "parts": to_gemini_parts(
+                                    output.text,
+                                    function_calls=output.function_calls,
+                                    function_responses=output.function_responses,
+                                ),
+                            },
+                            "finishReason": "STOP" if not output.function_calls else "FUNCTION_CALL",
+                        }
+                    ]
+                }
+            except ValueError as exc:
+                raise HTTPException(400, detail={"message": str(exc), "type": "bad_request"}) from exc
+            except UsageLimitExceeded as exc:
+                runtime_state.record(model_path, "rate_limited")
+                last_error = exc
+
+                # 记录限流
+                rotator = runtime_state.rotator
+                if rotator:
+                    account = runtime_state.account_service.get_active_account() if runtime_state.account_service else None
+                    if account:
+                        rotator.record_rate_limited(account.id)
+
+                # 尝试切换账号
+                if await _try_switch_account():
+                    logger.info("Gemini 429 限流，已切换账号，重试 %d/%d", attempt + 1, max_retries)
+                    continue
+                else:
+                    logger.warning("Gemini 429 限流，无法切换账号")
+                    raise HTTPException(429, detail={"message": str(exc), "type": "rate_limit_exceeded"}) from exc
+            except AistudioError as exc:
+                runtime_state.record(model_path, "errors")
+                rotator = runtime_state.rotator
+                if rotator:
+                    account = runtime_state.account_service.get_active_account() if runtime_state.account_service else None
+                    if account:
+                        rotator.record_error(account.id)
+                raise HTTPException(500, detail={"message": str(exc), "type": "server_error"}) from exc
+            except Exception as exc:
+                runtime_state.record(model_path, "errors")
+                logger.error("Gemini error: %s", exc, exc_info=True)
+                raise HTTPException(500, detail={"message": str(exc), "type": "server_error"}) from exc
+            finally:
+                if normalized is not None and not stream:
+                    cleanup_files(normalized["cleanup_paths"])
+
+    raise HTTPException(429, detail={"message": str(last_error), "type": "rate_limit_exceeded"}) from last_error
 
 
 def _build_gemini_streaming_response(*, client: AIStudioClient, normalized: dict) -> StreamingResponse:

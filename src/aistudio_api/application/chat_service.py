@@ -290,7 +290,7 @@ def normalize_gemini_request(req, requested_model: str, tmp_dir: str = "/tmp") -
                 tools.append(TOOLS_TEMPLATES["google_search"])
 
     # Gemma 4 小模型默认开启 Google Search
-    if tools is None and any(m in model for m in ("gemma-4-26b-a4b-it", "gemma-4-26b-a4b-it")):
+    if tools is None and any(m in model for m in ("gemma-4-26b-a4b-it", "gemma-4-31b-it")):
         tools = [TOOLS_TEMPLATES["google_search"]]
 
     generation_config = req.generationConfig

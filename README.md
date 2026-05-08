@@ -219,10 +219,13 @@ snapshot 函数名随 Google bundle 更新持续变化（Mv → Ov → Sv → ..
 
 ## TODO
 - [ ] 完整 webui 支持
+- [ ] 完整流式支持
+- [ ] 兼容 /v1/messages
 
 ## 致谢
 - https://github.com/LuanRT/BgUtils
 - https://github.com/iBUHub/AIStudioToAPI
+- https://linux.do
 
 ## License
 

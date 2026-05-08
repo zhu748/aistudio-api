@@ -130,12 +130,20 @@ class AccountRotator:
         return available
 
     def _pick_round_robin(self, available: list[tuple[AccountMeta, AccountStats]]) -> tuple[AccountMeta, AccountStats] | None:
-        """Round-robin 选择。"""
+        """Round-robin 选择，基于全量账号索引，避免 available 变化导致跳过或重复。"""
         if not available:
             return None
-        idx = self._current_index % len(available)
-        self._current_index = (self._current_index + 1) % len(available)
-        return available[idx]
+        available_ids = {a.id for a, _ in available}
+        all_accounts = self._store.list_accounts()
+        if not all_accounts:
+            return None
+        total = len(all_accounts)
+        for i in range(total):
+            idx = (self._current_index + i) % total
+            if all_accounts[idx].id in available_ids:
+                self._current_index = (idx + 1) % total
+                return next((a, s) for a, s in available if a.id == all_accounts[idx].id)
+        return available[0]
 
     def _pick_lru(self, available: list[tuple[AccountMeta, AccountStats]]) -> tuple[AccountMeta, AccountStats] | None:
         """最久未用优先。"""
