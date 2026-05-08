@@ -230,9 +230,6 @@ class AIStudioClient:
         )
 
         status, raw = await self.replay(modified_body)
-        if status != 200:
-            raise classify_error(status, raw.decode("utf-8", errors="replace"))
-
         raw_text = raw.decode("utf-8", errors="replace")
         self._dump_raw_exchange(
             kind="generate_content",
@@ -241,6 +238,8 @@ class AIStudioClient:
             modified_body=modified_body,
             raw_response=raw_text,
         )
+        if status != 200:
+            raise classify_error(status, raw_text)
         output = parse_text_output(raw_text)
         output.model = model
         return output
@@ -258,9 +257,6 @@ class AIStudioClient:
 
         modified_body = modify_body(self._captured.body, model=model, prompt=prompt)
         status, raw = await self.replay(modified_body, timeout=120)
-        if status != 200:
-            raise classify_error(status, raw.decode("utf-8", errors="replace"))
-
         raw_text = raw.decode("utf-8", errors="replace")
         self._dump_raw_exchange(
             kind="generate_image",
@@ -269,6 +265,8 @@ class AIStudioClient:
             modified_body=modified_body,
             raw_response=raw_text,
         )
+        if status != 200:
+            raise classify_error(status, raw_text)
         output = parse_image_output(raw_text)
         output.model = model
 

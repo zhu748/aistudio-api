@@ -110,14 +110,14 @@ class StreamingGateway:
         parser = IncrementalJSONStreamParser()
         latest_usage: dict | None = None
         raw_response = raw.decode("utf-8", errors="replace")
+        _dump_stream_exchange(
+            model=model,
+            url=captured.url,
+            modified_body=modified_body,
+            status_code=status,
+            raw_response=raw_response,
+        )
         if status != 200:
-            _dump_stream_exchange(
-                model=model,
-                url=captured.url,
-                modified_body=modified_body,
-                status_code=status,
-                raw_response=raw_response,
-            )
             detail = _summarize_error_body(raw_response)
             if detail:
                 raise RuntimeError(f"Upstream error: {status} - {detail}")
