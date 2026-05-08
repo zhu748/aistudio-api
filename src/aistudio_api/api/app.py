@@ -32,11 +32,16 @@ async def lifespan(app: FastAPI):
     from aistudio_api.application.account_service import AccountService
     from aistudio_api.application.account_rotator import init_rotator, RotationMode
 
-    runtime_state.client = AIStudioClient(
+    client = AIStudioClient(
         port=runtime_state.camoufox_port,
         use_pure_http=settings.use_pure_http,
     )
+    runtime_state.client = client
     runtime_state.busy_lock = asyncio.Lock()
+
+    # 注入 snapshot 缓存引用，切号时需要清除
+    from aistudio_api.infrastructure.gateway.client import _snapshot_cache
+    runtime_state.snapshot_cache = _snapshot_cache
 
     # 初始化账号管理服务
     account_store = AccountStore()

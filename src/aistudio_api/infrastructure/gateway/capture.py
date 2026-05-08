@@ -43,10 +43,11 @@ class RequestCaptureService:
         model: str = DEFAULT_TEXT_MODEL,
         images: list[str] | None = None,
         contents: list[AistudioContent] | None = None,
+        force_refresh: bool = False,
     ) -> CapturedRequest | None:
         # Image bytes live in rewritten contents, so template capture does not need
         # the original image list. Only cache plain-text prompts.
-        if not images:
+        if not images and not force_refresh:
             cached = self._snapshot_cache.get(prompt)
             if cached:
                 _snapshot, url, headers, body = cached

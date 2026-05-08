@@ -48,7 +48,7 @@ class AccountService:
         browser_session: Any,
         snapshot_cache: Any,
         busy_lock: Any = None,  # None = skip lock (caller already holds it)
-        keep_snapshot_cache: bool = True,  # 新增：保留 snapshot 缓存
+        keep_snapshot_cache: bool = False,
     ) -> AccountMeta | None:
         """切换到指定账号。
 
@@ -57,7 +57,7 @@ class AccountService:
             browser_session: BrowserSession 实例
             snapshot_cache: SnapshotCache 实例
             busy_lock: asyncio.Lock，确保切换时无请求在飞行中。None 则跳过锁
-            keep_snapshot_cache: 是否保留 snapshot 缓存（默认 True，因为 snapshot 跟账号无关）
+            keep_snapshot_cache: 是否保留 snapshot 缓存（默认 False，避免切号后复用旧 snapshot）
 
         Returns:
             切换后的账号元数据，或 None（如果账号不存在）
@@ -77,8 +77,7 @@ class AccountService:
             # 切换 BrowserSession 的 auth
             await browser_session.switch_auth(str(auth_path))
 
-            # 只在明确要求时才清除 snapshot 缓存
-            # snapshot 是按 prompt hash 缓存的，跟账号 cookies 无关
+            # 切号后默认清理 snapshot，避免旧页面态和新账号 cookies 混用。
             if not keep_snapshot_cache and snapshot_cache is not None:
                 snapshot_cache.clear()
                 logger.info("已清除 snapshot 缓存")

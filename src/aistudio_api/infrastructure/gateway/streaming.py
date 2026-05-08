@@ -9,6 +9,7 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from aistudio_api.config import settings
+from aistudio_api.domain.errors import RequestError, classify_error
 from aistudio_api.domain.models import parse_chunk_usage
 from aistudio_api.infrastructure.gateway.capture import CapturedRequest
 from aistudio_api.infrastructure.gateway.request_rewriter import modify_body
@@ -119,9 +120,11 @@ class StreamingGateway:
         )
         if status != 200:
             detail = _summarize_error_body(raw_response)
+            if status in (401, 403, 429):
+                raise classify_error(status, raw_response)
             if detail:
-                raise RuntimeError(f"Upstream error: {status} - {detail}")
-            raise RuntimeError(f"Upstream error: {status}")
+                raise RequestError(status, detail)
+            raise RequestError(status, "")
 
         for chunk in parser.feed(raw_response):
             usage = parse_chunk_usage(chunk)

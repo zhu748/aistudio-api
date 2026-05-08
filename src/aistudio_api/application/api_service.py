@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from aistudio_api.application.chat_service import cleanup_files, normalize_chat_request, normalize_gemini_request, normalize_openai_tools
-from aistudio_api.domain.errors import AistudioError, UsageLimitExceeded
+from aistudio_api.domain.errors import AistudioError, AuthError, RequestError, UsageLimitExceeded
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent, AistudioPart
 from aistudio_api.api.responses import (
@@ -46,13 +46,13 @@ async def _try_switch_account() -> bool:
     if not all([account_service, client]):
         return False
 
-    # 切换账号（保留 snapshot 缓存，busy_lock 由外层 handle_chat 持有，不重复获取）
+    # 切换账号时清掉 snapshot，避免复用旧页面态。
     result = await account_service.activate_account(
         next_account.id,
         client._session,
         runtime_state.snapshot_cache,
         None,  # skip lock — caller already holds it
-        keep_snapshot_cache=True,
+        keep_snapshot_cache=False,
     )
     return result is not None
 
@@ -285,57 +285,76 @@ def _build_streaming_response(
     tools: list[list] | None = None,
 ) -> StreamingResponse:
     async def stream_response():
-        try:
-            chat_id = new_chat_id()
-            final_usage = None
-            saw_tool_calls = False
-            async for event_type, text in client.stream_generate_content(
-                model=model,
-                capture_prompt=capture_prompt,
-                capture_images=capture_images,
-                contents=contents,
-                system_instruction_content=(
-                    AistudioContent(role="user", parts=[AistudioPart(text=system_instruction)])
-                    if system_instruction
-                    else None
-                ),
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                max_tokens=max_tokens,
-                tools=tools,
-            ):
-                if event_type == "body" and text:
-                    yield sse_chunk(chat_id, model, text, include_usage=include_usage)
-                elif event_type == "thinking" and text:
-                    yield sse_chunk(chat_id, model, "", thinking=text, include_usage=include_usage)
-                elif event_type == "tool_calls" and text:
-                    saw_tool_calls = True
-                    yield sse_chunk(
-                        chat_id,
-                        model,
-                        "",
-                        tool_calls=to_openai_tool_calls(text if isinstance(text, list) else []),
-                        include_usage=include_usage,
-                    )
-                elif event_type == "usage" and include_usage:
-                    final_usage = text if isinstance(text, dict) else None
-
-            runtime_state.record(model, "success", final_usage)
-            yield sse_chunk(chat_id, model, "", finish="tool_calls" if saw_tool_calls else "stop", include_usage=include_usage)
-            if include_usage:
-                yield sse_usage_chunk(chat_id, model, final_usage)
-            yield "data: [DONE]\n\n"
-        except Exception as exc:
-            logger.error("Stream error: %s", exc, exc_info=True)
-            runtime_state.record(model, "errors")
-            message = str(exc)
-            if message.startswith("Upstream error: "):
-                yield sse_error(message)
-            else:
-                yield sse_error(message)
-        finally:
+        busy_lock = runtime_state.busy_lock
+        if busy_lock is None:
+            yield sse_error("Server not ready")
             cleanup_files(cleanup_paths)
+            return
+
+        async with busy_lock:
+            try:
+                chat_id = new_chat_id()
+                final_usage = None
+                saw_tool_calls = False
+                for stream_attempt in range(2):
+                    try:
+                        async for event_type, text in client.stream_generate_content(
+                            model=model,
+                            capture_prompt=capture_prompt,
+                            capture_images=capture_images,
+                            contents=contents,
+                            system_instruction_content=(
+                                AistudioContent(role="user", parts=[AistudioPart(text=system_instruction)])
+                                if system_instruction
+                                else None
+                            ),
+                            temperature=temperature,
+                            top_p=top_p,
+                            top_k=top_k,
+                            max_tokens=max_tokens,
+                            tools=tools,
+                            force_refresh_capture=stream_attempt > 0,
+                        ):
+                            if event_type == "body" and text:
+                                yield sse_chunk(chat_id, model, text, include_usage=include_usage)
+                            elif event_type == "thinking" and text:
+                                yield sse_chunk(chat_id, model, "", thinking=text, include_usage=include_usage)
+                            elif event_type == "tool_calls" and text:
+                                saw_tool_calls = True
+                                yield sse_chunk(
+                                    chat_id,
+                                    model,
+                                    "",
+                                    tool_calls=to_openai_tool_calls(text if isinstance(text, list) else []),
+                                    include_usage=include_usage,
+                                )
+                            elif event_type == "usage" and include_usage:
+                                final_usage = text if isinstance(text, dict) else None
+                        break
+                    except RequestError as exc:
+                        if exc.status == 204 and stream_attempt == 0:
+                            logger.warning("Stream 收到 204，清理 snapshot 缓存后重试一次")
+                            client.clear_snapshot_cache()
+                            continue
+                        raise
+                    except AuthError as exc:
+                        if stream_attempt == 0:
+                            logger.warning("Stream 鉴权异常，清理 snapshot 缓存后重试一次: %s", exc)
+                            client.clear_snapshot_cache()
+                            continue
+                        raise
+
+                runtime_state.record(model, "success", final_usage)
+                yield sse_chunk(chat_id, model, "", finish="tool_calls" if saw_tool_calls else "stop", include_usage=include_usage)
+                if include_usage:
+                    yield sse_usage_chunk(chat_id, model, final_usage)
+                yield "data: [DONE]\n\n"
+            except Exception as exc:
+                logger.error("Stream error: %s", exc, exc_info=True)
+                runtime_state.record(model, "errors")
+                yield sse_error(str(exc))
+            finally:
+                cleanup_files(cleanup_paths)
 
     return StreamingResponse(
         stream_response(),
@@ -458,42 +477,65 @@ async def handle_gemini_generate_content(
 
 def _build_gemini_streaming_response(*, client: AIStudioClient, normalized: dict) -> StreamingResponse:
     async def stream_response():
-        try:
-            async for event_type, text in client.stream_generate_content(
-                model=normalized["model"],
-                capture_prompt=normalized["capture_prompt"],
-                capture_images=normalized["capture_images"],
-                contents=normalized["contents"],
-                system_instruction_content=normalized["system_instruction"],
-                tools=normalized["tools"],
-                temperature=normalized["temperature"],
-                top_p=normalized["top_p"],
-                top_k=normalized["top_k"],
-                max_tokens=normalized["max_tokens"],
-                generation_config_overrides=normalized["generation_config_overrides"],
-                sanitize_plain_text=False,
-            ):
-                if event_type == "body" and text:
-                    yield "data: " + json.dumps(
-                        {
-                            "candidates": [
-                                {
-                                    "content": {"role": "model", "parts": [{"text": text}]},
-                                    "finishReason": None,
-                                }
-                            ]
-                        },
-                        ensure_ascii=False,
-                    ) + "\n\n"
-
-            runtime_state.record(normalized["model"], "success")
-            yield "data: [DONE]\n\n"
-        except Exception as exc:
-            logger.error("Gemini stream error: %s", exc, exc_info=True)
-            runtime_state.record(normalized["model"], "errors")
-            yield "data: " + json.dumps({"error": {"message": str(exc)}}, ensure_ascii=False) + "\n\n"
-        finally:
+        busy_lock = runtime_state.busy_lock
+        if busy_lock is None:
+            yield "data: " + json.dumps({"error": {"message": "Server not ready"}}, ensure_ascii=False) + "\n\n"
             cleanup_files(normalized["cleanup_paths"])
+            return
+
+        async with busy_lock:
+            try:
+                for stream_attempt in range(2):
+                    try:
+                        async for event_type, text in client.stream_generate_content(
+                            model=normalized["model"],
+                            capture_prompt=normalized["capture_prompt"],
+                            capture_images=normalized["capture_images"],
+                            contents=normalized["contents"],
+                            system_instruction_content=normalized["system_instruction"],
+                            tools=normalized["tools"],
+                            temperature=normalized["temperature"],
+                            top_p=normalized["top_p"],
+                            top_k=normalized["top_k"],
+                            max_tokens=normalized["max_tokens"],
+                            generation_config_overrides=normalized["generation_config_overrides"],
+                            sanitize_plain_text=False,
+                            force_refresh_capture=stream_attempt > 0,
+                        ):
+                            if event_type == "body" and text:
+                                yield "data: " + json.dumps(
+                                    {
+                                        "candidates": [
+                                            {
+                                                "content": {"role": "model", "parts": [{"text": text}]},
+                                                "finishReason": None,
+                                            }
+                                        ]
+                                    },
+                                    ensure_ascii=False,
+                                ) + "\n\n"
+                        break
+                    except RequestError as exc:
+                        if exc.status == 204 and stream_attempt == 0:
+                            logger.warning("Gemini stream 收到 204，清理 snapshot 缓存后重试一次")
+                            client.clear_snapshot_cache()
+                            continue
+                        raise
+                    except AuthError as exc:
+                        if stream_attempt == 0:
+                            logger.warning("Gemini stream 鉴权异常，清理 snapshot 缓存后重试一次: %s", exc)
+                            client.clear_snapshot_cache()
+                            continue
+                        raise
+
+                runtime_state.record(normalized["model"], "success")
+                yield "data: [DONE]\n\n"
+            except Exception as exc:
+                logger.error("Gemini stream error: %s", exc, exc_info=True)
+                runtime_state.record(normalized["model"], "errors")
+                yield "data: " + json.dumps({"error": {"message": str(exc)}}, ensure_ascii=False) + "\n\n"
+            finally:
+                cleanup_files(normalized["cleanup_paths"])
 
     return StreamingResponse(
         stream_response(),

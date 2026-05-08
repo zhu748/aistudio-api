@@ -85,8 +85,15 @@ class AIStudioClient:
         model: str = DEFAULT_TEXT_MODEL,
         images: Optional[list[str]] = None,
         contents: Optional[list[AistudioContent]] = None,
+        force_refresh: bool = False,
     ) -> Optional[CapturedRequest]:
-        return await self._capture_service.capture(prompt=prompt, model=model, images=images, contents=contents)
+        return await self._capture_service.capture(
+            prompt=prompt,
+            model=model,
+            images=images,
+            contents=contents,
+            force_refresh=force_refresh,
+        )
 
     async def replay(self, body: str, timeout: int = 120) -> tuple[int, bytes]:
         return await self._replay_service.replay(self._captured, body=body, timeout=timeout)
@@ -138,8 +145,15 @@ class AIStudioClient:
         max_tokens: Optional[int] = None,
         generation_config_overrides: dict | None = None,
         sanitize_plain_text: bool = True,
+        force_refresh_capture: bool = False,
     ):
-        captured = await self.capture_request(prompt=capture_prompt, model=model, images=capture_images, contents=contents)
+        captured = await self.capture_request(
+            prompt=capture_prompt,
+            model=model,
+            images=capture_images,
+            contents=contents,
+            force_refresh=force_refresh_capture,
+        )
         async for event in self._streaming_gateway.stream_chat(
             captured=captured,
             model=model,

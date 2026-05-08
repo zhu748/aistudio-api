@@ -56,9 +56,10 @@ class PureHttpCaptureService:
         model: str = DEFAULT_TEXT_MODEL,
         images: list[str] | None = None,
         contents=None,
+        force_refresh: bool = False,
     ) -> CapturedRequest | None:
         # Check cache first
-        if not images:
+        if not images and not force_refresh:
             cached = self._snapshot_cache.get(prompt)
             if cached:
                 _snapshot, url, headers, body = cached

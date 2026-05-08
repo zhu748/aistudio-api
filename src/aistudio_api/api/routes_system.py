@@ -102,7 +102,7 @@ async def force_next_account(runtime_state=Depends(get_runtime_state)):
         client._session,
         runtime_state.snapshot_cache,
         busy_lock,
-        keep_snapshot_cache=True,
+        keep_snapshot_cache=False,
     )
 
     if result is None:
