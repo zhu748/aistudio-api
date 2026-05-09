@@ -17,3 +17,6 @@ docs/
 .env
 /test_*
 /capture_*
+chromium-profile/
+botguard-fork/
+scripts/

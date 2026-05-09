@@ -28,13 +28,10 @@ cd aistudio-api
 # 安装依赖
 pip install -r requirements.txt
 
-# 登录 Google（打开浏览器，保存 cookies）
-python3 main.py login
-
 # 启动服务
 python3 main.py server --port 8080 --camoufox-port 9222
 ```
-
+打开 http://localhost:8080 打开有头浏览器登录。
 ## 使用示例
 
 ### OpenAI 兼容接口
@@ -219,7 +216,7 @@ snapshot 函数名随 Google bundle 更新持续变化（Mv → Ov → Sv → ..
 
 ## TODO
 - [ ] 完整 webui 支持
-- [ ] 完整流式支持
+- [ ] 完整真流式支持
 - [ ] 兼容 /v1/messages
 
 ## 致谢

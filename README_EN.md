@@ -120,16 +120,30 @@ python3 main.py client "Draw a cat" --image --save cat.png
 | Model | ID | Default Google Search | Notes |
 |-------|----|----------------------|-------|
 | Gemma 4 31B | `gemma-4-31b-it` | ❌ | Default text model |
-| Gemma 4 12B | `gemma-4-12b-it` | ✅ | |
-| Gemma 4 4B | `gemma-4-4b-it` | ✅ | |
+| Gemma 4 26B A4B | `gemma-4-26b-a4b-it` | ✅ | MoE, 4B active |
 | Gemini 3 Flash | `gemini-3-flash-preview` | ❌ | Fast |
-| Gemini 3.1 Flash Lite | `gemini-3.1-flash-lite-preview` | ❌ | |
+| Gemini 3.1 Pro | `gemini-3.1-pro-preview` | ❌ | |
+| Gemini 3.1 Flash Lite | `gemini-3.1-flash-lite` | ❌ | |
 | Gemini 3.1 Flash Image | `gemini-3.1-flash-image-preview` | ❌ | Default image model |
-| Gemini 2.5 Flash | `gemini-2.5-flash-preview-05-20` | ❌ | |
-| Gemini 2.5 Pro | `gemini-2.5-pro-preview-05-06` | ❌ | |
-| Gemini 2.5 Flash Image | `gemini-2.5-flash-preview-image-generation` | ❌ | Image generation |
+| Gemini 3 Pro Image | `gemini-3-pro-image-preview` | ❌ | |
+| Gemini 3.1 Flash Live | `gemini-3.1-flash-live-preview` | ❌ | Real-time conversation |
+| Gemini 3.1 Flash TTS | `gemini-3.1-flash-tts-preview` | ❌ | Text-to-speech |
+| Gemini 2.5 Pro | `gemini-2.5-pro` | ❌ | |
+| Gemini 2.5 Flash | `gemini-2.5-flash` | ❌ | |
+| Gemini 2.5 Flash Lite | `gemini-2.5-flash-lite` | ❌ | |
+| Gemini 2.5 Flash Image | `gemini-2.5-flash-image` | ❌ | |
+| Gemini 2.0 Flash Lite | `gemini-2.0-flash-lite` | ❌ | |
+| Deep Research | `deep-research-preview-04-2026` | ❌ | |
+| Deep Research Max | `deep-research-max-preview-04-2026` | ❌ | |
+| Imagen 4 | `imagen-4.0-generate-001` | ❌ | Image generation |
+| Imagen 4 Ultra | `imagen-4.0-ultra-generate-001` | ❌ | |
+| Imagen 4 Fast | `imagen-4.0-fast-generate-001` | ❌ | |
+| Veo 3.1 | `veo-3.1-generate-preview` | ❌ | Video generation |
+| Veo 2 | `veo-2.0-generate-001` | ❌ | |
+| Lyria 3 | `lyria-3-pro-preview` | ❌ | Music generation |
+| Robotics ER | `gemini-robotics-er-1.6-preview` | ❌ | Robotics |
 
-All models have thinking enabled by default (streaming `thinking` field). Gemma 4 4B/12B have Google Search enabled by default.
+All models have thinking enabled by default (streaming `thinking` field). Gemma 4 26B A4B has Google Search enabled by default.
 
 ## Configuration
 

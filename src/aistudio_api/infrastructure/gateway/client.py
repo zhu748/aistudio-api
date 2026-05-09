@@ -43,6 +43,12 @@ class AIStudioClient:
         
         self._streaming_gateway = StreamingGateway(session=self._session)
 
+    async def warmup(self) -> None:
+        """预热浏览器，启动 Camoufox 并加载 AI Studio 页面。"""
+        if self._session is not None:
+            await self._session.ensure_context()
+            logger.info("浏览器预热完成")
+
     async def switch_auth(self, auth_file: str | None) -> None:
         """切换账号的 auth 文件。"""
         if self._session is not None:
