@@ -39,9 +39,12 @@ class RuntimeState:
         stats[event] += 1
         stats["last_used"] = datetime.now(timezone(timedelta(hours=8))).isoformat()
         if usage and event == "success":
-            stats["prompt_tokens"] += usage.get("prompt_tokens", 0) or 0
-            stats["completion_tokens"] += usage.get("completion_tokens", 0) or 0
-            stats["total_tokens"] += usage.get("total_tokens", 0) or 0
+            pt = usage.get("prompt_tokens", 0)
+            ct = usage.get("completion_tokens", 0)
+            tt = usage.get("total_tokens", 0)
+            stats["prompt_tokens"] += pt if isinstance(pt, int) else 0
+            stats["completion_tokens"] += ct if isinstance(ct, int) else 0
+            stats["total_tokens"] += tt if isinstance(tt, int) else 0
 
 
 runtime_state = RuntimeState()

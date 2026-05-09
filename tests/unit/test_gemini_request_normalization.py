@@ -113,3 +113,26 @@ def test_normalize_openai_tools_encodes_function_tools_to_wire():
             ],
         ]
     ]
+
+
+def test_normalize_openai_tools_encodes_required_to_schema_index_7():
+    req = ChatRequest(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_click",
+                    "description": "Click by ref",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"ref": {"type": "string"}},
+                        "required": ["ref"],
+                    },
+                },
+            }
+        ],
+    )
+
+    schema = normalize_openai_tools(req.tools)[0][1][0][2]
+    assert schema[7] == ["ref"]

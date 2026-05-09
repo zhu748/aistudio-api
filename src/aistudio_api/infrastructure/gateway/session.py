@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
@@ -14,11 +15,19 @@ from typing import Any
 from aistudio_api.config import settings
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 
+log = logging.getLogger("aistudio.session")
+
 AI_STUDIO_URL = "https://aistudio.google.com/prompts/new_chat"
 AI_STUDIO_URL_FALLBACK = "https://aistudio.google.com/app/prompts/new_chat"
 INSTALL_HOOKS_JS = r"""
 mw:((() => {
-    if (window.__bg_hooked) return 'already_hooked';
+    // Verify hooks are actually present on XHR prototype, not just a stale flag
+    const xhrHookAlive = XMLHttpRequest.prototype.open.__api_hooked === true;
+    const fetchHookAlive = window.fetch.__api_hooked === true;
+    if (window.__bg_hooked && xhrHookAlive && fetchHookAlive) return 'already_hooked';
+    // Reset stale flag if hooks are missing
+    if (window.__bg_hooked && (!xhrHookAlive || !fetchHookAlive)) window.__bg_hooked = false;
+
     const dms = window.default_MakerSuite;
     if (!dms) return 'no_default_MakerSuite';
 
@@ -36,25 +45,30 @@ mw:((() => {
     }
     if (!snapKey) return 'no_snapshot_fn';
 
-    // Hook snapshot function to capture service
-    const origSnap = dms[snapKey];
-    dms[snapKey] = function(...args) {
-        window.__bg_service = args[0];
-        const result = origSnap.apply(this, args);
-        if (result instanceof Promise) return result.then(s => { window.__bg_snapshot = s; return s; });
-        window.__bg_snapshot = result;
-        return result;
-    };
+    // Hook snapshot function to capture service (only if not already hooked)
+    if (!dms[snapKey].__api_hooked) {
+        const origSnap = dms[snapKey];
+        dms[snapKey] = function(...args) {
+            window.__bg_service = args[0];
+            const result = origSnap.apply(this, args);
+            if (result instanceof Promise) return result.then(s => { window.__bg_snapshot = s; return s; });
+            window.__bg_snapshot = result;
+            return result;
+        };
+        dms[snapKey].__api_hooked = true;
+    }
 
-    // XHR hook for body replacement
+    // XHR hook for body replacement (always re-install if missing)
     const origOpen = XMLHttpRequest.prototype.open;
     const origSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function(method, url, ...args) {
+    const hookedOpen = function(method, url, ...args) {
         this.__url = url;
         this.__is_gen = url.includes('GenerateContent') && !url.includes('CountTokens');
         window.__last_hook_url = url;
         return origOpen.call(this, method, url, ...args);
     };
+    hookedOpen.__api_hooked = true;
+    XMLHttpRequest.prototype.open = hookedOpen;
     XMLHttpRequest.prototype.send = function(body) {
         if (this.__is_gen && window.__pending_body) {
             const captured = window.__pending_body;
@@ -65,6 +79,27 @@ mw:((() => {
         }
         return origSend.call(this, body);
     };
+
+    // fetch hook for body replacement (streaming uses fetch)
+    const origFetch = window.fetch;
+    const hookedFetch = function(input, init) {
+        let url = typeof input === 'string' ? input : (input instanceof Request ? input.url : String(input));
+        if (url.includes('GenerateContent') && !url.includes('CountTokens') && window.__pending_body) {
+            const captured = window.__pending_body;
+            window.__pending_body = null;
+            window.__hooked = true;
+            window.__last_hook_url = url;
+            if (init) {
+                init.body = captured;
+            } else {
+                init = { body: captured };
+            }
+            return origFetch.call(this, input, init);
+        }
+        return origFetch.call(this, input, init);
+    };
+    hookedFetch.__api_hooked = true;
+    window.fetch = hookedFetch;
 
     window.__bg_hooked = true;
     window.__snap_key = snapKey;
@@ -137,6 +172,8 @@ class BrowserSession:
         if self._ctx is not None and self._hook_page is not None and not self._hook_page.is_closed():
             return self._ctx
 
+        import time as _t
+        _t0 = _t.time()
         from camoufox.sync_api import Camoufox
 
         self._close_sync()
@@ -144,8 +181,11 @@ class BrowserSession:
         self._browser = self._cf.__enter__()
         self._ctx = self._new_context_sync()
         self._hook_page = self._ctx.pages[0] if self._ctx.pages else self._ctx.new_page()
+        log.debug(f"[timing] browser launched in {_t.time()-_t0:.1f}s")
         self._goto_aistudio_sync(self._hook_page)
+        log.debug(f"[timing] page loaded in {_t.time()-_t0:.1f}s")
         self._install_hooks_sync(self._hook_page)
+        log.debug(f"[timing] hooks installed in {_t.time()-_t0:.1f}s")
         return self._ctx
 
     def _new_context_sync(self):
@@ -172,34 +212,49 @@ class BrowserSession:
         return self._hook_page
 
     def _ensure_botguard_service_sync(self):
+        import time as _t
+        _t0 = _t.time()
         page = self._ensure_hook_page_sync()
         if page.evaluate("mw:!!window.__bg_service"):
             self._wait_until_idle_sync(page)
+            log.debug(f"[timing] botguard cached, took {_t.time()-_t0:.1f}s")
             return page
 
         page.evaluate(DIALOG_CLEANUP_JS)
         textarea = page.query_selector("textarea")
         if textarea is None:
-            raise RuntimeError("textarea not found while capturing BotGuardService")
+            # Debug: show page state
+            try:
+                dbg_url = page.url
+                dbg_title = page.title()
+                dbg_body = page.evaluate("() => document.body?.innerText?.substring(0, 300) || ''")
+            except Exception:
+                dbg_url = dbg_title = dbg_body = '<error>'
+            raise RuntimeError(f"textarea not found while capturing BotGuardService; url={dbg_url}, title={dbg_title}, body={dbg_body[:200]}")
         textarea.fill("1")
         page.wait_for_timeout(800)
         page.evaluate(DIALOG_CLEANUP_JS)
         if not self._click_run_button_sync(page):
             raise RuntimeError("failed to trigger send while capturing BotGuardService")
 
-        for _ in range(45):
+        for i in range(45):
             page.wait_for_timeout(1000)
             if page.evaluate("mw:!!window.__bg_service"):
                 self._wait_until_idle_sync(page)
+                log.debug(f"[timing] botguard captured after {i+1}s, total {_t.time()-_t0:.1f}s")
                 return page
 
         raise RuntimeError("BotGuardService capture timeout")
 
     def _capture_template_sync(self, model: str) -> dict[str, Any]:
+        import time as _t
+        _t0 = _t.time()
         if model in self._templates:
+            log.debug(f"[timing] template cached for {model}")
             return self._templates[model]
 
         page = self._ensure_botguard_service_sync()
+        log.debug(f"[timing] botguard done in {_t.time()-_t0:.1f}s, starting template capture")
         captured: dict[str, Any] = {}
 
         def on_response(response):
@@ -238,6 +293,7 @@ class BrowserSession:
 
             self._wait_until_idle_sync(page)
             self._templates[model] = captured
+            log.debug(f"[timing] template captured for {model} in {_t.time()-_t0:.1f}s")
             return captured
         finally:
             page.remove_listener("response", on_response)
@@ -462,104 +518,82 @@ mw:((hash) => {
         return uploaded_ids
 
     def _send_hooked_request_sync(self, body: str, timeout_ms: int) -> tuple[int, bytes]:
+        import time as _t
+        _t0 = _t.time()
         page = self._ensure_botguard_service_sync()
+        log.debug(f"[timing] botguard ready in {_t.time()-_t0:.1f}s")
         self._wait_until_idle_sync(page)
-        route_hits: list[str] = []
 
-        def route_handler(route):
-            request = route.request
-            if "GenerateContent" in request.url and "CountTokens" not in request.url:
-                route_hits.append(request.url)
-                route.continue_(post_data=body)
-                return
-            route.continue_()
+        # Get captured URL and headers from template
+        captured_url = None
+        captured_headers = {}
+        for tpl in self._templates.values():
+            if tpl.get("url"):
+                captured_url = tpl["url"]
+                captured_headers = {k: v for k, v in tpl.get("headers", {}).items() if k.lower() not in ("host", "content-length")}
+                break
+        if not captured_url:
+            raise RuntimeError("no captured URL available for replay")
 
-        page.route("**/*GenerateContent*", route_handler)
-        page.evaluate(
-            """(payload) => {
-                window.__pending_body = payload;
-                window.__hooked = false;
-                window.__last_hook_url = '';
-            }""",
-            body,
-        )
-        page.evaluate(DIALOG_CLEANUP_JS)
-        textarea = page.query_selector("textarea")
-        if textarea is None:
-            raise RuntimeError("textarea not found before hooked send")
-        textarea.fill("__api_trigger__")
-        page.wait_for_timeout(500)
-        page.evaluate(DIALOG_CLEANUP_JS)
-        responses: list[tuple[int, str]] = []
-        failures: list[dict[str, str]] = []
+        # Replay via XHR in browser context (same approach as non-streaming replay_v2)
+        timeout_s = timeout_ms / 1000
+        result = page.evaluate("""(args) => {
+            return new Promise((resolve) => {
+                var xhr = new XMLHttpRequest();
+                xhr.open('POST', args.url);
+                var h = args.headers;
+                for (var k in h) {
+                    xhr.setRequestHeader(k, h[k]);
+                }
+                xhr.withCredentials = true;
+                xhr.timeout = args.timeout * 1000;
+                xhr.onload = function() {
+                    resolve({status: xhr.status, body: xhr.responseText});
+                };
+                xhr.onerror = function() {
+                    resolve({status: 0, body: 'network error'});
+                };
+                xhr.ontimeout = function() {
+                    resolve({status: 0, body: 'timeout'});
+                };
+                xhr.send(args.body);
+            });
+        }""", {
+            "url": captured_url,
+            "headers": captured_headers,
+            "body": body,
+            "timeout": timeout_s,
+        })
 
-        def on_response(response):
-            if "GenerateContent" in response.url and "Count" not in response.url:
-                try:
-                    text = response.text()
-                except Exception:
-                    return
-                responses.append((response.status, text))
-
-        def on_failed(request):
-            if "GenerateContent" in request.url and "Count" not in request.url:
-                failures.append(
-                    {
-                        "url": request.url,
-                        "failure": str(request.failure),
-                    }
-                )
-
-        page.on("response", on_response)
-        page.on("requestfailed", on_failed)
-        try:
-            if not self._click_run_button_sync(page):
-                raise RuntimeError("failed to trigger send before hooked request")
-            deadline = timeout_ms / 1000
-            elapsed = 0.0
-            while elapsed < deadline:
-                state = page.evaluate(
-                    """() => ({
-                        hooked: !!window.__hooked,
-                        ready: document.body.innerText.includes('Response ready.'),
-                    })"""
-                )
-                if state["ready"] and responses:
-                    break
-                if failures:
-                    break
-                page.wait_for_timeout(500)
-                elapsed += 0.5
-        finally:
-            page.remove_listener("response", on_response)
-            page.remove_listener("requestfailed", on_failed)
-            page.unroute("**/*GenerateContent*", route_handler)
-
-        hook_debug = page.evaluate(
-            """() => ({
-                hooked: !!window.__hooked,
-                pending_exists: !!window.__pending_body,
-                pending_len: window.__pending_body ? window.__pending_body.length : 0,
-                textarea: document.querySelector('textarea')?.value || '',
-                last_url: window.__last_hook_url || '',
-            })"""
-        )
-        hook_debug["failures"] = failures
-        if not responses:
-            raise RuntimeError(f"No response captured; debug={hook_debug}")
-        status, raw_text = responses[-1]
-        if not hook_debug.get("hooked") and not route_hits:
-            raise RuntimeError(f"Hook did not intercept request; debug={hook_debug}")
+        status = result.get("status", 0)
+        raw_text = result.get("body", "")
+        log.debug(f"[timing] replay done in {_t.time()-_t0:.1f}s, status={status}")
+        if status == 0:
+            raise RuntimeError(f"replay failed: {raw_text}")
         return status, raw_text.encode("utf-8")
 
     def _goto_aistudio_sync(self, page) -> None:
+        import time as _t
         last_exc = None
         for url in (AI_STUDIO_URL, AI_STUDIO_URL_FALLBACK):
             try:
+                _t0 = _t.time()
                 page.goto(url, wait_until="networkidle", timeout=30000)
-                page.wait_for_timeout(10000)
+                log.debug(f"[timing] goto {url} took {_t.time()-_t0:.1f}s")
+                # Wait for SPA framework and chat UI to render
+                for _ in range(60):
+                    page.wait_for_timeout(1000)
+                    has_dms = page.evaluate("mw:!!window.default_MakerSuite")
+                    has_textarea = page.query_selector("textarea") is not None
+                    if has_dms and has_textarea:
+                        log.debug(f"[timing] UI ready (dms+textarea) after {_t.time()-_t0:.1f}s", flush=True)
+                        return
+                    if has_dms and _ > 20:
+                        page.evaluate(DIALOG_CLEANUP_JS)
+                log.debug(f"[timing] UI partially ready after {_t.time()-_t0:.1f}s (dms={has_dms}, textarea={has_textarea})", flush=True)
                 return
             except Exception as exc:
+                log.debug(f"[timing] goto {url} failed after {_t.time()-_t0:.1f}s: {exc}")
                 last_exc = exc
         if last_exc is not None:
             raise last_exc

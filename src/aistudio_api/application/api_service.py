@@ -88,9 +88,11 @@ async def handle_chat(req: ChatRequest, client: AIStudioClient):
 
     for attempt in range(max_retries):
         async with busy_lock:
-            # 首次尝试时轮询到下一个账号
+            # 首次尝试时，仅在没有活跃账号时才轮询（避免每次请求都重建浏览器）
             if attempt == 0:
-                await _try_switch_account()
+                account_svc = runtime_state.account_service
+                if account_svc and not account_svc.get_active_account():
+                    await _try_switch_account()
             normalized = normalize_chat_request(req.messages, req.model)
             model = normalized["model"]
             tmp_files = list(normalized["cleanup_paths"])
@@ -212,9 +214,10 @@ async def handle_image_generation(req: ImageRequest, client: AIStudioClient):
 
     for attempt in range(max_retries):
         async with busy_lock:
-            # 首次尝试时轮询到下一个账号
             if attempt == 0:
-                await _try_switch_account()
+                account_svc = runtime_state.account_service
+                if account_svc and not account_svc.get_active_account():
+                    await _try_switch_account()
             try:
                 logger.info("Image: model=%s, prompt=%s..., attempt=%d", req.model, req.prompt[:50], attempt + 1)
                 output = await client.generate_image(prompt=req.prompt, model=req.model)
@@ -381,9 +384,10 @@ async def handle_gemini_generate_content(
 
     for attempt in range(max_retries):
         async with busy_lock:
-            # 首次尝试时轮询到下一个账号
             if attempt == 0:
-                await _try_switch_account()
+                account_svc = runtime_state.account_service
+                if account_svc and not account_svc.get_active_account():
+                    await _try_switch_account()
             normalized = None
             try:
                 normalized = normalize_gemini_request(req, model_path)
