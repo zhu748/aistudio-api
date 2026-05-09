@@ -24,6 +24,19 @@ def normalize_usage(usage: dict | None = None) -> dict:
     }
 
 
+def to_gemini_usage_metadata(usage: dict | None = None) -> dict:
+    completion_details = (usage or {}).get("completion_tokens_details") or {}
+    reasoning_tokens = completion_details.get("reasoning_tokens", 0) or 0
+    visible_tokens = completion_details.get("visible_tokens")
+    candidates_tokens = visible_tokens if visible_tokens is not None else (usage or {}).get("completion_tokens", 0)
+    return {
+        "promptTokenCount": (usage or {}).get("prompt_tokens", 0) or 0,
+        "candidatesTokenCount": candidates_tokens or 0,
+        "thoughtsTokenCount": reasoning_tokens,
+        "totalTokenCount": (usage or {}).get("total_tokens", 0) or 0,
+    }
+
+
 def sse_chunk(
     chat_id: str,
     model: str,
@@ -100,8 +113,15 @@ def to_openai_tool_calls(function_calls: list[dict[str, Any]]) -> list[dict[str,
     return tool_calls
 
 
-def to_gemini_parts(content: str, function_calls: list[dict[str, Any]] | None = None, function_responses: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+def to_gemini_parts(
+    content: str,
+    function_calls: list[dict[str, Any]] | None = None,
+    function_responses: list[dict[str, Any]] | None = None,
+    thinking: str = "",
+) -> list[dict[str, Any]]:
     parts: list[dict[str, Any]] = []
+    if thinking:
+        parts.append({"text": thinking, "thought": True})
     if content:
         parts.append({"text": content})
     for function_call in function_calls or []:

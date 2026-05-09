@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from aistudio_api.infrastructure.gateway.wire_codec import AistudioWireCodec
+from aistudio_api.infrastructure.gateway.wire_types import AistudioGenerationConfig, AistudioThinkingConfig, ThinkingLevel
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,3 +38,16 @@ def test_encode_preserves_newly_mapped_proto_fields():
     assert reparsed.generation_config.thinking_config == [1, None, None, 3]
     assert reparsed.request_flag == 1
     assert reparsed.cached_content == request.cached_content
+
+
+def test_thinking_config_encodes_high_level_wire_shape():
+    assert AistudioThinkingConfig(ThinkingLevel.HIGH).to_wire() == [1, None, None, 3]
+
+
+def test_generation_config_enables_default_thinking():
+    config = AistudioGenerationConfig([])
+
+    config.enable_default_thinking()
+
+    assert config.thinking_config == [1, None, None, 3]
+    assert config.request_flag == 1

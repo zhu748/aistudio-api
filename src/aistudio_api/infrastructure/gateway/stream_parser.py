@@ -8,6 +8,9 @@ from typing import Generator
 from aistudio_api.domain.models import parse_response_chunk
 
 
+XSSI_PREFIX = ")]}'"
+
+
 class IncrementalJSONStreamParser:
     def __init__(self):
         self.buffer = ""
@@ -23,8 +26,10 @@ class IncrementalJSONStreamParser:
 
         while True:
             if not self.preamble_skipped:
-                if self.buffer.startswith(")]}'"):
-                    self.buffer = self.buffer[4:].lstrip()
+                if self.buffer.startswith(XSSI_PREFIX):
+                    self.buffer = self.buffer[len(XSSI_PREFIX) :].lstrip()
+                elif XSSI_PREFIX.startswith(self.buffer):
+                    break
                 self.preamble_skipped = True
 
             made_progress = False

@@ -44,7 +44,7 @@ class ChatRequest(BaseModel):
 
 
 class StreamOptions(BaseModel):
-    include_usage: bool = False
+    include_usage: bool = True
 
 
 class ImageRequest(BaseModel):

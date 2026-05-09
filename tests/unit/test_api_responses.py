@@ -1,6 +1,15 @@
 import json
 
-from aistudio_api.api.responses import chat_completion_response, normalize_usage, sse_chunk, sse_usage_chunk, to_gemini_parts
+import pytest
+
+from aistudio_api.api.responses import (
+    chat_completion_response,
+    normalize_usage,
+    sse_chunk,
+    sse_usage_chunk,
+    to_gemini_parts,
+    to_gemini_usage_metadata,
+)
 
 
 def test_sse_chunk_includes_null_usage_when_requested():
@@ -10,6 +19,18 @@ def test_sse_chunk_includes_null_usage_when_requested():
     assert data["choices"][0]["delta"]["content"] == "你好"
     assert "usage" in data
     assert data["usage"] is None
+
+
+def test_chat_request_stream_usage_is_enabled_by_default():
+    schemas = pytest.importorskip("aistudio_api.api.schemas")
+    req = schemas.ChatRequest(
+        model="models/gemma-4-31b-it",
+        messages=[{"role": "user", "content": "你好"}],
+        stream=True,
+        stream_options={},
+    )
+
+    assert req.stream_options.include_usage is True
 
 
 def test_sse_usage_chunk_matches_openai_style_shape():
@@ -40,6 +61,22 @@ def test_normalize_usage_defaults_missing_values_to_zero():
         "completion_tokens": 0,
         "total_tokens": 0,
         "completion_tokens_details": {"reasoning_tokens": 0},
+    }
+
+
+def test_to_gemini_usage_metadata_uses_visible_and_reasoning_tokens():
+    assert to_gemini_usage_metadata(
+        {
+            "prompt_tokens": 9,
+            "completion_tokens": 316,
+            "total_tokens": 325,
+            "completion_tokens_details": {"reasoning_tokens": 290, "visible_tokens": 26},
+        }
+    ) == {
+        "promptTokenCount": 9,
+        "candidatesTokenCount": 26,
+        "thoughtsTokenCount": 290,
+        "totalTokenCount": 325,
     }
 
 
@@ -86,4 +123,11 @@ def test_to_gemini_parts_keeps_function_call_and_response_parts():
     assert parts == [
         {"functionCall": {"name": "getWeather", "args": {"city": "Shanghai"}}},
         {"functionResponse": {"name": "getWeather", "response": {"temperature": "24C"}}},
+    ]
+
+
+def test_to_gemini_parts_can_emit_thought_part():
+    assert to_gemini_parts("答案", thinking="思考") == [
+        {"text": "思考", "thought": True},
+        {"text": "答案"},
     ]

@@ -24,6 +24,8 @@ def test_modify_body_updates_generation_config_and_prompt():
     assert body[3][4] == 0.2
     assert body[3][5] == 0.9
     assert body[3][6] == 32
+    assert body[3][16] == [1, None, None, 3]
+    assert body[3][17] == 1
 
 
 def test_wire_codec_decodes_semantic_fields():
@@ -52,6 +54,21 @@ def test_modify_body_sanitizes_plain_text_generation_config():
     assert '"text/plain"' in rewritten
     assert '"application/json"' not in rewritten
     assert '[6]' not in rewritten
+    assert json.loads(rewritten)[3][16] == [1, None, None, 3]
+    assert json.loads(rewritten)[3][17] == 1
+
+
+def test_modify_body_enables_thinking_for_any_model():
+    original = '["models/original",[[[[null,"old"]],"user"]],null,[null,null,null,128,0.5,0.8,16],"!snap",null,null]'
+    rewritten = modify_body(
+        original,
+        model="models/new-text-model",
+        prompt="hello",
+    )
+
+    body = json.loads(rewritten)
+    assert body[3][16] == [1, None, None, 3]
+    assert body[3][17] == 1
 
 
 def test_modify_body_keeps_structured_generation_config_for_gemini_mode():

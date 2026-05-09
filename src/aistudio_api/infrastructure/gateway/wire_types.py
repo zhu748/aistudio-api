@@ -3,6 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import IntEnum
+
+
+class ThinkingLevel(IntEnum):
+    LOW = 1
+    MEDIUM = 2
+    HIGH = 3
+
+
+@dataclass(frozen=True)
+class AistudioThinkingConfig:
+    level: ThinkingLevel = ThinkingLevel.HIGH
+    mode: int = 1
+
+    def to_wire(self) -> list:
+        return [self.mode, None, None, int(self.level)]
+
+    @classmethod
+    def default(cls) -> "AistudioThinkingConfig":
+        return cls()
 
 
 @dataclass
@@ -138,6 +158,12 @@ class AistudioGenerationConfig:
     def clear_gemma_thinking_budget(self):
         if len(self.values) > 16:
             self.values[16] = None
+
+    def enable_default_thinking(self):
+        if self.thinking_config is None:
+            self.thinking_config = AistudioThinkingConfig.default().to_wire()
+        if self.request_flag is None:
+            self.request_flag = 1
 
     def sanitize_for_plain_text(self):
         self.response_mime_type = "text/plain"

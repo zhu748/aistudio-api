@@ -130,23 +130,13 @@ class AistudioWireCodec:
             if value is None or not hasattr(request.generation_config, attr):
                 continue
             setattr(request.generation_config, attr, value)
-        # Gemma models: enable thinking by default for supported models
-        THINKING_MODELS = {"gemma-4-31b-it", "gemma-4-26b-a4b-it"}
-        if "gemma" in model.lower():
-            if model in THINKING_MODELS:
-                # Keep or set default thinking config
-                if request.generation_config.thinking_config is None:
-                    request.generation_config.thinking_config = [1, None, None, 3]
-            else:
-                request.generation_config.clear_gemma_thinking_budget()
+        request.generation_config.enable_default_thinking()
 
         # OpenAI chat compatibility should not inherit browser-side structured output
         # or explicit reasoning settings from a previously captured AI Studio request.
         if sanitize_plain_text and "image" not in model.lower():
             request.generation_config.sanitize_for_plain_text()
-            # Re-apply thinking for thinking models after sanitize
-            if model in THINKING_MODELS:
-                request.generation_config.thinking_config = [1, None, None, 3]
+            request.generation_config.enable_default_thinking()
 
         if safety_off:
             request.safety_settings = [[None, None, cat, 4] for cat in [7, 8, 9, 10]]

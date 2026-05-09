@@ -104,35 +104,43 @@ class StreamingGateway:
             sanitize_plain_text=sanitize_plain_text,
         )
 
-        status, raw = await self._session.send_hooked_request(
-            body=modified_body,
-            timeout_ms=settings.timeout_stream * 1000,
-        )
         parser = IncrementalJSONStreamParser()
         latest_usage: dict | None = None
-        raw_response = raw.decode("utf-8", errors="replace")
+        raw_parts: list[str] = []
+        status_code = 0
+
+        async for event_type, payload in self._session.send_streaming_request(
+            body=modified_body,
+            timeout_ms=settings.timeout_stream * 1000,
+        ):
+            if event_type == "status" and payload and not status_code:
+                status_code = int(payload)
+            elif event_type == "chunk" and payload:
+                text_payload = payload.decode("utf-8", errors="replace")
+                raw_parts.append(text_payload)
+                for parsed_chunk in parser.feed(text_payload):
+                    usage = parse_chunk_usage(parsed_chunk)
+                    if usage:
+                        latest_usage = usage
+                    ctype, text = classify_chunk(parsed_chunk)
+                    if ctype in ("body", "thinking", "tool_calls") and text:
+                        yield (ctype, text)
+
+        raw_response = "".join(raw_parts)
         _dump_stream_exchange(
             model=model,
             url=captured.url,
             modified_body=modified_body,
-            status_code=status,
+            status_code=status_code,
             raw_response=raw_response,
         )
-        if status != 200:
+        if status_code != 200:
             detail = _summarize_error_body(raw_response)
-            if status in (401, 403, 429):
-                raise classify_error(status, raw_response)
+            if status_code in (401, 403, 429):
+                raise classify_error(status_code, raw_response)
             if detail:
-                raise RequestError(status, detail)
-            raise RequestError(status, "")
-
-        for chunk in parser.feed(raw_response):
-            usage = parse_chunk_usage(chunk)
-            if usage:
-                latest_usage = usage
-            ctype, text = classify_chunk(chunk)
-            if ctype in ("body", "thinking", "tool_calls") and text:
-                yield (ctype, text)
+                raise RequestError(status_code, detail)
+            raise RequestError(status_code, "")
 
         yield ("usage", latest_usage)
         yield ("done", None)

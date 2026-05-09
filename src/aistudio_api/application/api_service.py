@@ -21,6 +21,7 @@ from aistudio_api.api.responses import (
     sse_error,
     sse_usage_chunk,
     to_gemini_parts,
+    to_gemini_usage_metadata,
     to_openai_tool_calls,
 )
 from aistudio_api.api.schemas import ChatRequest, GeminiGenerateContentRequest, ImageRequest
@@ -115,6 +116,9 @@ async def handle_chat(req: ChatRequest, client: AIStudioClient):
                     tools = [TOOLS_TEMPLATES["google_search"]]
 
                 if req.stream:
+                    include_usage = True
+                    if req.stream_options is not None:
+                        include_usage = req.stream_options.include_usage
                     return _build_streaming_response(
                         client=client,
                         capture_prompt=normalized["capture_prompt"],
@@ -123,7 +127,7 @@ async def handle_chat(req: ChatRequest, client: AIStudioClient):
                         contents=normalized["contents"],
                         system_instruction=normalized["system_instruction"],
                         cleanup_paths=tmp_files,
-                        include_usage=bool(req.stream_options and req.stream_options.include_usage),
+                        include_usage=include_usage,
                         temperature=req.temperature,
                         top_p=req.top_p,
                         top_k=req.top_k,
@@ -331,7 +335,7 @@ def _build_streaming_response(
                                     tool_calls=to_openai_tool_calls(text if isinstance(text, list) else []),
                                     include_usage=include_usage,
                                 )
-                            elif event_type == "usage" and include_usage:
+                            elif event_type == "usage":
                                 final_usage = text if isinstance(text, dict) else None
                         break
                     except RequestError as exc:
@@ -434,11 +438,13 @@ async def handle_gemini_generate_content(
                                     output.text,
                                     function_calls=output.function_calls,
                                     function_responses=output.function_responses,
+                                    thinking=output.thinking,
                                 ),
                             },
                             "finishReason": "STOP" if not output.function_calls else "FUNCTION_CALL",
                         }
-                    ]
+                    ],
+                    "usageMetadata": to_gemini_usage_metadata(output.usage),
                 }
             except ValueError as exc:
                 raise HTTPException(400, detail={"message": str(exc), "type": "bad_request"}) from exc
@@ -489,6 +495,7 @@ def _build_gemini_streaming_response(*, client: AIStudioClient, normalized: dict
 
         async with busy_lock:
             try:
+                final_usage = None
                 for stream_attempt in range(2):
                     try:
                         async for event_type, text in client.stream_generate_content(
@@ -518,6 +525,23 @@ def _build_gemini_streaming_response(*, client: AIStudioClient, normalized: dict
                                     },
                                     ensure_ascii=False,
                                 ) + "\n\n"
+                            elif event_type == "thinking" and text:
+                                yield "data: " + json.dumps(
+                                    {
+                                        "candidates": [
+                                            {
+                                                "content": {
+                                                    "role": "model",
+                                                    "parts": [{"text": text, "thought": True}],
+                                                },
+                                                "finishReason": None,
+                                            }
+                                        ]
+                                    },
+                                    ensure_ascii=False,
+                                ) + "\n\n"
+                            elif event_type == "usage":
+                                final_usage = text if isinstance(text, dict) else None
                         break
                     except RequestError as exc:
                         if exc.status == 204 and stream_attempt == 0:
@@ -532,7 +556,15 @@ def _build_gemini_streaming_response(*, client: AIStudioClient, normalized: dict
                             continue
                         raise
 
-                runtime_state.record(normalized["model"], "success")
+                runtime_state.record(normalized["model"], "success", final_usage)
+                if final_usage:
+                    yield "data: " + json.dumps(
+                        {
+                            "candidates": [],
+                            "usageMetadata": to_gemini_usage_metadata(final_usage),
+                        },
+                        ensure_ascii=False,
+                    ) + "\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as exc:
                 logger.error("Gemini stream error: %s", exc, exc_info=True)

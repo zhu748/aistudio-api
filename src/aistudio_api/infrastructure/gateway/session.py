@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
@@ -158,10 +159,221 @@ class BrowserSession:
     async def send_hooked_request(self, *, body: str, timeout_ms: int) -> tuple[int, bytes]:
         return await self._run_sync(self._send_hooked_request_sync, body, timeout_ms)
 
+    async def send_streaming_request(self, *, body: str, timeout_ms: int):
+        """Send a streaming request, yielding ("status", int) and ("chunk", bytes) events."""
+        queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        cancel_event = threading.Event()
+
+        def _stream_worker():
+            try:
+                log.debug("[stream] worker started")
+                self._send_streaming_request_sync(body, timeout_ms, queue, loop, cancel_event)
+                log.debug("[stream] worker finished")
+            except Exception as e:
+                log.debug(f"[stream] worker exception: {e}")
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", e))
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        async with self._lock:
+            executor_task = loop.run_in_executor(self._executor, _stream_worker)
+            try:
+                while True:
+                    item = await queue.get()
+                    if item is None:
+                        break
+                    tag, data = item
+                    if tag == "error":
+                        raise data
+                    yield tag, data
+            finally:
+                cancel_event.set()
+                await executor_task
+
     async def _run_sync(self, func, *args):
         loop = asyncio.get_running_loop()
         async with self._lock:
             return await loop.run_in_executor(self._executor, lambda: func(*args))
+
+    def _get_captured_info(self) -> tuple[str, dict[str, str]]:
+        """Get captured URL and headers from template."""
+        for tpl in self._templates.values():
+            if tpl.get("url"):
+                url = tpl["url"]
+                headers = {k: v for k, v in tpl.get("headers", {}).items() if k.lower() not in ("host", "content-length")}
+                return url, headers
+        raise RuntimeError("no captured URL available for replay")
+
+    def _send_streaming_request_sync(
+        self,
+        body: str,
+        timeout_ms: int,
+        queue: asyncio.Queue,
+        loop: asyncio.AbstractEventLoop,
+        cancel_event: threading.Event,
+    ):
+        """Sync method: sends XHR request and consumes page-side stream events."""
+        import time as _t
+        _t0 = _t.time()
+
+        page, captured_url, captured_headers = self._prepare_streaming_sync()
+        log.debug(f"[stream] prep done in {_t.time()-_t0:.1f}s, url={captured_url}")
+
+        timeout_s = timeout_ms / 1000
+
+        # Start XHR in page context. The page tracks responseText growth via XHR
+        # events and exposes a small async queue to Python.
+        page.evaluate("""(args) => {
+            if (window.__stream_xhr && window.__stream_xhr.readyState !== 4) {
+                try { window.__stream_xhr.abort(); } catch (e) {}
+            }
+
+            const state = {
+                events: [],
+                waiter: null,
+                recvPos: 0,
+                statusSent: false,
+            };
+
+            function push(event) {
+                if (state.waiter) {
+                    const waiter = state.waiter;
+                    state.waiter = null;
+                    waiter(event);
+                    return;
+                }
+                state.events.push(event);
+            }
+
+            function pushStatus(xhr) {
+                if (state.statusSent || xhr.readyState < 2) return;
+                state.statusSent = true;
+                push({type: 'status', status: xhr.status || 0});
+            }
+
+            function pushChunk(xhr) {
+                if (xhr.readyState < 3) return;
+                const chunk = xhr.responseText.substring(state.recvPos);
+                if (!chunk) return;
+                state.recvPos = xhr.responseText.length;
+                push({type: 'chunk', text: chunk});
+            }
+
+            window.__stream_next = function(timeoutMs) {
+                if (state.events.length) return Promise.resolve(state.events.shift());
+                return new Promise((resolve) => {
+                    let done = false;
+                    const timer = setTimeout(() => {
+                        if (done) return;
+                        done = true;
+                        if (state.waiter === finish) state.waiter = null;
+                        resolve({type: 'idle'});
+                    }, timeoutMs);
+                    const finish = (event) => {
+                        if (done) return;
+                        done = true;
+                        clearTimeout(timer);
+                        resolve(event);
+                    };
+                    state.waiter = finish;
+                });
+            };
+
+            window.__stream_abort = function() {
+                if (window.__stream_xhr && window.__stream_xhr.readyState !== 4) {
+                    try { window.__stream_xhr.abort(); } catch (e) {}
+                }
+            };
+
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', args.url);
+            var h = args.headers;
+            for (var k in h) {
+                xhr.setRequestHeader(k, h[k]);
+            }
+            xhr.withCredentials = true;
+            xhr.timeout = args.timeout * 1000;
+
+            xhr.onreadystatechange = function() {
+                pushStatus(xhr);
+                pushChunk(xhr);
+            };
+            xhr.onprogress = function() {
+                pushStatus(xhr);
+                pushChunk(xhr);
+            };
+            xhr.onload = function() {
+                pushStatus(xhr);
+                pushChunk(xhr);
+                push({type: 'done'});
+            };
+            xhr.onerror = function() {
+                push({type: 'error', message: 'network error'});
+            };
+            xhr.ontimeout = function() {
+                push({type: 'error', message: 'timeout'});
+            };
+            xhr.onabort = function() {
+                push({type: 'aborted'});
+            };
+
+            window.__stream_xhr = xhr;
+            xhr.send(args.body);
+        }""", {
+            "url": captured_url,
+            "headers": captured_headers,
+            "body": body,
+            "timeout": timeout_s,
+        })
+
+        deadline = _t.time() + timeout_s
+        status_sent = False
+        while _t.time() < deadline:
+            if cancel_event.is_set():
+                log.debug("[stream] cancellation requested")
+                page.evaluate("() => window.__stream_abort && window.__stream_abort()")
+                break
+
+            event = page.evaluate("timeoutMs => window.__stream_next(timeoutMs)", 250)
+            event_type = event.get("type")
+
+            if event_type == "idle":
+                continue
+            if event_type == "status":
+                status = event.get("status", 0)
+                log.debug(f"[stream] got status={status} after {_t.time()-_t0:.1f}s")
+                loop.call_soon_threadsafe(queue.put_nowait, ("status", status))
+                status_sent = True
+                continue
+            if event_type == "chunk":
+                text = event.get("text") or ""
+                if text:
+                    loop.call_soon_threadsafe(queue.put_nowait, ("chunk", text.encode("utf-8")))
+                continue
+            if event_type == "error":
+                message = event.get("message", "unknown error")
+                log.debug(f"[stream] error after {_t.time()-_t0:.1f}s: {message}")
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", RuntimeError(f"streaming request failed: {message}")))
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+                return
+            if event_type in ("done", "aborted"):
+                break
+
+        if not status_sent:
+            log.debug(f"[stream] timeout after {_t.time()-_t0:.1f}s before response status")
+            loop.call_soon_threadsafe(queue.put_nowait, ("error", RuntimeError("streaming request timeout: no response status")))
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+            return
+
+        # Signal completion
+        loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    def _prepare_streaming_sync(self):
+        """Prepare page for streaming request. Returns (page, url, headers)."""
+        page = self._ensure_botguard_service_sync()
+        self._wait_until_idle_sync(page)
+        url, headers = self._get_captured_info()
+        return page, url, headers
 
     def _switch_auth_sync(self, auth_file: str | None) -> None:
         self._auth_file = auth_file
@@ -523,17 +735,7 @@ mw:((hash) => {
         page = self._ensure_botguard_service_sync()
         log.debug(f"[timing] botguard ready in {_t.time()-_t0:.1f}s")
         self._wait_until_idle_sync(page)
-
-        # Get captured URL and headers from template
-        captured_url = None
-        captured_headers = {}
-        for tpl in self._templates.values():
-            if tpl.get("url"):
-                captured_url = tpl["url"]
-                captured_headers = {k: v for k, v in tpl.get("headers", {}).items() if k.lower() not in ("host", "content-length")}
-                break
-        if not captured_url:
-            raise RuntimeError("no captured URL available for replay")
+        captured_url, captured_headers = self._get_captured_info()
 
         # Replay via XHR in browser context (same approach as non-streaming replay_v2)
         timeout_s = timeout_ms / 1000
