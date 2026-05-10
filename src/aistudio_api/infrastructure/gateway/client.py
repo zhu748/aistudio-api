@@ -231,12 +231,12 @@ class AIStudioClient:
         sanitize_plain_text: bool = True,
     ) -> ModelOutput:
         logger.info("拦截请求: %r", f"{capture_prompt[:20]}...")
-        self._captured = await self.capture_request(capture_prompt, model=model, images=capture_images, contents=contents)
-        if not self._captured:
+        captured = await self.capture_request(capture_prompt, model=model, images=capture_images, contents=contents)
+        if not captured:
             raise RequestError(0, "无法拦截请求")
 
         modified_body = modify_body(
-            self._captured.body,
+            captured.body,
             model=model,
             contents=contents,
             system_instruction_content=system_instruction_content,
@@ -249,7 +249,7 @@ class AIStudioClient:
             sanitize_plain_text=sanitize_plain_text,
         )
 
-        status, raw = await self.replay(modified_body)
+        status, raw = await self._replay_service.replay(captured, body=modified_body)
         raw_text = raw.decode("utf-8", errors="replace")
         self._dump_raw_exchange(
             kind="generate_content",
@@ -271,12 +271,12 @@ class AIStudioClient:
         save_path: Optional[str] = None,
     ) -> ModelOutput:
         logger.info("生图请求: %r", f"{prompt[:20]}...")
-        self._captured = await self.capture_request(prompt, model=model)
-        if not self._captured:
+        captured = await self.capture_request(prompt, model=model)
+        if not captured:
             raise RequestError(0, "无法拦截请求")
 
-        modified_body = modify_body(self._captured.body, model=model, prompt=prompt)
-        status, raw = await self.replay(modified_body, timeout=120)
+        modified_body = modify_body(captured.body, model=model, prompt=prompt)
+        status, raw = await self._replay_service.replay(captured, body=modified_body, timeout=120)
         raw_text = raw.decode("utf-8", errors="replace")
         self._dump_raw_exchange(
             kind="generate_image",

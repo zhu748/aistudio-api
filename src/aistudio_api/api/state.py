@@ -13,7 +13,7 @@ from aistudio_api.infrastructure.gateway.client import AIStudioClient
 @dataclass
 class RuntimeState:
     client: AIStudioClient | None = None
-    busy_lock: asyncio.Lock | None = None
+    busy_lock: asyncio.Semaphore | None = None
     camoufox_port: int = 9222
     snapshot_cache: object | None = None  # SnapshotCache 实例
     account_service: object | None = None  # AccountService 实例

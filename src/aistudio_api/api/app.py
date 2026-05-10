@@ -37,7 +37,8 @@ async def lifespan(app: FastAPI):
         use_pure_http=settings.use_pure_http,
     )
     runtime_state.client = client
-    runtime_state.busy_lock = asyncio.Lock()
+    from aistudio_api.config import settings as app_settings
+    runtime_state.busy_lock = asyncio.Semaphore(app_settings.max_concurrency)
 
     # 注入 snapshot 缓存引用，切号时需要清除
     from aistudio_api.infrastructure.gateway.client import _snapshot_cache

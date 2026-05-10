@@ -1,639 +1,177 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Studio 账号管理</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background-color: #f5f5f5;
-            color: #333;
-            line-height: 1.6;
-        }
-
-        .container {
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-
-        header {
-            background-color: #fff;
-            padding: 20px;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            margin-bottom: 20px;
-        }
-
-        h1 {
-            font-size: 24px;
-            color: #1a73e8;
-        }
-
-        .actions {
-            margin-bottom: 20px;
-        }
-
-        .btn {
-            display: inline-block;
-            padding: 10px 20px;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 500;
-            text-decoration: none;
-            transition: background-color 0.2s;
-        }
-
-        .btn-primary {
-            background-color: #1a73e8;
-            color: #fff;
-        }
-
-        .btn-primary:hover {
-            background-color: #1557b0;
-        }
-
-        .btn-danger {
-            background-color: #dc3545;
-            color: #fff;
-        }
-
-        .btn-danger:hover {
-            background-color: #c82333;
-        }
-
-        .btn-secondary {
-            background-color: #6c757d;
-            color: #fff;
-        }
-
-        .btn-secondary:hover {
-            background-color: #545b62;
-        }
-
-        .btn-sm {
-            padding: 6px 12px;
-            font-size: 12px;
-        }
-
-        .account-list {
-            background-color: #fff;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            overflow: hidden;
-        }
-
-        .account-item {
-            padding: 20px;
-            border-bottom: 1px solid #eee;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-
-        .account-item:last-child {
-            border-bottom: none;
-        }
-
-        .account-item.active {
-            background-color: #e8f0fe;
-        }
-
-        .account-info {
-            flex: 1;
-        }
-
-        .account-name {
-            font-size: 16px;
-            font-weight: 500;
-            margin-bottom: 4px;
-        }
-
-        .account-email {
-            font-size: 14px;
-            color: #666;
-            margin-bottom: 4px;
-        }
-
-        .account-meta {
-            font-size: 12px;
-            color: #999;
-        }
-
-        .account-status {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: 500;
-            margin-left: 8px;
-        }
-
-        .status-active {
-            background-color: #d4edda;
-            color: #155724;
-        }
-
-        .account-actions {
-            display: flex;
-            gap: 8px;
-        }
-
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-color: rgba(0,0,0,0.5);
-            z-index: 1000;
-            justify-content: center;
-            align-items: center;
-        }
-
-        .modal.show {
-            display: flex;
-        }
-
-        .modal-content {
-            background-color: #fff;
-            padding: 24px;
-            border-radius: 8px;
-            max-width: 500px;
-            width: 90%;
-        }
-
-        .modal-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 16px;
-        }
-
-        .modal-title {
-            font-size: 18px;
-            font-weight: 500;
-        }
-
-        .modal-close {
-            background: none;
-            border: none;
-            font-size: 24px;
-            cursor: pointer;
-            color: #666;
-        }
-
-        .form-group {
-            margin-bottom: 16px;
-        }
-
-        .form-group label {
-            display: block;
-            margin-bottom: 8px;
-            font-weight: 500;
-        }
-
-        .form-group input {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            font-size: 14px;
-        }
-
-        .form-group input:focus {
-            outline: none;
-            border-color: #1a73e8;
-        }
-
-        .login-status {
-            margin-top: 16px;
-            padding: 12px;
-            border-radius: 4px;
-            display: none;
-        }
-
-        .login-status.pending {
-            background-color: #fff3cd;
-            color: #856404;
-            display: block;
-        }
-
-        .login-status.completed {
-            background-color: #d4edda;
-            color: #155724;
-            display: block;
-        }
-
-        .login-status.failed {
-            background-color: #f8d7da;
-            color: #721c24;
-            display: block;
-        }
-
-        .spinner {
-            display: inline-block;
-            width: 16px;
-            height: 16px;
-            border: 2px solid #856404;
-            border-radius: 50%;
-            border-top-color: transparent;
-            animation: spin 1s linear infinite;
-            margin-right: 8px;
-            vertical-align: middle;
-        }
-
-        @keyframes spin {
-            to {
-                transform: rotate(360deg);
-            }
-        }
-
-        .empty-state {
-            text-align: center;
-            padding: 40px;
-            color: #666;
-        }
-
-        .empty-state p {
-            margin-bottom: 16px;
-        }
-
-        .toast {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            padding: 12px 24px;
-            border-radius: 4px;
-            color: #fff;
-            font-size: 14px;
-            z-index: 2000;
-            opacity: 0;
-            transform: translateX(100%);
-            transition: all 0.3s ease;
-        }
-
-        .toast.show {
-            opacity: 1;
-            transform: translateX(0);
-        }
-
-        .toast.success {
-            background-color: #28a745;
-        }
-
-        .toast.error {
-            background-color: #dc3545;
-        }
-
-        .toast.info {
-            background-color: #17a2b8;
-        }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>AI Studio Proxy</title>
+<link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
-    <div class="toast" id="toast"></div>
+<body x-data="app()" x-init="init()" @click="configOpen=false">
 
-    <div class="container">
-        <header>
-            <h1>AI Studio 账号管理</h1>
-        </header>
+<div class="overlay" :class="{open:sidebarOpen}" @click="sidebarOpen=false"></div>
 
-        <div class="actions">
-            <button class="btn btn-primary" onclick="showLoginModal()">+ 登录新账号</button>
-            <button class="btn btn-secondary" onclick="loadAccounts()">刷新</button>
+<nav class="sidebar" :class="{open:sidebarOpen}">
+  <div class="sidebar-header"><div class="logo">AI</div><span>AI Studio Proxy</span></div>
+  <div class="nav-section">
+    <button class="nav-item" :class="{active:view==='chat'}" @click="go('chat')">
+      <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+      Playground
+    </button>
+    <button class="nav-item" :class="{active:view==='dashboard'}" @click="go('dashboard')">
+      <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg>
+      控制面板
+    </button>
+    <button class="nav-item" :class="{active:view==='accounts'}" @click="go('accounts')">
+      <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>
+      账号管理
+    </button>
+  </div>
+  <div class="sidebar-footer"><div class="dot"></div><span>系统在线</span></div>
+</nav>
+
+<div class="main">
+  <div class="topbar">
+    <div class="topbar-left">
+      <button class="mh-btn" @click="sidebarOpen=true">☰</button>
+      <template x-if="view==='chat'">
+        <div class="cselect cselect-lg" :class="{open:openSelect==='model'}" @click.stop>
+          <div class="cselect-btn" @click="toggleSelect('model',$event)" tabindex="0">
+            <span x-text="model||'选择模型'"></span><span class="arrow"></span>
+          </div>
+          <div class="cselect-menu">
+            <template x-for="m in models" :key="m.id">
+              <div class="cselect-opt" :class="{active:model===m.id}" @click="model=m.id;openSelect=null" x-text="m.id"></div>
+            </template>
+          </div>
         </div>
-
-        <div class="account-list" id="accountList">
-            <div class="empty-state">
-                <p>加载中...</p>
-            </div>
-        </div>
+      </template>
+      <template x-if="view!=='chat'">
+        <span class="topbar-title" x-text="view==='dashboard'?'控制面板':'账号管理'"></span>
+      </template>
     </div>
+    <div class="topbar-right" @click.stop>
+      <button class="icon-btn" :class="{active:configOpen}" @click="configOpen=!configOpen" title="Chat Settings">
+        <svg viewBox="0 0 24 24"><path d="M12.22 2h-.44a2 2 0 00-2 2v.18a2 2 0 01-1 1.73l-.43.25a2 2 0 01-2 0l-.15-.08a2 2 0 00-2.73.73l-.22.38a2 2 0 00.73 2.73l.15.1a2 2 0 011 1.72v.51a2 2 0 01-1 1.74l-.15.09a2 2 0 00-.73 2.73l.22.38a2 2 0 002.73.73l.15-.08a2 2 0 012 0l.43.25a2 2 0 011 1.73V20a2 2 0 002 2h.44a2 2 0 002-2v-.18a2 2 0 011-1.73l.43-.25a2 2 0 012 0l.15.08a2 2 0 002.73-.73l.22-.39a2 2 0 00-.73-2.73l-.15-.08a2 2 0 01-1-1.74v-.5a2 2 0 011-1.74l.15-.09a2 2 0 00.73-2.73l-.22-.38a2 2 0 00-2.73-.73l-.15.08a2 2 0 01-2 0l-.43-.25a2 2 0 01-1-1.73V4a2 2 0 00-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+      </button>
 
-    <!-- 登录模态框 -->
-    <div class="modal" id="loginModal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2 class="modal-title">登录新账号</h2>
-                <button class="modal-close" onclick="closeLoginModal()">&times;</button>
-            </div>
-            <div class="form-group">
-                <label for="accountName">账号名称（可选）</label>
-                <input type="text" id="accountName" placeholder="例如：工作账号、个人账号">
-            </div>
-            <button class="btn btn-primary" onclick="startLogin()">开始登录</button>
-            <div class="login-status" id="loginStatus"></div>
+      <div class="cfg-dropdown" x-show="configOpen" x-cloak @click.stop>
+        <div class="cfg-head">聊天设置</div>
+        <div class="cfg-body">
+          <div class="cfg-item"><div class="cfg-info"><div class="cfg-name">推理强度 (Thinking)</div><div class="cfg-desc">启用模型思维链推理</div></div><div class="cfg-ctrl"><div class="cselect" :class="{open:openSelect==='thinking'}" @click.stop><div class="cselect-btn" @click="toggleSelect('thinking',$event)" tabindex="0"><span x-text="cfg.thinking==='off'?'关闭':cfg.thinking==='low'?'低':cfg.thinking==='medium'?'中':cfg.thinking==='high'?'高':cfg.thinking"></span><span class="arrow"></span></div><div class="cselect-menu"><template x-for="v in ['off','low','medium','high']"><div class="cselect-opt" :class="{active:cfg.thinking===v}" @click="cfg.thinking=v;openSelect=null" x-text="v==='off'?'关闭':v==='low'?'低':v==='medium'?'中':v==='high'?'高':v"></div></template></div></div></div></div>
+          <div class="cfg-item"><div class="cfg-info"><div class="cfg-name">谷歌搜索 (Search)</div><div class="cfg-desc">启用联网搜索功能</div></div><div class="cfg-ctrl"><div class="cselect" :class="{open:openSelect==='search'}" @click.stop><div class="cselect-btn" @click="toggleSelect('search',$event)" tabindex="0"><span x-text="cfg.search==='on'?'开启':'关闭'"></span><span class="arrow"></span></div><div class="cselect-menu"><template x-for="v in ['off','on']"><div class="cselect-opt" :class="{active:cfg.search===v}" @click="cfg.search=v;openSelect=null" x-text="v==='on'?'开启':'关闭'"></div></template></div></div></div></div>
+          <div class="cfg-item"><div class="cfg-info"><div class="cfg-name">流式输出 (Stream)</div><div class="cfg-desc">逐字生成内容</div></div><div class="cfg-ctrl"><div class="cselect" :class="{open:openSelect==='stream'}" @click.stop><div class="cselect-btn" @click="toggleSelect('stream',$event)" tabindex="0"><span x-text="cfg.stream==='on'?'开启':'关闭'"></span><span class="arrow"></span></div><div class="cselect-menu"><template x-for="v in ['on','off']"><div class="cselect-opt" :class="{active:cfg.stream===v}" @click="cfg.stream=v;openSelect=null" x-text="v==='on'?'开启':'关闭'"></div></template></div></div></div></div>
+          <div class="cfg-item"><div class="cfg-info"><div class="cfg-name">温度 (Temperature)</div><div class="cfg-desc">0 = 稳定, 2 = 创意</div></div><div class="cfg-ctrl"><input class="cfg-num" type="number" x-model.number="cfg.temperature" min="0" max="2" step="0.1"></div></div>
+          <div class="cfg-item"><div class="cfg-info"><div class="cfg-name">Top P</div><div class="cfg-desc">核采样阈值</div></div><div class="cfg-ctrl"><input class="cfg-num" type="number" x-model.number="cfg.topP" min="0" max="1" step="0.05"></div></div>
+          <div class="cfg-item"><div class="cfg-info"><div class="cfg-name">最大 Token</div><div class="cfg-desc">最大生成长度</div></div><div class="cfg-ctrl"><input class="cfg-num" type="number" x-model.number="cfg.maxTokens" min="1" max="65536" step="256"></div></div>
+          <div class="cfg-item"><div class="cfg-info"><div class="cfg-name">安全过滤 (Safety)</div><div class="cfg-desc">内容合规性检查</div></div><div class="cfg-ctrl"><div class="cselect" :class="{open:openSelect==='safety'}" @click.stop><div class="cselect-btn" @click="toggleSelect('safety',$event)" tabindex="0"><span x-text="cfg.safety==='on'?'开启':'关闭'"></span><span class="arrow"></span></div><div class="cselect-menu"><template x-for="v in ['on','off']"><div class="cselect-opt" :class="{active:cfg.safety===v}" @click="cfg.safety=v;openSelect=null" x-text="v==='on'?'开启':'关闭'"></div></template></div></div></div></div>
         </div>
+      </div>
     </div>
+  </div>
 
-    <!-- 编辑模态框 -->
-    <div class="modal" id="editModal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2 class="modal-title">编辑账号名称</h2>
-                <button class="modal-close" onclick="closeEditModal()">&times;</button>
-            </div>
-            <input type="hidden" id="editAccountId">
-            <div class="form-group">
-                <label for="editName">账号名称</label>
-                <input type="text" id="editName">
-            </div>
-            <button class="btn btn-primary" onclick="updateAccount()">保存</button>
-        </div>
-    </div>
-
-    <script>
-        const API_BASE = '/accounts';
-        let loginSessionId = null;
-        let loginPollInterval = null;
-
-        // 加载账号列表
-        async function loadAccounts() {
-            try {
-                const response = await fetch(API_BASE);
-                const accounts = await response.json();
-                renderAccounts(accounts);
-            } catch (error) {
-                console.error('加载账号失败:', error);
-                document.getElementById('accountList').innerHTML =
-                    '<div class="empty-state"><p>加载失败，请刷新页面</p></div>';
-            }
-        }
-
-        // 渲染账号列表
-        function renderAccounts(accounts) {
-            const container = document.getElementById('accountList');
-
-            if (accounts.length === 0) {
-                container.innerHTML = `
-                    <div class="empty-state">
-                        <p>还没有账号</p>
-                        <p>点击"登录新账号"开始使用</p>
-                    </div>
-                `;
-                return;
-            }
-
-            container.innerHTML = accounts.map(account => `
-                <div class="account-item ${account.id === getActiveAccountId(accounts) ? 'active' : ''}">
-                    <div class="account-info">
-                        <div class="account-name">
-                            ${escapeHtml(account.name)}
-                            ${account.id === getActiveAccountId(accounts) ?
-                                '<span class="account-status status-active">活跃</span>' : ''}
-                        </div>
-                        <div class="account-email">${account.email || '未获取到邮箱'}</div>
-                        <div class="account-meta">
-                            创建: ${formatDate(account.created_at)}
-                            ${account.last_used ? ' | 最后使用: ' + formatDate(account.last_used) : ''}
-                        </div>
-                    </div>
-                    <div class="account-actions">
-                        ${account.id !== getActiveAccountId(accounts) ?
-                            `<button class="btn btn-secondary btn-sm" onclick="activateAccount('${account.id}')">切换</button>` : ''}
-                        <button class="btn btn-secondary btn-sm" onclick="showEditModal('${account.id}', '${escapeHtml(account.name)}')">编辑</button>
-                        <button class="btn btn-danger btn-sm" onclick="deleteAccount('${account.id}', '${escapeHtml(account.name)}')">删除</button>
-                    </div>
+  <!-- Chat -->
+  <div id="chat-page" :class="{active:view==='chat'}">
+    <div id="chat-scroll">
+      <template x-if="msgs.length===0">
+        <div class="welcome"><h2>今天我能帮您做什么？</h2><p>发送消息来测试代理服务。</p></div>
+      </template>
+      <template x-for="(m,i) in msgs" :key="i">
+        <div class="msg" :class="m.role==='user'?'':'msg-ai'">
+          <div class="msg-inner">
+            <div class="avatar" :class="m.role==='user'?'avatar-user':'avatar-ai'" x-text="m.role==='user'?'U':'AI'"></div>
+            <div style="flex:1;min-width:0">
+              <template x-if="m.thinking">
+                <div class="think-block" @click="m.showThinking=!m.showThinking">
+                  <div class="think-toggle"><span class="think-icon">🧠</span><span>思考中</span><span class="think-arrow" :class="{open:m.showThinking}">›</span></div>
+                  <div class="think-body" x-show="m.showThinking" x-text="m.thinking"></div>
                 </div>
-            `).join('');
-        }
+              </template>
+              <div class="msg-body" :class="{error:m.error}" x-text="m.error||m.content"></div>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+    <div id="input-area">
+      <div id="input-box">
+        <textarea x-ref="ta" x-model="draft" @keydown.enter.prevent="if(!$event.shiftKey)send()" @input="resizeTa()" placeholder="给 AI Studio 代理发送消息..." rows="1"></textarea>
+        <button class="send" :disabled="busy||!draft.trim()||!model" @click="send()">
+          <svg viewBox="0 0 24 24"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+        </button>
+      </div>
+    </div>
+  </div>
 
-        // 获取活跃账号 ID
-        function getActiveAccountId(accounts) {
-            // 从 accounts 中找 active_account_id
-            // 由于 API 没有直接返回，我们通过 /accounts/active 获取
-            return window._activeAccountId || null;
-        }
+  <!-- Dashboard -->
+  <div class="page-wrap" :class="{active:view==='dashboard'}">
+    <div class="scroll-area">
+      <div class="page-pad">
+        <div class="stat-grid">
+          <div class="stat-card"><div class="slabel">当前激活账号</div><div class="sval" x-text="activeAccount.email||'暂无'"></div></div>
+          <div class="stat-card"><div class="slabel">轮询模式</div><div class="sval" x-text="rotationMode==='round_robin'?'顺序轮询':rotationMode"></div></div>
+          <div class="stat-card"><div class="slabel">总请求数</div><div class="sval" x-text="totalReqs"></div></div>
+          <div class="stat-card"><div class="slabel">429 频率限制数</div><div class="sval sval-amber" x-text="totalRL"></div></div>
+        </div>
+        <div class="card">
+          <div class="card-head">模型统计</div>
+          <div class="table-wrap"><table>
+            <thead><tr><th>模型</th><th>请求</th><th>成功</th><th>429</th><th>错误</th><th>最后使用</th></tr></thead>
+            <tbody>
+              <template x-for="(s,n) in stats" :key="n"><tr>
+                <td style="font-weight:500" x-text="n.replace('models/','')"></td>
+                <td x-text="s.requests||0"></td>
+                <td><span class="badge badge-green" x-text="s.success||0"></span></td>
+                <td><span class="badge" :class="(s.rate_limited||0)>0?'badge-red':'badge-gray'" x-text="s.rate_limited||0"></span></td>
+                <td x-text="s.errors||0"></td>
+                <td style="font-size:13px;color:var(--muted)" x-text="fmtDate(s.last_used)"></td>
+              </tr></template>
+              <tr x-show="!Object.keys(stats).length"><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">暂无数据</td></tr>
+            </tbody></table></div>
+        </div>
+      </div>
+    </div>
+  </div>
 
-        // 加载活跃账号
-        async function loadActiveAccount() {
-            try {
-                const response = await fetch(`${API_BASE}/active`);
-                if (response.ok) {
-                    const account = await response.json();
-                    window._activeAccountId = account.id;
-                }
-            } catch (error) {
-                console.error('加载活跃账号失败:', error);
-            }
-        }
+  <!-- Accounts -->
+  <div class="page-wrap" :class="{active:view==='accounts'}">
+    <div class="scroll-area">
+      <div class="page-pad">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:24px">
+          <h1 style="font-size:24px;font-weight:700">账号管理</h1>
+          <button class="btn btn-primary" @click="addAccount()">+ 登录账号</button>
+        </div>
+        <div class="card" style="margin-bottom:24px">
+          <div class="card-head">轮询设置</div>
+          <div style="padding:20px;display:flex;flex-wrap:wrap;gap:16px;align-items:end">
+            <div><div style="font-size:13px;color:var(--muted);margin-bottom:4px">模式</div><div class="cselect" :class="{open:openSelect==='rotMode'}" @click.stop><div class="cselect-btn" @click="toggleSelect('rotMode',$event)" tabindex="0" style="min-width:130px"><span x-text="rotCfg.mode==='round_robin'?'顺序轮询':rotCfg.mode==='lru'?'最近最少使用 (LRU)':rotCfg.mode==='least_rl'?'最小频率限制':'未知'"></span><span class="arrow"></span></div><div class="cselect-menu"><template x-for="v in ['round_robin','lru','least_rl']"><div class="cselect-opt" :class="{active:rotCfg.mode===v}" @click="rotCfg.mode=v;openSelect=null" x-text="v==='round_robin'?'顺序轮询':v==='lru'?'最近最少使用 (LRU)':v==='least_rl'?'最小频率限制':v"></div></template></div></div></div>
+            <div><div style="font-size:13px;color:var(--muted);margin-bottom:4px">冷却时间 (秒)</div><input type="number" x-model.number="rotCfg.cooldown" style="width:80px;padding:8px;border:1px solid var(--border);border-radius:8px;font-size:14px" min="0"></div>
+            <button class="btn" @click="saveRotation()">保存设置</button>
+            <button class="btn" @click="forceNext()">强制切换</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><span>账号池</span><span style="font-size:13px;color:var(--muted)" x-text="accountRows.length+' 个账号'"></span></div>
+          <div class="table-wrap"><table>
+            <thead><tr><th>邮箱</th><th>请求</th><th>成功</th><th>429</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody>
+              <template x-for="a in accountRows" :key="a.id"><tr>
+                <td><div style="font-weight:500" x-text="a.email||a.name||a.id"></div><div style="font-size:12px;color:var(--muted);font-family:monospace" x-text="a.id"></div></td>
+                <td x-text="a.requests||0"></td>
+                <td><span class="badge badge-green" x-text="a.success||0"></span></td>
+                <td><span class="badge" :class="(a.rate_limited||0)>0?'badge-red':'badge-gray'" x-text="a.rate_limited||0"></span></td>
+                <td><span class="badge badge-green" x-show="a.id===activeId">激活</span><span class="badge badge-gray" x-show="a.id!==activeId">待命</span></td>
+                <td><button class="btn btn-sm" x-show="a.id!==activeId" @click="activateAccount(a.id)">手动激活</button></td>
+              </tr></template>
+              <tr x-show="!accountRows.length"><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">暂无账号</td></tr>
+            </tbody></table></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 
-        // 显示登录模态框
-        function showLoginModal() {
-            document.getElementById('loginModal').classList.add('show');
-            document.getElementById('accountName').value = '';
-            document.getElementById('loginStatus').className = 'login-status';
-            document.getElementById('loginStatus').textContent = '';
-            loginSessionId = null;
-            if (loginPollInterval) {
-                clearInterval(loginPollInterval);
-                loginPollInterval = null;
-            }
-        }
-
-        // 关闭登录模态框
-        function closeLoginModal() {
-            document.getElementById('loginModal').classList.remove('show');
-            if (loginPollInterval) {
-                clearInterval(loginPollInterval);
-                loginPollInterval = null;
-            }
-        }
-
-        // 开始登录
-        async function startLogin() {
-            const name = document.getElementById('accountName').value.trim();
-            const statusEl = document.getElementById('loginStatus');
-
-            try {
-                const response = await fetch(`${API_BASE}/login/start`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ name: name || null }),
-                });
-
-                const data = await response.json();
-                loginSessionId = data.session_id;
-
-                statusEl.className = 'login-status pending';
-                statusEl.innerHTML = '<span class="spinner"></span> 浏览器已打开，请在浏览器中完成登录...';
-
-                // 开始轮询登录状态
-                loginPollInterval = setInterval(checkLoginStatus, 2000);
-            } catch (error) {
-                statusEl.className = 'login-status failed';
-                statusEl.textContent = '启动登录失败: ' + error.message;
-            }
-        }
-
-        // 检查登录状态
-        async function checkLoginStatus() {
-            if (!loginSessionId) return;
-
-            try {
-                const response = await fetch(`${API_BASE}/login/status/${loginSessionId}`);
-                const data = await response.json();
-                const statusEl = document.getElementById('loginStatus');
-
-                if (data.status === 'completed') {
-                    statusEl.className = 'login-status completed';
-                    statusEl.textContent = `登录成功！邮箱: ${data.email || '未获取到'}`;
-                    clearInterval(loginPollInterval);
-                    loginPollInterval = null;
-                    // 刷新账号列表
-                    setTimeout(() => {
-                        loadActiveAccount();
-                        loadAccounts();
-                        closeLoginModal();
-                    }, 1500);
-                } else if (data.status === 'failed') {
-                    statusEl.className = 'login-status failed';
-                    statusEl.textContent = '登录失败: ' + (data.error || '未知错误');
-                    clearInterval(loginPollInterval);
-                    loginPollInterval = null;
-                }
-                // pending 状态继续轮询
-            } catch (error) {
-                console.error('检查登录状态失败:', error);
-            }
-        }
-
-        // 切换账号
-        async function activateAccount(accountId) {
-            try {
-                const response = await fetch(`${API_BASE}/${accountId}/activate`, {
-                    method: 'POST',
-                });
-
-                if (response.ok) {
-                    showToast('切换成功', 'success');
-                    window._activeAccountId = accountId;
-                    loadAccounts();
-                } else {
-                    const error = await response.json();
-                    showToast('切换失败: ' + (error.detail || '未知错误'), 'error');
-                }
-            } catch (error) {
-                showToast('切换失败: ' + error.message, 'error');
-            }
-        }
-
-        // 删除账号
-        async function deleteAccount(accountId, name) {
-            if (!confirm(`确定要删除"${name}"吗？`)) return;
-
-            try {
-                const response = await fetch(`${API_BASE}/${accountId}`, {
-                    method: 'DELETE',
-                });
-
-                if (response.ok) {
-                    showToast('删除成功', 'success');
-                    loadActiveAccount();
-                    loadAccounts();
-                } else {
-                    const error = await response.json();
-                    showToast('删除失败: ' + (error.detail || '未知错误'), 'error');
-                }
-            } catch (error) {
-                showToast('删除失败: ' + error.message, 'error');
-            }
-        }
-
-        // 显示编辑模态框
-        function showEditModal(accountId, name) {
-            document.getElementById('editAccountId').value = accountId;
-            document.getElementById('editName').value = name;
-            document.getElementById('editModal').classList.add('show');
-        }
-
-        // 关闭编辑模态框
-        function closeEditModal() {
-            document.getElementById('editModal').classList.remove('show');
-        }
-
-        // 更新账号
-        async function updateAccount() {
-            const accountId = document.getElementById('editAccountId').value;
-            const name = document.getElementById('editName').value.trim();
-
-            if (!name) {
-                showToast('请输入账号名称', 'error');
-                return;
-            }
-
-            try {
-                const response = await fetch(`${API_BASE}/${accountId}`, {
-                    method: 'PUT',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ name }),
-                });
-
-                if (response.ok) {
-                    showToast('更新成功', 'success');
-                    closeEditModal();
-                    loadAccounts();
-                } else {
-                    const error = await response.json();
-                    showToast('更新失败: ' + (error.detail || '未知错误'), 'error');
-                }
-            } catch (error) {
-                showToast('更新失败: ' + error.message, 'error');
-            }
-        }
-
-        // 格式化日期
-        function formatDate(dateStr) {
-            if (!dateStr) return '';
-            const date = new Date(dateStr);
-            return date.toLocaleString('zh-CN', {
-                year: 'numeric',
-                month: '2-digit',
-                day: '2-digit',
-                hour: '2-digit',
-                minute: '2-digit',
-            });
-        }
-
-        // HTML 转义
-        function escapeHtml(text) {
-            if (!text) return '';
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-
-        // 显示 toast 通知
-        function showToast(message, type = 'info') {
-            const toast = document.getElementById('toast');
-            toast.textContent = message;
-            toast.className = `toast ${type} show`;
-
-            setTimeout(() => {
-                toast.classList.remove('show');
-            }, 3000);
-        }
-
-        // 初始化
-        document.addEventListener('DOMContentLoaded', () => {
-            loadActiveAccount();
-            loadAccounts();
-        });
-    </script>
+<div class="toast" :class="{show:toast.show}" x-text="toast.msg"></div>
+<script src="/static/app.js"></script>
+<script defer src="/static/alpine.min.js"></script>
 </body>
 </html>

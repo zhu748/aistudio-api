@@ -8,6 +8,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
@@ -131,7 +132,8 @@ class BrowserSession:
         self._snap_key: str | None = None
         self._templates: dict[str, dict[str, Any]] = {}
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aistudio-camoufox")
-        self._lock = asyncio.Lock()
+        self._botguard_lock = asyncio.Lock()
+        self._snapshot_lock = asyncio.Lock()
 
     async def ensure_context(self):
         return await self._run_sync(self._ensure_browser_sync)
@@ -154,7 +156,9 @@ class BrowserSession:
         return await self._run_sync(self._upload_images_sync, image_paths)
 
     async def generate_snapshot(self, contents: list[AistudioContent]) -> str:
-        return await self._run_sync(self._generate_snapshot_sync, contents)
+        loop = asyncio.get_running_loop()
+        async with self._snapshot_lock:
+            return await loop.run_in_executor(self._executor, lambda: self._generate_snapshot_sync(contents))
 
     async def send_hooked_request(self, *, body: str, timeout_ms: int) -> tuple[int, bytes]:
         return await self._run_sync(self._send_hooked_request_sync, body, timeout_ms)
@@ -175,24 +179,23 @@ class BrowserSession:
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", e))
                 loop.call_soon_threadsafe(queue.put_nowait, None)
 
-        async with self._lock:
-            executor_task = loop.run_in_executor(self._executor, _stream_worker)
-            try:
-                while True:
-                    item = await queue.get()
-                    if item is None:
-                        break
-                    tag, data = item
-                    if tag == "error":
-                        raise data
-                    yield tag, data
-            finally:
-                cancel_event.set()
-                await executor_task
+        executor_task = loop.run_in_executor(self._executor, _stream_worker)
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                tag, data = item
+                if tag == "error":
+                    raise data
+                yield tag, data
+        finally:
+            cancel_event.set()
+            await executor_task
 
     async def _run_sync(self, func, *args):
         loop = asyncio.get_running_loop()
-        async with self._lock:
+        async with self._botguard_lock:
             return await loop.run_in_executor(self._executor, lambda: func(*args))
 
     def _get_captured_info(self) -> tuple[str, dict[str, str]]:
@@ -220,20 +223,27 @@ class BrowserSession:
         log.debug(f"[stream] prep done in {_t.time()-_t0:.1f}s, url={captured_url}")
 
         timeout_s = timeout_ms / 1000
+        rid = uuid.uuid4().hex[:8]
 
-        # Start XHR in page context. The page tracks responseText growth via XHR
-        # events and exposes a small async queue to Python.
+        # Start XHR in page context. Each request gets an isolated state object
+        # keyed by rid, allowing multiple concurrent XHRs on the same page.
         page.evaluate("""(args) => {
-            if (window.__stream_xhr && window.__stream_xhr.readyState !== 4) {
-                try { window.__stream_xhr.abort(); } catch (e) {}
+            const rid = args.rid;
+            if (!window.__streams) window.__streams = {};
+
+            const existing = window.__streams[rid];
+            if (existing && existing.xhr && existing.xhr.readyState !== 4) {
+                try { existing.xhr.abort(); } catch (e) {}
             }
 
             const state = {
+                xhr: null,
                 events: [],
                 waiter: null,
                 recvPos: 0,
                 statusSent: false,
             };
+            window.__streams[rid] = state;
 
             function push(event) {
                 if (state.waiter) {
@@ -259,7 +269,8 @@ class BrowserSession:
                 push({type: 'chunk', text: chunk});
             }
 
-            window.__stream_next = function(timeoutMs) {
+            if (!window.__stream_next) window.__stream_next = {};
+            window.__stream_next[rid] = function(timeoutMs) {
                 if (state.events.length) return Promise.resolve(state.events.shift());
                 return new Promise((resolve) => {
                     let done = false;
@@ -279,9 +290,10 @@ class BrowserSession:
                 });
             };
 
-            window.__stream_abort = function() {
-                if (window.__stream_xhr && window.__stream_xhr.readyState !== 4) {
-                    try { window.__stream_xhr.abort(); } catch (e) {}
+            if (!window.__stream_abort) window.__stream_abort = {};
+            window.__stream_abort[rid] = function() {
+                if (state.xhr && state.xhr.readyState !== 4) {
+                    try { state.xhr.abort(); } catch (e) {}
                 }
             };
 
@@ -317,24 +329,25 @@ class BrowserSession:
                 push({type: 'aborted'});
             };
 
-            window.__stream_xhr = xhr;
+            state.xhr = xhr;
             xhr.send(args.body);
         }""", {
             "url": captured_url,
             "headers": captured_headers,
             "body": body,
             "timeout": timeout_s,
+            "rid": rid,
         })
 
         deadline = _t.time() + timeout_s
         status_sent = False
         while _t.time() < deadline:
             if cancel_event.is_set():
-                log.debug("[stream] cancellation requested")
-                page.evaluate("() => window.__stream_abort && window.__stream_abort()")
+                log.debug("[stream] cancellation requested for %s", rid)
+                page.evaluate("rid => { if (window.__stream_abort && window.__stream_abort[rid]) window.__stream_abort[rid](); }", rid)
                 break
 
-            event = page.evaluate("timeoutMs => window.__stream_next(timeoutMs)", 250)
+            event = page.evaluate("rid => window.__stream_next[rid](250)", rid)
             event_type = event.get("type")
 
             if event_type == "idle":
@@ -371,7 +384,6 @@ class BrowserSession:
     def _prepare_streaming_sync(self):
         """Prepare page for streaming request. Returns (page, url, headers)."""
         page = self._ensure_botguard_service_sync()
-        self._wait_until_idle_sync(page)
         url, headers = self._get_captured_info()
         return page, url, headers
 
@@ -428,7 +440,6 @@ class BrowserSession:
         _t0 = _t.time()
         page = self._ensure_hook_page_sync()
         if page.evaluate("mw:!!window.__bg_service"):
-            self._wait_until_idle_sync(page)
             log.debug(f"[timing] botguard cached, took {_t.time()-_t0:.1f}s")
             return page
 
@@ -734,7 +745,6 @@ mw:((hash) => {
         _t0 = _t.time()
         page = self._ensure_botguard_service_sync()
         log.debug(f"[timing] botguard ready in {_t.time()-_t0:.1f}s")
-        self._wait_until_idle_sync(page)
         captured_url, captured_headers = self._get_captured_info()
 
         # Replay via XHR in browser context (same approach as non-streaming replay_v2)
