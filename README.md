@@ -17,7 +17,7 @@ Google AIStudio Playgroud 反代，支持 Google 会员（Pro/Ultra），支持 
 - **反检测** — 使用 Camoufox
 - **BotGuard** — 自动特征匹配定位 snapshot 函数
 - **多账号轮询** — round-robin / LRU / 最少限流
-
+![alt text](image/chat.png)
 ## 快速开始
 
 ```bash
@@ -31,7 +31,8 @@ pip install -r requirements.txt
 # 启动服务
 python3 main.py server --port 8080 --camoufox-port 9222
 ```
-打开 http://localhost:8080 打开有头浏览器登录。
+首次启动后，访问 http://localhost:8080 进行 Google 账号登录。
+![alt text](login.png)
 ## 使用示例
 
 ### OpenAI 兼容接口

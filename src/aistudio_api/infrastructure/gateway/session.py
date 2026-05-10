@@ -384,6 +384,13 @@ class BrowserSession:
     def _prepare_streaming_sync(self):
         """Prepare page for streaming request. Returns (page, url, headers)."""
         page = self._ensure_botguard_service_sync()
+        if not self._templates:
+            # Template not yet captured — capture one so we have a URL
+            from aistudio_api.config import DEFAULT_TEXT_MODEL
+            try:
+                self._capture_template_sync(DEFAULT_TEXT_MODEL)
+            except Exception as e:
+                log.warning("auto template capture failed: %s", e)
         url, headers = self._get_captured_info()
         return page, url, headers
 
