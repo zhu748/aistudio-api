@@ -19,7 +19,7 @@ Google AIStudio Playgroud 反代，支持 Google 会员（Pro/Ultra），支持 
 - **多账号轮询** — round-robin / LRU / 最少限流
 ![alt text](image/chat.png)
 ## 快速开始
-
+### 直接启动
 ```bash
 # 克隆项目
 git clone https://github.com/chrysoljq/aistudio-api.git
@@ -31,7 +31,20 @@ pip install -r requirements.txt
 # 启动服务
 python3 main.py server --port 8080 --camoufox-port 9222
 ```
-首次启动后，访问 http://localhost:8080 进行 Google 账号登录。
+
+### Docker 部署
+
+
+```bash
+docker run -d \
+  --name aistudio-api \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -v aistudio-api-data:/app/data \
+  ghcr.io/chrysoljq/aistudio-api:latest
+```
+
+首次启动后，访问 http://localhost:8080 进行 Google 账号登录，支持浏览器登录和手动导入cookies（访问）。
 ![alt text](image/login.png)
 ## 使用示例
 
@@ -76,19 +89,6 @@ curl http://localhost:8080/v1beta/models/gemini-3-flash-preview:generateContent 
     "tools": [{"googleSearchRetrieval": {}}]
   }'
 ```
-
-## Docker 部署
-
-
-```bash
-docker run -d \
-  --name aistudio-api \
-  --restart unless-stopped \
-  -p 8080:8080 \
-  -v aistudio-api-data:/app/data \
-  ghcr.io/chrysoljq/aistudio-api:latest
-```
-
 ### Python（OpenAI SDK）
 
 ```python
@@ -148,8 +148,7 @@ python3 main.py client "画一只猫" --image --save cat.png
 | `AISTUDIO_SNAPSHOT_CACHE_TTL` | `3600` | BotGuard snapshot 缓存时间 |
 | `AISTUDIO_ACCOUNT_ROTATION_MODE` | `round_robin` | 轮询模式：`round_robin`、`lru`、`least_rl` |
 | `AISTUDIO_ACCOUNT_COOLDOWN_SECONDS` | `60` | 限流后冷却时间 |
-| `AISTUDIO_USE_PURE_HTTP` | `0` | 纯 HTTP 模式（不用浏览器） |
-| `AISTUDIO_DUMP_RAW_RESPONSE` | `0` | 保存原始响应到磁盘 |
+| `AISTUDIO_DUMP_RAW_RESPONSE` | `0` | 保存原始响应到磁盘（调试） |
 
 ## 架构
 
