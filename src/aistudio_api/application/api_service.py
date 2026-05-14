@@ -303,8 +303,10 @@ def _build_streaming_response(
                 chat_id = new_chat_id()
                 final_usage = None
                 saw_tool_calls = False
-                for stream_attempt in range(2):
+                max_retries = 3
+                for stream_attempt in range(max_retries):
                     try:
+                        has_yielded_data = False
                         async for event_type, text in client.stream_generate_content(
                             model=model,
                             capture_prompt=capture_prompt,
@@ -322,6 +324,7 @@ def _build_streaming_response(
                             tools=tools,
                             force_refresh_capture=stream_attempt > 0,
                         ):
+                            has_yielded_data = True
                             if event_type == "body" and text:
                                 yield sse_chunk(chat_id, model, text, include_usage=include_usage)
                             elif event_type == "thinking" and text:
@@ -338,6 +341,17 @@ def _build_streaming_response(
                             elif event_type == "usage":
                                 final_usage = text if isinstance(text, dict) else None
                         break
+                    except UsageLimitExceeded as exc:
+                        runtime_state.record(model, "rate_limited")
+                        rotator = runtime_state.rotator
+                        if rotator:
+                            account = runtime_state.account_service.get_active_account() if runtime_state.account_service else None
+                            if account:
+                                rotator.record_rate_limited(account.id)
+                        if not has_yielded_data and await _try_switch_account():
+                            logger.warning("Stream 429 限流，已切换账号，重试 %d/%d", stream_attempt + 1, max_retries)
+                            continue
+                        raise
                     except RequestError as exc:
                         if exc.status == 204 and stream_attempt == 0:
                             logger.warning("Stream 收到 204，清理 snapshot 缓存后重试一次")
@@ -496,8 +510,10 @@ def _build_gemini_streaming_response(*, client: AIStudioClient, normalized: dict
         async with busy_lock:
             try:
                 final_usage = None
-                for stream_attempt in range(2):
+                max_retries = 3
+                for stream_attempt in range(max_retries):
                     try:
+                        has_yielded_data = False
                         async for event_type, text in client.stream_generate_content(
                             model=normalized["model"],
                             capture_prompt=normalized["capture_prompt"],
@@ -513,6 +529,7 @@ def _build_gemini_streaming_response(*, client: AIStudioClient, normalized: dict
                             sanitize_plain_text=False,
                             force_refresh_capture=stream_attempt > 0,
                         ):
+                            has_yielded_data = True
                             if event_type == "body" and text:
                                 yield "data: " + json.dumps(
                                     {
@@ -543,6 +560,17 @@ def _build_gemini_streaming_response(*, client: AIStudioClient, normalized: dict
                             elif event_type == "usage":
                                 final_usage = text if isinstance(text, dict) else None
                         break
+                    except UsageLimitExceeded as exc:
+                        runtime_state.record(normalized["model"], "rate_limited")
+                        rotator = runtime_state.rotator
+                        if rotator:
+                            account = runtime_state.account_service.get_active_account() if runtime_state.account_service else None
+                            if account:
+                                rotator.record_rate_limited(account.id)
+                        if not has_yielded_data and await _try_switch_account():
+                            logger.warning("Gemini stream 429 限流，已切换账号，重试 %d/%d", stream_attempt + 1, max_retries)
+                            continue
+                        raise
                     except RequestError as exc:
                         if exc.status == 204 and stream_attempt == 0:
                             logger.warning("Gemini stream 收到 204，清理 snapshot 缓存后重试一次")
