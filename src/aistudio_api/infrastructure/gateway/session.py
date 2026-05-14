@@ -805,6 +805,13 @@ mw:((hash) => {
                 _t0 = _t.time()
                 page.goto(url, wait_until="networkidle", timeout=30000)
                 log.debug(f"[timing] goto {url} took {_t.time()-_t0:.1f}s")
+                # 检查是否被重定向到登录页
+                current_url = page.url or ""
+                if "accounts.google.com" in current_url and "signin" in current_url:
+                    raise RuntimeError(
+                        f"Cookie 认证失败，已被重定向到 Google 登录页。"
+                        f" (url={current_url})"
+                    )
                 # Wait for SPA framework and chat UI to render
                 for _ in range(60):
                     page.wait_for_timeout(1000)
@@ -838,7 +845,13 @@ mw:((hash) => {
             if isinstance(result, str) and result.startswith("hooked:"):
                 self._snap_key = result.split(":", 1)[1]
                 return
-        raise RuntimeError(f"Hook install failed: {result}")
+        page_url = page.url if page else "(no page)"
+        page_title = ""
+        try:
+            page_title = page.title()
+        except Exception:
+            pass
+        raise RuntimeError(f"Hook install failed: {result} (url={page_url}, title={page_title!r})")
 
     def _click_run_button_sync(self, page) -> bool:
         try:

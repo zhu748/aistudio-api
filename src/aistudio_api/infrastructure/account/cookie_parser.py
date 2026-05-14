@@ -11,6 +11,15 @@ _DOMAIN_OVERRIDES: dict[str, list[str]] = {
     "__Secure-BUCKET": ["aistudio.google.com"],
     "OTZ": ["accounts.google.com"],
     "__Host-GAPS": ["accounts.google.com"],
+    "__Host-1PLSID": ["accounts.google.com"],
+    "__Host-3PLSID": ["accounts.google.com"],
+    "LSID": ["accounts.google.com"],
+    "SMSV": ["accounts.google.com"],
+    "LSOLH": ["accounts.google.com"],
+    "ACCOUNT_CHOOSER": ["accounts.google.com"],
+    # SIDTS 系列只在 .youtube.com 域名下
+    "__Secure-1PSIDTS": [".youtube.com"],
+    "__Secure-3PSIDTS": [".youtube.com"],
 }
 
 # 需要复制到多个 Google 域名的核心认证 cookie
