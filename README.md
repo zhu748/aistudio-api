@@ -14,7 +14,7 @@ Google AIStudio Playgroud 反代，支持 Google 会员（Pro/Ultra），支持 
 - **Google 搜索** — 通过 `googleSearchRetrieval` 实时联网搜索
 - **Thinking** — 返回模型思考过程（`thinking` 字段）
 - **图片生成** — 通过 Gemini 图片模型生成图片
-- **反检测** — 使用 Camoufox
+- **反检测** — 支持 Camoufox/CloakBrowser(默认)
 - **BotGuard** — 自动特征匹配定位 snapshot 函数
 - **多账号轮询** — round-robin / LRU / 最少限流
 ![alt text](image/chat.png)
@@ -43,9 +43,12 @@ docker run -d \
   -v aistudio-api-data:/app/data \
   ghcr.io/chrysoljq/aistudio-api:latest
 ```
-
+#### 有头模式，适合本地
 首次启动后，访问 http://localhost:8080 进行 Google 账号登录，支持浏览器登录和手动导入cookies（访问）。
 ![alt text](image/login.png)
+#### 使用 cookies 登录(目前仅支持chromium系)
+访问 https://myaccount.google.com/ ，复制 cookies 导入
+![alt text](image/cookie.png)
 ## 使用示例
 
 ### OpenAI 兼容接口

@@ -14,7 +14,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     server_parser = subparsers.add_parser("server", help="启动 OpenAI 兼容 API 服务")
     server_parser.add_argument("--port", type=int, default=settings.port)
-    server_parser.add_argument("--camoufox-port", type=int, default=settings.camoufox_port)
+    server_parser.add_argument("--browser-port", type=int, default=settings.browser_port)
+    server_parser.add_argument("--camoufox-port", type=int, dest="browser_port", help=argparse.SUPPRESS)
 
     client_parser = subparsers.add_parser("client", help="发送一次客户端请求")
     client_parser.add_argument("prompt", nargs="?", default="你好", help="用户消息")
@@ -25,7 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     client_parser.add_argument("--image", action="store_true", help="生图模式")
     client_parser.add_argument("--save", help="图片保存路径")
     client_parser.add_argument("--attach", "-a", nargs="+", help="附加图片（文件路径）")
-    client_parser.add_argument("--port", type=int, default=settings.camoufox_port, help="Camoufox 调试端口")
+    client_parser.add_argument("--port", type=int, default=settings.browser_port, help="浏览器调试端口（仅 Camoufox 后端使用）")
 
     snapshot_parser = subparsers.add_parser("snapshot", help="抓取 snapshot")
     snapshot_parser.add_argument("prompt", nargs="?", default="你好，测试snapshot提取", help="触发用 prompt")
@@ -41,7 +42,7 @@ def main():
         from aistudio_api.api.app import main as server_main
         import sys
 
-        sys.argv = ["aistudio-api-server", "--port", str(args.port), "--camoufox-port", str(args.camoufox_port)]
+        sys.argv = ["aistudio-api-server", "--port", str(args.port), "--browser-port", str(args.browser_port)]
         server_main()
         return
 
@@ -66,4 +67,3 @@ def main():
 
         asyncio.run(_run_snapshot())
         return
-

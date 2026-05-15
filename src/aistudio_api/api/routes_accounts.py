@@ -7,6 +7,9 @@ from pydantic import BaseModel
 
 from aistudio_api.api.dependencies import get_account_service, get_runtime_state
 from aistudio_api.infrastructure.account.cookie_parser import parse_cookie_string
+import logging
+
+log = logging.getLogger("aistudio.routes_accounts")
 
 router = APIRouter(prefix="/accounts")
 
@@ -180,24 +183,26 @@ async def update_account(
 async def import_cookies(
     req: ImportCookiesRequest,
     account_service=Depends(get_account_service),
+    runtime_state=Depends(get_runtime_state),
 ):
     """从 cookie 字符串导入账号。
 
     支持格式: `key=value; key=value; ...`（浏览器开发者工具或 Cookie 编辑扩展导出格式）
+
+    流程: 解析 → 保存到 store → 注入浏览器 → 访问页面 → 导出 auth.json
     """
+    # 1. 解析并保存到账号 store
     storage_state = parse_cookie_string(req.cookies)
     cookie_count = len(storage_state["cookies"])
 
     if cookie_count == 0:
         raise HTTPException(status_code=400, detail="未解析到有效 cookie")
 
-    # 统计各域名的 cookie 数量
     domain_summary: dict[str, int] = {}
     for c in storage_state["cookies"]:
         d = c["domain"]
         domain_summary[d] = domain_summary.get(d, 0) + 1
 
-    # 从 cookie 中尝试提取 email（如果有 Gmail 相关信息）
     name = req.name or "导入的账号"
 
     account = account_service._store.save_account(
@@ -206,6 +211,19 @@ async def import_cookies(
         storage_state=storage_state,
         account_id=req.account_id,
     )
+
+    # 2. 注入浏览器 + 访问页面 + 保存 auth.json
+    try:
+        browser_session = runtime_state.client._session if runtime_state.client else None
+        if browser_session:
+            auth_path = account_service._store.get_auth_path(account.id)
+            count = await browser_session.import_cookies(
+                req.cookies,
+                auth_file=str(auth_path) if auth_path else None,
+            )
+            log.info("[import-cookies] injected %d cookies, saved auth.json", count)
+    except Exception as e:
+        log.warning("[import-cookies] browser injection failed: %s", e)
 
     return ImportCookiesResponse(
         account_id=account.id,

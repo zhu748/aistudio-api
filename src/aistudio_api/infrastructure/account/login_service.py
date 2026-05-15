@@ -10,6 +10,11 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from aistudio_api.infrastructure.browser.browser_engine import (
+    async_maximize_page_window,
+    build_browser_context_options,
+    describe_browser_backend,
+)
 from aistudio_api.infrastructure.browser.camoufox_manager import CamoufoxManager
 
 logger = logging.getLogger("aistudio.login")
@@ -80,15 +85,16 @@ class LoginService:
         try:
             # 启动浏览器
             logger.info("启动登录浏览器，端口 %d", self._port)
-            ws_endpoint = await manager.start()
-            logger.info("浏览器已启动: %s", ws_endpoint)
+            await manager.start()
+            logger.info("浏览器后端已准备: %s", describe_browser_backend())
 
             # 连接 Playwright
             from playwright.async_api import async_playwright
             playwright = await async_playwright().start()
-            browser = await playwright.firefox.connect(ws_endpoint)
-            context = await browser.new_context()
+            browser = await manager.launch_browser(playwright)
+            context = await browser.new_context(**build_browser_context_options(headless=False))
             page = await context.new_page()
+            await async_maximize_page_window(page, headless=False)
 
             # 设置登录完成检测
             login_done = asyncio.Event()

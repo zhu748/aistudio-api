@@ -33,7 +33,7 @@ async def lifespan(app: FastAPI):
     from aistudio_api.application.account_rotator import init_rotator, RotationMode
 
     client = AIStudioClient(
-        port=runtime_state.camoufox_port,
+        port=runtime_state.browser_port,
         use_pure_http=settings.use_pure_http,
     )
     runtime_state.client = client
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 
     # 初始化账号管理服务
     account_store = AccountStore()
-    login_service = LoginService(port=settings.login_camoufox_port)
+    login_service = LoginService(port=settings.login_browser_port)
     account_service = AccountService(account_store, login_service)
     runtime_state.account_service = account_service
 
@@ -61,8 +61,9 @@ async def lifespan(app: FastAPI):
     runtime_state.rotator = rotator
 
     logger.info(
-        "Client initialized (camoufox port=%s, rotation=%s, accounts=%d)",
-        runtime_state.camoufox_port,
+        "Client initialized (browser=%s, port=%s, rotation=%s, accounts=%d)",
+        settings.browser_engine,
+        runtime_state.browser_port,
         rotator.mode,
         len(account_store.list_accounts()),
     )
@@ -110,10 +111,11 @@ def main():
 
     parser = argparse.ArgumentParser(description="AI Studio OpenAI-compatible API Server")
     parser.add_argument("--port", type=int, default=settings.port)
-    parser.add_argument("--camoufox-port", type=int, default=settings.camoufox_port)
+    parser.add_argument("--browser-port", type=int, default=settings.browser_port)
+    parser.add_argument("--camoufox-port", type=int, dest="browser_port", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    runtime_state.camoufox_port = args.camoufox_port
+    runtime_state.browser_port = args.browser_port
 
     import uvicorn
 

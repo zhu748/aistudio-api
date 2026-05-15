@@ -47,7 +47,6 @@ def cli_main():
     parser.add_argument("--image", action="store_true", help="生图模式")
     parser.add_argument("--save", help="图片保存路径")
     parser.add_argument("--attach", "-a", nargs="+", help="附加图片（文件路径）")
-    parser.add_argument("--port", type=int, default=settings.camoufox_port, help="Camoufox 调试端口")
+    parser.add_argument("--port", type=int, default=settings.browser_port, help="浏览器调试端口（仅 Camoufox 后端使用）")
     args = parser.parse_args()
     asyncio.run(_run_cli(args))
-

@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from aistudio_api.config import DEFAULT_CAMOUFOX_PORT, DEFAULT_IMAGE_MODEL, DEFAULT_TEXT_MODEL, settings
+from aistudio_api.config import DEFAULT_BROWSER_PORT, DEFAULT_IMAGE_MODEL, DEFAULT_TEXT_MODEL, settings
 from aistudio_api.domain.errors import RequestError, classify_error
 from aistudio_api.domain.models import ModelOutput, parse_image_output, parse_text_output
 from aistudio_api.infrastructure.cache.snapshot_cache import SnapshotCache
@@ -24,7 +24,7 @@ _snapshot_cache = SnapshotCache()
 
 
 class AIStudioClient:
-    def __init__(self, port: int = DEFAULT_CAMOUFOX_PORT, use_pure_http: bool = False):
+    def __init__(self, port: int = DEFAULT_BROWSER_PORT, use_pure_http: bool = False):
         self.port = port
         self._use_pure_http = use_pure_http
         self._captured: Optional[CapturedRequest] = None
@@ -44,7 +44,7 @@ class AIStudioClient:
         self._streaming_gateway = StreamingGateway(session=self._session)
 
     async def warmup(self) -> None:
-        """预热浏览器，启动 Camoufox 并加载 AI Studio 页面。"""
+        """预热浏览器后端并加载 AI Studio 页面。"""
         if self._session is not None:
             await self._session.ensure_context()
             logger.info("浏览器预热完成")

@@ -10,34 +10,43 @@ import sys
 import time
 from typing import Optional
 
-from aistudio_api.config import DEFAULT_CAMOUFOX_PORT, settings
+from aistudio_api.config import DEFAULT_BROWSER_PORT, settings
+from aistudio_api.infrastructure.browser.browser_engine import (
+    async_launch_browser,
+    build_browser_context_options,
+    is_camoufox_engine,
+)
 
 logger = logging.getLogger("aistudio.snapshot")
 TARGET_HOST = "alkalimakersuite-pa.clients6.google.com"
 
 
 class SnapshotExtractor:
-    def __init__(self, port: int = DEFAULT_CAMOUFOX_PORT):
+    def __init__(self, port: int = DEFAULT_BROWSER_PORT):
         self.port = port
         self._snapshot: Optional[str] = None
         self._cookies: Optional[dict[str, str]] = None
 
     async def extract(self, prompt: str = "test") -> str:
-        import urllib.request
-        from playwright.async_api import async_playwright
+        pw = None
+        if is_camoufox_engine():
+            from playwright.async_api import async_playwright
 
-        resp = urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json", timeout=5)
-        data = json.loads(resp.read())
-        ws_url = f"ws://127.0.0.1:{self.port}{data['wsEndpointPath']}"
+            pw = await async_playwright().start()
+            import urllib.request
 
-        pw = await async_playwright().start()
-        browser = await pw.firefox.connect(ws_url)
+            resp = urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json", timeout=5)
+            data = json.loads(resp.read())
+            ws_url = f"ws://127.0.0.1:{self.port}{data['wsEndpointPath']}"
+            browser = await pw.firefox.connect(ws_url)
+        else:
+            browser = await async_launch_browser(headless=settings.browser_headless)
 
         ctx_kwargs = {}
         if settings.auth_file and os.path.exists(settings.auth_file):
             ctx_kwargs["storage_state"] = settings.auth_file
 
-        ctx = await browser.new_context(**ctx_kwargs)
+        ctx = await browser.new_context(**(build_browser_context_options() | ctx_kwargs))
         page = await ctx.new_page()
         snapshots = []
 
@@ -85,7 +94,8 @@ class SnapshotExtractor:
         await page.close()
         await ctx.close()
         await browser.close()
-        await pw.stop()
+        if pw is not None:
+            await pw.stop()
         return result or ""
 
     def get_snapshot(self) -> Optional[str]:
@@ -107,4 +117,3 @@ async def main():
     if snap:
         print(f"前50字符: {snap[:50]}...")
     print(f"{'=' * 60}")
-

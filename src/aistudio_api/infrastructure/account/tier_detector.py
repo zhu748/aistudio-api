@@ -11,6 +11,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+from aistudio_api.config import settings
+from aistudio_api.infrastructure.browser.browser_engine import (
+    async_launch_browser,
+    build_browser_context_options,
+    is_camoufox_engine,
+)
+
 logger = logging.getLogger("aistudio.premium_detect")
 
 
@@ -123,15 +130,15 @@ async def detect_tier(
 
 async def detect_tier_for_auth_file(
     auth_file: str | Path,
-    camoufox_port: int = 9222,
+    browser_port: int = 9222,
     timeout_ms: int = 30000,
 ) -> TierResult:
     """
-    Convenience function: connect to running Camoufox, load auth, detect tier.
+    Convenience function: load auth and detect tier with the configured browser backend.
 
     Args:
         auth_file: Path to the auth JSON file (Playwright storage state).
-        camoufox_port: Camoufox debug port.
+        browser_port: Browser debug port when using Camoufox backend.
         timeout_ms: Navigation timeout.
 
     Returns:
@@ -143,22 +150,27 @@ async def detect_tier_for_auth_file(
     if not Path(auth_file).exists():
         raise FileNotFoundError(f"Auth file not found: {auth_file}")
 
-    pw = await async_playwright().start()
+    pw = None
     try:
-        resp = urllib.request.urlopen(
-            f"http://127.0.0.1:{camoufox_port}/json", timeout=5
-        )
-        data = json.loads(resp.read())
-        ws_url = f"ws://127.0.0.1:{camoufox_port}{data['wsEndpointPath']}"
-
-        browser = await pw.firefox.connect(ws_url)
-        ctx = await browser.new_context(storage_state=auth_file)
+        if is_camoufox_engine():
+            pw = await async_playwright().start()
+            resp = urllib.request.urlopen(
+                f"http://127.0.0.1:{browser_port}/json", timeout=5
+            )
+            data = json.loads(resp.read())
+            ws_url = f"ws://127.0.0.1:{browser_port}{data['wsEndpointPath']}"
+            browser = await pw.firefox.connect(ws_url)
+        else:
+            browser = await async_launch_browser(headless=settings.browser_headless)
+        ctx = await browser.new_context(**(build_browser_context_options() | {"storage_state": auth_file}))
         try:
             return await detect_tier(ctx, timeout_ms=timeout_ms)
         finally:
             await ctx.close()
+            await browser.close()
     finally:
-        await pw.stop()
+        if pw is not None:
+            await pw.stop()
 
 
 # --- CLI ---

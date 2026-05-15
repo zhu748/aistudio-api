@@ -1,4 +1,4 @@
-"""Shared Camoufox session management for gateway operations."""
+"""Shared browser session management for gateway operations."""
 
 from __future__ import annotations
 
@@ -15,6 +15,13 @@ from pathlib import Path
 from typing import Any
 
 from aistudio_api.config import settings
+from aistudio_api.infrastructure.browser.browser_engine import (
+    build_browser_context_options,
+    describe_browser_backend,
+    is_camoufox_engine,
+    sync_launch_browser,
+    sync_maximize_page_window,
+)
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 
 log = logging.getLogger("aistudio.session")
@@ -120,6 +127,9 @@ DIALOG_CLEANUP_JS = """(() => {
     document.querySelectorAll('.cdk-overlay-container').forEach((node) => node.remove());
 })()"""
 
+BOTGUARD_BOOTSTRAP_PROMPT = "say '1'"
+TEMPLATE_CAPTURE_PROMPT = "say 't'"
+
 
 class BrowserSession:
     def __init__(self, port: int):
@@ -129,9 +139,11 @@ class BrowserSession:
         self._ctx = None
         self._browser = None
         self._cf = None
+        self._playwright = None
         self._snap_key: str | None = None
         self._templates: dict[str, dict[str, Any]] = {}
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aistudio-camoufox")
+        self._bootstrap_template: dict[str, Any] | None = None
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aistudio-browser")
         self._botguard_lock = asyncio.Lock()
         self._snapshot_lock = asyncio.Lock()
 
@@ -148,6 +160,37 @@ class BrowserSession:
     async def ensure_botguard_service(self):
         await self._run_sync(self._ensure_botguard_service_sync)
         return True
+
+    async def import_cookies(self, cookie_string: str, auth_file: str | None = None) -> int:
+        """注入 cookie 字符串到浏览器，访问页面获取完整 cookie，再导出保存。"""
+        def _sync():
+            from aistudio_api.infrastructure.account.cookie_refresher import load_cookies_from_string
+
+            pw_cookies = load_cookies_from_string(cookie_string)
+            if not self._ctx:
+                return 0
+            self._ctx.add_cookies(pw_cookies)
+
+            # 浏览器访问 aistudio.google.com，让浏览器生成完整 cookies
+            try:
+                page = self._ctx.new_page()
+                page.goto("https://myaccount.google.com", wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(3000)  # 等待 JS 设置 cookies
+                page.close()
+            except Exception as e:
+                log.warning("[import_cookies] browser visit failed: %s", e)
+
+            # 从浏览器导出全部 cookies
+            browser_cookies = self._ctx.cookies()
+            if browser_cookies:
+                self._save_cookies_sync(auth_file=auth_file, cookies=browser_cookies)
+                log.info("[import_cookies] exported %d cookies from browser", len(browser_cookies))
+            else:
+                # fallback: 用 curl_cffi 的结果
+                self._save_cookies_sync(auth_file=auth_file, cookies=pw_cookies)
+            return len(browser_cookies or pw_cookies)
+
+        return await self._run_sync(_sync)
 
     async def capture_template(self, model: str) -> dict[str, Any]:
         return await self._run_sync(self._capture_template_sync, model)
@@ -397,6 +440,7 @@ class BrowserSession:
     def _switch_auth_sync(self, auth_file: str | None) -> None:
         self._auth_file = auth_file
         self._templates.clear()
+        self._bootstrap_template = None
         self._close_sync()
 
     def _ensure_browser_sync(self):
@@ -405,19 +449,27 @@ class BrowserSession:
 
         import time as _t
         _t0 = _t.time()
-        from camoufox.sync_api import Camoufox
 
         self._close_sync()
+
+        # Chromium backend: auth.json
+        if not is_camoufox_engine():
+            return self._ensure_browser_chromium_sync(_t0)
+
+        # Legacy mode: Camoufox + auth.json
+        from camoufox.sync_api import Camoufox
         from aistudio_api.config import build_camoufox_proxy
 
         self._cf = Camoufox(
-            headless=settings.camoufox_headless,
+            headless=settings.browser_headless,
             main_world_eval=True,
             proxy=build_camoufox_proxy(settings.proxy_url),
         )
         self._browser = self._cf.__enter__()
-        self._ctx = self._new_context_sync()
+        self._ctx = self._browser.new_context(**build_browser_context_options())
+        self._apply_auth_file_sync()
         self._hook_page = self._ctx.pages[0] if self._ctx.pages else self._ctx.new_page()
+        sync_maximize_page_window(self._hook_page)
         log.debug(f"[timing] browser launched in {_t.time()-_t0:.1f}s")
         self._goto_aistudio_sync(self._hook_page)
         log.debug(f"[timing] page loaded in {_t.time()-_t0:.1f}s")
@@ -425,21 +477,91 @@ class BrowserSession:
         log.debug(f"[timing] hooks installed in {_t.time()-_t0:.1f}s")
         return self._ctx
 
-    def _new_context_sync(self):
+    def _ensure_browser_chromium_sync(self, _t0: float):
+        """Chromium backend: load auth.json into Playwright context."""
+        import time as _t
+
+        self._browser, self._cf, self._playwright = sync_launch_browser()
+        self._ctx = self._browser.new_context(**build_browser_context_options())
+
+        # Try auth.json cache first
         if self._auth_file and Path(self._auth_file).exists():
             try:
-                return self._browser.new_context(storage_state=self._auth_file)
-            except Exception:
-                ctx = self._browser.new_context()
-                self._apply_storage_state_sync(ctx, self._auth_file)
-                return ctx
-        return self._browser.new_context()
+                data = json.loads(Path(self._auth_file).read_text())
+                cached = data.get("cookies") or []
+                if cached:
+                    self._ctx.add_cookies(cached)
+                    self._hook_page = self._ctx.new_page()
+                    sync_maximize_page_window(self._hook_page)
+                    # Quick check: is the login still valid?
+                    self._hook_page.goto("https://aistudio.google.com/", wait_until="domcontentloaded", timeout=15000)
+                    if "accounts.google.com" not in (self._hook_page.url or ""):
+                        log.info("[chromium-auth] auth.json cache hit (%d cookies)", len(cached))
+                        self._goto_aistudio_sync(self._hook_page)
+                        self._install_hooks_sync(self._hook_page)
+                        log.debug(f"[timing] page loaded (cached) in {_t.time()-_t0:.1f}s")
+                        return self._ctx
+                    log.info("[chromium-auth] auth.json appears expired")
+                    self._close_sync()
+                    self._browser, self._cf, self._playwright = sync_launch_browser()
+                    self._ctx = self._browser.new_context(**build_browser_context_options())
+            except Exception as e:
+                log.debug("[chromium-auth] auth.json load failed: %s", e)
 
-    def _apply_storage_state_sync(self, ctx, auth_file: str) -> None:
-        data = json.loads(Path(auth_file).read_text())
-        cookies = data.get("cookies") or []
-        if cookies:
-            ctx.add_cookies(cookies)
+        self._hook_page = self._ctx.new_page()
+        sync_maximize_page_window(self._hook_page)
+        log.debug(f"[timing] browser launched in {_t.time()-_t0:.1f}s")
+        self._goto_aistudio_sync(self._hook_page)
+        log.debug(f"[timing] page loaded in {_t.time()-_t0:.1f}s")
+        self._install_hooks_sync(self._hook_page)
+        log.debug(f"[timing] hooks installed in {_t.time()-_t0:.1f}s")
+        return self._ctx
+
+    def _apply_auth_file_sync(self):
+        """Legacy mode: load cookies from auth.json."""
+        if self._auth_file and Path(self._auth_file).exists():
+            log.info(f"Loading auth from: {self._auth_file}")
+            data = json.loads(Path(self._auth_file).read_text())
+            cookies = data.get("cookies") or []
+            if cookies:
+                self._ctx.add_cookies(cookies)
+                log.info(f"Added {len(cookies)} cookies to context")
+        else:
+            log.warning(f"No auth_file! self._auth_file={self._auth_file}")
+
+
+    def _save_cookies_sync(
+        self,
+        *,
+        auth_file: str | None = None,
+        cookies: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """将 cookie 保存回 auth.json。"""
+        target_auth_file = auth_file or self._auth_file
+        if not target_auth_file:
+            return
+        try:
+            current_cookies = cookies
+            if current_cookies is None:
+                if self._ctx is None:
+                    return
+                current_cookies = self._ctx.cookies()
+            if not current_cookies:
+                return
+            auth_path = Path(target_auth_file)
+            # 读取现有的 origins 数据（如果有）
+            origins = []
+            if auth_path.exists():
+                try:
+                    existing = json.loads(auth_path.read_text())
+                    origins = existing.get("origins", [])
+                except Exception:
+                    pass
+            auth_path.parent.mkdir(parents=True, exist_ok=True)
+            auth_path.write_text(json.dumps({"cookies": current_cookies, "origins": origins}, indent=2))
+            log.info(f"Saved {len(current_cookies)} cookies to {target_auth_file}")
+        except Exception as e:
+            log.debug(f"Failed to save cookies: {e}")
 
     def _ensure_hook_page_sync(self):
         self._ensure_browser_sync()
@@ -456,6 +578,18 @@ class BrowserSession:
             log.debug(f"[timing] botguard cached, took {_t.time()-_t0:.1f}s")
             return page
 
+        captured: dict[str, Any] = {}
+
+        def on_request(request):
+            if "GenerateContent" not in request.url or "Count" in request.url or captured:
+                return
+            body = request.post_data
+            if not body:
+                return
+            captured["url"] = request.url
+            captured["headers"] = dict(request.headers)
+            captured["body"] = body
+
         page.evaluate(DIALOG_CLEANUP_JS)
         textarea = page.query_selector("textarea")
         if textarea is None:
@@ -467,20 +601,29 @@ class BrowserSession:
             except Exception:
                 dbg_url = dbg_title = dbg_body = '<error>'
             raise RuntimeError(f"textarea not found while capturing BotGuardService; url={dbg_url}, title={dbg_title}, body={dbg_body[:200]}")
-        textarea.fill("1")
-        page.wait_for_timeout(800)
-        page.evaluate(DIALOG_CLEANUP_JS)
-        if not self._click_run_button_sync(page):
-            raise RuntimeError("failed to trigger send while capturing BotGuardService")
+        original_text = self._read_textarea_value_sync(textarea)
+        page.on("request", on_request)
+        try:
+            textarea.fill(BOTGUARD_BOOTSTRAP_PROMPT)
+            page.wait_for_timeout(800)
+            page.evaluate(DIALOG_CLEANUP_JS)
+            if not self._click_run_button_sync(page):
+                raise RuntimeError("failed to trigger send while capturing BotGuardService")
 
-        for i in range(45):
-            page.wait_for_timeout(1000)
-            if page.evaluate("mw:!!window.__bg_service"):
-                self._wait_until_idle_sync(page)
-                log.debug(f"[timing] botguard captured after {i+1}s, total {_t.time()-_t0:.1f}s")
-                return page
+            for i in range(45):
+                page.wait_for_timeout(1000)
+                if page.evaluate("mw:!!window.__bg_service"):
+                    self._wait_until_idle_sync(page)
+                    if captured and self._bootstrap_template is None:
+                        self._bootstrap_template = dict(captured)
+                    self._restore_textarea_value_sync(textarea, original_text)
+                    log.debug(f"[timing] botguard captured after {i+1}s, total {_t.time()-_t0:.1f}s")
+                    return page
 
-        raise RuntimeError("BotGuardService capture timeout")
+            raise RuntimeError("BotGuardService capture timeout")
+        finally:
+            page.remove_listener("request", on_request)
+            self._restore_textarea_value_sync(textarea, original_text)
 
     def _capture_template_sync(self, model: str) -> dict[str, Any]:
         import time as _t
@@ -490,32 +633,47 @@ class BrowserSession:
             return self._templates[model]
 
         page = self._ensure_botguard_service_sync()
+        if self._bootstrap_template:
+            captured = dict(self._bootstrap_template)
+            self._templates[model] = captured
+            log.debug(f"[timing] reused bootstrap template for {model} in {_t.time()-_t0:.1f}s")
+            return captured
         log.debug(f"[timing] botguard done in {_t.time()-_t0:.1f}s, starting template capture")
         captured: dict[str, Any] = {}
+        last_generate_response: dict[str, Any] | None = None
+
+        def on_request(request):
+            if "GenerateContent" not in request.url or "Count" in request.url or captured:
+                return
+            body = request.post_data
+            if not body or len(body) <= 100:
+                return
+            captured["url"] = request.url
+            captured["headers"] = dict(request.headers)
+            captured["body"] = body
 
         def on_response(response):
-            if "GenerateContent" not in response.url or "Count" in response.url or captured:
+            nonlocal last_generate_response
+            if "GenerateContent" not in response.url or "Count" in response.url:
                 return
             try:
                 text = response.text()
-            except Exception:
-                return
-            if len(text) <= 100:
-                return
-            req = response.request
-            body = req.post_data
-            if not body or len(body) <= 100:
-                return
-            captured["url"] = req.url
-            captured["headers"] = dict(req.headers)
-            captured["body"] = body
+            except Exception as exc:
+                text = f"<response.text() failed: {exc}>"
+            last_generate_response = {
+                "status": response.status,
+                "url": response.url,
+                "body": text[:500],
+            }
 
+        page.on("request", on_request)
         page.on("response", on_response)
         try:
             textarea = page.query_selector("textarea")
             if textarea is None:
                 raise RuntimeError("textarea not found during template capture")
-            textarea.fill("template")
+            original_text = self._read_textarea_value_sync(textarea)
+            textarea.fill(TEMPLATE_CAPTURE_PROMPT)
             page.wait_for_timeout(500)
             if not self._click_run_button_sync(page):
                 raise RuntimeError("failed to trigger send during template capture")
@@ -525,14 +683,25 @@ class BrowserSession:
                 if captured:
                     break
             if not captured:
+                if last_generate_response is not None:
+                    raise RuntimeError(
+                        "template capture failed after request: "
+                        f"status={last_generate_response['status']} "
+                        f"url={last_generate_response['url']} "
+                        f"body={last_generate_response['body']}"
+                    )
                 raise RuntimeError(f"template capture timeout for model={model}")
 
             self._wait_until_idle_sync(page)
+            self._restore_textarea_value_sync(textarea, original_text)
             self._templates[model] = captured
             log.debug(f"[timing] template captured for {model} in {_t.time()-_t0:.1f}s")
             return captured
         finally:
+            page.remove_listener("request", on_request)
             page.remove_listener("response", on_response)
+            if 'textarea' in locals() and textarea is not None and 'original_text' in locals():
+                self._restore_textarea_value_sync(textarea, original_text)
 
     def _generate_snapshot_sync(self, contents: list[AistudioContent]) -> str:
         page = self._ensure_botguard_service_sync()
@@ -818,11 +987,13 @@ mw:((hash) => {
                     has_dms = page.evaluate("mw:!!window.default_MakerSuite")
                     has_textarea = page.query_selector("textarea") is not None
                     if has_dms and has_textarea:
-                        log.debug(f"[timing] UI ready (dms+textarea) after {_t.time()-_t0:.1f}s", flush=True)
+                        log.debug(f"[timing] UI ready (dms+textarea) after {_t.time()-_t0:.1f}s")
+                        self._save_cookies_sync()
                         return
                     if has_dms and _ > 20:
                         page.evaluate(DIALOG_CLEANUP_JS)
-                log.debug(f"[timing] UI partially ready after {_t.time()-_t0:.1f}s (dms={has_dms}, textarea={has_textarea})", flush=True)
+                log.debug(f"[timing] UI partially ready after {_t.time()-_t0:.1f}s (dms={has_dms}, textarea={has_textarea})")
+                self._save_cookies_sync()
                 return
             except Exception as exc:
                 log.debug(f"[timing] goto {url} failed after {_t.time()-_t0:.1f}s: {exc}")
@@ -879,10 +1050,33 @@ mw:((hash) => {
             page.wait_for_timeout(1000)
         raise RuntimeError("page never became idle")
 
+    def _read_textarea_value_sync(self, textarea) -> str:
+        try:
+            return textarea.input_value()
+        except Exception:
+            return ""
+
+    def _restore_textarea_value_sync(self, textarea, value: str) -> None:
+        try:
+            current = textarea.input_value()
+        except Exception:
+            current = None
+        if current == value:
+            return
+        try:
+            textarea.fill(value)
+        except Exception:
+            pass
+
     def _close_sync(self) -> None:
         if self._ctx is not None:
             try:
                 self._ctx.close()
+            except Exception:
+                pass
+        if self._browser is not None and self._cf is None:
+            try:
+                self._browser.close()
             except Exception:
                 pass
         if self._cf is not None:
@@ -890,8 +1084,14 @@ mw:((hash) => {
                 self._cf.__exit__(None, None, None)
             except Exception:
                 pass
+        if self._playwright is not None:
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
         self._hook_page = None
         self._ctx = None
         self._browser = None
         self._cf = None
+        self._playwright = None
         self._snap_key = None

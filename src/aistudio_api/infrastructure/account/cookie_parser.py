@@ -5,6 +5,13 @@ from __future__ import annotations
 import time
 from typing import Any
 
+# Auth cookies that need httpOnly=False so JS can read them (for SAPISIDHASH)
+_AUTH_COOKIE_NAMES = {
+    "SID", "SSID", "HSID", "APISID", "SAPISID",
+    "__Secure-1PAPISID", "__Secure-3PAPISID",
+    "__Secure-1PSID", "__Secure-3PSID",
+}
+
 _DOMAIN_OVERRIDES: dict[str, list[str]] = {
     "OSID": [".youtube.com"],
     "__Secure-OSID": [".youtube.com"],
@@ -35,6 +42,12 @@ _GOOGLE_DOMAINS = [
     ".google.com",
     ".youtube.com",
     ".google.com.tw",
+    ".google.com.hk",
+    ".google.com.sg",
+    ".aistudio.google.com",
+    ".gemini.google.com",
+    "accounts.google.com",
+    "aistudio.google.com",
 ]
 
 
@@ -75,7 +88,7 @@ def parse_cookie_string(raw: str) -> dict[str, Any]:
             "domain": domain,
             "path": "/",
             "secure": True,
-            "httpOnly": False,
+            "httpOnly": name not in _AUTH_COOKIE_NAMES,
             "sameSite": "None",
             "expires": default_expires,
         })
@@ -84,12 +97,6 @@ def parse_cookie_string(raw: str) -> dict[str, Any]:
         # 有域名覆盖的 cookie
         if name in _DOMAIN_OVERRIDES:
             for domain in _DOMAIN_OVERRIDES[name]:
-                _add_cookie(name, value, domain)
-            continue
-
-        # 核心认证 cookie → 复制到多个域名
-        if name in _MULTI_DOMAIN_COOKIES:
-            for domain in _GOOGLE_DOMAINS:
                 _add_cookie(name, value, domain)
             continue
 

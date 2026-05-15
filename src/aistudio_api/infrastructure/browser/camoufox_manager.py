@@ -1,4 +1,4 @@
-"""Camoufox browser lifecycle management."""
+"""Browser lifecycle management for Camoufox and Chromium backends."""
 
 from __future__ import annotations
 
@@ -12,6 +12,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from aistudio_api.config import settings
+from aistudio_api.infrastructure.browser.browser_engine import (
+    async_maximize_page_window,
+    build_browser_context_options,
+    describe_browser_backend,
+    is_camoufox_engine,
+)
 
 logger = logging.getLogger("aistudio.camoufox")
 LAUNCHER_PATH = Path(__file__).with_name("camoufox_launcher.py")
@@ -30,13 +36,17 @@ class CamoufoxManager:
         self._process: Optional[subprocess.Popen] = None
         self._ws_endpoint: Optional[str] = None
         self._browser = None
+        self._context = None
         self._page = None
         self._playwright = None
-        self.python_executable = settings.camoufox_python or sys.executable
+        self.python_executable = settings.browser_python or sys.executable
 
-    async def start(self) -> str:
+    async def start(self) -> str | None:
         if self._ws_endpoint:
             return self._ws_endpoint
+        if not is_camoufox_engine():
+            logger.info("Using %s backend", describe_browser_backend())
+            return None
 
         try:
             import urllib.request
@@ -110,9 +120,9 @@ class CamoufoxManager:
         )
 
     def _build_failure_hint(self, output: str) -> str:
-        if settings.camoufox_python:
+        if settings.browser_python:
             return (
-                f"Check whether AISTUDIO_CAMOUFOX_PYTHON={settings.camoufox_python} "
+                f"Check whether AISTUDIO_BROWSER_PYTHON={settings.browser_python} "
                 "has camoufox installed and can run `-m camoufox.server`."
             )
 
@@ -121,7 +131,7 @@ class CamoufoxManager:
             return (
                 "Current server interpreter does not appear to have camoufox installed. "
                 "Run the server with the environment that has camoufox, or set "
-                "AISTUDIO_CAMOUFOX_PYTHON to that Python executable."
+                "AISTUDIO_BROWSER_PYTHON to that Python executable."
             )
 
         if not output.strip():
@@ -132,19 +142,47 @@ class CamoufoxManager:
 
         return "Inspect the command output above for startup failures."
 
+    async def launch_browser(self, playwright):
+        if self._browser and self._browser.is_connected():
+            return self._browser
+
+        if is_camoufox_engine():
+            if not self._ws_endpoint:
+                await self.start()
+            self._browser = await playwright.firefox.connect(self._ws_endpoint)
+            return self._browser
+        from cloakbrowser import launch_async
+        from aistudio_api.config import build_browser_proxy
+        self._browser = await launch_async(
+            headless=self.headless,
+            proxy=build_browser_proxy(settings.proxy_url),
+        )
+        logger.info("Started %s", describe_browser_backend())
+        return self._browser
+
     async def get_page(self):
         if self._page and not self._page.is_closed():
             return self._page
 
-        from playwright.async_api import async_playwright
+        if is_camoufox_engine():
+            from playwright.async_api import async_playwright
 
-        if not self._ws_endpoint:
-            await self.start()
+            if self._playwright is None:
+                self._playwright = await async_playwright().start()
+            if self._browser is None or not self._browser.is_connected():
+                self._browser = await self.launch_browser(self._playwright)
+        else:
+            if self._browser is None or not self._browser.is_connected():
+                self._browser = await self.launch_browser(None)
 
-        self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.firefox.connect(self._ws_endpoint)
-        ctx = self._browser.contexts[0]
+        if is_camoufox_engine():
+            ctx = self._browser.contexts[0]
+        else:
+            self._context = self._context or await self._browser.new_context(**build_browser_context_options(headless=self.headless))
+            ctx = self._context
+
         self._page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await async_maximize_page_window(self._page, headless=self.headless)
         return self._page
 
     async def evaluate(self, js_code: str, timeout: int = 30000) -> Any:
@@ -183,12 +221,33 @@ class CamoufoxManager:
         return await self.evaluate(js_code, timeout=60000)
 
     async def stop(self):
+        if self._page:
+            try:
+                await self._page.close()
+            except Exception:
+                pass
+        if self._context:
+            try:
+                await self._context.close()
+            except Exception:
+                pass
         if self._browser:
-            await self._browser.close()
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
         if self._playwright:
-            await self._playwright.stop()
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
         if self._process:
-            self._process.terminate()
+            try:
+                self._process.terminate()
+            except Exception:
+                pass
         self._ws_endpoint = None
         self._browser = None
+        self._context = None
         self._page = None
+        self._playwright = None
