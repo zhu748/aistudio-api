@@ -174,8 +174,13 @@ def _is_function_declarations_container(tool: object) -> bool:
 def _iter_declared_function_names(tools: list[list[object]] | None) -> list[str]:
     names: list[str] = []
     for tool in tools or []:
-        if _is_function_declarations_container(tool):
-            for decl in tool[1]:
+        if not _is_function_declarations_container(tool):
+            continue
+        decls = tool[1]
+        if not isinstance(decls, list):
+            continue
+        for decl in decls:
+            if isinstance(decl, list) and decl:
                 names.append(str(decl[0]))
     return names
 
@@ -321,9 +326,11 @@ def prepare_anti_truncation(
         appended = False
         for tool in tools:
             if _is_function_declarations_container(tool):
-                tool[1].append(synthetic_decl)
-                appended = True
-                break
+                decls = tool[1]
+                if isinstance(decls, list):
+                    decls.append(synthetic_decl)
+                    appended = True
+                    break
         if not appended:
             tools.append([None, [synthetic_decl]])
     else:

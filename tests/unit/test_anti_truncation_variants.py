@@ -126,6 +126,7 @@ def test_selected_models_normalized(variant_config):
 def test_settings_shape_normalized(variant_config):
     at_settings = get_anti_truncation_settings()
     variants = at_settings["model_variants"]
+    assert isinstance(variants, dict)
     assert variants["enabled"] is True
     assert variants["models"] == ["gemini-3.7-flash", "models/gemini-3-pro-preview"]
 
@@ -154,8 +155,10 @@ def test_update_settings_round_trip(tmp_path, monkeypatch):
         models=["gemini-3.7-flash", "", "gemini-3-pro-preview"],
     )
     assert result["enabled"] is True
-    assert result["model_variants"]["enabled"] is True
-    assert result["model_variants"]["models"] == [
+    result_variants = result["model_variants"]
+    assert isinstance(result_variants, dict)
+    assert result_variants["enabled"] is True
+    assert result_variants["models"] == [
         "gemini-3.7-flash",
         "gemini-3-pro-preview",
     ]
@@ -163,7 +166,9 @@ def test_update_settings_round_trip(tmp_path, monkeypatch):
     # 重新读取仍生效（已落盘）。
     reread = get_anti_truncation_settings()
     assert reread["enabled"] is True
-    assert reread["model_variants"]["models"] == [
+    reread_variants = reread["model_variants"]
+    assert isinstance(reread_variants, dict)
+    assert reread_variants["models"] == [
         "gemini-3.7-flash",
         "gemini-3-pro-preview",
     ]
@@ -172,7 +177,9 @@ def test_update_settings_round_trip(tmp_path, monkeypatch):
     update_anti_truncation_settings(enabled=False)
     reread = get_anti_truncation_settings()
     assert reread["enabled"] is False
-    assert reread["model_variants"]["enabled"] is True
+    reread_variants = reread["model_variants"]
+    assert isinstance(reread_variants, dict)
+    assert reread_variants["enabled"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -273,10 +280,11 @@ async def test_get_variant_model_detail(variant_config, monkeypatch):
 
 
 def _stub_output(text: str = "", content: str | None = None) -> ModelOutput:
-    function_calls = (
+    # 无函数调用时用空列表（域模型的 function_calls 不接受 None）
+    function_calls: list[dict[str, object]] = (
         [{"name": "router_emit", "args": {"content": content}}]
         if content is not None
-        else None
+        else []
     )
     return ModelOutput(
         candidates=[

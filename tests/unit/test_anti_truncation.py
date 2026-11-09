@@ -141,8 +141,10 @@ def test_prepare_injects_synthetic_tool_and_instruction(at_enabled):
     assert len(normalized.tools) == 1
     container = normalized.tools[0]
     assert container[0] is None
-    assert len(container[1]) == 1
-    assert container[1][0][0] == "router_emit"
+    decls = container[1]
+    assert isinstance(decls, list)
+    assert len(decls) == 1
+    assert decls[0][0] == "router_emit"
 
     # 末尾追加了 user 角色传输指令。
     assert len(normalized.contents) == 2
@@ -220,8 +222,11 @@ def test_prepare_coexists_with_client_function_declarations(at_enabled):
     ctx = prepare_anti_truncation(normalized)
     assert ctx.active is True
     # 合成声明追加进同一容器，不新增 tools 元素。
+    assert normalized.tools is not None
     assert len(normalized.tools) == 1
-    names = [d[0] for d in normalized.tools[0][1]]
+    decls = normalized.tools[0][1]
+    assert isinstance(decls, list)
+    names = [d[0] for d in decls]
     assert names == ["get_weather", "router_emit"]
     # 有可调用工具时指令为共存话术。
     assert "Call the other tools" in (normalized.contents[-1].parts[0].text or "")
@@ -235,7 +240,10 @@ def test_prepare_random_name_on_prefix_conflict(at_enabled):
     assert ctx.active is True
     assert ctx.tool_name != "router_emit"
     assert ctx.tool_name.startswith("router_")
-    names = [d[0] for d in normalized.tools[0][1]]
+    assert normalized.tools is not None
+    decls = normalized.tools[0][1]
+    assert isinstance(decls, list)
+    names = [d[0] for d in decls]
     assert "router_emit" not in names
     assert ctx.tool_name in names
 
@@ -676,10 +684,12 @@ async def test_end_to_end_generate_content_with_header(monkeypatch):
 
     # 请求侧注入确实发生：合成声明 + 末尾传输指令。
     tools = captured["tools"]
-    assert tools and tools[0][1]
+    assert isinstance(tools, list) and tools and tools[0][1]
     names = [decl[0] for decl in tools[0][1]]
     assert "router_emit" in names
-    tail_text = captured["contents"][-1].parts[0].text or ""
+    contents = captured["contents"]
+    assert isinstance(contents, list)
+    tail_text = contents[-1].parts[0].text or ""
     assert "router_emit" in tail_text
 
 

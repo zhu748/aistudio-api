@@ -24,7 +24,6 @@ from aistudio_api.infrastructure.gateway.model_defaults import (
     set_runtime_waa_override,
 )
 
-
 _CONFIG_YAML = """
 waa:
   active_server: local_spidermonkey
