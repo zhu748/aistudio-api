@@ -1,5 +1,6 @@
 # Stage 1: Build native Go WAA signer daemon
-FROM golang:1.23-bookworm AS signer-builder
+# go.mod 要求 go 1.27（golang 官方镜像 GOTOOLCHAIN=local，低版本镜像会拒绝构建）
+FROM golang:1.27-bookworm AS signer-builder
 
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -8,7 +9,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     clang \
     build-essential \
     file \
+    xz-utils \
     && rm -rf /var/lib/apt/lists/*
+
+# SpiderMonkey 静态库基于 LLVM libc++ 构建（std::__1:: 符号），clang/gcc 的
+# libstdc++ 无法完成链接；zig 工具链自带 libc++（musl 静态链接），build.sh
+# 检测到 zig 后会优先使用并产出全静态二进制（运行阶段无 libc++ 依赖）。
+ARG ZIG_VERSION=0.17.1
+RUN set -eux; \
+    case "$(uname -m)" in \
+        x86_64)  ZIG_ARCH="x86_64" ;; \
+        aarch64) ZIG_ARCH="aarch64" ;; \
+        *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --retry 2 -o /tmp/zig.tar.xz \
+        "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"; \
+    mkdir -p /opt/zig; \
+    tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 --no-same-owner; \
+    rm -f /tmp/zig.tar.xz; \
+    ln -s /opt/zig/zig /usr/local/bin/zig; \
+    zig version
 
 COPY waa-signer/ waa-signer/
 WORKDIR /build/waa-signer
