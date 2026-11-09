@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -965,6 +966,44 @@ def get_configured_paid_model_rules(
 # ─── WAA 签名服务多节点管理与特征绑定 (纯手动切换，不轮询) ───
 
 
+# 运行时覆盖层：面板切换写入，优先级高于环境变量与配置文件。
+# 目的：即便部署时用 AISTUDIO_WAA_SERVER 环境变量注入了默认节点
+# （本地或远程），面板手动切换也能对当前进程立即生效，无需重启；
+# 进程重启后覆盖自动消失，回到"环境变量 > 配置文件"的默认优先级，
+# 与无盘 PaaS（Render Free 等）的部署语义完全兼容。
+_runtime_waa_override: str | None = None
+_runtime_waa_override_lock = threading.Lock()
+
+
+def set_runtime_waa_override(server_id: str | None) -> None:
+    """设置（或清除）运行时 WAA 签名服务覆盖，进程内立即生效。"""
+    global _runtime_waa_override
+    cleaned = server_id.strip() if isinstance(server_id, str) and server_id.strip() else None
+    with _runtime_waa_override_lock:
+        _runtime_waa_override = cleaned
+
+
+def get_runtime_waa_override() -> str | None:
+    """读取当前运行时覆盖的签名服务 id（未设置时为 None）。"""
+    with _runtime_waa_override_lock:
+        return _runtime_waa_override
+
+
+def clear_runtime_waa_override() -> str | None:
+    """清除运行时覆盖，恢复"环境变量 > 配置文件"的默认优先级。
+
+    返回清除前的覆盖 id（原本就未设置时返回 None）。
+    注意：不清除 config.yaml 中已持久化的 active_server —— 该值只在
+    环境变量缺失时才参与判定，而环境变量存在时清除覆盖后即回到环境
+    变量默认节点，语义自洽。
+    """
+    global _runtime_waa_override
+    with _runtime_waa_override_lock:
+        previous = _runtime_waa_override
+        _runtime_waa_override = None
+    return previous
+
+
 def get_configured_waa_settings(
     config_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
@@ -985,16 +1024,25 @@ def get_active_waa_server(
 ) -> dict[str, object]:
     """获取当前激活的 WAA 签名服务器配置及其绑定的特征信息。
 
-    环境变量 ``AISTUDIO_WAA_SERVER`` 可强制覆盖 config.yaml 的选择
-    （值为目标 server id，如 ``remote_spinsnow``）。适用于无持久磁盘的
-    PaaS 部署（Render Free 等）：面板切换无法跨部署持久，改用平台环境
-    变量注入；也便于小内存实例强制走远程签名器、跳过本地引擎进程。
+    优先级（从高到低）：
+    1. 运行时覆盖 —— 面板手动切换写入（``switch_active_waa_server``），
+       即便部署时用环境变量锁定了默认节点，面板切换也对当前进程立即生效；
+    2. 环境变量 ``AISTUDIO_WAA_SERVER``（值为目标 server id，如
+       ``remote_spinsnow``），适用于无持久磁盘的 PaaS 部署（Render Free
+       等）：面板切换无法跨部署持久，改用平台环境变量注入；也便于小内存
+       实例强制走远程签名器、跳过本地引擎进程；
+    3. config.yaml 的 ``waa.active_server``。
+
+    进程重启后运行时覆盖消失，自动回到 2/3 的默认优先级。
     """
     waa = get_configured_waa_settings(config_path)
     active_id = str(waa.get("active_server") or "local_spidermonkey").strip()
     env_override = os.getenv("AISTUDIO_WAA_SERVER", "").strip()
     if env_override:
         active_id = env_override
+    runtime_override = get_runtime_waa_override()
+    if runtime_override:
+        active_id = runtime_override
     raw_servers = waa.get("servers")
     servers = raw_servers if isinstance(raw_servers, list) else []
 
@@ -1018,7 +1066,11 @@ def switch_active_waa_server(
     server_id: str,
     config_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
-    """纯手动切换当前激活的 WAA 签名服务器，并持久化保存到 config.yaml。"""
+    """纯手动切换当前激活的 WAA 签名服务器，并持久化保存到 config.yaml。
+
+    同时写入运行时覆盖层：即便 ``AISTUDIO_WAA_SERVER`` 环境变量指定了
+    默认节点，切换也对当前进程立即生效（重启后回到环境变量默认）。
+    """
     resolved_path = _resolve_config_path(config_path)
     content = (
         resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
@@ -1037,6 +1089,8 @@ def switch_active_waa_server(
         yaml.dump(parsed, allow_unicode=True, sort_keys=False),
         encoding="utf-8",
     )
+    # 运行时覆盖：确保环境变量指定默认节点的场景下，切换同样立即生效
+    set_runtime_waa_override(target_id)
     invalidate_config_cache()
     return get_active_waa_server(config_path)
 
@@ -1118,6 +1172,11 @@ def delete_waa_server(
     raw_waa["servers"] = new_servers
     if str(raw_waa.get("active_server") or "").strip() == target_id and new_servers:
         raw_waa["active_server"] = str(new_servers[0].get("id") or "")
+
+    # 删除的节点若正是运行时覆盖指向的节点，同步清掉避免悬空
+    # （清除后自动回到“环境变量 > 配置文件”的默认优先级）
+    if get_runtime_waa_override() == target_id:
+        set_runtime_waa_override(None)
 
     parsed["waa"] = raw_waa
     resolved_path.write_text(
