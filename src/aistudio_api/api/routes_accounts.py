@@ -44,6 +44,7 @@ class AccountResponse(BaseModel):
     enabled: bool = True
     group: str = "default"
     notes: str = ""
+    proxy_url: str | None = None
 
 
 def to_account_response(account: AccountMeta) -> AccountResponse:
@@ -64,6 +65,7 @@ def to_account_response(account: AccountMeta) -> AccountResponse:
         enabled=getattr(account, "enabled", True),
         group=getattr(account, "group", "default") or "default",
         notes=getattr(account, "notes", "") or "",
+        proxy_url=getattr(account, "proxy_url", None),
     )
 
 
@@ -228,11 +230,17 @@ async def detect_account_email(
         try:
             cookie_dict = load_cookies_from_auth_file(target_auth)
             if cookie_dict:
+                # 账号绑定独立代理时，探活请求走同一出口
+                acc_proxy = getattr(acc, "proxy_url", None)
                 email = await probe_account_email(
-                    cookie_dict, auth_user=acc.auth_user or "0"
+                    cookie_dict,
+                    auth_user=acc.auth_user or "0",
+                    proxy_url=acc_proxy,
                 )
                 http_tier = await probe_account_benefit_tier(
-                    cookie_dict, auth_user=acc.auth_user or "0"
+                    cookie_dict,
+                    auth_user=acc.auth_user or "0",
+                    proxy_url=acc_proxy,
                 )
                 if http_tier:
                     detected_tier = http_tier
@@ -268,7 +276,9 @@ async def detect_account_tier(
             cookie_dict = load_cookies_from_auth_file(target_auth)
             if cookie_dict:
                 detected_tier = await probe_account_benefit_tier(
-                    cookie_dict, auth_user=acc.auth_user or "0"
+                    cookie_dict,
+                    auth_user=acc.auth_user or "0",
+                    proxy_url=getattr(acc, "proxy_url", None),
                 )
         except Exception as e:
             log.debug("探测账号 %s 订阅等级失败: %s", account_id, e)
@@ -446,6 +456,40 @@ async def update_account_notes(
     account = account_service.update_account_notes(account_id, req.notes)
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
+    return to_account_response(account)
+
+
+class UpdateProxyRequest(BaseModel):
+    proxy_url: str | None = None
+
+
+@router.put("/{account_id}/proxy", response_model=AccountResponse)
+async def update_account_proxy(
+    account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
+    req: UpdateProxyRequest = Body(...),
+    account_service: AccountService = Depends(get_account_service),
+) -> AccountResponse:
+    """更新账号的独立出口代理（留空表示回退全局 AISTUDIO_PROXY）。
+
+    支持 http:// / https:// / socks5:// 等完整地址，或 host:port 简写。
+    """
+    from aistudio_api.infrastructure.account.cookie_parser import normalize_proxy_url
+
+    raw_proxy = (req.proxy_url or "").strip()
+    if raw_proxy and normalize_proxy_url(raw_proxy) is None:
+        raise HTTPException(
+            status_code=400,
+            detail="代理地址无效：需为 http(s):// / socks5:// 完整地址或 host:port 形式",
+        )
+    account_service.update_account_proxy(account_id, raw_proxy or None)
+    account = account_service.get_account(account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    log.info(
+        "更新账号代理: id=%s, proxy=%s",
+        account_id,
+        account.proxy_url or "(全局)",
+    )
     return to_account_response(account)
 
 

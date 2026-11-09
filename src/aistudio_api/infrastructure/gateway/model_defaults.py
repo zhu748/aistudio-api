@@ -299,6 +299,10 @@ def _profile_from_mapping(raw: dict[str, object]) -> ModelProfile:
 
 def _default_config() -> dict[str, object]:
     return {
+        "anti_truncation": {
+            "enabled": False,
+            "tool_name": "router_emit",
+        },
         "waa": {
             "active_server": "local_spidermonkey",
             "servers": [
@@ -503,6 +507,116 @@ def invalidate_config_cache() -> None:
     _API_KEYS_CACHE.clear()
     _compiled_profiles.cache_clear()
     _compiled_model_overrides.cache_clear()
+    _anti_truncation_cache.clear()
+
+
+_anti_truncation_cache: dict[str, tuple[float, dict[str, object]]] = {}
+
+
+def get_anti_truncation_settings(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """获取 config.yaml 中配置的抗截断传输 (anti_truncation) 设置。
+
+    支持环境变量 ``AISTUDIO_ANTI_TRUNCATION`` 强制覆盖 enabled 开关
+    (``1/true/on`` 开启，``0/false/off`` 关闭)，便于容器化部署场景。
+    """
+    import os as _os
+
+    resolved_path = _resolve_config_path(config_path)
+    settings: dict[str, object] = {
+        "enabled": False,
+        "tool_name": "router_emit",
+        "model_variants": {"enabled": False, "models": []},
+    }
+    if resolved_path.exists():
+        path_key = str(resolved_path.resolve())
+        try:
+            mtime = resolved_path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        cached = _anti_truncation_cache.get(path_key)
+        if cached is not None and cached[0] == mtime:
+            settings = dict(cached[1])
+        else:
+            config = _load_yaml_config(resolved_path)
+            raw_at = config.get("anti_truncation")
+            if isinstance(raw_at, dict):
+                settings.update(raw_at)
+            _anti_truncation_cache[path_key] = (mtime, dict(settings))
+
+    env_value = _os.getenv("AISTUDIO_ANTI_TRUNCATION")
+    if env_value is not None and env_value.strip():
+        settings["enabled"] = env_value.strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+            "y",
+            "t",
+        )
+    # 规范化 model_variants 结构，保证下游读取到固定形状。
+    raw_variants = settings.get("model_variants")
+    if not isinstance(raw_variants, dict):
+        raw_variants = {}
+    raw_models = raw_variants.get("models")
+    models = (
+        [str(m).strip() for m in raw_models if str(m).strip()]
+        if isinstance(raw_models, list)
+        else []
+    )
+    settings["model_variants"] = {
+        "enabled": bool(raw_variants.get("enabled", False)),
+        "models": models,
+    }
+    return settings
+
+
+def update_anti_truncation_settings(
+    *,
+    enabled: bool | None = None,
+    tool_name: str | None = None,
+    variants_enabled: bool | None = None,
+    models: list[str] | None = None,
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """更新 config.yaml 中的 anti_truncation 设置并刷新缓存。
+
+    面板"抗截断传输"卡片持久化入口：全局开关、合成工具名、模型变体
+    开关与选中模型列表。仅写入显式传入的字段，其余保持原值。
+    """
+    resolved_path = _resolve_config_path(config_path)
+    content = (
+        resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
+    )
+    parsed = yaml.safe_load(content) or {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    raw_at = parsed.get("anti_truncation")
+    at_dict = dict(raw_at) if isinstance(raw_at, dict) else {}
+    if enabled is not None:
+        at_dict["enabled"] = bool(enabled)
+    if tool_name is not None and tool_name.strip():
+        at_dict["tool_name"] = tool_name.strip()
+    if variants_enabled is not None or models is not None:
+        raw_variants = at_dict.get("model_variants")
+        variants_dict = dict(raw_variants) if isinstance(raw_variants, dict) else {}
+        if variants_enabled is not None:
+            variants_dict["enabled"] = bool(variants_enabled)
+        if models is not None:
+            variants_dict["models"] = [
+                str(m).strip() for m in models if str(m).strip()
+            ]
+        at_dict["model_variants"] = variants_dict
+
+    parsed["anti_truncation"] = at_dict
+    resolved_path.write_text(
+        yaml.dump(parsed, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    invalidate_config_cache()
+    return get_anti_truncation_settings(config_path)
 
 
 def _load_yaml_config(config_path: Path) -> dict[str, object]:
@@ -869,9 +983,18 @@ def get_configured_waa_settings(
 def get_active_waa_server(
     config_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
-    """获取当前激活的 WAA 签名服务器配置及其绑定的特征信息。"""
+    """获取当前激活的 WAA 签名服务器配置及其绑定的特征信息。
+
+    环境变量 ``AISTUDIO_WAA_SERVER`` 可强制覆盖 config.yaml 的选择
+    （值为目标 server id，如 ``remote_spinsnow``）。适用于无持久磁盘的
+    PaaS 部署（Render Free 等）：面板切换无法跨部署持久，改用平台环境
+    变量注入；也便于小内存实例强制走远程签名器、跳过本地引擎进程。
+    """
     waa = get_configured_waa_settings(config_path)
     active_id = str(waa.get("active_server") or "local_spidermonkey").strip()
+    env_override = os.getenv("AISTUDIO_WAA_SERVER", "").strip()
+    if env_override:
+        active_id = env_override
     raw_servers = waa.get("servers")
     servers = raw_servers if isinstance(raw_servers, list) else []
 

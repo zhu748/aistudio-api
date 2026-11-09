@@ -16,6 +16,7 @@ import {
   Mail,
   Tag,
   Check,
+  Globe,
 } from 'lucide-vue-next'
 import { useAccountsStore } from '@/stores/accounts.ts'
 
@@ -60,6 +61,17 @@ const groupInput = ref('')
 
 const accountTier = computed(() => {
   return props.account.tier || 'Free'
+})
+
+const proxyShort = computed(() => {
+  const p = props.account.proxy_url
+  if (!p) return ''
+  try {
+    const u = new URL(p)
+    return u.host
+  } catch {
+    return p.length > 24 ? `${p.slice(0, 24)}…` : p
+  }
 })
 
 const isEnabled = computed(() => {
@@ -177,6 +189,16 @@ async function handleDetectTier() {
         >
           {{ detectingTier ? '...' : accountTier }}
         </button>
+
+        <!-- Per-Account Proxy Badge -->
+        <span
+          v-if="account.proxy_url"
+          class="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-mono font-medium text-cyan-800 bg-cyan-50 hover:bg-cyan-100/80 transition-colors border border-cyan-200/70 shrink-0"
+          :title="`独立代理: ${account.proxy_url}`"
+        >
+          <Globe class="w-2.5 h-2.5 text-cyan-500" />
+          <span>{{ proxyShort }}</span>
+        </span>
 
         <!-- Group Tag / Inline Editor -->
         <div class="flex items-center">

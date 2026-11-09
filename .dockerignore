@@ -9,22 +9,38 @@
 *.swo
 
 # Python
-__pycache__
+__pycache__/
 *.pyc
 *.pyo
 *.egg-info
 dist
 build
-.pytest_cache
+.pytest_cache/
+.venv/
+venv/
 
-# Environment (use .env.example as reference, mount .env at runtime)
+# 环境变量与凭据 —— 绝不进入构建上下文与镜像
+# （运行时通过 Render 环境变量 / compose 挂载注入，参考 .env.example）
 .env
+.env.*
 .env.local
+*.auth.json
 
-# Logs
+# 本地运行时数据（账号 Cookie / 统计 / 转储）—— 镜像绝不内嵌
+data/
+dumps/
 *.log
 server.log
 server.pid
+
+# 前端源码与构建缓存（镜像使用 src/aistudio_api/static/ 预构建产物）
+web/node_modules
+web/dist
+web/*.tsbuildinfo
+
+# Go 构建产物与下载依赖（镜像内多阶段构建自行生成）
+waa-signer/bin/
+waa-signer/.deps/
 
 # Test files
 test_*.py
@@ -45,4 +61,12 @@ scripts/
 # Docker
 Dockerfile
 docker-compose.yml
+docker-compose.deploy.yml
 .dockerignore
+
+# 部署平台配置（无需进入镜像）
+render.yaml
+
+# 系统杂项
+.DS_Store
+Thumbs.db

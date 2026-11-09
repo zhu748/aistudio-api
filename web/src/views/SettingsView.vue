@@ -7,6 +7,7 @@ import ApiKeyManagerCard from '@/components/settings/ApiKeyManagerCard.vue'
 import LogConfigCard from '@/components/settings/LogConfigCard.vue'
 import VisualConfigEditor from '@/components/config/VisualConfigEditor.vue'
 import SignerServerCard from '@/components/settings/SignerServerCard.vue'
+import AntiTruncationCard from '@/components/settings/AntiTruncationCard.vue'
 import {
   Server,
   CheckCircle2,
@@ -140,6 +141,10 @@ onMounted(() => {
       :initial-config="config"
       @saved="loadConfig"
     />
+
+    <!-- Anti-Truncation Transport Config Card -->
+    <AntiTruncationCard />
+
     <!-- WAA Signer Servers & Features Binding Card -->
     <SignerServerCard @switched="loadConfig" />
 

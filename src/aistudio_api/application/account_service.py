@@ -78,6 +78,10 @@ class AccountService:
         """更新账号的登录邮箱。"""
         return self._store.update_account_email(account_id, email)
 
+    def update_account_proxy(self, account_id: str, proxy_url: str | None) -> bool:
+        """更新账号的独立出口代理（None 表示回退全局代理）。"""
+        return self._store.update_account_proxy(account_id, proxy_url)
+
     def update_account_tier(self, account_id: str, tier: str) -> bool:
         """更新账号的订阅权益等级 (Free / Pro / Ultra / Plus)。"""
         return self._store.update_account_tier(account_id, tier)
@@ -122,11 +126,16 @@ class AccountService:
         if not cookies:
             return {"ok": False, "status": 0, "updated": []}
 
-        result = await rotate_google_cookies(cookies, client=client)
+        # 账号绑定了独立出口代理时，轮换请求也走同一代理（保持 IP 一致性）
+        target_acc = self._store.get_account(account_id)
+        account_proxy = getattr(target_acc, "proxy_url", None) if target_acc else None
+
+        result = await rotate_google_cookies(
+            cookies, client=client, proxy_url=account_proxy
+        )
         if not result.get("ok"):
             # 若当前子账号缺少最新滚动种子，尝试合并同会话兄弟账号的 Cookie 重试
             anchor = compute_session_anchor(cookies)
-            target_acc = self._store.get_account(account_id)
             target_cid = target_acc.cookie_id if target_acc else None
             for sib in self._store.list_accounts():
                 if sib.id == account_id:
@@ -144,7 +153,9 @@ class AccountService:
                 if not (same_anchor or same_cid):
                     continue
                 merged_sib = {**cookies, **sib_cookies}
-                sib_res = await rotate_google_cookies(merged_sib, client=client)
+                sib_res = await rotate_google_cookies(
+                    merged_sib, client=client, proxy_url=account_proxy
+                )
                 if sib_res.get("ok"):
                     cookies = merged_sib
                     result = sib_res
@@ -187,6 +198,7 @@ class AccountService:
         enabled: bool = True,
         group: str = "default",
         notes: str = "",
+        proxy_url: str | None = None,
     ) -> AccountMeta:
         """从 Cookie 存储状态保存新账号。"""
         return self._store.save_account(
@@ -200,6 +212,7 @@ class AccountService:
             enabled=enabled,
             group=group,
             notes=notes,
+            proxy_url=proxy_url,
         )
 
     def batch_import_accounts(

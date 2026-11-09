@@ -49,8 +49,9 @@ RUN chmod +x /app/waa-signer/bin/waa-signer
 # Copy application code and default configuration template
 COPY src/ src/
 COPY main.py .
-COPY config.yaml /app/defaults/config.yaml
-COPY config.yaml /app/config.yaml
+# 注意：镜像内嵌 defaults/config.yaml 纯净模板，而非仓库根目录的开发用
+# config.yaml（后者可能含本地调试配置，不应进入分发镜像）。
+COPY defaults/config.yaml /app/defaults/config.yaml
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 # Create necessary directories
 RUN mkdir -p /app/data /tmp
@@ -58,13 +59,18 @@ RUN mkdir -p /app/data /tmp
 # Set permissions
 RUN chmod +x /app/main.py /app/docker-entrypoint.sh
 
-# Expose API server port
+# Expose API server port (实际端口由 AISTUDIO_PORT / PORT 环境变量决定;
+# Render 等 PaaS 平台会注入 PORT, 未注入时默认 8080)
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/v1beta/models || exit 1
+# Health check: /healthz 为轻量无鉴权端点（k8s/PaaS 探活命名惯例，
+# /health 为等价别名），不依赖上游账号与外部网络。
+# 旧版用 /v1beta/models 会在“零账号首次启动”时探活失败导致部署误判。
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD curl -f "http://localhost:${AISTUDIO_PORT:-8080}/healthz" || exit 1
 
 # Container entrypoint and default command
+# 不硬编码端口：entrypoint 已把平台注入的 PORT 映射为 AISTUDIO_PORT，
+# 未注入时回退到默认 8080。
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
-CMD ["python3", "main.py", "server", "--port", "8080"]
+CMD ["python3", "main.py", "server"]
