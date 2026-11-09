@@ -12,6 +12,19 @@ anti_truncation:
     enabled: false
     models: []
 
+# OpenAI / Claude 协议兼容层 (/v1/chat/completions 与 /v1/messages)
+# - default_model: 客户端请求 gpt-* / o1* / chatgpt-* / claude-* 等家族模型名时
+#   回退到的 Gemini 模型；直接填 Gemini 模型名（含抗截断变体）则原样透传。
+# - model_mapping: 自定义映射，支持精确匹配与最长前缀匹配，
+#   例: "claude-opus-*": gemini-4-argon、"gpt-4o": gemini-3.7-flash
+compat:
+  openai:
+    default_model: gemini-3.7-flash
+    model_mapping: {}
+  claude:
+    default_model: gemini-3.7-flash
+    model_mapping: {}
+
 # WAA 签名与挑战求解配置 (脱离浏览器的纯净轻量化签名引擎)
 waa:
   active_server: local_spidermonkey

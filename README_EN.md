@@ -48,6 +48,7 @@
 | Feature | Description |
 |---|---|
 | **Gemini API Compatibility** | Supports `/v1beta/...` endpoints including Thinking, multimodal inputs, function calling, and image generation |
+| **OpenAI / Claude Protocol Compatibility** | Additionally exposes `/v1/chat/completions` (OpenAI Chat Completions) and `/v1/messages` (Anthropic Claude Messages) endpoints: streaming & non-streaming, tool calling, multimodal images, reasoning chains (`reasoning_content` / thinking blocks), and automatic model-name mapping (`gpt-*` / `claude-*` → configured Gemini models), fully reusing account rotation and anti-truncation transport |
 | **Dynamic Model Discovery** | Automatically synchronizes and discovers available models from upstream Google AI Studio |
 | **Multi-Account Rotation** | Manages multiple accounts with automatic failover, tracks 429 rate limits per model independently, and resets quotas at midnight Pacific Time |
 | **Runtime State Persistence** | Model usage statistics (`stats.json`) and account 429 cooldown & quota status (`rotator_state.json`) are automatically persisted to disk across restarts |
@@ -278,16 +279,20 @@ environment:
 
 ## Third-Party Client Setup Guide (NextChat / Cherry Studio / One API)
 
-> [!WARNING]
-> **Strictly Gemini Protocol Required**!
-> This project is a dedicated reverse proxy strictly adhering to the Google Gemini API specification. It **does NOT provide OpenAI-compatible routes** (such as `/v1/chat/completions`). In all third-party clients, you MUST select **Google Gemini** (or **Gemini**) as the model provider type.
+The service exposes three protocol entry points — pick whichever your client supports:
+
+| Protocol | Endpoint | Suitable Clients |
+|---|---|---|
+| **Google Gemini (native)** | `http://localhost:8080` (use `http://localhost:8080/v1beta` if a version prefix is required) | google-genai SDK and any Gemini-protocol client |
+| **OpenAI compatible** | `http://localhost:8080/v1` | NextChat / Cherry Studio / one-api / LobeChat and any client with an "OpenAI" provider |
+| **Anthropic Claude compatible** | `http://localhost:8080` (Claude clients need no `/v1` suffix — the SDK appends it) | Claude Code / Anthropic SDK and any Claude-protocol client |
 
 | Setting | Value | Description |
 |---|---|---|
-| **Provider / Model Type** | **Google Gemini** | Do NOT select OpenAI or custom OpenAI formats |
-| **API Base URL** | `http://localhost:8080` | If the client mandates a version prefix, enter `http://localhost:8080/v1beta` |
-| **API Key** | Any string (e.g. `aistudio-api`) | If `api_keys` is not set in `config.yaml`, any non-empty string works; otherwise enter your configured key |
-| **Supported Models** | `gemini-3.7-flash`<br/>`gemini-3.8-flash`<br/>`gemini-4-argon`<br/>`gemini-3.1-flash-image` | Supports all active models discovered dynamically from Google AI Studio |
+| **Provider / Model Type** | Google Gemini / OpenAI / Claude — any of them | All three protocols share the same account pool and model catalog |
+| **API Base URL** | See table above | — |
+| **API Key** | Any string (e.g. `aistudio-api`) | If `api_keys` is not set in `config.yaml`, any non-empty string works; OpenAI clients authenticate via `Authorization: Bearer`, Claude clients via `x-api-key` — both honor the same key set |
+| **Supported Models** | OpenAI/Claude channels may enter Gemini model names directly (e.g. `gemini-3.7-flash`); `gpt-*` / `o1*` / `claude-*` family names are mapped to the `compat` default model | `GET /v1/models` returns OpenAI or Claude format automatically (detected via the `anthropic-version` header) |
 
 ## Configuration & Environment Variables
 
@@ -316,6 +321,24 @@ Open `http://localhost:8080` in your browser to access the Web Console.
 | `AISTUDIO_DUMP_REQUESTS` | bool | `false` | Dump API request/response exchanges to console logs (enabled via `DEBUG=1`) |
 | `AISTUDIO_DUMP_FILE` | bool | `false` | Dump request/response exchanges to individual disk files |
 | `AISTUDIO_DUMP_DIR` | string | `dumps/` | Target directory for dumped exchange files |
+
+### OpenAI / Claude Compatibility Layer (compat)
+
+Model-name mapping for the `/v1/chat/completions` and `/v1/messages` endpoints (hot-reloaded with `config.yaml`):
+
+```yaml
+# config.yaml
+compat:
+  openai:
+    default_model: gemini-3.7-flash # fallback for gpt-* / o1* / chatgpt-* family names
+    model_mapping: {}               # custom mapping, exact + longest-prefix match, e.g. gpt-4o: gemini-3.7-flash
+  claude:
+    default_model: gemini-3.7-flash # fallback for claude-* family names
+    model_mapping: {}               # e.g. claude-opus: gemini-4-argon (matches claude-opus-4-1)
+```
+
+- Gemini model names (including `-at` / `-at-stream` anti-truncation variants) pass through unchanged;
+- The compatibility layer shares the same account pool, model catalog, API keys, and paid-model gating as the native `/v1beta` endpoints.
 
 ---
 
@@ -370,6 +393,47 @@ curl http://localhost:8080/v1beta/models/gemini-3.7-flash:streamGenerateContent?
     ]
   }'
 ```
+</details>
+
+<details>
+<summary><b>4. OpenAI-compatible format (/v1/chat/completions)</b></summary>
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.7-flash",
+    "messages": [{"role": "user", "content": "Explain quantum computing in one sentence."}],
+    "stream": true
+  }'
+```
+
+- Enter a Gemini model name in `model` directly; family names like `gpt-4o` are mapped to `compat.openai.default_model` in `config.yaml`;
+- Streaming emits standard `chat.completion.chunk` sequences (including `data: [DONE]`); reasoning chains stream through the `reasoning_content` delta field;
+- Tool calling (`tools` / `tool_choice`), `response_format` (JSON mode), `reasoning_effort`, and image inputs (data URLs or remote URLs) are supported.
+</details>
+
+<details>
+<summary><b>5. Claude-compatible format (/v1/messages)</b></summary>
+
+```bash
+curl http://localhost:8080/v1/messages \
+  -H "x-api-key: your-api-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Explain quantum computing in one sentence."}],
+    "stream": true
+  }'
+```
+
+- `claude-*` family names are mapped to `compat.claude.default_model` in `config.yaml` (Gemini model names pass through directly);
+- Streaming emits the full Claude event sequence (`message_start` / `content_block_delta` / `message_delta` / `message_stop`) with thinking blocks for reasoning chains;
+- Tools (`tools` / `tool_choice`), `thinking.budget_tokens` (auto-converted to Gemini thinking levels), image/PDF blocks, and `stop_sequences` are supported;
+- `POST /v1/messages/count_tokens` provides a rough token estimate; `GET /v1/models` returns the Claude format when the `anthropic-version` header is present.
 </details>
 
 ---

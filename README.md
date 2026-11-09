@@ -48,6 +48,7 @@
 | 功能模块 | 说明 |
 |---|---|
 | **Gemini 协议兼容** | 支持 `/v1beta/...` 接口规范，包括 Thinking 思维链、多模态、Function Calling 工具调用及图片生成 |
+| **OpenAI / Claude 协议兼容** | 额外提供 `/v1/chat/completions`（OpenAI Chat Completions）与 `/v1/messages`（Anthropic Claude Messages）兼容端点：流式/非流式、工具调用、多模态图片、思考链（`reasoning_content` / thinking 块）、模型名自动映射（`gpt-*` / `claude-*` → 配置的 Gemini 模型），完整复用多账号轮换与抗截断传输 |
 | **动态模型发现** | 自动向上游同步可用模型列表，支持 `gemini-3.7-flash`、`gemini-3.8-flash` 等最新模型 |
 | **多账号自动轮换** | 支持多账号管理与故障自动切换，按模型独立记录 429 配额，每日美西午夜自动重置 |
 | **运行状态持久化** | 模型调用量、Token 消耗统计 (`stats.json`) 以及账号 429 限额与冷却状态 (`rotator_state.json`) 自动落盘，容器/服务重启不丢失状态 |
@@ -312,16 +313,20 @@ environment:
 
 ## 第三方客户端配置指引 (NextChat / Cherry Studio / One API 等)
 
-> [!WARNING]
-> **必须选择 Google Gemini 协议**！
-> 本项目是专为 Google Gemini API 规范打造的反向代理网关，**不包含 OpenAI 协议兼容接口**（如 `/v1/chat/completions`）。在任何客户端中配置时，模型提供商类型请务必选择 **Google Gemini**（或 **Gemini**），切勿选择 OpenAI 格式。
+本服务同时提供三种协议入口，任选其一：
+
+| 协议 | 接口 | 适用客户端 |
+|---|---|---|
+| **Google Gemini（原生）** | `http://localhost:8080`（需版本号时填 `http://localhost:8080/v1beta`） | google-genai SDK 及所有 Gemini 协议客户端 |
+| **OpenAI 兼容** | `http://localhost:8080/v1` | NextChat / Cherry Studio / one-api / LobeChat 等选择「OpenAI」提供商的客户端 |
+| **Anthropic Claude 兼容** | `http://localhost:8080`（Claude 客户端的 Base URL 无需 `/v1` 后缀，SDK 会自动拼接） | Claude Code / Anthropic SDK / Claude 协议客户端 |
 
 | 配置项目 | 填写内容 | 说明 |
 |---|---|---|
-| **模型提供商 (Provider)** | **Google Gemini** | 严禁选择 OpenAI 或自定义 OpenAI 格式 |
-| **API Base URL / 代理地址** | `http://localhost:8080` | 若客户端要求必须带版本号，可填写 `http://localhost:8080/v1beta` |
-| **API Key / 密钥** | 任意字符串 (如 `aistudio-api`) | 若未在服务端 `config.yaml` 中配置 `api_keys`，客户端填写任意非空字符即可；若服务端已配置鉴权 Key 则需匹配 |
-| **支持的模型名称** | `gemini-3.7-flash`<br/>`gemini-3.8-flash`<br/>`gemini-4-argon`<br/>`gemini-3.1-flash-image` | 自动向上游同步所有可用模型，支持官方全部功能 |
+| **模型提供商 (Provider)** | Google Gemini / OpenAI / Claude 任选 | 三种协议共享同一账号池与模型目录 |
+| **API Base URL / 代理地址** | 见上表 | — |
+| **API Key / 密钥** | 任意字符串 (如 `aistudio-api`) | 若未在服务端 `config.yaml` 中配置 `api_keys`，客户端填写任意非空字符即可；OpenAI 客户端用 `Authorization: Bearer`，Claude 客户端用 `x-api-key`，均受同一套 Key 鉴权 |
+| **支持的模型名称** | OpenAI/Claude 渠道直接填 Gemini 模型名（如 `gemini-3.7-flash`）；填 `gpt-*` / `o1*` / `claude-*` 等家族名时会自动映射到 `compat` 配置的默认模型 | 支持 `GET /v1/models` 查询（OpenAI 与 Claude 双格式自动识别） |
 
 ## 配置与环境变量
 
@@ -380,6 +385,26 @@ anti_truncation:
 
 > 机制移植自 [ken050210/vertex-streaming-anti-truncation](https://github.com/ken050210/vertex-streaming-anti-truncation)，并适配本项目 AI Studio JSPB 线路协议（MakerSuite 协议无 `tool_choice` 强制字段，故依赖指令遵循 + 优雅降级）。
 
+### OpenAI / Claude 协议兼容层 (compat)
+
+`/v1/chat/completions` 与 `/v1/messages` 两个兼容端点的模型名映射配置（支持 `config.yaml` 热重载）：
+
+```yaml
+# config.yaml
+compat:
+  openai:
+    default_model: gemini-3.7-flash # 客户端填 gpt-* / o1* / chatgpt-* 等家族名时回退到的模型
+    model_mapping: {}               # 自定义映射，支持精确与最长前缀匹配，例: gpt-4o: gemini-3.7-flash
+  claude:
+    default_model: gemini-3.7-flash # 客户端填 claude-* 家族名时回退到的模型
+    model_mapping: {}               # 例: claude-opus: gemini-4-argon（可命中 claude-opus-4-1）
+```
+
+- 直接填 Gemini 模型名（含 `-at` / `-at-stream` 抗截断变体）时原样透传，不经过映射；
+- 兼容层与原生 `/v1beta` 共享同一账号池、模型目录、鉴权 Key 与付费模型门控；
+- 多模态图片 / 音频 / 文档：远程 URL 由服务端代下载，内联 base64 与远程下载统一受 20MB 原始字节上限（超限返回 400）；`count_tokens` 估算不计入 base64 媒体数据；
+- 工具调用只转换自定义函数工具（OpenAI `type: function` / Claude 无 type 或 `type: custom`），`web_search` 等服务端工具类型会被跳过而非误声明为函数。
+
 ## API 调用示例
 
 支持以下鉴权方式：
@@ -431,6 +456,47 @@ curl http://localhost:8080/v1beta/models/gemini-3.7-flash:streamGenerateContent?
     ]
   }'
 ```
+</details>
+
+<details>
+<summary><b>4. OpenAI 兼容格式（/v1/chat/completions）</b></summary>
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.7-flash",
+    "messages": [{"role": "user", "content": "用简短的一句话介绍量子计算。"}],
+    "stream": true
+  }'
+```
+
+- `model` 直接填 Gemini 模型名；填 `gpt-4o` 等家族名会自动映射到 `config.yaml` 中 `compat.openai.default_model`；
+- 流式返回标准 `chat.completion.chunk` 序列（含 `data: [DONE]`），思考链走 `reasoning_content` 增量字段；
+- 工具调用（`tools` / `tool_choice`）、`response_format`（JSON 模式）、`reasoning_effort`、图片输入（data URL 或远程 URL）均已支持。
+</details>
+
+<details>
+<summary><b>5. Claude 兼容格式（/v1/messages）</b></summary>
+
+```bash
+curl http://localhost:8080/v1/messages \
+  -H "x-api-key: your-api-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "用简短的一句话介绍量子计算。"}],
+    "stream": true
+  }'
+```
+
+- `model` 填 `claude-*` 家族名会自动映射到 `config.yaml` 中 `compat.claude.default_model`（也可直接填 Gemini 模型名）；
+- 流式返回完整 Claude 事件序列（`message_start` / `content_block_delta` / `message_delta` / `message_stop`），思考链走 thinking 块；
+- 工具（`tools` / `tool_choice`）、`thinking.budget_tokens`（自动换算为 Gemini 思考等级）、图片 / PDF 块、`stop_sequences` 均已支持；
+- `POST /v1/messages/count_tokens` 提供粗略 token 估算，`GET /v1/models` 在携带 `anthropic-version` 头时返回 Claude 格式。
 </details>
 
 ---
@@ -527,7 +593,7 @@ if response.function_calls:
 
 - **仪表盘 (Dashboard)**：实时展示服务健康状况、各模型请求量、成功率及 429 冷却指标。
 - **账号管理 (Accounts)**：支持 Cookie 单条与凭据包批量导入、自动探测多账号、手动切换当前活跃账号或重置冷却状态。
-- **运行日志 (Logs)**：内存环形缓冲最近 2000 条日志，3 秒自动刷新，支持级别过滤（信息/警告+/错误+）与关键字检索，可一键清空。
+- **运行日志 (Logs)**：内存环形缓冲最近 2000 条日志，SSE 实时推送（`GET /api/logs/stream`，新日志毫秒级直达面板，空闲期 20 秒心跳保活），支持级别过滤（信息/警告+/错误+）与关键字检索，可一键清空。
 - **系统设置 (Settings)**：在线编辑 `config.yaml`（支持配置 profiles 与 models 默认规则），保存后服务端即时热重载。
 - **访问鉴权**：设置环境变量 `AISTUDIO_WEB_PASSWORD` 后自动开启登录鉴权守卫。
 

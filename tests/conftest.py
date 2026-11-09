@@ -6,6 +6,15 @@ import pytest
 
 _TEST_DEFAULT_CONFIG = """
 api_keys: []
+compat:
+  openai:
+    default_model: gemini-3.8-flash
+    model_mapping:
+      "gpt-4o-mini": gemini-3.7-flash
+  claude:
+    default_model: gemini-3.8-flash
+    model_mapping:
+      "claude-opus": gemini-4-argon
 model_defaults:
   drop_unsupported_params: false
   profiles:

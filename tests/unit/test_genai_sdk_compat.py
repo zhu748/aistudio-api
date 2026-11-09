@@ -22,6 +22,28 @@ def mock_client() -> MagicMock:
     return MagicMock()
 
 
+def _build_sdk_client() -> tuple[genai.Client, httpx.AsyncClient]:
+    """构建注入 ASGI 测试传输的 google-genai SDK 客户端。
+
+    google-genai 3.x 需通过 ``HttpOptions.httpx_async_client`` 公开注入
+    自定义 httpx 客户端（旧版私有属性注入已失效，且 3.x 默认走 aiohttp
+    传输 + ``v1`` API 版本，需显式指定 ``v1beta``）。
+    """
+    custom_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    )
+    sdk_client = genai.Client(
+        api_key="test-key",
+        http_options=types.HttpOptions(
+            base_url="http://testserver",
+            api_version="v1beta",
+            httpx_async_client=custom_client,
+        ),
+    )
+    return sdk_client, custom_client
+
+
 @pytest.mark.asyncio
 async def test_genai_sdk_aio_non_streaming(mock_client: MagicMock) -> None:
     """Test async non-streaming generation with official Google GenAI SDK."""
@@ -40,19 +62,8 @@ async def test_genai_sdk_aio_non_streaming(mock_client: MagicMock) -> None:
     custom_client: httpx.AsyncClient | None = None
 
     try:
-        sdk_client = genai.Client(
-            api_key="test-key",
-            http_options=types.HttpOptions(
-                base_url="http://testserver",
-            ),
-        )
+        sdk_client, custom_client = _build_sdk_client()
         async with sdk_client.aio as aio_client:
-            custom_client = httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app),
-                base_url="http://testserver",
-            )
-            aio_client._api_client._async_httpx_client = custom_client
-
             response = await aio_client.models.generate_content(
                 model="gemini-3.8-flash",
                 contents="Hi",
@@ -98,19 +109,8 @@ async def test_genai_sdk_aio_streaming(mock_client: MagicMock) -> None:
     custom_client: httpx.AsyncClient | None = None
 
     try:
-        sdk_client = genai.Client(
-            api_key="test-key",
-            http_options=types.HttpOptions(
-                base_url="http://testserver",
-            ),
-        )
+        sdk_client, custom_client = _build_sdk_client()
         async with sdk_client.aio as aio_client:
-            custom_client = httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app),
-                base_url="http://testserver",
-            )
-            aio_client._api_client._async_httpx_client = custom_client
-
             chunks = []
             async for chunk in await aio_client.models.generate_content_stream(
                 model="gemini-3.8-flash",
@@ -192,17 +192,8 @@ async def test_genai_sdk_function_calling_and_response_flow(
     custom_client: httpx.AsyncClient | None = None
 
     try:
-        sdk_client = genai.Client(
-            api_key="test-key",
-            http_options=types.HttpOptions(base_url="http://testserver"),
-        )
+        sdk_client, custom_client = _build_sdk_client()
         async with sdk_client.aio as aio_client:
-            custom_client = httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app),
-                base_url="http://testserver",
-            )
-            aio_client._api_client._async_httpx_client = custom_client
-
             # Turn 1: user asks question, model returns function call
             turn1_resp = await aio_client.models.generate_content(
                 model="gemini-3.8-flash",
@@ -269,16 +260,8 @@ async def test_genai_sdk_standard_api_error_parsing(mock_client: MagicMock) -> N
     custom_client: httpx.AsyncClient | None = None
 
     try:
-        sdk_client = genai.Client(
-            api_key="test-key",
-            http_options=types.HttpOptions(base_url="http://testserver"),
-        )
+        sdk_client, custom_client = _build_sdk_client()
         async with sdk_client.aio as aio_client:
-            custom_client = httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app),
-                base_url="http://testserver",
-            )
-            aio_client._api_client._async_httpx_client = custom_client
             with pytest.raises(errors.APIError) as exc_info:
                 await aio_client.models.generate_content(
                     model="gemini-3.8-flash",
@@ -307,16 +290,8 @@ async def test_genai_sdk_tool_config_forwarding(mock_client: MagicMock) -> None:
     custom_client: httpx.AsyncClient | None = None
 
     try:
-        sdk_client = genai.Client(
-            api_key="test-key",
-            http_options=types.HttpOptions(base_url="http://testserver"),
-        )
+        sdk_client, custom_client = _build_sdk_client()
         async with sdk_client.aio as aio_client:
-            custom_client = httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app),
-                base_url="http://testserver",
-            )
-            aio_client._api_client._async_httpx_client = custom_client
             await aio_client.models.generate_content(
                 model="gemini-3.8-flash",
                 contents="What is the weather?",

@@ -16,9 +16,10 @@
 
 ## 1. 核心架构与设计原则
 
-`aistudio-api` 是 Google AI Studio 反向代理网关，提供原生 **Gemini API 兼容接口**（`/v1beta/...`）。
+`aistudio-api` 是 Google AI Studio 反向代理网关，提供原生 **Gemini API 兼容接口**（`/v1beta/...`），并附带 **OpenAI / Anthropic Claude 协议兼容层**（`/v1/chat/completions`、`/v1/messages`）。
 
-- **Gemini 协议实现**：实现 Gemini 官方 `/v1beta/...` 接口规范（包含 thinking、multimodal、image-generation、function calling 等），不引入其他厂商的协议转译层。
+- **Gemini 协议实现**：实现 Gemini 官方 `/v1beta/...` 接口规范（包含 thinking、multimodal、image-generation、function calling 等）。
+- **OpenAI / Claude 兼容层**：在 Gemini 管线之上做双向协议转译（请求→`GeminiGenerateContentRequest`，响应/流→对应协议格式），完整复用账号轮换、重试与抗截断传输，不另建独立链路。
 - **无浏览器 WAA 签名架构**：通过独立 `waa-signer`（嵌入式 SpiderMonkey 152 + Firefox 152 DOM 宿主）或兼容的远程证明签名服务生成 `!proof` 令牌，配合 `httpx` HTTP/2 异步连接池直连 Google AI Studio。
 - **代码即事实标准（Code as Ground Truth）**：以通过测试验证的代码为准。当文档与代码逻辑不一致时，以代码为准并同步更新文档。
 - **接口契约优先（Contract over Brittle Mocks）**：测试应对齐公共接口契约，避免耦合私有属性。
@@ -183,17 +184,20 @@ aistudio-api/
 │   │   ├── app.py                 # 应用生命周期与静态托管
 │   │   ├── dependencies.py        # API Key 与 Token 鉴权注入
 │   │   ├── routes_gemini.py       # /v1beta/models/*:generateContent 路由
+│   │   ├── routes_compat.py       # /v1/chat/completions 与 /v1/messages OpenAI/Claude 兼容路由
 │   │   ├── routes_models.py       # /v1beta/models 模型发现路由
 │   │   ├── routes_accounts.py     # 账号管理与探活路由
 │   │   ├── routes_system.py       # 监控指标、日志配置与 config.yaml 热重载路由
 │   │   ├── state.py               # 运行时全局单例容器 (RuntimeState)
 │   │   ├── schemas.py             # API 请求与校验模型
+│   │   ├── schemas_compat.py      # OpenAI / Claude 兼容层请求模型
 │   │   ├── responses.py           # Gemini API 响应格式化辅助工具
 │   │   └── response_models.py     # API Pydantic 响应模型
 │   ├── application/               # 业务应用层
 │   │   ├── account_rotator.py     # 黏性账号调度器 (按模型记录 429 与太平洋午夜重置)
 │   │   ├── account_service.py     # 账号存储与激活上下文协调
 │   │   ├── api_service_gemini.py  # Gemini 请求生命周期与流式处理
+│   │   ├── compat_service.py      # OpenAI / Claude ↔ Gemini 协议双向转换 (含 SSE 流式与模型映射)
 │   │   ├── account_orchestrator.py# _switch_lock 切号互斥与故障转移编排
 │   │   └── chat_service.py        # 消息规范化与多模态数据处理
 │   ├── domain/                    # 领域模型与异常定义

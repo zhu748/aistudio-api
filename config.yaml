@@ -7,8 +7,15 @@ anti_truncation:
     models:
     - gemini-3.8-flash
     - gemini-4-argon
+compat:
+  openai:
+    default_model: gemini-3.7-flash
+    model_mapping: {}
+  claude:
+    default_model: gemini-3.7-flash
+    model_mapping: {}
 waa:
-  active_server: local_spidermonkey
+  active_server: remote_spinsnow
   servers:
   - id: local_spidermonkey
     name: 本地 Go 签名服务 (SpiderMonkey 152)
