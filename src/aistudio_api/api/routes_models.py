@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -104,7 +104,7 @@ def _to_variant_model(
 
 
 def _expand_anti_truncation_variants(
-    discovered: list[Mapping[str, object]],
+    discovered: Sequence[Mapping[str, object]],
 ) -> list[GeminiModelResponse]:
     """为面板选中的模型生成流式 / 非流式两个抗截断变体条目。
 

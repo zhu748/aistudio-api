@@ -72,7 +72,12 @@ def isolated_runtime(monkeypatch):
 
     old_client = runtime_state.client
     old_svc = runtime_state.account_service
-    runtime_state.account_service = _FakeAccountService()
+    from typing import cast
+
+    from aistudio_api.application.account_service import AccountService
+
+    # 测试桩仅实现鸭子类型接口，用 cast 告知类型检查器
+    runtime_state.account_service = cast(AccountService, _FakeAccountService())
     yield runtime_state
     runtime_state.client = old_client
     runtime_state.account_service = old_svc

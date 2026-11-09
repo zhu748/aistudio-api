@@ -754,6 +754,8 @@ def _build_gemini_streaming_response(
             buffered_thought_sig: str | None = None
             stream_completed = False
             last_stream_error: Exception | None = None
+            # 预先初始化，避免循环零次执行时下方引用被判 possibly-unbound
+            has_yielded_data = False
             auth_manager = Auth403RetryManager()
             total_attempts = MAX_RETRIES + AUTH_403_MAX_RETRIES
             for stream_attempt in range(total_attempts):

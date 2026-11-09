@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import httpx
 import pytest
 
@@ -113,7 +115,7 @@ class _FakeSignerResponse:
 
 
 class _FakeSignerClient:
-    responses: list = []
+    responses: ClassVar[list] = []
 
     def __init__(self, timeout: float = 8.0, proxy: str | None = None):
         pass
@@ -177,7 +179,7 @@ async def test_signer_server_test_new_protocol_missing_cookies(monkeypatch):
 @pytest.mark.asyncio
 async def test_signer_server_test_new_protocol_with_cookie_recheck(monkeypatch):
     """新版协议且本地有活跃账号：携带 Cookie 复测应返回完整池化状态。"""
-    from unittest.mock import AsyncMock, MagicMock
+    from unittest.mock import MagicMock
 
     from aistudio_api.infrastructure.account.account_store import AccountStore
 

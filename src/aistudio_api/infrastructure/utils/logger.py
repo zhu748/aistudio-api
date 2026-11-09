@@ -64,11 +64,11 @@ class RingBufferHandler(logging.Handler):
     def _format_exc_tail(record: logging.LogRecord) -> str:
         import traceback
 
+        exc = record.exc_info[1] if record.exc_info else None
+        if exc is None:
+            return ""
         try:
-            lines = traceback.format_exception(
-                *record.exc_info, limit=4
-            )
-            return "".join(lines).strip()
+            return "".join(traceback.format_exception(exc, limit=4)).strip()
         except Exception:
             return ""
 

@@ -32,25 +32,27 @@ logger = get_logger("transport")
 # 探测：缺失时打一条 WARNING（会进面板日志环形缓冲）并降级 HTTP/1.1，
 # 保证服务可用而不是整站瘫。安装 `pip install 'httpx[http2]'` 后重启
 # 即恢复 HTTP/2 多路复用。
-_H2_AVAILABLE: bool | None = None
+# 注意：变量名不能用全大写（如 _H2_AVAILABLE），pyright 会将其视为
+# 常量并拒绝 global 重定义（reportConstantRedefinition）。
+_h2_available: bool | None = None
 
 
 def _http2_enabled() -> bool:
     """h2 包可用时启用 HTTP/2；缺失时告警一次并降级为 HTTP/1.1。"""
-    global _H2_AVAILABLE
-    if _H2_AVAILABLE is None:
+    global _h2_available
+    if _h2_available is None:
         try:
-            import h2  # noqa: F401  # 仅为探测可选依赖是否存在
+            import h2  # noqa: F401  # pyright: ignore[reportUnusedImport]  # 仅为探测可选依赖是否存在
         except ImportError:
-            _H2_AVAILABLE = False
+            _h2_available = False
             logger.warning(
                 "未安装 h2 包（httpx 的 http2 extra），上游连接已降级为 "
                 "HTTP/1.1；执行 `pip install 'httpx[http2]'` 并重启可启用 "
                 "HTTP/2 多路复用"
             )
         else:
-            _H2_AVAILABLE = True
-    return _H2_AVAILABLE
+            _h2_available = True
+    return _h2_available
 
 
 def _get_auth_cookies(auth_file: str | None = None) -> dict[str, str] | None:

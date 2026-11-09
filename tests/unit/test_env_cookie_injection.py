@@ -126,7 +126,9 @@ def test_parse_env_entries_skips_invalid_and_duplicates():
     # 滚动 Cookie 变化不影响确定性 ID（锚点稳定）
     assert entries[0].id_hash != ""
     # storage_state 已按 parse_cookie_string 规整
-    assert {"name": "SID", "value": "first"} in entries[0].storage_state["cookies"]
+    cookies = entries[0].storage_state["cookies"]
+    assert isinstance(cookies, list)
+    assert {"name": "SID", "value": "first"} in cookies
 
 
 # ========== 注入幂等性 / 代理绑定 / 清理 ==========
@@ -208,6 +210,7 @@ def test_inject_env_accounts_preserves_custom_name_and_skips_ui_accounts(
     store.update_account(env_acc.id, "我的主力号")
     inject_env_accounts(store)
     env_acc = store.get_account(env_acc.id)
+    assert env_acc is not None
     assert env_acc.name == "我的主力号"
 
     # UI 账号不受清理影响
@@ -318,7 +321,12 @@ async def test_session_send_request_uses_context_proxy():
         async def close(self):
             pass
 
-    session._transport = FakeTransport()
+    from typing import cast
+
+    from aistudio_api.infrastructure.gateway.transport import HTTPStreamTransport
+
+    # 测试桩仅实现鸭子类型接口，用 cast 告知类型检查器
+    session._transport = cast(HTTPStreamTransport, FakeTransport())
     ctx = SessionContext(
         auth_user="0",
         auth_file="/tmp/auth.json",
@@ -359,10 +367,14 @@ def test_update_account_proxy_persists(tmp_path):
         storage_state={"cookies": [{"name": "SID", "value": "p"}]},
     )
     assert store.update_account_proxy(acc.id, "10.0.0.9:7890")
-    assert store.get_account(acc.id).proxy_url == "http://10.0.0.9:7890"
+    proxied = store.get_account(acc.id)
+    assert proxied is not None
+    assert proxied.proxy_url == "http://10.0.0.9:7890"
     # 清除
     assert store.update_account_proxy(acc.id, None)
-    assert store.get_account(acc.id).proxy_url is None
+    cleared = store.get_account(acc.id)
+    assert cleared is not None
+    assert cleared.proxy_url is None
     # 非法代理直接被规整为 None
     assert not store.update_account_proxy(acc.id, "not a proxy")
 
@@ -432,4 +444,6 @@ async def test_probe_env_sub_accounts_imports_and_dedupes(monkeypatch, tmp_path)
 
 def test_healthz_alias_still_available():
     """/healthz 别名（上一任务新增）不应受本次改动影响。"""
-    from aistudio_api.api.routes_system import healthz  # noqa: F401
+    from aistudio_api.api.routes_system import (  # noqa: F401
+        healthz,  # pyright: ignore[reportUnusedImport]
+    )

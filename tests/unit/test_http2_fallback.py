@@ -28,20 +28,20 @@ from aistudio_api.infrastructure.utils.logger import (
 
 async def test_http2_enabled_when_h2_importable(monkeypatch):
     """sys.modules 中存在 h2 时探测结果为 True，客户端启用 HTTP/2。"""
-    monkeypatch.setattr(transport_mod, "_H2_AVAILABLE", None)
+    monkeypatch.setattr(transport_mod, "_h2_available", None)
     monkeypatch.setitem(sys.modules, "h2", types.ModuleType("h2"))
 
     assert transport_mod._http2_enabled() is True
-    assert transport_mod._H2_AVAILABLE is True
+    assert transport_mod._h2_available is True
 
 
 async def test_http2_disabled_when_h2_missing(monkeypatch):
     """sys.modules['h2'] 为 None 时 import 抛 ImportError，探测结果为 False。"""
-    monkeypatch.setattr(transport_mod, "_H2_AVAILABLE", None)
+    monkeypatch.setattr(transport_mod, "_h2_available", None)
     monkeypatch.setitem(sys.modules, "h2", None)
 
     assert transport_mod._http2_enabled() is False
-    assert transport_mod._H2_AVAILABLE is False
+    assert transport_mod._h2_available is False
 
 
 async def test_client_created_with_http1_when_h2_missing(monkeypatch):
@@ -55,7 +55,7 @@ async def test_client_created_with_http1_when_h2_missing(monkeypatch):
             captured.update(kwargs)
 
     monkeypatch.setattr(transport_mod.httpx, "AsyncClient", FakeAsyncClient)
-    monkeypatch.setattr(transport_mod, "_H2_AVAILABLE", False)
+    monkeypatch.setattr(transport_mod, "_h2_available", False)
 
     transport = HTTPStreamTransport(proxy_url=None, timeout=30.0)
     await transport._get_client()
@@ -74,7 +74,7 @@ async def test_client_created_with_http2_when_h2_present(monkeypatch):
             captured.update(kwargs)
 
     monkeypatch.setattr(transport_mod.httpx, "AsyncClient", FakeAsyncClient)
-    monkeypatch.setattr(transport_mod, "_H2_AVAILABLE", True)
+    monkeypatch.setattr(transport_mod, "_h2_available", True)
 
     transport = HTTPStreamTransport(proxy_url=None, timeout=30.0)
     await transport._get_client()
@@ -86,7 +86,7 @@ async def test_missing_h2_warning_visible_in_panel_log_buffer(monkeypatch):
     """降级 WARNING 必须进入环形缓冲（面板 Logs 页可见），且只发一次。"""
     setup_logging("INFO")
     clear_recent_logs()
-    monkeypatch.setattr(transport_mod, "_H2_AVAILABLE", None)
+    monkeypatch.setattr(transport_mod, "_h2_available", None)
     monkeypatch.setitem(sys.modules, "h2", None)
 
     assert transport_mod._http2_enabled() is False
@@ -104,7 +104,7 @@ async def test_missing_h2_does_not_break_mock_request(monkeypatch):
     """端到端冒烟：h2 缺失降级后，请求仍能经 MockTransport 正常完成。"""
     import httpx
 
-    monkeypatch.setattr(transport_mod, "_H2_AVAILABLE", False)
+    monkeypatch.setattr(transport_mod, "_h2_available", False)
 
     transport = HTTPStreamTransport(proxy_url=None, timeout=30.0)
 
