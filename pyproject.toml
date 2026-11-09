@@ -80,6 +80,7 @@ addopts = "-p no:anyio"
 filterwarnings = [
     "error",
     "ignore:.*_UnionGenericAlias.*:DeprecationWarning:google\\.genai\\.types",
+    "ignore:Inheritance class AiohttpClientSession from ClientSession is discouraged:DeprecationWarning",
 ]
 
 [tool.ruff]
