@@ -98,3 +98,158 @@ async def test_rotation_status_and_clear_cooldown():
         )
         assert resp_clear.status_code == 200
         mock_rotator.clear_cooldown.assert_called_once_with("acc_1", model=None)
+
+
+class _FakeSignerResponse:
+    def __init__(self, status_code: int, text: str = "", json_data: object = None):
+        self.status_code = status_code
+        self.text = text
+        self._json = json_data
+
+    def json(self):
+        if self._json is None:
+            raise ValueError("no json body")
+        return self._json
+
+
+class _FakeSignerClient:
+    responses: list = []
+
+    def __init__(self, timeout: float = 8.0, proxy: str | None = None):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def get(self, url: str, headers: dict | None = None):
+        return type(self).responses.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_signer_server_test_legacy_200(monkeypatch):
+    """旧版签名服务：GET /health 无参返回 200。"""
+    _FakeSignerClient.responses = [
+        _FakeSignerResponse(200, json_data={"ok": True, "status": "healthy"})
+    ]
+    async with _client() as client:
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeSignerClient)
+        resp = await client.post(
+            "/config/signer-servers/test", json={"url": "https://waa.example.com"}
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["status_code"] == 200
+        assert data["data"]["status"] == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_signer_server_test_new_protocol_missing_cookies(monkeypatch):
+    """新版 spinsnow 协议：/health 缺 Cookie 返回 400 + Missing cookies，
+    应判定服务在线（ok=True）并附说明。"""
+    _FakeSignerClient.responses = [
+        _FakeSignerResponse(
+            400,
+            text='{"ok":false,"error":"Missing `cookies` query parameter or '
+            'X-Google-Cookies header"}',
+            json_data={
+                "ok": False,
+                "error": "Missing `cookies` query parameter or "
+                "X-Google-Cookies header",
+            },
+        )
+    ]
+    async with _client() as client:
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeSignerClient)
+        resp = await client.post(
+            "/config/signer-servers/test", json={"url": "https://waa.spinsnow.fun"}
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["status_code"] == 400
+        assert "服务在线" in data.get("note", "")
+
+
+@pytest.mark.asyncio
+async def test_signer_server_test_new_protocol_with_cookie_recheck(monkeypatch):
+    """新版协议且本地有活跃账号：携带 Cookie 复测应返回完整池化状态。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aistudio_api.infrastructure.account.account_store import AccountStore
+
+    fake_store = MagicMock(spec=AccountStore)
+    fake_store.get_active_account.return_value = MagicMock(id="acc_test")
+    fake_store.get_auth_path_optional.return_value = None  # 无 auth 文件则跳过复测
+    monkeypatch.setattr(AccountStore, "__new__", lambda cls, *a, **kw: fake_store)
+
+    _FakeSignerClient.responses = [
+        _FakeSignerResponse(
+            400,
+            text='{"ok":false,"error":"Missing `cookies` query parameter"}',
+            json_data={
+                "ok": False,
+                "error": "Missing `cookies` query parameter",
+            },
+        )
+    ]
+    async with _client() as client:
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeSignerClient)
+        resp = await client.post(
+            "/config/signer-servers/test", json={"url": "https://waa.spinsnow.fun"}
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_signer_server_test_other_400_stays_failed(monkeypatch):
+    """非缺 Cookie 的 400 仍应视为失败。"""
+    _FakeSignerClient.responses = [
+        _FakeSignerResponse(
+            400,
+            text='{"ok":false,"error":"Bad gateway"}',
+            json_data={"ok": False, "error": "Bad gateway"},
+        )
+    ]
+    async with _client() as client:
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeSignerClient)
+        resp = await client.post(
+            "/config/signer-servers/test", json={"url": "https://waa.example.com"}
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is False
+        assert data["status_code"] == 400
+
+
+@pytest.mark.asyncio
+async def test_signer_server_test_network_error(monkeypatch):
+    """网络不可达时返回 ok=False 与错误信息。"""
+
+    class _BrokenClient:
+        def __init__(self, timeout: float = 8.0, proxy: str | None = None):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url: str, headers: dict | None = None):
+            raise httpx.ConnectError("All connection attempts failed")
+
+    async with _client() as client:
+        monkeypatch.setattr(httpx, "AsyncClient", _BrokenClient)
+        resp = await client.post(
+            "/config/signer-servers/test", json={"url": "https://waa.example.com"}
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is False
+        assert "error" in data

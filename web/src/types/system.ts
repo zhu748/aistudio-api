@@ -51,10 +51,12 @@ export interface SignerServerItem {
   user_agent?: string
   headers?: Record<string, string>
   is_active?: boolean
+  env_locked?: boolean
 }
 
 export interface SignerServersResponse {
   active_server: string
+  env_override?: string | null
   servers: SignerServerItem[]
 }
 
@@ -69,6 +71,22 @@ export interface TestSignerServerResponse {
 export interface AvailableModelItem {
   id: string
   displayName: string
+}
+
+export interface LogEntry {
+  ts: string
+  ts_ms: number
+  level: string
+  name: string
+  message: string
+}
+
+export interface LogsResponse {
+  ok: boolean
+  count: number
+  total: number
+  capacity: number
+  logs: LogEntry[]
 }
 
 export interface AntiTruncationConfig {

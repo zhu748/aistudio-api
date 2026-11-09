@@ -15,6 +15,8 @@ import type {
   TestSignerServerResponse,
   AntiTruncationConfig,
   UpdateAntiTruncationConfigRequest,
+  LogsResponse,
+  LogEntry,
 } from '@/types'
 
 
@@ -107,7 +109,7 @@ export const systemApi = {
     return request<SignerServersResponse>('/config/signer-servers')
   },
 
-  switchSignerServer(serverId: string): Promise<{ ok: boolean; active_server: SignerServerItem }> {
+  switchSignerServer(serverId: string): Promise<{ ok: boolean; active_server: SignerServerItem; warning?: string | null }> {
     return request('/config/signer-servers/switch', {
       method: 'POST',
       body: JSON.stringify({ server_id: serverId }),
@@ -132,5 +134,24 @@ export const systemApi = {
       method: 'POST',
       body: JSON.stringify({ url }),
     })
+  },
+
+  getLogs(params: {
+    level?: string
+    limit?: number
+    search?: string
+    order?: string
+  }): Promise<LogsResponse> {
+    const q = new URLSearchParams()
+    if (params.level) q.set('level', params.level)
+    if (params.limit) q.set('limit', String(params.limit))
+    if (params.search && params.search.trim()) q.set('search', params.search.trim())
+    if (params.order) q.set('order', params.order)
+    const qs = q.toString()
+    return request<LogsResponse>(`/api/logs${qs ? `?${qs}` : ''}`)
+  },
+
+  clearLogs(): Promise<{ ok: boolean; removed: number }> {
+    return request('/api/logs', { method: 'DELETE' })
   },
 }

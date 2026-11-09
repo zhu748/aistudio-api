@@ -13,6 +13,7 @@ import {
   Activity,
   Check,
   Loader2,
+  Lock,
 } from 'lucide-vue-next'
 
 const emit = defineEmits<{
@@ -27,6 +28,7 @@ const testingId = ref<string | null>(null)
 const testResults = ref<Record<string, { ok: boolean; ms?: number; err?: string }>>({})
 
 const activeServerId = ref('local_spidermonkey')
+const envOverride = ref<string | null>(null)
 const servers = ref<SignerServerItem[]>([])
 
 const showModal = ref(false)
@@ -48,6 +50,7 @@ async function fetchServers() {
   try {
     const res = await systemApi.getSignerServers()
     activeServerId.value = res.active_server
+    envOverride.value = res.env_override ?? null
     servers.value = res.servers
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : '获取签名服务器列表失败'
@@ -63,12 +66,19 @@ async function handleSwitch(serverId: string) {
   try {
     const res = await systemApi.switchSignerServer(serverId)
     if (res.ok) {
-      activeServerId.value = serverId
+      // 以运行时实际生效的节点为准（环境变量锁定/本地二进制回退时可能与点击目标不同）
+      const activeId = res.active_server.id
+      activeServerId.value = activeId
       servers.value = servers.value.map(s => ({
         ...s,
-        is_active: s.id === serverId,
+        is_active: s.id === activeId,
+        env_locked: envOverride.value ? s.id === envOverride.value : s.env_locked,
       }))
-      toast.success(`已手动切换至签名服务器: ${res.active_server.name}`)
+      if (res.warning) {
+        toast.warning(res.warning, 8000)
+      } else {
+        toast.success(`已切换至签名服务器: ${res.active_server.name}`)
+      }
       emit('switched')
     }
   } catch (err: unknown) {
@@ -209,6 +219,17 @@ onMounted(() => {
       </button>
     </div>
 
+    <!-- Env Override Banner -->
+    <div
+      v-if="envOverride"
+      class="mt-3 flex items-start gap-2 px-3.5 py-2.5 rounded-xl bg-amber-50 border border-amber-200"
+    >
+      <Lock class="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+      <p class="text-xs text-amber-800 leading-relaxed">
+        当前运行时由环境变量 <code class="font-mono font-semibold">AISTUDIO_WAA_SERVER={{ envOverride }}</code> 锁定，面板切换仅写入配置文件，对本进程不生效；移除该环境变量并重启后，面板切换即完全生效。
+      </p>
+    </div>
+
     <!-- Server List -->
     <div class="mt-4 space-y-3">
       <div
@@ -234,6 +255,14 @@ onMounted(() => {
               >
                 <Check class="w-3 h-3" />
                 当前激活
+              </span>
+              <span
+                v-if="server.env_locked"
+                class="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium bg-amber-100 text-amber-800 rounded-md"
+                title="由环境变量 AISTUDIO_WAA_SERVER 锁定"
+              >
+                <Lock class="w-3 h-3" />
+                环境变量锁定
               </span>
               <span class="text-xs font-mono text-gray-500 bg-gray-100 px-1.5 py-0.5 rounded">
                 {{ server.url }}
