@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import yaml
@@ -436,9 +436,10 @@ async def switch_signer_server(req: SwitchSignerServerRequest) -> dict[str, obje
 
     target_id = req.server_id.strip()
     waa = get_configured_waa_settings()
+    raw_servers = waa.get("servers")
     known_ids = {
         str(s.get("id") or "").strip()
-        for s in (waa.get("servers") or [])
+        for s in (raw_servers if isinstance(raw_servers, list) else [])
         if isinstance(s, dict)
     }
     if target_id not in known_ids:
@@ -810,7 +811,9 @@ class UpdateAntiTruncationConfigRequest(BaseModel):
     models: list[str] | None = None
 
 
-def _anti_truncation_payload(models: list[Mapping[str, object]]) -> dict[str, object]:
+def _anti_truncation_payload(
+    models: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
     """组装面板所需的抗截断配置 + 可选模型列表（过滤生图/视频/音频）。"""
     from aistudio_api.infrastructure.gateway.model_defaults import (
         get_anti_truncation_settings,

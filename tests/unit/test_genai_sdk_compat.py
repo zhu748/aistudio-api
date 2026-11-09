@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -241,9 +242,11 @@ async def test_genai_sdk_function_calling_and_response_flow(
                     ],
                 ),
             ]
+            # SDK 1.68 的 contents 参数联合类型未声明 list[Content] 形态
+            # （运行时会正常归一化），此处用 cast 绕过类型检查器盲区
             turn2_resp = await aio_client.models.generate_content(
                 model="gemini-3.8-flash",
-                contents=turn2_contents,
+                contents=cast(Any, turn2_contents),
             )
             assert (
                 turn2_resp.text
