@@ -635,13 +635,13 @@ class UpdateApiKeyRequest(BaseModel):
 
 @protected_router.get("/api-keys", response_model=list[ApiKeyItemModel])
 async def list_api_keys() -> list[ApiKeyItemModel]:
-    """获取 config.yaml 中配置的 API Keys 列表。"""
+    """获取已配置的 API Keys 列表（config.yaml + 环境变量注入合并展示）。"""
     from aistudio_api.infrastructure.gateway.model_defaults import (
         get_configured_api_key_items,
     )
 
     items = get_configured_api_key_items()
-    return [
+    result = [
         ApiKeyItemModel(
             name=item.get("name") or "API Key",
             key=item.get("key") or "",
@@ -649,6 +649,23 @@ async def list_api_keys() -> list[ApiKeyItemModel]:
         )
         for item in items
     ]
+
+    # 追加环境变量注入的 Key（只读展示：来源 AISTUDIO_API_KEYS / AISTUDIO_API_KEY，
+    # 无法在 UI 中删除或修改，随容器重启自动恢复）
+    seen_keys = {item.get("key") for item in items}
+    from aistudio_api.config import settings
+
+    for key in sorted(settings.api_keys):
+        if key in seen_keys:
+            continue
+        result.append(
+            ApiKeyItemModel(
+                name="环境变量注入 (ENV)",
+                key=key,
+                created_at=None,
+            )
+        )
+    return result
 
 
 @protected_router.post("/api-keys", response_model=ApiKeyItemModel)

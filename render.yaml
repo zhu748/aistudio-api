@@ -41,6 +41,11 @@ services:
       # 【必填】Web 管理面板登录密码 —— 公网部署务必设置，否则面板裸奔
       - key: AISTUDIO_WEB_PASSWORD
         sync: false
+      # 【推荐】API 调用鉴权 Key（防止 /v1beta 接口被白嫖）。
+      # 多个用逗号/换行分隔或 JSON 数组，例: sk-aaa,sk-bbb
+      # 与 config.yaml 中面板创建的 Key 合并生效，重启后自动恢复。
+      - key: AISTUDIO_API_KEYS
+        sync: false
       # 【推荐】账号 Cookie 注入（免磁盘，重启自动恢复）。
       # 多条用换行分隔；单条支持三种格式（+ 为分隔符）：
       #   代理+Cookie   socks5://user:pass@host:port+SID=xxx; HSID=yyy

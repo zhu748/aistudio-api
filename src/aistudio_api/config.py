@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -34,6 +35,42 @@ def _load_bool_env(*names: str, default: bool) -> bool:
 
 def _load_web_password() -> str | None:
     return os.getenv("AISTUDIO_WEB_PASSWORD") or os.getenv("AISTUDIO_ADMIN_PASSWORD")
+
+
+def _load_api_keys() -> frozenset[str]:
+    """从环境变量加载 API Key 集合（AISTUDIO_API_KEYS / AISTUDIO_API_KEY）。
+
+    适用于无持久磁盘的 PaaS 部署：config.yaml 中的 api_keys 随重启丢失，
+    改由环境变量在每次启动时注入，与 config.yaml 中配置的 Key 合并生效。
+
+    取值支持三种等价写法：
+    - 逗号分隔:        AISTUDIO_API_KEYS=sk-aaa,sk-bbb
+    - 换行 / 字面 \\n:   多行值，或单行内嵌 \\n 转义
+    - JSON 字符串数组: AISTUDIO_API_KEYS=["sk-aaa","sk-bbb"]
+
+    单数别名 AISTUDIO_API_KEY（单个 Key，适合只注入一个的平台）可与
+    复数变量同时使用，自动合并去重；空值 / 纯空白条目自动忽略。
+    """
+    raw_values: list[str] = []
+    for name in ("AISTUDIO_API_KEYS", "AISTUDIO_API_KEY"):
+        value = os.getenv(name)
+        if value and value.strip():
+            raw_values.append(value.strip())
+
+    keys: list[str] = []
+    for raw in raw_values:
+        if raw.startswith("["):
+            try:
+                arr = json.loads(raw)
+            except json.JSONDecodeError:
+                arr = None
+            if isinstance(arr, list):
+                keys.extend(str(k).strip() for k in arr if str(k).strip())
+                continue
+        normalized = raw.replace("\\n", "\n")
+        keys.extend(part.strip() for part in re.split(r"[,\n]", normalized))
+
+    return frozenset(k for k in keys if k)
 
 
 def _load_dump_requests_env() -> bool:
@@ -203,7 +240,7 @@ class Settings:
     tmp_dir: str = os.getenv("AISTUDIO_TMP_DIR", tempfile.gettempdir())
     proxy_url: str | None = discover_proxy_url()
     web_password: str | None = _load_web_password()
-    api_keys: frozenset[str] = frozenset()
+    api_keys: frozenset[str] = _load_api_keys()
     timezone: str = resolve_timezone()
     data_dir: str = str(resolve_data_dir())
     accounts_dir: str = os.getenv("AISTUDIO_ACCOUNTS_DIR", "")
