@@ -14,9 +14,11 @@ HOST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$ARCH" in
   x86_64|amd64)
     GO_ARCH="amd64"
+    ZIG_ARCH="x86_64"
     ;;
   aarch64|arm64)
     GO_ARCH="arm64"
+    ZIG_ARCH="aarch64"
     ;;
   *)
     echo "不支持的架构: $ARCH" >&2
@@ -44,6 +46,7 @@ case "$TARGET_OS" in
     ;;
 esac
 
+# zig cc 的目标三元组用 LLVM 架构名（x86_64/aarch64），非 GO 风格（amd64/arm64）
 SM_ARCH="${OS_PREFIX}-${GO_ARCH}"
 DEPS_DIR="${SCRIPT_DIR}/.deps/spidermonkey/${SM_ARCH}"
 mkdir -p "$DEPS_DIR"
@@ -104,7 +107,10 @@ if [ ! -f "$DEPS_DIR/lib/libjs_static.a" ]; then
     fi
   fi
 
-  tar -xz -f "$TEMP_TAR" -C "$DEPS_DIR"
+  # --no-same-owner：依赖包在 Windows 环境打包（属主 uid 197609），
+  # user namespace 映射的容器（Render / rootless Docker）无法 chown，
+  # 会报 "Cannot change ownership ... Invalid argument" 直接失败，放弃恢复属主。
+  tar -xz -f "$TEMP_TAR" -C "$DEPS_DIR" --no-same-owner
   rm -f "$TEMP_TAR"
   echo ">>> SpiderMonkey 解压完成: ${DEPS_DIR}"
 fi
@@ -112,9 +118,9 @@ fi
 # 检查编译器
 if command -v zig >/dev/null 2>&1; then
   case "$TARGET_GOOS" in
-    linux)   ZIG_TARGET="${GO_ARCH}-linux-musl" ;;
-    darwin)  ZIG_TARGET="${GO_ARCH}-macos-none" ;;
-    windows) ZIG_TARGET="${GO_ARCH}-windows-gnu" ;;
+    linux)   ZIG_TARGET="${ZIG_ARCH}-linux-musl" ;;
+    darwin)  ZIG_TARGET="${ZIG_ARCH}-macos-none" ;;
+    windows) ZIG_TARGET="${ZIG_ARCH}-windows-gnu" ;;
   esac
   CC_CMD="zig cc -target ${ZIG_TARGET}"
   CXX_CMD="zig c++ -target ${ZIG_TARGET}"
