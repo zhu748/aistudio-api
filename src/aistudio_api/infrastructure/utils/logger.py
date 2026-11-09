@@ -7,18 +7,23 @@ variable or web configuration.
 Additionally mirrors every log record into an in-memory ring buffer so the
 web console can expose runtime logs (including upstream errors) via
 ``GET /api/logs`` — the operator should never face an "empty reply with
-no clue" situation again.
+no clue" situation again. New entries are also broadcast to registered
+subscribers so the web panel can stream them live via
+``GET /api/logs/stream`` (Server-Sent Events).
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import re
 import sys
+import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -36,6 +41,10 @@ _LEVEL_ORDER: dict[str, int] = {
 }
 
 _log_ring: deque[dict[str, object]] = deque(maxlen=_LOG_RING_CAPACITY)
+# 保护环形缓冲的并发访问：日志可能在任意线程产生（FastAPI 线程池、WAA
+# daemon 线程等），而面板查询/SSE 快照在事件循环线程读取。deque 在迭代
+# 期间被其他线程 append 会抛 RuntimeError，必须用锁串行化读写。
+_log_ring_lock = threading.Lock()
 
 
 class RingBufferHandler(logging.Handler):
@@ -48,15 +57,19 @@ class RingBufferHandler(logging.Handler):
                 exc_text = self._format_exc_tail(record)
                 if exc_text:
                     message = f"{message}\n{exc_text}"
-            _log_ring.append(
-                {
-                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "ts_ms": int(record.created * 1000),
-                    "level": record.levelname,
-                    "name": record.name,
-                    "message": message,
-                }
-            )
+            entry: dict[str, object] = {
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "ts_ms": int(record.created * 1000),
+                "level": record.levelname,
+                "name": record.name,
+                "message": message,
+            }
+            with _log_ring_lock:
+                _log_ring.append(entry)
+            # 同步广播给实时订阅者（面板 SSE 日志流），与环形缓冲共享同一对象。
+            # 放在锁外：订阅回调只做 call_soon_threadsafe 入队，但为避免任何
+            # 潜在的慢回调阻塞日志主链路，不与缓冲写入互斥。
+            _publish_log_entry(entry)
         except Exception:
             self.handleError(record)
 
@@ -86,8 +99,12 @@ def get_recent_logs(
     """
     min_no = _LEVEL_ORDER.get(str(min_level).strip().upper(), logging.INFO)
     needle = (search or "").strip().lower()
+    # 锁内快照：避免迭代期间其他线程 append 触发
+    # "deque mutated during iteration" RuntimeError
+    with _log_ring_lock:
+        snapshot = list(_log_ring)
     matched: list[dict[str, object]] = []
-    for entry in _log_ring:
+    for entry in snapshot:
         if _LEVEL_ORDER.get(str(entry.get("level")), logging.INFO) < min_no:
             continue
         if needle:
@@ -105,14 +122,73 @@ def get_recent_logs(
 
 def clear_recent_logs() -> int:
     """清空内存日志缓冲，返回清空前条数。"""
-    count = len(_log_ring)
-    _log_ring.clear()
+    with _log_ring_lock:
+        count = len(_log_ring)
+        _log_ring.clear()
     return count
 
 
 def get_log_buffer_stats() -> dict[str, int]:
     """返回日志环形缓冲的容量与当前条数。"""
-    return {"capacity": _LOG_RING_CAPACITY, "size": len(_log_ring)}
+    with _log_ring_lock:
+        return {"capacity": _LOG_RING_CAPACITY, "size": len(_log_ring)}
+
+
+# ---------------------------------------------------------------------------
+# 日志实时订阅（供 Web 面板 /api/logs/stream SSE 增量推送）
+# ---------------------------------------------------------------------------
+
+_LogSubscriber = Callable[[dict[str, object]], None]
+_log_subscribers: dict[int, _LogSubscriber] = {}
+_log_subscriber_lock = threading.Lock()
+_log_subscriber_seq = 0
+
+
+def subscribe_log_entries(callback: _LogSubscriber) -> int:
+    """注册实时日志订阅回调，返回可用于取消的订阅句柄。
+
+    回调会在产生日志的线程中被同步调用，订阅方需自行保证线程安全
+    （例如通过 ``loop.call_soon_threadsafe`` 把条目投递到自己的事件循环）。
+    """
+    global _log_subscriber_seq
+    with _log_subscriber_lock:
+        _log_subscriber_seq += 1
+        handle: int = _log_subscriber_seq
+        _log_subscribers[handle] = callback
+    return handle
+
+
+def unsubscribe_log_entries(handle: int) -> None:
+    """按句柄取消实时日志订阅（句柄不存在时静默忽略）。"""
+    with _log_subscriber_lock:
+        _log_subscribers.pop(handle, None)
+
+
+def get_log_subscriber_count() -> int:
+    """返回当前活跃的实时日志订阅连接数。"""
+    with _log_subscriber_lock:
+        return len(_log_subscribers)
+
+
+def _publish_log_entry(entry: dict[str, object]) -> None:
+    """把新日志条目广播给所有订阅者；订阅方异常绝不影响日志主链路。"""
+    if not _log_subscribers:
+        return
+    with _log_subscriber_lock:
+        callbacks = tuple(_log_subscribers.values())
+    for callback in callbacks:
+        with contextlib.suppress(Exception):
+            # 订阅方异常绝不影响日志主链路，也不影响其他订阅者
+            callback(entry)
+
+
+def passes_min_level(level_name: str, min_level: str = "INFO") -> bool:
+    """判断日志级别是否不低于给定最低级别（供查询与流式推送共用）。"""
+    level_no = _LEVEL_ORDER.get(str(level_name).strip().upper())
+    min_no = _LEVEL_ORDER.get(str(min_level).strip().upper(), logging.INFO)
+    if level_no is None:
+        level_no = logging.INFO
+    return level_no >= min_no
 
 
 _UNIFIED_LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
@@ -405,7 +481,7 @@ def get_logger(name: str = "aistudio") -> logging.Logger:
 dump_logger = get_logger("dump")
 
 _SENSITIVE_FIELD_RE = re.compile(
-    r"(?i)(authorization|api[_-]?key|cookie|set-cookie|token|secret|password|auth)"
+    r"(?i)(authorization|api[_-]?key|(^|[^a-z0-9])key|cookie|set-cookie|token|secret|password|auth)"
 )
 
 

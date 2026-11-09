@@ -8,7 +8,8 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import yaml
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from aistudio_api.api.dependencies import get_runtime_state
@@ -741,6 +742,150 @@ async def clear_runtime_logs() -> dict[str, object]:
     logger.info("内存日志缓冲已清空: 清除条数=%d", removed)
     stats = get_log_buffer_stats()
     return {"ok": True, "removed": removed, "total": stats["size"], "capacity": stats["capacity"]}
+
+
+@protected_router.get("/api/logs/stream")
+async def stream_runtime_logs(
+    request: Request,
+    level: str = "INFO",
+    limit: int = 300,
+) -> StreamingResponse:
+    """SSE 实时日志流：连接后先下发历史快照，随后持续增量推送新日志。
+
+    - ``level``: 最低日志级别过滤（连接期间固定，切换级别由前端重连实现）
+    - ``limit``: 初始历史快照条数上限（1~500）
+    - 鉴权复用 ``require_web_auth``：浏览器 EventSource 无法携带自定义请求头，
+      因此可通过 ``?key=`` 查询参数传递管理密码（鉴权依赖原生支持该方式）
+    - 空闲期每 20 秒发送一次 ``ping`` 心跳事件（附带缓冲统计），
+      既防止反向代理层超时断连，也作为前端 total/capacity 的低频刷新源
+
+    事件协议：
+    ``ready``     连接确认（附带缓冲统计与订阅级别）
+    ``snapshot``  历史快照（正序日志数组，重连时前端用它整体替换本地列表）
+    ``log``       单条增量日志
+    ``ping``      心跳（附带缓冲统计）
+    """
+    import asyncio
+    import json as _json
+    from collections.abc import AsyncIterator
+
+    from aistudio_api.infrastructure.utils.logger import (
+        get_log_buffer_stats,
+        get_recent_logs,
+        passes_min_level,
+        subscribe_log_entries,
+        unsubscribe_log_entries,
+    )
+
+    clean_level = str(level or "INFO").strip().upper()
+    if clean_level not in _LOG_LEVELS:
+        clean_level = "INFO"
+    try:
+        clean_limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        clean_limit = 300
+
+    def _sse(event: str, payload: object) -> str:
+        data = _json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        return f"event: {event}\ndata: {data}\n\n"
+
+    async def _event_stream() -> AsyncIterator[str]:
+        queue: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=1000)
+        loop = asyncio.get_running_loop()
+
+        def _on_entry(entry: dict[str, object]) -> None:
+            # 级别过滤在入队前完成，低于订阅级别的日志不占用连接带宽
+            if not passes_min_level(str(entry.get("level")), clean_level):
+                return
+
+            def _put() -> None:
+                try:
+                    queue.put_nowait(entry)
+                except asyncio.QueueFull:
+                    # 慢消费者：丢弃最旧一条，优先保留最新日志
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        queue.get_nowait()
+                    with contextlib.suppress(asyncio.QueueFull):
+                        queue.put_nowait(entry)
+
+            with contextlib.suppress(RuntimeError):
+                # 事件循环已关闭（进程关闭阶段）会抛 RuntimeError，静默丢弃
+                loop.call_soon_threadsafe(_put)
+
+        handle = subscribe_log_entries(_on_entry)
+        pushed = 0
+        t_start = time.perf_counter()
+        client_ip = request.client.host if request.client else "unknown"
+        logger.info("面板实时日志流已连接: 客户端=%s, 级别>=%s", client_ip, clean_level)
+        try:
+            # 1) ready：连接确认 + 缓冲统计（字段命名与 /api/logs 响应保持一致）
+            stats = get_log_buffer_stats()
+            yield _sse(
+                "ready",
+                {
+                    "ok": True,
+                    "level": clean_level,
+                    "total": stats["size"],
+                    "capacity": stats["capacity"],
+                },
+            )
+            # 2) 历史快照：在订阅之后读取，保证快照与增量流无缝衔接
+            snapshot = get_recent_logs(
+                min_level=clean_level,
+                limit=clean_limit,
+                order="asc",
+            )
+            if snapshot:
+                yield _sse("snapshot", {"count": len(snapshot), "logs": snapshot})
+            # 3) 先排空订阅瞬间积压的增量（跳过已包含在快照中的条目，按对象身份去重）
+            snapshot_ids = {id(entry) for entry in snapshot}
+            backlog: list[dict[str, object]] = []
+            while True:
+                try:
+                    pending = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if id(pending) not in snapshot_ids:
+                    backlog.append(pending)
+            for entry in backlog:
+                yield _sse("log", entry)
+                pushed += 1
+            # 4) 持续增量推送 + 空闲心跳
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    entry = await asyncio.wait_for(queue.get(), timeout=20.0)
+                except TimeoutError:
+                    stats = get_log_buffer_stats()
+                    yield _sse(
+                        "ping",
+                        {
+                            "ok": True,
+                            "total": stats["size"],
+                            "capacity": stats["capacity"],
+                        },
+                    )
+                    continue
+                yield _sse("log", entry)
+                pushed += 1
+        finally:
+            unsubscribe_log_entries(handle)
+            logger.info(
+                "面板实时日志流已断开: 客户端=%s, 推送条数=%d, 持续=%.1fs",
+                client_ip,
+                pushed,
+                time.perf_counter() - t_start,
+            )
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 class LoggingConfigRequest(BaseModel):
