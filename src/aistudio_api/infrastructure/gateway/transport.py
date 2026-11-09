@@ -6,6 +6,7 @@ using connection pooling and chunk streaming.
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import AsyncGenerator
 
@@ -89,6 +90,13 @@ def _sync_response_cookies(
         )
     except Exception as e:
         logger.debug("持久化 Set-Cookie 失败: %s", e)
+
+
+def _mask_proxy_url(proxy_url: str | None) -> str:
+    """脱敏代理地址中的账号密码，避免日志泄漏凭据。"""
+    if not proxy_url:
+        return "(直连)"
+    return re.sub(r"//[^@/]+@", "//***@", str(proxy_url))
 
 
 async def _ensure_authorization_header(
@@ -216,7 +224,12 @@ class HTTPStreamTransport:
             err_detail = (
                 f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
             )
-            logger.error("HTTP 请求失败: url=%s, error=%s", url, err_detail)
+            logger.error(
+                "HTTP 请求失败: url=%s, proxy=%s, error=%s",
+                url,
+                _mask_proxy_url(proxy_url),
+                err_detail,
+            )
             raise TransportError(f"HTTP request failed: {err_detail}") from exc
 
     async def send_streaming_request(
@@ -265,7 +278,12 @@ class HTTPStreamTransport:
             err_detail = (
                 f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
             )
-            logger.warning("流式传输异常: %s", err_detail)
+            logger.warning(
+                "流式传输异常: url=%s, proxy=%s, error=%s",
+                url,
+                _mask_proxy_url(proxy_url),
+                err_detail,
+            )
             yield ("error", err_detail)
         finally:
             if resp is not None:

@@ -527,8 +527,27 @@ if response.function_calls:
 
 - **仪表盘 (Dashboard)**：实时展示服务健康状况、各模型请求量、成功率及 429 冷却指标。
 - **账号管理 (Accounts)**：支持 Cookie 单条与凭据包批量导入、自动探测多账号、手动切换当前活跃账号或重置冷却状态。
+- **运行日志 (Logs)**：内存环形缓冲最近 2000 条日志，3 秒自动刷新，支持级别过滤（信息/警告+/错误+）与关键字检索，可一键清空。
 - **系统设置 (Settings)**：在线编辑 `config.yaml`（支持配置 profiles 与 models 默认规则），保存后服务端即时热重载。
 - **访问鉴权**：设置环境变量 `AISTUDIO_WEB_PASSWORD` 后自动开启登录鉴权守卫。
+
+### 失败排查：请求失败 / 空回看哪里
+
+请求失败或"空回"时**错误原因会直接透传到客户端回复里**（形如 `[aistudio-api 请求失败 502 UNAVAILABLE] HTTP request failed: ConnectError ...`），无需登录服务器即可定位：
+
+- `[aistudio-api 请求失败 ...]` —— 上游/签名/代理失败的具体原因（502 = 传输或签名失败、403 = 账号风控、429 = 配额耗尽）；
+- `[aistudio-api 空回诊断] ...` —— 上游返回 200 但零内容（多为账号风控拦截）。
+
+更完整的上下文在 **Web 控制台 → 运行日志 (Logs)**：传输与签名失败日志会注明所用代理地址与签名服务地址（凭据自动脱敏）；PaaS 部署也可查看平台日志流（stdout 同步输出）。
+
+常见根因速查：
+
+| 现象 | 典型原因 |
+| --- | --- |
+| `ConnectError / ConnectTimeout`（502） | `AISTUDIO_PROXY` 指向了部署环境无法访问的代理（如把本地 SOCKS5 代理变量带上了 PaaS）；删除该环境变量改直连即可 |
+| `Remote proof minting failed (server=...)` | WAA 签名服务不可达或拒绝：在 设置 → 签名服务 切换节点（本地/远程面板切换即时生效） |
+| 403 PERMISSION_DENIED | 账号级风控：需在 Google 账号完成手机绑定/年龄验证后恢复 |
+| 429 RESOURCE_EXHAUSTED | 账号当日配额耗尽，多账号轮换或等待 00:00 PST 重置 |
 
 ---
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import time
 from typing import Any
 
@@ -89,6 +90,12 @@ class RemoteProofSigner:
             await self._client.aclose()
             self._client = None
 
+    def _masked_proxy(self) -> str:
+        """脱敏代理地址中的账号密码，用于日志输出。"""
+        if not self.proxy_url:
+            return "(直连)"
+        return re.sub(r"//[^@/]+@", "//***@", str(self.proxy_url))
+
     async def mint_proof(
         self,
         *,
@@ -161,9 +168,11 @@ class RemoteProofSigner:
             except (httpx.TransportError, httpx.TimeoutException) as e:
                 last_error = e
                 logger.warning(
-                    "连接签名服务失败 (%d/%d): %s",
+                    "连接签名服务失败 (%d/%d): server=%s, proxy=%s, error=%s",
                     attempt,
                     max_attempts,
+                    self.server_url,
+                    self._masked_proxy(),
                     e,
                 )
                 # Reset client on connection errors to discard stale connections
@@ -175,16 +184,18 @@ class RemoteProofSigner:
             except Exception as e:
                 last_error = e
                 logger.warning(
-                    "请求签名服务异常 (%d/%d): %s",
+                    "请求签名服务异常 (%d/%d): server=%s, error=%s",
                     attempt,
                     max_attempts,
+                    self.server_url,
                     e,
                 )
                 if attempt < max_attempts:
                     await asyncio.sleep(0.5)
 
         raise TransportError(
-            f"Remote proof minting failed after {max_attempts} attempts: {last_error}"
+            f"Remote proof minting failed after {max_attempts} attempts "
+            f"(server={self.server_url}): {last_error}"
         )
 
 
