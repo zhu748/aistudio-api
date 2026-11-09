@@ -14,6 +14,7 @@ from aistudio_api.api.response_models import (
     GeminiCandidateResponse,
     GeminiContentResponse,
     GeminiGenerateContentResponse,
+    GeminiPartResponse,
 )
 from aistudio_api.api.responses import to_gemini_parts, to_gemini_usage_metadata
 from aistudio_api.api.schemas import GeminiGenerateContentRequest
@@ -562,7 +563,18 @@ async def handle_gemini_generate_content(
                 pt,
                 ct,
             )
-            return _build_gemini_response_from_output(output, normalized.model)
+            response_obj = _build_gemini_response_from_output(output, normalized.model)
+            # 空回防护：上游 200 但零内容时注入可见诊断文本，避免客户端空回无从排查
+            if not has_any_output:
+                diagnostic = (
+                    "[aistudio-api 空回诊断] 上游返回 200 但内容为空 "
+                    f"(finish={final_fr})。"
+                    "可能为账号风控拦截或安全策略，请在面板“运行日志”页查看详情。"
+                )
+                response_obj.candidates[0].content.parts.append(
+                    GeminiPartResponse(text=diagnostic)
+                )
+            return response_obj
         except Exception as exc:
             last_error = exc
             if isinstance(exc, AuthError) and not isinstance(exc, SessionExpiredError):
@@ -700,6 +712,24 @@ def format_sse_error(exc: Exception) -> str:
     )
 
 
+_ERROR_TEXT_PREFIX = "[aistudio-api 请求失败"
+
+
+def format_sse_error_text(exc: Exception) -> str | None:
+    """把失败原因格式化为可见文本 part 的 SSE 事件。
+
+    背景：Chatbox 等客户端的 Gemini 流式解析器只读
+    ``candidates[].content.parts[].text``，会直接忽略 ``{"error": ...}`` 事件，
+    导致失败时表现为“空回啥都没有”。此事件把具体错误原因作为正常文本
+    part 下发，任何客户端都能看到，避免静默空回。
+    """
+    code, msg, status_str = classify_gemini_error_payload(exc)
+    if not msg:
+        msg = type(exc).__name__
+    text = f"{_ERROR_TEXT_PREFIX} {code} {status_str}] {msg}"
+    return format_sse_event("body", text)
+
+
 def _build_gemini_streaming_response(
     *,
     client: AIStudioClient,
@@ -711,6 +741,7 @@ def _build_gemini_streaming_response(
     async def stream_response():
         normalized = None
         stream_start_time = time.perf_counter()
+        has_yielded_any = False
         try:
             logger.info(
                 "流式请求: model=%s, 轮数=%d",
@@ -772,6 +803,7 @@ def _build_gemini_streaming_response(
                             output, normalized.model
                         )
                         has_yielded_data = True
+                        has_yielded_any = True
                         yield (
                             "data: "
                             + json.dumps(
@@ -834,6 +866,7 @@ def _build_gemini_streaming_response(
                                         ttft_ms,
                                     )
                                 has_yielded_data = True
+                                has_yielded_any = True
                                 yield chunk
                     auth_manager.current_prepared = None
                     stream_completed = True
@@ -867,7 +900,8 @@ def _build_gemini_streaming_response(
             if not stream_completed and last_stream_error is not None:
                 raise last_stream_error
             target_model = normalized.model if normalized else model_path
-            # 空回防护：流式完成但未产出任何内容时留下明确日志
+            # 空回防护：流式完成但未产出任何内容时，注入可见诊断文本，
+            # 避免客户端收到 200 却“空回啥都没有”无从排查
             if stream_completed and not has_yielded_data and not force_buffer:
                 logger.warning(
                     "流式完成但未产生任何内容（可能是上游风控拦截或安全策略）: "
@@ -875,6 +909,15 @@ def _build_gemini_streaming_response(
                     target_model,
                     final_finish_reason,
                 )
+                diagnostic = (
+                    "[aistudio-api 空回诊断] 上游返回 200 但内容为空 "
+                    f"(finish={final_finish_reason})。"
+                    "可能为账号风控拦截或安全策略，请在面板“运行日志”页查看详情。"
+                )
+                diagnostic_chunk = format_sse_event("body", diagnostic)
+                if diagnostic_chunk:
+                    has_yielded_any = True
+                    yield diagnostic_chunk
             record_rotator_event("success", model=target_model, usage=final_usage)
             if normalized is not None:
                 runtime_state.record(
@@ -901,7 +944,26 @@ def _build_gemini_streaming_response(
                 response_id=latest_response_id,
             )
         except Exception as exc:
-            logger.warning("流式生成异常: model=%s, error=%s", model_path, exc)
+            elapsed_ms = (time.perf_counter() - stream_start_time) * 1000
+            code, msg, status_str = classify_gemini_error_payload(exc)
+            logger.warning(
+                "流式生成失败: model=%s, 耗时=%.1fms, code=%d(%s), "
+                "已输出内容=%s, 异常类型=%s, 原因=%s",
+                model_path,
+                elapsed_ms,
+                code,
+                status_str,
+                "是" if has_yielded_any else "否",
+                type(exc).__name__,
+                msg,
+            )
+            # 错误透传：尚未输出任何内容时，把具体失败原因作为可见文本 part
+            # 下发，避免 Chatbox 等客户端只忽略 {"error":...} 事件而表现为空回；
+            # 已输出部分内容时不追加，保持正文纯净（仅下发结构化错误事件）。
+            if not has_yielded_any:
+                error_text_chunk = format_sse_error_text(exc)
+                if error_text_chunk:
+                    yield error_text_chunk
             yield format_sse_error(exc)
 
     return StreamingResponse(
