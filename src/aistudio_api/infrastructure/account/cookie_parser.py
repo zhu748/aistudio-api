@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -388,6 +390,184 @@ def parse_cookie_string(
     return {"cookies": cookies}
 
 
+# ========== 环境变量 Cookie 注入（AISTUDIO_COOKIES / AISTUDIO_COOKIES_<N> / AISTUDIO_COOKIES_FILE） ==========
+
+_PROXY_SCHEMES: tuple[str, ...] = (
+    "http://",
+    "https://",
+    "socks4://",
+    "socks5://",
+    "socks5h://",
+)
+
+
+def normalize_proxy_url(candidate: str | None) -> str | None:
+    """规整代理地址：补全 ``http://`` 前缀，无法识别时返回 None。"""
+    if not candidate:
+        return None
+    text = candidate.strip().rstrip("/")
+    if not text:
+        return None
+    if text.lower().startswith(_PROXY_SCHEMES):
+        return text
+    # host:port 形式视为隐式 HTTP 代理（如 127.0.0.1:7890）
+    if re.fullmatch(r"[A-Za-z0-9_.\-]+:\d{2,5}", text):
+        return f"http://{text}"
+    return None
+
+
+def _looks_like_proxy(candidate: str) -> bool:
+    """判断片段是否形似代理地址：含协议头或 host:port，且不含 Cookie 特征（= / ;）。"""
+    text = candidate.strip()
+    if not text or "=" in text or ";" in text:
+        return False
+    if "://" in text:
+        return True
+    return bool(re.fullmatch(r"[A-Za-z0-9_.\-]+:\d{2,5}", text))
+
+
+def _has_core_cookies(raw: object) -> bool:
+    """判断内容能否解析出 Google 核心鉴权 Cookie。"""
+    parsed = parse_raw_cookies(raw)
+    if not parsed:
+        return False
+    return any(k in ROTATE_COOKIE_WHITELIST for k in parsed)
+
+
+def split_proxy_cookie_entry(entry: str) -> tuple[str | None, str]:
+    """拆分单条环境变量注入项，支持「代理+Cookie」「仅 Cookie」「Cookie+代理」三种格式。
+
+    Cookie 值本身可能包含 ``+``（如 base64 取值），因此不能简单按第一个加号切分：
+    只有当某一侧形似代理地址、且另一侧能解析出核心 Cookie 时才认定切分有效。
+    优先从左向右扫描（代理在前），失败后从右向左扫描（代理在后），均失败则整体视为纯 Cookie。
+    """
+    text = entry.strip()
+    if "+" not in text:
+        return None, text
+
+    # 代理在前：从左向右寻找第一个有效切点
+    pos = 0
+    while True:
+        idx = text.find("+", pos)
+        if idx < 0:
+            break
+        left, right = text[:idx], text[idx + 1 :]
+        if _looks_like_proxy(left) and _has_core_cookies(right):
+            return normalize_proxy_url(left), right.strip()
+        pos = idx + 1
+
+    # Cookie 在前：从右向左寻找第一个有效切点
+    pos = len(text)
+    while True:
+        idx = text.rfind("+", 0, pos)
+        if idx < 0:
+            break
+        left, right = text[:idx], text[idx + 1 :]
+        if _looks_like_proxy(right) and _has_core_cookies(left):
+            return normalize_proxy_url(right), left.strip()
+        pos = idx
+
+    return None, text
+
+
+@dataclass(slots=True)
+class EnvCookieEntry:
+    """单条环境变量 Cookie 注入项（已解析、已校验）。"""
+
+    index: int
+    raw: str
+    proxy_url: str | None
+    cookie_raw: str
+    cookies: dict[str, str] = field(default_factory=dict)
+    storage_state: dict[str, object] = field(default_factory=dict)
+    anchor: str = ""
+    id_hash: str = ""
+
+
+def _split_env_lines(value: str) -> list[str]:
+    """按换行拆分环境变量值，兼容 JSON 字符串数组与字面 ``\\n`` 转义两种写法。"""
+    text = value.strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, list):
+                return [str(x).strip() for x in obj if str(x).strip()]
+        except Exception:
+            pass
+    # docker run -e / PaaS 面板无法传入真实换行时，允许用字面 \n 分隔多条
+    text = text.replace("\\r\\n", "\n").replace("\\n", "\n")
+    return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+
+def collect_env_cookie_raw_values() -> list[str]:
+    """收集 AISTUDIO_COOKIES / AISTUDIO_COOKIES_<N> / AISTUDIO_COOKIES_FILE 的原始注入项。"""
+    raw_values: list[str] = []
+
+    main_value = (os.getenv("AISTUDIO_COOKIES") or "").strip()
+    if main_value:
+        raw_values.extend(_split_env_lines(main_value))
+
+    # 编号变量：AISTUDIO_COOKIES_1、AISTUDIO_COOKIES_2 ... 按序号升序合并
+    numbered: list[tuple[int, str]] = []
+    for name, value in os.environ.items():
+        m = re.fullmatch(r"AISTUDIO_COOKIES_(\d{1,3})", name)
+        if m and value.strip():
+            numbered.append((int(m.group(1)), value.strip()))
+    numbered.sort(key=lambda kv: kv[0])
+    raw_values.extend(v for _, v in numbered)
+
+    file_path = (os.getenv("AISTUDIO_COOKIES_FILE") or "").strip()
+    if file_path:
+        try:
+            content = Path(file_path).expanduser().read_text(encoding="utf-8")
+            raw_values.extend(_split_env_lines(content))
+        except OSError as e:
+            logger.warning("读取 AISTUDIO_COOKIES_FILE 失败: %s (%s)", file_path, e)
+
+    return raw_values
+
+
+def parse_env_cookie_entries(raw_values: list[str]) -> list[EnvCookieEntry]:
+    """将原始注入项列表解析为已校验的 EnvCookieEntry 列表（无效项跳过并告警）。"""
+    entries: list[EnvCookieEntry] = []
+    seen_hashes: set[str] = set()
+    for idx, raw in enumerate(raw_values, start=1):
+        if not raw.strip():
+            continue
+        proxy_url, cookie_raw = split_proxy_cookie_entry(raw)
+        if not _has_core_cookies(cookie_raw):
+            logger.warning(
+                "环境变量 Cookie 注入项 #%d 未解析出核心鉴权 Cookie，已跳过", idx
+            )
+            continue
+        cookies = parse_raw_cookies(cookie_raw)
+        storage_state = parse_cookie_string(cookie_raw)
+        anchor = compute_session_anchor(cookies)
+        digest_src = anchor or json.dumps(cookies, sort_keys=True, ensure_ascii=False)
+        id_hash = hashlib.sha256(digest_src.encode("utf-8")).hexdigest()[:10]
+        if id_hash in seen_hashes:
+            logger.warning(
+                "环境变量 Cookie 注入项 #%d 与此前条目属于同一会话，已跳过重复项", idx
+            )
+            continue
+        seen_hashes.add(id_hash)
+        entries.append(
+            EnvCookieEntry(
+                index=idx,
+                raw=raw,
+                proxy_url=proxy_url,
+                cookie_raw=cookie_raw,
+                cookies=cookies,
+                storage_state=storage_state,
+                anchor=anchor,
+                id_hash=id_hash,
+            )
+        )
+    return entries
+
+
 def get_auth_user_from_meta(auth_file: str | Path | None) -> str:
     """Read auth_user index from meta.json adjacent to auth_file."""
     if auth_file:
@@ -412,6 +592,21 @@ def get_tier_from_meta(auth_file: str | Path | None) -> str:
         except Exception:
             pass
     return "Free"
+
+
+def get_proxy_from_meta(auth_file: str | Path | None) -> str | None:
+    """Read per-account proxy URL from meta.json adjacent to auth_file."""
+    if auth_file:
+        try:
+            meta_path = Path(auth_file).parent / "meta.json"
+            if meta_path.is_file():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                raw = meta.get("proxy_url")
+                if raw:
+                    return normalize_proxy_url(str(raw))
+        except Exception:
+            pass
+    return None
 
 
 def load_cookies_from_auth_file(auth_file: str | Path | None) -> dict[str, str]:
@@ -463,6 +658,7 @@ async def probe_account_emails_map(
     auth_user: str = "0",
     *,
     client: httpx.AsyncClient | None = None,
+    proxy_url: str | None = None,
 ) -> dict[str, str]:
     """通过 Google OneGoogleWidget / AI Studio 页面探测全部已登录子账号的邮箱映射。"""
     cookie_dict = (
@@ -506,7 +702,7 @@ async def probe_account_emails_map(
         if client is not None:
             return await _do_fetch(client)
         async with httpx.AsyncClient(
-            timeout=8.0, proxy=settings.proxy_url, follow_redirects=True
+            timeout=8.0, proxy=proxy_url or settings.proxy_url, follow_redirects=True
         ) as new_client:
             return await _do_fetch(new_client)
     except Exception as e:
@@ -519,17 +715,18 @@ async def probe_account_email(
     auth_user: str = "0",
     *,
     client: httpx.AsyncClient | None = None,
+    proxy_url: str | None = None,
 ) -> str | None:
     """探测单个指定 auth_user 的登录邮箱。"""
     u_index = str(auth_user or "0")
     emails_map = await probe_account_emails_map(
-        raw_or_dict, auth_user=u_index, client=client
+        raw_or_dict, auth_user=u_index, client=client, proxy_url=proxy_url
     )
     if u_index in emails_map:
         return emails_map[u_index]
     if u_index != "0":
         root_map = await probe_account_emails_map(
-            raw_or_dict, auth_user="0", client=client
+            raw_or_dict, auth_user="0", client=client, proxy_url=proxy_url
         )
         if u_index in root_map:
             return root_map[u_index]
@@ -541,6 +738,7 @@ async def probe_account_benefit_tier(
     auth_user: str = "0",
     *,
     client: httpx.AsyncClient | None = None,
+    proxy_url: str | None = None,
 ) -> str:
     """通过 GetAiStudioBenefitTier RPC 探测指定子账号的订阅权益等级。"""
     cookie_dict = (
@@ -569,7 +767,9 @@ async def probe_account_benefit_tier(
             if resp.status_code == 200:
                 return parse_benefit_tier_response(resp.text)
             return "Free"
-        async with httpx.AsyncClient(timeout=8.0, proxy=settings.proxy_url) as new_cli:
+        async with httpx.AsyncClient(
+            timeout=8.0, proxy=proxy_url or settings.proxy_url
+        ) as new_cli:
             resp = await new_cli.post(tier_url, headers=headers, content="[]")
             if resp.status_code == 200:
                 return parse_benefit_tier_response(resp.text)
@@ -583,6 +783,7 @@ async def probe_aistudio_session(
     *,
     client: httpx.AsyncClient | None = None,
     user_agent: str | None = None,
+    proxy_url: str | None = None,
 ) -> tuple[bool, str]:
     """探测 AI Studio 登录会话是否仍然存活。
 
@@ -632,7 +833,9 @@ async def probe_aistudio_session(
         if client is not None:
             return await _do_probe(client)
         async with httpx.AsyncClient(
-            timeout=10.0, proxy=settings.proxy_url, follow_redirects=False
+            timeout=10.0,
+            proxy=proxy_url or settings.proxy_url,
+            follow_redirects=False,
         ) as new_client:
             return await _do_probe(new_client)
     except Exception as e:
@@ -645,6 +848,7 @@ async def rotate_google_cookies(
     client: httpx.AsyncClient | None = None,
     user_agent: str | None = None,
     timeout: float = 15.0,
+    proxy_url: str | None = None,
 ) -> dict[str, object]:
     """调用 accounts.google.com/RotateCookies 刷新短效滚动凭据 (__Secure-1PSIDTS / SIDCC)。
 
@@ -716,7 +920,7 @@ async def rotate_google_cookies(
         if client is not None:
             return await _do_rotate(client)
         async with httpx.AsyncClient(
-            timeout=timeout, proxy=settings.proxy_url
+            timeout=timeout, proxy=proxy_url or settings.proxy_url
         ) as new_client:
             return await _do_rotate(new_client)
     except Exception as e:
@@ -728,6 +932,7 @@ async def probe_google_accounts_infinite(
     raw_or_dict: object,
     *,
     max_fails_in_a_row: int = 1,
+    proxy_url: str | None = None,
 ) -> list[dict[str, object]]:
     """一路向下探测多账号登录索引（u/0, u/1, u/2...），直到探测失败为止。
 
@@ -746,7 +951,9 @@ async def probe_google_accounts_infinite(
 
     auth_user_idx = 0
     consecutive_failures = 0
-    async with httpx.AsyncClient(timeout=10.0, proxy=settings.proxy_url) as client:
+    async with httpx.AsyncClient(
+        timeout=10.0, proxy=proxy_url or settings.proxy_url
+    ) as client:
         emails_map = await probe_account_emails_map(
             cookie_dict, auth_user="0", client=client
         )

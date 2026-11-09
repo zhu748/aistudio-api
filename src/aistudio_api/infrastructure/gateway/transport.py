@@ -146,22 +146,29 @@ class HTTPStreamTransport:
     def __init__(self, proxy_url: str | None = None, timeout: float = 120.0) -> None:
         self.proxy_url = proxy_url or settings.proxy_url
         self.timeout = timeout
-        self._client: httpx.AsyncClient | None = None
+        # 按代理地址分池的客户端缓存：key 为代理 URL（空串表示直连）
+        self._clients: dict[str, httpx.AsyncClient] = {}
 
     async def close(self) -> None:
-        if self._client is not None and not self._client.is_closed:
-            await self._client.aclose()
-            self._client = None
+        for client in self._clients.values():
+            if not client.is_closed:
+                await client.aclose()
+        self._clients.clear()
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(
+    async def _get_client(self, proxy_url: str | None = None) -> httpx.AsyncClient:
+        """获取（或创建）绑定指定出口代理的客户端；proxy_url=None 时使用全局默认代理。"""
+        effective = self.proxy_url if proxy_url is None else (proxy_url or None)
+        key = effective or ""
+        client = self._clients.get(key)
+        if client is None or client.is_closed:
+            client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.timeout, connect=15.0),
-                proxy=self.proxy_url,
+                proxy=effective,
                 http2=True,
                 limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
             )
-        return self._client
+            self._clients[key] = client
+        return client
 
     async def send_request(
         self,
@@ -173,6 +180,7 @@ class HTTPStreamTransport:
         tier: str | None = None,
         auth_file: str | None = None,
         cookies: dict[str, str] | None = None,
+        proxy_url: str | None = None,
     ) -> tuple[int, bytes]:
         """Execute non-streaming HTTP request directly."""
         t0 = time.perf_counter()
@@ -190,7 +198,7 @@ class HTTPStreamTransport:
             auth_user,
         )
 
-        client = await self._get_client()
+        client = await self._get_client(proxy_url)
         try:
             resp = await client.post(
                 url, headers=clean_headers, content=body.encode("utf-8")
@@ -221,6 +229,7 @@ class HTTPStreamTransport:
         tier: str | None = None,
         auth_file: str | None = None,
         cookies: dict[str, str] | None = None,
+        proxy_url: str | None = None,
     ) -> AsyncGenerator[tuple[str, object], None]:
         """Stream HTTP response chunks directly."""
         clean_headers = await _ensure_authorization_header(
@@ -232,7 +241,7 @@ class HTTPStreamTransport:
         )
         logger.debug("建立流式请求: url=%s, u/%s", url, auth_user)
 
-        client = await self._get_client()
+        client = await self._get_client(proxy_url)
 
         resp = None
         try:

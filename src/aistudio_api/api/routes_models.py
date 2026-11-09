@@ -12,6 +12,12 @@ from aistudio_api.api.response_models import (
     GeminiModelListResponse,
     GeminiModelResponse,
 )
+from aistudio_api.application.anti_truncation import (
+    BUFFER_VARIANT_SUFFIX,
+    STREAM_VARIANT_SUFFIX,
+    get_selected_variant_models,
+    resolve_model_variant,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("routes.models")
@@ -72,6 +78,59 @@ def _to_gemini_model(model_data: Mapping[str, object]) -> GeminiModelResponse:
     )
 
 
+def _to_variant_model(
+    model_data: Mapping[str, object], *, buffered: bool
+) -> GeminiModelResponse:
+    """在基础模型上叠加抗截断变体后缀与展示名。"""
+    base = _to_gemini_model(model_data)
+    clean_id = str(model_data.get("id") or model_data.get("name") or "").removeprefix(
+        "models/"
+    )
+    if buffered:
+        return base.model_copy(
+            update={
+                "name": f"models/{clean_id}{BUFFER_VARIANT_SUFFIX}",
+                "displayName": f"{base.displayName}（非流式抗截断）",
+                "description": f"{base.description}（抗截断传输：缓冲上游，整体还原后单条下发）",
+            }
+        )
+    return base.model_copy(
+        update={
+            "name": f"models/{clean_id}{STREAM_VARIANT_SUFFIX}",
+            "displayName": f"{base.displayName}（流式抗截断）",
+            "description": f"{base.description}（抗截断传输：流式增量还原）",
+        }
+    )
+
+
+def _expand_anti_truncation_variants(
+    discovered: list[Mapping[str, object]],
+) -> list[GeminiModelResponse]:
+    """为面板选中的模型生成流式 / 非流式两个抗截断变体条目。
+
+    变体功能关闭时返回空；生图 / 视频 / 音频模型会被抗截断传输安全
+   旁路，不暴露变体以免误导。"""
+    selected = get_selected_variant_models()
+    if not selected:
+        return []
+    variants: list[GeminiModelResponse] = []
+    for item in discovered:
+        clean_id = str(item.get("id") or item.get("name") or "").removeprefix(
+            "models/"
+        )
+        if clean_id.lower() not in selected:
+            continue
+        if (
+            item.get("is_image_model")
+            or item.get("is_video_model")
+            or item.get("is_audio_model")
+        ):
+            continue
+        variants.append(_to_variant_model(item, buffered=False))
+        variants.append(_to_variant_model(item, buffered=True))
+    return variants
+
+
 @router.get("/v1beta/models", response_model=GeminiModelListResponse)
 async def list_models(
     runtime_state: RuntimeState = Depends(get_runtime_state),
@@ -81,6 +140,7 @@ async def list_models(
 
     discovered = await model_discovery.get_models(session=session)
     models = [_to_gemini_model(item) for item in discovered]
+    models.extend(_expand_anti_truncation_variants(discovered))
     logger.debug("返回模型列表: count=%d", len(models))
     return GeminiModelListResponse(models=models)
 
@@ -92,6 +152,16 @@ async def get_model(
 ) -> GeminiModelResponse:
     session = runtime_state.client.session if runtime_state.client else None
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    # 抗截断变体详情：带后缀的模型 ID 直接返回变体元数据。
+    variant = resolve_model_variant(model_id)
+    if variant is not None:
+        base_info = await model_discovery.get_model_by_id(
+            variant.model_path, session=session
+        )
+        if base_info is not None:
+            return _to_variant_model(base_info, buffered=variant.buffered)
+        raise HTTPException(status_code=404, detail="Model not found")
 
     model_info = await model_discovery.get_model_by_id(model_id, session=session)
     if model_info is not None:

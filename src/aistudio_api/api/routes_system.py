@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import time
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import yaml
@@ -122,6 +123,14 @@ def stats_response() -> StatsResponse:
 
 @public_router.get("/health", response_model=HealthResponse)
 async def health():
+    return health_response()
+
+
+# /healthz：与 /health 等价的别名端点，遵循 Kubernetes / PaaS 探活命名惯例
+# （Render / Fly.io / k8s 用户习惯性配置 /healthz）。无鉴权、不触上游、
+# 不依赖账号，任何启动状态下都应返回 200。
+@public_router.get("/healthz", response_model=HealthResponse, include_in_schema=False)
+async def healthz():
     return health_response()
 
 
@@ -517,6 +526,93 @@ async def update_logging_config(req: LoggingConfigRequest) -> dict[str, object]:
         "dump_to_file": is_dump_to_file_enabled(),
         "dump_dir": str(get_dump_dir()),
     }
+
+
+# ========== 抗截断传输面板配置 ==========
+
+
+class UpdateAntiTruncationConfigRequest(BaseModel):
+    enabled: bool | None = None
+    tool_name: str | None = None
+    variants_enabled: bool | None = None
+    models: list[str] | None = None
+
+
+def _anti_truncation_payload(models: list[Mapping[str, object]]) -> dict[str, object]:
+    """组装面板所需的抗截断配置 + 可选模型列表（过滤生图/视频/音频）。"""
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_anti_truncation_settings,
+    )
+
+    settings = get_anti_truncation_settings()
+    raw_variants = settings.get("model_variants")
+    variants = raw_variants if isinstance(raw_variants, dict) else {}
+    available: list[dict[str, str]] = []
+    for item in models:
+        if (
+            item.get("is_image_model")
+            or item.get("is_video_model")
+            or item.get("is_audio_model")
+        ):
+            continue
+        model_id = str(item.get("id") or item.get("name") or "")
+        if not model_id:
+            continue
+        available.append(
+            {
+                "id": model_id.removeprefix("models/"),
+                "displayName": str(item.get("displayName") or model_id),
+            }
+        )
+    return {
+        "enabled": bool(settings.get("enabled")),
+        "tool_name": str(settings.get("tool_name") or "router_emit"),
+        "variants": {
+            "enabled": bool(variants.get("enabled", False)),
+            "models": [
+                str(m) for m in (variants.get("models") or [])
+            ],
+        },
+        "available_models": available,
+    }
+
+
+@protected_router.get("/config/anti-truncation")
+async def get_anti_truncation_config() -> dict[str, object]:
+    """获取抗截断传输配置与可选模型列表（面板"抗截断传输"卡片数据源）。"""
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    models = await model_discovery.get_models()
+    return _anti_truncation_payload(models)
+
+
+@protected_router.put("/config/anti-truncation")
+async def update_anti_truncation_config(
+    req: UpdateAntiTruncationConfigRequest,
+) -> dict[str, object]:
+    """更新抗截断传输配置（全局开关 / 变体开关 / 选中模型）并持久化。"""
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        update_anti_truncation_settings,
+    )
+
+    update_anti_truncation_settings(
+        enabled=req.enabled,
+        tool_name=req.tool_name,
+        variants_enabled=req.variants_enabled,
+        models=req.models,
+    )
+    logger.info(
+        "抗截断配置已更新: 全局=%s, 变体=%s, 模型数=%d",
+        req.enabled,
+        req.variants_enabled,
+        len(req.models or []),
+    )
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    models = await model_discovery.get_models()
+    payload = _anti_truncation_payload(models)
+    payload["ok"] = True
+    return payload
 
 
 # ========== API Key 备注与密钥管理 ==========

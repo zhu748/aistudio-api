@@ -97,6 +97,13 @@ export const accountsApi = {
     })
   },
 
+  updateProxy(id: string, proxyUrl: string | null): Promise<Account> {
+    return request<Account>(`/api/accounts/${id}/proxy`, {
+      method: 'PUT',
+      body: JSON.stringify({ proxy_url: proxyUrl }),
+    })
+  },
+
   listGroups(): Promise<string[]> {
     return request<string[]>('/api/accounts/groups/list')
   },

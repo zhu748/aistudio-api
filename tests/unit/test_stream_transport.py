@@ -23,7 +23,7 @@ async def test_transport_non_streaming_request():
         return httpx.Response(200, content=b'["response data"]')
 
     mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    transport._client = mock_client
+    transport._clients[transport.proxy_url or ""] = mock_client
 
     status, body = await transport.send_request(
         url="https://example.com/api",
@@ -48,7 +48,7 @@ async def test_transport_streaming_request():
         return httpx.Response(200, content=stream())
 
     mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    transport._client = mock_client
+    transport._clients[transport.proxy_url or ""] = mock_client
 
     events = []
     async for tag, payload in transport.send_streaming_request(
@@ -72,7 +72,7 @@ async def test_transport_error_handling():
         raise httpx.ConnectError("Connection refused")
 
     mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    transport._client = mock_client
+    transport._clients[transport.proxy_url or ""] = mock_client
 
     with pytest.raises(TransportError, match="HTTP request failed"):
         await transport.send_request(

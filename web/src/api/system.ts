@@ -13,6 +13,8 @@ import type {
   SignerServerItem,
   SignerServersResponse,
   TestSignerServerResponse,
+  AntiTruncationConfig,
+  UpdateAntiTruncationConfigRequest,
 } from '@/types'
 
 
@@ -61,6 +63,17 @@ export const systemApi = {
 
   updateLoggingConfig(req: UpdateLoggingConfigRequest): Promise<UpdateLoggingConfigResponse> {
     return request<UpdateLoggingConfigResponse>('/config/logging', {
+      method: 'PUT',
+      body: JSON.stringify(req),
+    })
+  },
+
+  getAntiTruncationConfig(): Promise<AntiTruncationConfig> {
+    return request<AntiTruncationConfig>('/config/anti-truncation')
+  },
+
+  updateAntiTruncationConfig(req: UpdateAntiTruncationConfigRequest): Promise<AntiTruncationConfig & { ok: boolean }> {
+    return request('/config/anti-truncation', {
       method: 'PUT',
       body: JSON.stringify(req),
     })

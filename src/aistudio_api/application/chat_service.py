@@ -788,9 +788,8 @@ def normalize_gemini_request(
         isinstance(tool_config, list)
         and len(tool_config) > 1
         and isinstance(tool_config[1], list)
-    ):
-        if tool_config[1] and tool_config[1][0] == 3:
-            is_mode_none = True
+    ) and tool_config[1] and tool_config[1][0] == 3:
+        is_mode_none = True
 
     if is_mode_none:
         tools = None

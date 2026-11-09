@@ -6,7 +6,7 @@ import argparse
 import asyncio
 import secrets
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -64,6 +64,22 @@ async def lifespan(_app: FastAPI):
     account_service = AccountService(account_store)
     runtime_state.account_service = account_service
 
+    # 环境变量 Cookie 注入（AISTUDIO_COOKIES / _<N> / _FILE，支持 代理+Cookie / Cookie / Cookie+代理）
+    from aistudio_api.application.env_account_injector import (
+        inject_env_accounts,
+        probe_env_sub_accounts,
+    )
+
+    env_report = inject_env_accounts(account_store)
+    if env_report.total:
+        logger.info(
+            "环境变量账号注入完成: 共 %d 条（新建=%d, 更新=%d, 清理=%d）",
+            env_report.total,
+            len(env_report.created_ids),
+            len(env_report.updated_ids),
+            len(env_report.pruned_ids),
+        )
+
     # 初始化黏性账号调度器
     rotator = init_rotator(account_store)
     runtime_state.rotator = rotator
@@ -109,9 +125,20 @@ async def lifespan(_app: FastAPI):
         checked_count = 0
         sem = asyncio.Semaphore(4)
 
-        async with httpx.AsyncClient(
-            timeout=8.0, proxy=settings.proxy_url, follow_redirects=True
-        ) as probe_client:
+        # 按代理分池的探活客户端：绑定独立代理的账号各走各的出口
+        probe_clients: dict[str, httpx.AsyncClient] = {}
+
+        def _get_probe_client(proxy_url: str | None) -> httpx.AsyncClient:
+            key = proxy_url or ""
+            if key not in probe_clients:
+                probe_clients[key] = httpx.AsyncClient(
+                    timeout=8.0,
+                    proxy=proxy_url if proxy_url is not None else settings.proxy_url,
+                    follow_redirects=True,
+                )
+            return probe_clients[key]
+
+        try:
 
             async def _check_one(a):
                 nonlocal checked_count, upgraded_count
@@ -124,6 +151,7 @@ async def lifespan(_app: FastAPI):
                         if not cdict:
                             return
                         checked_count += 1
+                        probe_client = _get_probe_client(getattr(a, "proxy_url", None))
                         if not a.email:
                             em = await probe_account_email(
                                 cdict,
@@ -153,6 +181,10 @@ async def lifespan(_app: FastAPI):
                         logger.debug("账号 %s 订阅检测失败: %s", a.id, e)
 
             await asyncio.gather(*(_check_one(a) for a in accounts_to_check))
+        finally:
+            for probe_client in probe_clients.values():
+                with suppress(Exception):
+                    await probe_client.aclose()
 
         logger.info(
             "账号校验完成: 已检测=%d, 付费升级=%d",
@@ -176,9 +208,9 @@ async def lifespan(_app: FastAPI):
                 now_ts = time.time()
                 seen_anchors: set[str] = set()
                 accounts = account_store.list_accounts()
-                async with httpx.AsyncClient(
-                    timeout=15.0, proxy=settings.proxy_url, follow_redirects=False
-                ) as rot_client:
+                # 按代理分池的轮换客户端：账号绑定独立代理时走各自出口
+                rot_clients: dict[str, httpx.AsyncClient] = {}
+                try:
                     for acc in accounts:
                         if not acc.enabled:
                             continue
@@ -199,6 +231,19 @@ async def lifespan(_app: FastAPI):
                             if anchor in seen_anchors:
                                 continue
                             seen_anchors.add(anchor)
+
+                        acc_proxy = getattr(acc, "proxy_url", None)
+                        client_key = acc_proxy or ""
+                        rot_client = rot_clients.get(client_key)
+                        if rot_client is None:
+                            rot_client = httpx.AsyncClient(
+                                timeout=15.0,
+                                proxy=acc_proxy
+                                if acc_proxy is not None
+                                else settings.proxy_url,
+                                follow_redirects=False,
+                            )
+                            rot_clients[client_key] = rot_client
 
                         before_ts = cdict.get("__Secure-1PSIDTS", "")
                         rot_res = await account_service.rotate_account_cookies(
@@ -230,6 +275,10 @@ async def lifespan(_app: FastAPI):
                             )
                             if not alive:
                                 rotator.record_session_expired(acc.id)
+                finally:
+                    for rot_client in rot_clients.values():
+                        with suppress(Exception):
+                            await rot_client.aclose()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -239,9 +288,25 @@ async def lifespan(_app: FastAPI):
     tier_task = asyncio.create_task(_auto_refresh_tiers())
     rotate_task = asyncio.create_task(_cookie_rotation_loop())
 
+    # 新注入的环境变量账号：后台探活多登子账号 (u/1..u/N)
+    env_probe_task = None
+    if env_report.created_ids:
+
+        async def _env_subaccount_probe() -> None:
+            try:
+                imported = await probe_env_sub_accounts(
+                    account_store, list(env_report.created_ids)
+                )
+                if imported:
+                    logger.info("环境变量子账号探活导入完成: 新增 %d 个", imported)
+            except Exception as e:
+                logger.debug("环境变量子账号探活失败: %s", e)
+
+        env_probe_task = asyncio.create_task(_env_subaccount_probe())
+
     yield
     logger.info("正在关闭服务")
-    for bg_task in (tier_task, rotate_task):
+    for bg_task in (tier_task, rotate_task, env_probe_task):
         if bg_task and not bg_task.done():
             bg_task.cancel()
     if client:

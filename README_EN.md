@@ -247,6 +247,33 @@ This service does not store your Google account password. It uses standard web s
 4. Paste your clipboard data into the input box and click **Confirm Import**;
 5. The service will automatically test connectivity and probe any multi-login sub-accounts (`u/0`, `u/1`...) to register them for load balancing.
 
+### Option 3: Environment Variable Injection (diskless PaaS / containers)
+
+On platforms without persistent disks (Render Free, ephemeral Railway deploys, stateless K8s pods, ...), accounts are lost on redeploy. Set `AISTUDIO_COOKIES` to inject them at startup — fully equivalent to the web import (automatic rotation, probing, and multi-login sub-account discovery included):
+
+```yaml
+# docker-compose.yml example: multiple accounts, each with its own proxy
+environment:
+  - AISTUDIO_COOKIES=|
+      socks5://user:pass@proxy-a.example.com:1080+SID=xxx; HSID=yyy; __Secure-3PSID=zzz
+      SID=aaa; HSID=bbb; __Secure-3PSID=ccc
+      SID=ddd; HSID=eee+http://proxy-b.example.com:8080
+```
+
+**Per-entry format (all three equivalent, separated by `+`):**
+
+| Format | Example | Notes |
+| --- | --- | --- |
+| `proxy+cookies` | `socks5://127.0.0.1:1080+SID=xxx; HSID=yyy` | Proxy first |
+| `cookies` | `SID=xxx; HSID=yyy` | No proxy — uses the global `AISTUDIO_PROXY` |
+| `cookies+proxy` | `SID=xxx; HSID=yyy+http://10.0.0.1:7890` | Proxy last |
+
+- Proxies accept full `http://` / `https://` / `socks5://` URLs or shorthand `127.0.0.1:7890` (auto-prefixed with `http://`);
+- Cookie payloads accept header KV, JSON arrays (Cookie-Editor export), or Netscape text;
+- Requests, cookie rotation, and liveness probes for a proxy-bound account all egress through that proxy;
+- Re-injecting the same account across restarts is idempotent (deterministic session-anchor IDs); removing an entry prunes its account;
+- When multi-line env vars are inconvenient, use numbered variables (`AISTUDIO_COOKIES_1`, `AISTUDIO_COOKIES_2`, ...) or point `AISTUDIO_COOKIES_FILE` at a file; within a single line, entries may also be separated by a literal `\n`.
+
 ---
 
 ## Third-Party Client Setup Guide (NextChat / Cherry Studio / One API)
@@ -272,6 +299,9 @@ Open `http://localhost:8080` in your browser to access the Web Console.
 | `AISTUDIO_PORT` | int | `8080` | HTTP service listening port |
 | `AISTUDIO_WEB_PASSWORD` | string | `""` | Web Console access password (also checks `AISTUDIO_ADMIN_PASSWORD`) |
 | `AISTUDIO_PROXY` | string | `""` | Outbound proxy URL (`http://`, `https://`, or `socks5://`) |
+| `AISTUDIO_COOKIES` | string | `""` | Account cookies injected at startup; one entry per line, each entry supports `proxy+cookies` / `cookies` / `cookies+proxy` formats |
+| `AISTUDIO_COOKIES_<N>` | string | `""` | Numbered injection variables (`AISTUDIO_COOKIES_1`, `AISTUDIO_COOKIES_2`, ...) for platforms that cannot pass multi-line env vars |
+| `AISTUDIO_COOKIES_FILE` | string | `""` | Path to a cookie injection file (same format as `AISTUDIO_COOKIES`, or a JSON string array) |
 | `AISTUDIO_DATA_DIR` | string | `data/` | Main data directory for persistent files (`/app/data` in Docker) |
 | `AISTUDIO_ACCOUNTS_DIR` | string | `data/accounts` | Directory for storing account credentials |
 | `AISTUDIO_STATS_FILE` | string | `data/stats.json` | Persistent storage file for model usage metrics |

@@ -65,3 +65,25 @@ export interface TestSignerServerResponse {
   error?: string
   data?: Record<string, unknown>
 }
+
+export interface AvailableModelItem {
+  id: string
+  displayName: string
+}
+
+export interface AntiTruncationConfig {
+  enabled: boolean
+  tool_name: string
+  variants: {
+    enabled: boolean
+    models: string[]
+  }
+  available_models: AvailableModelItem[]
+}
+
+export interface UpdateAntiTruncationConfigRequest {
+  enabled?: boolean
+  tool_name?: string
+  variants_enabled?: boolean
+  models?: string[]
+}

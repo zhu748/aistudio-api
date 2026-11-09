@@ -17,4 +17,11 @@ if [ ! -f "$CONFIG_FILE" ]; then
     fi
 fi
 
+# PaaS 端口注入（Render / Railway / Fly.io 等通过 PORT 下发监听端口）：
+# 优先级 AISTUDIO_PORT > PORT > 默认 8080。
+if [ -n "${PORT:-}" ] && [ -z "${AISTUDIO_PORT:-}" ]; then
+    export AISTUDIO_PORT="$PORT"
+    echo "[entrypoint] Using platform injected PORT=${PORT}"
+fi
+
 exec "$@"

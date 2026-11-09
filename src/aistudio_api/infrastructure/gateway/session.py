@@ -13,6 +13,7 @@ from aistudio_api.infrastructure.account.cookie_parser import (
     ROTATING_SESSION_COOKIE_NAMES,
     build_makersuite_headers,
     get_auth_user_from_meta,
+    get_proxy_from_meta,
     get_tier_from_meta,
     load_cookies_from_auth_file,
     parse_raw_cookies,
@@ -33,6 +34,7 @@ class SessionContext:
     auth_file: str | None = None
     tier: str = "Free"
     cookies: dict[str, str] = field(default_factory=dict)
+    proxy_url: str | None = None
     context_id: int = field(default_factory=itertools.count(1).__next__)
     created_at: float = field(default_factory=time.time)
 
@@ -125,6 +127,7 @@ class GatewaySession:
 
         target_auth_user = get_auth_user_from_meta(auth_file)
         target_tier = get_tier_from_meta(auth_file)
+        target_proxy = get_proxy_from_meta(auth_file)
         cookies = load_cookies_from_auth_file(auth_file)
 
         self._auth_file = auth_file
@@ -136,6 +139,7 @@ class GatewaySession:
             auth_file=auth_file,
             tier=target_tier,
             cookies=cookies,
+            proxy_url=target_proxy,
         )
         self._active_context = new_context
         log.info(
@@ -253,6 +257,7 @@ class GatewaySession:
             tier=active_ctx.tier,
             auth_file=active_ctx.auth_file,
             cookies=active_ctx.cookies,
+            proxy_url=active_ctx.proxy_url,
         )
 
     async def send_streaming_request(
@@ -279,6 +284,7 @@ class GatewaySession:
             tier=active_ctx.tier,
             auth_file=active_ctx.auth_file,
             cookies=active_ctx.cookies,
+            proxy_url=active_ctx.proxy_url,
         ):
             yield event
 

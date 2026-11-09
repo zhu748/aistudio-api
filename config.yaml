@@ -1,4 +1,11 @@
 api_keys: []
+anti_truncation:
+  enabled: false
+  tool_name: router_emit
+  model_variants:
+    enabled: true
+    models:
+    - gemini-3.8-flash
 waa:
   active_server: local_spidermonkey
   servers:

@@ -85,6 +85,7 @@ class AccountMeta:
     enabled: bool = True
     group: str = "default"
     notes: str = ""
+    proxy_url: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -116,6 +117,9 @@ class AccountMeta:
             enabled=enabled,
             group=raw_group or "default",
             notes=str(data.get("notes") or ""),
+            proxy_url=str(data["proxy_url"])
+            if data.get("proxy_url") is not None
+            else None,
         )
 
 
@@ -358,6 +362,7 @@ class AccountStore:
         enabled: bool = True,
         group: str = "default",
         notes: str = "",
+        proxy_url: str | None = None,
     ) -> AccountMeta:
         """保存新账号。"""
         registry = self._load_registry()
@@ -367,6 +372,7 @@ class AccountStore:
         resolved_enabled = enabled
         resolved_group = group or "default"
         resolved_notes = notes
+        resolved_proxy = proxy_url
 
         if account_id is None and email:
             for acc in registry.accounts.values():
@@ -381,6 +387,8 @@ class AccountStore:
                         resolved_notes = acc.notes
                     if not acc.enabled and enabled is True:
                         resolved_enabled = acc.enabled
+                    if resolved_proxy is None and acc.proxy_url:
+                        resolved_proxy = acc.proxy_url
                     break
 
         if account_id is not None:
@@ -400,6 +408,8 @@ class AccountStore:
                     resolved_notes = existing.notes
                 if not existing.enabled and enabled is True:
                     resolved_enabled = existing.enabled
+                if resolved_proxy is None and existing.proxy_url:
+                    resolved_proxy = existing.proxy_url
         else:
             account_id = _generate_account_id()
 
@@ -420,6 +430,7 @@ class AccountStore:
             enabled=resolved_enabled,
             group=resolved_group,
             notes=resolved_notes,
+            proxy_url=resolved_proxy,
         )
         account_dir.mkdir(parents=True, exist_ok=True)
         _atomic_write_json(account_dir / "auth.json", storage_state)
@@ -471,6 +482,25 @@ class AccountStore:
         if acc is None or acc.email == email:
             return False
         acc.email = email
+        account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+        meta_path = account_dir / "meta.json"
+        if meta_path.exists():
+            _atomic_write_json(meta_path, acc.to_dict())
+        self._save_registry(registry)
+        return True
+
+    def update_account_proxy(self, account_id: str, proxy_url: str | None) -> bool:
+        """更新账号的独立出口代理（None 表示回退全局代理），并持久化 meta.json 与 registry.json。"""
+        from aistudio_api.infrastructure.account.cookie_parser import (
+            normalize_proxy_url,
+        )
+
+        clean_proxy = normalize_proxy_url(proxy_url)
+        registry = self._load_registry()
+        acc = self._find_registered_account(registry, account_id)
+        if acc is None or acc.proxy_url == clean_proxy:
+            return False
+        acc.proxy_url = clean_proxy
         account_dir = _safe_account_dir(self._accounts_dir, acc.id)
         meta_path = account_dir / "meta.json"
         if meta_path.exists():

@@ -1,6 +1,17 @@
 # API 客户端调用鉴权密钥列表 (用于外部客户端调用 /v1beta/... 接口鉴权)
 api_keys: []
 
+# 抗截断传输 (Anti-Truncation Transport)
+# 全局开启后所有模型默认启用；也可开启 model_variants 为选中模型暴露
+# <model>-at-stream (流式抗截断) 与 <model>-at (非流式抗截断) 两个变体。
+# 请求头 X-Anti-Truncation: 1/0 可按请求强制开启 / 关闭。
+anti_truncation:
+  enabled: false
+  tool_name: router_emit
+  model_variants:
+    enabled: false
+    models: []
+
 # WAA 签名与挑战求解配置 (脱离浏览器的纯净轻量化签名引擎)
 waa:
   active_server: local_spidermonkey

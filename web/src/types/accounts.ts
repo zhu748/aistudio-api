@@ -12,6 +12,7 @@ export interface Account {
   enabled: boolean
   group: string
   notes?: string
+  proxy_url?: string | null
 }
 
 export type AccountWithStats = Omit<Account, 'last_used' | 'auth_user' | 'email'> &

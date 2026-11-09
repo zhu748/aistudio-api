@@ -208,6 +208,18 @@ export const useAccountsStore = defineStore('accounts', () => {
     }
   }
 
+  async function updateAccountProxy(id: string, proxyUrl: string | null) {
+    const toast = useToastStore()
+    try {
+      await accountsApi.updateProxy(id, proxyUrl)
+      toast.success(proxyUrl ? `账号代理已更新: ${proxyUrl}` : '已恢复使用全局代理')
+      await fetchAll()
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '代理更新失败'
+      toast.error(msg)
+    }
+  }
+
   async function importCookies(payload: ImportCookiesRequest) {
     const toast = useToastStore()
     importing.value = true
@@ -306,6 +318,7 @@ export const useAccountsStore = defineStore('accounts', () => {
     deleteAccount,
     deleteCookieGroup,
     updateAccountName,
+    updateAccountProxy,
     importCookies,
     probeAndImport,
     importBundle,
