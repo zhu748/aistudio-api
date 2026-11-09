@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onMounted, ref, computed } from 'vue'
 import { systemApi } from '@/api/system.ts'
 import { useToastStore } from '@/stores/toast.ts'
 import type { SignerServerItem } from '@/types/system.ts'
@@ -13,7 +13,8 @@ import {
   Activity,
   Check,
   Loader2,
-  Lock,
+  Settings2,
+  RotateCcw,
 } from 'lucide-vue-next'
 
 const emit = defineEmits<{
@@ -29,7 +30,19 @@ const testResults = ref<Record<string, { ok: boolean; ms?: number; err?: string 
 
 const activeServerId = ref('local_spidermonkey')
 const envOverride = ref<string | null>(null)
+const runtimeOverride = ref<string | null>(null)
 const servers = ref<SignerServerItem[]>([])
+
+/** 运行时已切离默认节点时，提供一键恢复默认入口 */
+const showResetButton = computed(() => {
+  if (!runtimeOverride.value) return false
+  const defaultId = envOverride.value
+    ?? servers.value.find(s => s.id === activeServerId.value)?.id
+    ?? activeServerId.value
+  return runtimeOverride.value !== defaultId
+})
+
+const resetting = ref(false)
 
 const showModal = ref(false)
 const isEditing = ref(false)
@@ -51,6 +64,7 @@ async function fetchServers() {
     const res = await systemApi.getSignerServers()
     activeServerId.value = res.active_server
     envOverride.value = res.env_override ?? null
+    runtimeOverride.value = res.runtime_override ?? null
     servers.value = res.servers
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : '获取签名服务器列表失败'
@@ -66,16 +80,16 @@ async function handleSwitch(serverId: string) {
   try {
     const res = await systemApi.switchSignerServer(serverId)
     if (res.ok) {
-      // 以运行时实际生效的节点为准（环境变量锁定/本地二进制回退时可能与点击目标不同）
+      // 以运行时实际生效的节点为准（本地二进制回退时可能与点击目标不同）
       const activeId = res.active_server.id
       activeServerId.value = activeId
+      runtimeOverride.value = res.runtime_override ?? activeId
       servers.value = servers.value.map(s => ({
         ...s,
         is_active: s.id === activeId,
-        env_locked: envOverride.value ? s.id === envOverride.value : s.env_locked,
       }))
-      if (res.warning) {
-        toast.warning(res.warning, 8000)
+      if (res.note) {
+        toast.info(res.note, 8000)
       } else {
         toast.success(`已切换至签名服务器: ${res.active_server.name}`)
       }
@@ -86,6 +100,27 @@ async function handleSwitch(serverId: string) {
     toast.error(msg)
   } finally {
     switching.value = null
+  }
+}
+
+async function handleReset() {
+  resetting.value = true
+  try {
+    const res = await systemApi.resetSignerServer()
+    if (res.ok) {
+      await fetchServers()
+      if (res.changed) {
+        toast.success(`已恢复默认签名节点: ${res.active_server.name}`)
+      } else {
+        toast.info('当前未设置运行时覆盖，节点保持默认')
+      }
+      emit('switched')
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : '恢复默认节点失败'
+    toast.error(msg)
+  } finally {
+    resetting.value = false
   }
 }
 
@@ -219,15 +254,58 @@ onMounted(() => {
       </button>
     </div>
 
-    <!-- Env Override Banner -->
+    <!-- Env Default Banner（信息式：面板切换即时生效，重启后恢复默认） -->
     <div
       v-if="envOverride"
-      class="mt-3 flex items-start gap-2 px-3.5 py-2.5 rounded-xl bg-amber-50 border border-amber-200"
+      class="mt-3 flex items-start gap-2 px-3.5 py-2.5 rounded-xl bg-sky-50 border border-sky-200"
     >
-      <Lock class="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-      <p class="text-xs text-amber-800 leading-relaxed">
-        当前运行时由环境变量 <code class="font-mono font-semibold">AISTUDIO_WAA_SERVER={{ envOverride }}</code> 锁定，面板切换仅写入配置文件，对本进程不生效；移除该环境变量并重启后，面板切换即完全生效。
-      </p>
+      <Settings2 class="w-4 h-4 text-sky-600 shrink-0 mt-0.5" />
+      <div class="text-xs text-sky-800 leading-relaxed flex-1">
+        启动默认节点由环境变量 <code class="font-mono font-semibold">AISTUDIO_WAA_SERVER={{ envOverride }}</code> 指定（本地或远程均可）。面板手动切换对当前进程<b>即时生效</b>，重启后自动恢复该默认；有盘部署的切换结果会同时持久化到 config.yaml。
+        <button
+          v-if="showResetButton"
+          type="button"
+          class="inline-flex items-center gap-1 ml-2 px-2 py-0.5 text-[11px] font-semibold text-sky-700 bg-white/70 hover:bg-white rounded-md border border-sky-200 transition-colors cursor-pointer disabled:opacity-50"
+          :disabled="resetting"
+          @click="handleReset"
+        >
+          <RotateCcw
+            v-if="!resetting"
+            class="w-3 h-3"
+          />
+          <Loader2
+            v-else
+            class="w-3 h-3 animate-spin"
+          />
+          恢复默认节点
+        </button>
+      </div>
+    </div>
+    <!-- 无环境变量但设置了运行时覆盖：也提供恢复入口（回到配置文件默认） -->
+    <div
+      v-else-if="runtimeOverride"
+      class="mt-3 flex items-start gap-2 px-3.5 py-2.5 rounded-xl bg-sky-50 border border-sky-200"
+    >
+      <Settings2 class="w-4 h-4 text-sky-600 shrink-0 mt-0.5" />
+      <div class="text-xs text-sky-800 leading-relaxed flex-1">
+        当前节点由面板手动切换指定（运行时覆盖），重启后恢复配置文件默认。
+        <button
+          type="button"
+          class="inline-flex items-center gap-1 ml-2 px-2 py-0.5 text-[11px] font-semibold text-sky-700 bg-white/70 hover:bg-white rounded-md border border-sky-200 transition-colors cursor-pointer disabled:opacity-50"
+          :disabled="resetting"
+          @click="handleReset"
+        >
+          <RotateCcw
+            v-if="!resetting"
+            class="w-3 h-3"
+          />
+          <Loader2
+            v-else
+            class="w-3 h-3 animate-spin"
+          />
+          恢复默认节点
+        </button>
+      </div>
     </div>
 
     <!-- Server List -->
@@ -257,12 +335,12 @@ onMounted(() => {
                 当前激活
               </span>
               <span
-                v-if="server.env_locked"
-                class="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium bg-amber-100 text-amber-800 rounded-md"
-                title="由环境变量 AISTUDIO_WAA_SERVER 锁定"
+                v-if="server.is_env_default"
+                class="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium bg-sky-100 text-sky-800 rounded-md"
+                title="环境变量 AISTUDIO_WAA_SERVER 指定的启动默认节点，重启后自动恢复"
               >
-                <Lock class="w-3 h-3" />
-                环境变量锁定
+                <Settings2 class="w-3 h-3" />
+                环境变量默认
               </span>
               <span class="text-xs font-mono text-gray-500 bg-gray-100 px-1.5 py-0.5 rounded">
                 {{ server.url }}

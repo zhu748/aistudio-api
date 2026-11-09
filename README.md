@@ -252,11 +252,11 @@ docker compose up -d
 | 健康检查 | `/healthz`（`/health` 等价别名），轻量无鉴权，零账号冷启动也可通过探活 |
 | 数据持久化 | **Free 计划无磁盘**：`/app/data` 随容器重启 / 重新部署清空 —— 账号用 `AISTUDIO_COOKIES` 环境变量注入，每次启动自动重建；调用统计等易失数据随重启归零 |
 | 配置初始化 | 每次启动自动将镜像内置的 `defaults/config.yaml` 模板初始化到 `/app/data`；Free 计划面板修改不持久，需固化的配置请用环境变量下发 |
-| 签名引擎 | 默认拉起容器内置的本地 Go 签名器（无需浏览器）；Free 计划建议设 `AISTUDIO_WAA_SERVER=remote_spinsnow` 改走远程签名器（更省内存） |
+| 签名引擎 | 默认拉起容器内置的本地 Go 签名器（无需浏览器）；Free 计划建议设 `AISTUDIO_WAA_SERVER=remote_spinsnow` 改走远程签名器（更省内存）。环境变量仅指定**启动默认**节点，面板手动切换对当前进程即时生效，重启后自动恢复默认 |
 
 **计划选择建议：**
 
-- **Free（512MB，Blueprint 默认）**：内存足够部署 —— 本引擎不需要浏览器（纯 Go + SpiderMonkey 本地签名）。无磁盘：账号用 `AISTUDIO_COOKIES` 环境变量注入，随重启自动恢复；15 分钟无流量自动休眠（唤醒约有几十秒冷启动）。建议设置 `AISTUDIO_WAA_SERVER=remote_spinsnow`（面板切换在 Free 计划不持久，必须用环境变量；同时跳过本地引擎进程更省内存）；
+- **Free（512MB，Blueprint 默认）**：内存足够部署 —— 本引擎不需要浏览器（纯 Go + SpiderMonkey 本地签名）。无磁盘：账号用 `AISTUDIO_COOKIES` 环境变量注入，随重启自动恢复；15 分钟无流量自动休眠（唤醒约有几十秒冷启动）。建议设置 `AISTUDIO_WAA_SERVER=remote_spinsnow` 作为长期默认（重启后自动回到该节点，同时跳过本地引擎进程更省内存）；临时排查时仍可在面板手动切换本地/远程节点，对当前进程即时生效、无需重启，面板也提供一键“恢复默认节点”；
 - **Starter（$7/月）**：支持持久磁盘 —— 将 `render.yaml` 中注释掉的 `disk` 段恢复并把 `plan` 改为 `starter` 即可；服务常驻不休眠，面板修改与 UI 导入账号持久生效；
 - **Standard 及以上**：本地签名器与 Python 服务同容器运行更宽裕，适合多账号高频调用。
 

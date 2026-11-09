@@ -12,11 +12,12 @@ import type {
   HealthCheckResponse,
   SignerServerItem,
   SignerServersResponse,
+  SwitchSignerServerResponse,
+  ResetSignerServerResponse,
   TestSignerServerResponse,
   AntiTruncationConfig,
   UpdateAntiTruncationConfigRequest,
   LogsResponse,
-  LogEntry,
 } from '@/types'
 
 
@@ -109,10 +110,16 @@ export const systemApi = {
     return request<SignerServersResponse>('/config/signer-servers')
   },
 
-  switchSignerServer(serverId: string): Promise<{ ok: boolean; active_server: SignerServerItem; warning?: string | null }> {
+  switchSignerServer(serverId: string): Promise<SwitchSignerServerResponse> {
     return request('/config/signer-servers/switch', {
       method: 'POST',
       body: JSON.stringify({ server_id: serverId }),
+    })
+  },
+
+  resetSignerServer(): Promise<ResetSignerServerResponse> {
+    return request('/config/signer-servers/reset', {
+      method: 'POST',
     })
   },
 

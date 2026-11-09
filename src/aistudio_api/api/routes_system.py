@@ -366,24 +366,31 @@ class TestSignerServerRequest(BaseModel):
 async def get_signer_servers() -> dict[str, object]:
     """获取所有配置的 WAA 签名服务器列表及当前激活项。
 
-    激活判定与运行时完全一致：优先环境变量 ``AISTUDIO_WAA_SERVER``，
-    其次 config.yaml 的 ``waa.active_server``，避免“实际用远端签名、
-    面板却显示本地”的不一致。响应中的 ``env_override`` 非空表示
-    运行时被环境变量锁定，面板切换不会改变实际生效节点。
+    激活判定与运行时完全一致，优先级从高到低：
+    1. 运行时覆盖（``runtime_override``，面板手动切换写入，进程内即时生效）；
+    2. 环境变量 ``AISTUDIO_WAA_SERVER``（启动默认，重启后恢复）；
+    3. config.yaml 的 ``waa.active_server``。
+
+    响应字段说明：
+    - ``env_override``：环境变量指定的启动默认节点 id（未设置时为 null）；
+    - ``runtime_override``：面板切换写入的运行时覆盖 id（未设置时为 null）；
+    - 每个 server 的 ``is_env_default``：该节点是否为环境变量指定的启动默认。
     """
     import os
 
     from aistudio_api.infrastructure.gateway.model_defaults import (
         get_active_waa_server,
         get_configured_waa_settings,
+        get_runtime_waa_override,
     )
 
     waa = get_configured_waa_settings()
-    # 运行时实际生效节点（环境变量优先），与 client/session 的取值逻辑对齐
+    # 运行时实际生效节点（含运行时覆盖/环境变量），与 client/session 的取值逻辑对齐
     active_id = str(
         get_active_waa_server().get("id") or "local_spidermonkey"
     ).strip()
     env_override = os.getenv("AISTUDIO_WAA_SERVER", "").strip()
+    runtime_override = get_runtime_waa_override()
     raw_servers = waa.get("servers")
     servers = raw_servers if isinstance(raw_servers, list) else []
 
@@ -393,30 +400,37 @@ async def get_signer_servers() -> dict[str, object]:
             s_id = str(s.get("id") or "").strip()
             item = dict(s)
             item["is_active"] = s_id == active_id
-            item["env_locked"] = bool(env_override) and s_id == env_override
+            item["is_env_default"] = bool(env_override) and s_id == env_override
+            # 兼容旧字段：面板不再将其渲染为“锁定”，仅表示环境变量默认节点
+            item["env_locked"] = item["is_env_default"]
             result_servers.append(item)
 
     return {
         "active_server": active_id,
         "env_override": env_override or None,
+        "runtime_override": runtime_override or None,
         "servers": result_servers,
     }
 
 
 @protected_router.post("/config/signer-servers/switch")
 async def switch_signer_server(req: SwitchSignerServerRequest) -> dict[str, object]:
-    """纯手动切换当前激活的 WAA 签名服务器（持久化到 config.yaml）。
+    """纯手动切换当前激活的 WAA 签名服务器（即时生效并持久化）。
 
+    - 写入运行时覆盖层：即便 ``AISTUDIO_WAA_SERVER`` 环境变量指定了
+      默认节点（本地或远程），切换也对当前进程立即生效，无需重启；
+    - 同步持久化到 config.yaml（有盘部署重启后仍保持）；
     - 切到本地节点时懒启动本地签名守护进程（二进制缺失时自动回退远程）；
     - 切走本地节点时停掉本进程自动拉起的守护实例，避免空转；
-    - 环境变量 ``AISTUDIO_WAA_SERVER`` 存在时运行时被锁定，返回 warning
-      说明面板切换对当前进程不生效，避免误导。
+    - 环境变量存在且与目标不一致时返回 ``note`` 说明重启后的回退行为
+      （仅信息提示，当前进程切换已完全生效）。
     """
     import os
 
     from aistudio_api.infrastructure.gateway.model_defaults import (
         get_active_waa_server,
         get_configured_waa_settings,
+        get_runtime_waa_override,
         switch_active_waa_server,
     )
 
@@ -447,20 +461,81 @@ async def switch_signer_server(req: SwitchSignerServerRequest) -> dict[str, obje
         stop_signer_daemon()
 
     env_override = os.getenv("AISTUDIO_WAA_SERVER", "").strip()
-    warning: str | None = None
-    if env_override:
-        warning = (
-            f"环境变量 AISTUDIO_WAA_SERVER={env_override} 正在锁定运行时签名服务，"
-            f"本次切换已写入配置文件，但当前进程实际仍使用 [{env_override}]。"
-            f"如需面板切换完全生效，请移除该环境变量并重启服务。"
+    runtime_override = get_runtime_waa_override()
+    note: str | None = None
+    if env_override and env_override != target_id:
+        note = (
+            f"已切换至 [{target_id}] 并对当前进程立即生效；"
+            f"重启后将恢复环境变量 AISTUDIO_WAA_SERVER={env_override} 指定的默认节点。"
+            f"（无盘部署建议保持环境变量为长期默认）"
         )
     logger.info(
         "切换 WAA 签名服务: id=%s, url=%s%s",
         active.get("id"),
         active.get("url"),
-        f"（运行时被环境变量锁定为 {env_override}）" if env_override else "",
+        f"（启动默认为环境变量 {env_override}，运行时已覆盖）"
+        if env_override and env_override != active.get("id")
+        else "",
     )
-    return {"ok": True, "active_server": active, "warning": warning}
+    return {
+        "ok": True,
+        "active_server": active,
+        "runtime_override": runtime_override or None,
+        "note": note,
+    }
+
+
+@protected_router.post("/config/signer-servers/reset")
+async def reset_signer_server() -> dict[str, object]:
+    """清除运行时覆盖，恢复“环境变量 > 配置文件”的默认优先级。
+
+    面板切换写入的运行时覆盖消失后：
+    - 设置了 ``AISTUDIO_WAA_SERVER`` 时恢复到环境变量指定的默认节点；
+    - 未设置时恢复到 config.yaml 的 ``waa.active_server``。
+
+    适用场景：临时切换排查问题后，一键回到部署时的默认签名节点。
+    """
+    import os
+
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        clear_runtime_waa_override,
+        get_active_waa_server,
+    )
+
+    previous = clear_runtime_waa_override()
+    if previous is None:
+        return {
+            "ok": True,
+            "active_server": get_active_waa_server(),
+            "runtime_override": None,
+            "changed": False,
+        }
+
+    # 覆盖清除后回到默认节点：远端则停掉本地守护，本地则懒启动
+    active = get_active_waa_server()
+    active_url = str(active.get("url") or "")
+    if "127.0.0.1" in active_url or "localhost" in active_url:
+        from aistudio_api.infrastructure.waa.daemon import ensure_signer_ready
+
+        ensure_signer_ready()
+        active = get_active_waa_server()
+    else:
+        from aistudio_api.infrastructure.waa.daemon import stop_signer_daemon
+
+        stop_signer_daemon()
+
+    env_override = os.getenv("AISTUDIO_WAA_SERVER", "").strip()
+    logger.info(
+        "恢复 WAA 签名服务默认节点: id=%s%s",
+        active.get("id"),
+        f"（环境变量默认 {env_override}）" if env_override else "（配置文件默认）",
+    )
+    return {
+        "ok": True,
+        "active_server": active,
+        "runtime_override": None,
+        "changed": True,
+    }
 
 
 @protected_router.put("/config/signer-servers")
