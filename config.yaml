@@ -6,6 +6,7 @@ anti_truncation:
     enabled: true
     models:
     - gemini-3.8-flash
+    - gemini-4-argon
 waa:
   active_server: local_spidermonkey
   servers:

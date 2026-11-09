@@ -115,11 +115,124 @@ async def test_model_discovery_falls_back_to_auth_file_cookies(tmp_path, monkeyp
     service._fetch_via_http = AsyncMock(return_value=fake_http_models)
 
     models = await service.get_models(session=mock_session, force_refresh=True)
-    assert models == fake_http_models
+    # 上游模型全部保留，且本地补充模型（gemini-4-argon）被合并进列表
+    assert {str(m["id"]) for m in models} == {
+        "dynamic-gemini-test",
+        "gemini-4-argon",
+    }
     assert service._fetch_via_http.called
     call_cookies, call_auth_user = service._fetch_via_http.call_args[0]
     assert call_cookies["SAPISID"] == "test_sapisid"
     assert call_auth_user == "0"
+
+
+@pytest.mark.asyncio
+async def test_list_models_includes_gemini_4_argon(monkeypatch):
+    """模型列表应始终包含本地补充模型 gemini-4-argon。"""
+    monkeypatch.setattr(settings, "api_keys", frozenset())
+    async with _build_client() as client:
+        response = await client.get("/v1beta/models")
+        assert response.status_code == 200
+        names = [m["name"] for m in response.json()["models"]]
+        assert "models/gemini-4-argon" in names
+
+
+@pytest.mark.asyncio
+async def test_get_gemini_4_argon_model_detail(monkeypatch):
+    """单个模型详情接口应能返回 gemini-4-argon 元数据。"""
+    monkeypatch.setattr(settings, "api_keys", frozenset())
+    async with _build_client() as client:
+        response = await client.get("/v1beta/models/gemini-4-argon")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["name"] == "models/gemini-4-argon"
+        assert data["displayName"] == "Gemini 4 Argon"
+        assert "generateContent" in data["supportedGenerationMethods"]
+
+
+@pytest.mark.asyncio
+async def test_model_discovery_merges_extra_models_into_upstream_list():
+    """上游 ListModels 未返回 gemini-4-argon 时，本地补充模型应被合并进列表。"""
+    from unittest.mock import AsyncMock
+
+    from aistudio_api.infrastructure.gateway.model_discovery import (
+        ModelDiscoveryService,
+    )
+
+    service = ModelDiscoveryService()
+    upstream_models = [
+        {"id": "gemini-3.7-flash", "displayName": "Gemini 3.7 Flash"},
+    ]
+    service._fetch_via_http = AsyncMock(return_value=upstream_models)
+
+    models = await service.get_models(cookies={"SAPISID": "test"}, force_refresh=True)
+    ids = [str(m["id"]) for m in models]
+    assert ids == ["gemini-3.7-flash", "gemini-4-argon"]
+
+
+@pytest.mark.asyncio
+async def test_model_discovery_does_not_duplicate_extra_models():
+    """上游已返回 gemini-4-argon 时，不应重复追加，且保留上游元数据。"""
+    from unittest.mock import AsyncMock
+
+    from aistudio_api.infrastructure.gateway.model_discovery import (
+        ModelDiscoveryService,
+    )
+
+    service = ModelDiscoveryService()
+    upstream_models = [
+        {
+            "id": "gemini-4-argon",
+            "displayName": "Gemini 4 Argon (upstream)",
+            "description": "upstream metadata should win",
+        },
+    ]
+    service._fetch_via_http = AsyncMock(return_value=upstream_models)
+
+    models = await service.get_models(cookies={"SAPISID": "test"}, force_refresh=True)
+    argon_entries = [m for m in models if str(m.get("id")) == "gemini-4-argon"]
+    assert len(argon_entries) == 1
+    assert argon_entries[0]["description"] == "upstream metadata should win"
+
+
+@pytest.mark.asyncio
+async def test_model_discovery_skips_extra_model_known_by_alias():
+    """上游以别名形式返回该模型时，同样不重复追加。"""
+    from unittest.mock import AsyncMock
+
+    from aistudio_api.infrastructure.gateway.model_discovery import (
+        ModelDiscoveryService,
+    )
+
+    service = ModelDiscoveryService()
+    upstream_models = [
+        {
+            "id": "gemini-4-argon-preview-001",
+            "displayName": "Gemini 4 Argon Preview",
+            "aliases": ["gemini-4-argon"],
+        },
+    ]
+    service._fetch_via_http = AsyncMock(return_value=upstream_models)
+
+    models = await service.get_models(cookies={"SAPISID": "test"}, force_refresh=True)
+    ids = [str(m["id"]) for m in models]
+    assert ids.count("gemini-4-argon") == 0
+    assert "gemini-4-argon-preview-001" in ids
+
+
+@pytest.mark.asyncio
+async def test_gemini_4_argon_tier_gating_from_config():
+    """gemini-4-argon 的层级门槛应由 config.yaml 的 paid_model_rules 驱动。"""
+    from aistudio_api.infrastructure.gateway.model_discovery import (
+        ModelDiscoveryService,
+    )
+
+    service = ModelDiscoveryService()
+    assert service.is_model_allowed_for_tier("gemini-4-argon", "Free") is False
+    assert service.is_model_allowed_for_tier("gemini-4-argon", "Pro") is True
+    assert service.is_model_allowed_for_tier("gemini-4-argon", "Ultra") is True
+    assert service.is_paid_model("gemini-4-argon") is True
+    assert service.get_required_tiers("gemini-4-argon") == ["Pro", "Ultra", "Ultra_20X"]
 
 
 @pytest.mark.asyncio
