@@ -57,10 +57,10 @@ rotator:
 
 paid_model_rules:
   ultra_required:
-    contains: ["veo", "ultra"]
+    contains: ["veo", "ultra", "antigravity"]
     required_tiers: ["Ultra", "Ultra_20X"]
   pro_required:
-    contains: ["argon", "gemini-4", "image", "imagen"]
+    contains: ["argon", "gemini-4", "image", "imagen", "omni", "deep-research", "lyria"]
     required_tiers: ["Pro", "Ultra", "Ultra_20X"]
 
 model_defaults:
@@ -79,6 +79,7 @@ model_defaults:
           - veo-
         contains:
           - veo
+          - omni
       disable_safety_settings: true
     - name: gemma_models
       match:
@@ -111,6 +112,10 @@ tier_quotas:
       match:
         contains: ["pro"]
       daily_limit: 10
+    tts_models:
+      match:
+        contains: ["tts"]
+      daily_limit: 10
     default_limit: 20
   Plus:
     flash_models:
@@ -120,6 +125,10 @@ tier_quotas:
     pro_models:
       match:
         contains: ["pro"]
+      daily_limit: 30
+    tts_models:
+      match:
+        contains: ["tts"]
       daily_limit: 30
     default_limit: 50
   Pro:
@@ -139,6 +148,14 @@ tier_quotas:
       match:
         contains: ["image", "imagen"]
       daily_limit: 50
+    tts_models:
+      match:
+        contains: ["tts"]
+      daily_limit: 50
+    music_models:
+      match:
+        contains: ["lyria"]
+      daily_limit: 10
     default_limit: 50
   Ultra:
     argon_models:
@@ -161,6 +178,14 @@ tier_quotas:
       match:
         contains: ["veo"]
       daily_limit: 50
+    tts_models:
+      match:
+        contains: ["tts"]
+      daily_limit: 250
+    music_models:
+      match:
+        contains: ["lyria"]
+      daily_limit: 50
     default_limit: 250
   Ultra_20X:
     argon_models:
@@ -182,6 +207,14 @@ tier_quotas:
     video_models:
       match:
         contains: ["veo"]
+      daily_limit: 200
+    tts_models:
+      match:
+        contains: ["tts"]
+      daily_limit: 1000
+    music_models:
+      match:
+        contains: ["lyria"]
       daily_limit: 200
     default_limit: 1000
   overrides: {}
