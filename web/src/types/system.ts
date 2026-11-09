@@ -51,13 +51,34 @@ export interface SignerServerItem {
   user_agent?: string
   headers?: Record<string, string>
   is_active?: boolean
+  /** 该节点是否为环境变量 AISTUDIO_WAA_SERVER 指定的启动默认（重启后恢复） */
+  is_env_default?: boolean
+  /** 兼容旧字段，语义同 is_env_default */
   env_locked?: boolean
 }
 
 export interface SignerServersResponse {
   active_server: string
   env_override?: string | null
+  /** 面板切换写入的运行时覆盖 id（未设置时为 null） */
+  runtime_override?: string | null
   servers: SignerServerItem[]
+}
+
+export interface SwitchSignerServerResponse {
+  ok: boolean
+  active_server: SignerServerItem
+  runtime_override?: string | null
+  /** 信息提示：环境变量默认与切换目标不一致时说明重启后的回退行为 */
+  note?: string | null
+}
+
+export interface ResetSignerServerResponse {
+  ok: boolean
+  active_server: SignerServerItem
+  runtime_override?: string | null
+  /** 是否真正清除了运行时覆盖（原本未设置时为 false） */
+  changed?: boolean
 }
 
 export interface TestSignerServerResponse {
