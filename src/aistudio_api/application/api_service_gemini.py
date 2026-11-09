@@ -529,6 +529,23 @@ async def handle_gemini_generate_content(
             final_fr = to_gemini_finish_reason(
                 output.candidates[0].finish_reason if output.candidates else None
             )
+            # 空回防护：上游 200 但零内容时留下明确日志，便于面板排查
+            has_any_output = bool(
+                output.text
+                or output.function_calls
+                or output.function_responses
+                or output.images
+                or output.reasoning_images
+            )
+            if not has_any_output:
+                logger.warning(
+                    "上游返回 200 但内容为空（可能是上游风控拦截或安全策略）: "
+                    "model=%s, finish=%s, 尝试次数=%d/%d",
+                    normalized.model,
+                    final_fr,
+                    attempt + 1,
+                    total_attempts,
+                )
             record_rotator_event("success", model=normalized.model, usage=output.usage)
             runtime_state.record(
                 normalized.model,
@@ -850,6 +867,14 @@ def _build_gemini_streaming_response(
             if not stream_completed and last_stream_error is not None:
                 raise last_stream_error
             target_model = normalized.model if normalized else model_path
+            # 空回防护：流式完成但未产出任何内容时留下明确日志
+            if stream_completed and not has_yielded_data and not force_buffer:
+                logger.warning(
+                    "流式完成但未产生任何内容（可能是上游风控拦截或安全策略）: "
+                    "model=%s, finish=%s",
+                    target_model,
+                    final_finish_reason,
+                )
             record_rotator_event("success", model=target_model, usage=final_usage)
             if normalized is not None:
                 runtime_state.record(

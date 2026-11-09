@@ -3,6 +3,11 @@
 Provides standardized log formatting, dynamic log level adjustments,
 and full-payload request dumping controlled via the DEBUG environment
 variable or web configuration.
+
+Additionally mirrors every log record into an in-memory ring buffer so the
+web console can expose runtime logs (including upstream errors) via
+``GET /api/logs`` — the operator should never face an "empty reply with
+no clue" situation again.
 """
 
 from __future__ import annotations
@@ -13,8 +18,102 @@ import os
 import re
 import sys
 import time
+from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# 内存日志环形缓冲（供 Web 面板 /api/logs 查询运行日志与报错）
+# ---------------------------------------------------------------------------
+
+_LOG_RING_CAPACITY = 2000
+_LEVEL_ORDER: dict[str, int] = {
+    "DEBUG": 10,
+    "INFO": 20,
+    "WARNING": 30,
+    "ERROR": 40,
+    "CRITICAL": 50,
+}
+
+_log_ring: deque[dict[str, object]] = deque(maxlen=_LOG_RING_CAPACITY)
+
+
+class RingBufferHandler(logging.Handler):
+    """把日志记录同步镜像进内存环形缓冲，供面板实时查看。"""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+            if record.exc_info:
+                exc_text = self._format_exc_tail(record)
+                if exc_text:
+                    message = f"{message}\n{exc_text}"
+            _log_ring.append(
+                {
+                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "ts_ms": int(record.created * 1000),
+                    "level": record.levelname,
+                    "name": record.name,
+                    "message": message,
+                }
+            )
+        except Exception:
+            self.handleError(record)
+
+    @staticmethod
+    def _format_exc_tail(record: logging.LogRecord) -> str:
+        import traceback
+
+        try:
+            lines = traceback.format_exception(
+                *record.exc_info, limit=4
+            )
+            return "".join(lines).strip()
+        except Exception:
+            return ""
+
+
+def get_recent_logs(
+    *,
+    min_level: str = "INFO",
+    limit: int = 300,
+    search: str | None = None,
+    order: str = "desc",
+) -> list[dict[str, object]]:
+    """读取环形缓冲中的最近日志，支持级别过滤与关键字检索。
+
+    ``order='desc'`` 时最新日志排在最前（面板默认），``asc`` 按时间正序。
+    """
+    min_no = _LEVEL_ORDER.get(str(min_level).strip().upper(), logging.INFO)
+    needle = (search or "").strip().lower()
+    matched: list[dict[str, object]] = []
+    for entry in _log_ring:
+        if _LEVEL_ORDER.get(str(entry.get("level")), logging.INFO) < min_no:
+            continue
+        if needle:
+            haystack = (
+                f"{entry.get('message', '')} {entry.get('name', '')} "
+                f"{entry.get('level', '')}"
+            ).lower()
+            if needle not in haystack:
+                continue
+        matched.append(entry)
+    if str(order).strip().lower() == "asc":
+        return matched[-limit:]
+    return list(reversed(matched))[:limit]
+
+
+def clear_recent_logs() -> int:
+    """清空内存日志缓冲，返回清空前条数。"""
+    count = len(_log_ring)
+    _log_ring.clear()
+    return count
+
+
+def get_log_buffer_stats() -> dict[str, int]:
+    """返回日志环形缓冲的容量与当前条数。"""
+    return {"capacity": _LOG_RING_CAPACITY, "size": len(_log_ring)}
+
 
 _UNIFIED_LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
 _UNIFIED_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -54,6 +153,7 @@ class UnifiedFormatter(logging.Formatter):
 
 
 _root_handler: logging.Handler | None = None
+_ring_handler: RingBufferHandler | None = None
 _current_level: str = "INFO"
 _dump_requests_override: bool | None = None
 _dump_to_file_override: bool | None = None
@@ -241,6 +341,8 @@ def set_log_level(level: str | int) -> None:
     # 同步更新已挂载的 handler 级别
     if _root_handler:
         _root_handler.setLevel(numeric_level)
+    if _ring_handler:
+        _ring_handler.setLevel(numeric_level)
 
     for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         logging.getLogger(logger_name).setLevel(numeric_level)
@@ -253,7 +355,7 @@ def set_log_level(level: str | int) -> None:
 
 def setup_logging(level: str | int = "INFO") -> None:
     """初始化全局日志系统并统一所有子系统的格式与输出。"""
-    global _root_handler
+    global _root_handler, _ring_handler
     formatter = UnifiedFormatter()
 
     if _root_handler is None:
@@ -264,6 +366,15 @@ def setup_logging(level: str | int = "INFO") -> None:
         root.addHandler(_root_handler)
     else:
         _root_handler.setFormatter(formatter)
+
+    # 内存环形缓冲镜像：供 Web 面板 /api/logs 查询运行日志
+    if _ring_handler is None:
+        _ring_handler = RingBufferHandler()
+        root = logging.getLogger()
+        if _ring_handler not in root.handlers:
+            root.addHandler(_ring_handler)
+    else:
+        _ring_handler.setFormatter(formatter)
 
     # 将 uvicorn 与 httpx 的日志器也接入统一格式
     for logger_name in (

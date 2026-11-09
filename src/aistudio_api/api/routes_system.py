@@ -364,13 +364,26 @@ class TestSignerServerRequest(BaseModel):
 
 @protected_router.get("/config/signer-servers")
 async def get_signer_servers() -> dict[str, object]:
-    """获取所有配置的 WAA 签名服务器列表及当前激活项。"""
+    """获取所有配置的 WAA 签名服务器列表及当前激活项。
+
+    激活判定与运行时完全一致：优先环境变量 ``AISTUDIO_WAA_SERVER``，
+    其次 config.yaml 的 ``waa.active_server``，避免“实际用远端签名、
+    面板却显示本地”的不一致。响应中的 ``env_override`` 非空表示
+    运行时被环境变量锁定，面板切换不会改变实际生效节点。
+    """
+    import os
+
     from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_active_waa_server,
         get_configured_waa_settings,
     )
 
     waa = get_configured_waa_settings()
-    active_id = str(waa.get("active_server") or "local_spidermonkey").strip()
+    # 运行时实际生效节点（环境变量优先），与 client/session 的取值逻辑对齐
+    active_id = str(
+        get_active_waa_server().get("id") or "local_spidermonkey"
+    ).strip()
+    env_override = os.getenv("AISTUDIO_WAA_SERVER", "").strip()
     raw_servers = waa.get("servers")
     servers = raw_servers if isinstance(raw_servers, list) else []
 
@@ -380,28 +393,74 @@ async def get_signer_servers() -> dict[str, object]:
             s_id = str(s.get("id") or "").strip()
             item = dict(s)
             item["is_active"] = s_id == active_id
+            item["env_locked"] = bool(env_override) and s_id == env_override
             result_servers.append(item)
 
     return {
         "active_server": active_id,
+        "env_override": env_override or None,
         "servers": result_servers,
     }
 
 
 @protected_router.post("/config/signer-servers/switch")
 async def switch_signer_server(req: SwitchSignerServerRequest) -> dict[str, object]:
-    """纯手动切换当前激活的 WAA 签名服务器。"""
+    """纯手动切换当前激活的 WAA 签名服务器（持久化到 config.yaml）。
+
+    - 切到本地节点时懒启动本地签名守护进程（二进制缺失时自动回退远程）；
+    - 切走本地节点时停掉本进程自动拉起的守护实例，避免空转；
+    - 环境变量 ``AISTUDIO_WAA_SERVER`` 存在时运行时被锁定，返回 warning
+      说明面板切换对当前进程不生效，避免误导。
+    """
+    import os
+
     from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_active_waa_server,
+        get_configured_waa_settings,
         switch_active_waa_server,
     )
 
-    active = switch_active_waa_server(req.server_id)
+    target_id = req.server_id.strip()
+    waa = get_configured_waa_settings()
+    known_ids = {
+        str(s.get("id") or "").strip()
+        for s in (waa.get("servers") or [])
+        if isinstance(s, dict)
+    }
+    if target_id not in known_ids:
+        raise HTTPException(404, detail=f"未找到签名服务器: {target_id}")
+
+    switch_active_waa_server(target_id)
+
+    # 切到本地节点：懒启动本地守护进程（缺失时自动回退远程并写回配置）
+    active = get_active_waa_server()
+    active_url = str(active.get("url") or "")
+    if "127.0.0.1" in active_url or "localhost" in active_url:
+        from aistudio_api.infrastructure.waa.daemon import ensure_signer_ready
+
+        ensure_signer_ready()
+        # 兼容二进制缺失自动回退远程的情况，重新读取实际生效节点
+        active = get_active_waa_server()
+    else:
+        from aistudio_api.infrastructure.waa.daemon import stop_signer_daemon
+
+        stop_signer_daemon()
+
+    env_override = os.getenv("AISTUDIO_WAA_SERVER", "").strip()
+    warning: str | None = None
+    if env_override:
+        warning = (
+            f"环境变量 AISTUDIO_WAA_SERVER={env_override} 正在锁定运行时签名服务，"
+            f"本次切换已写入配置文件，但当前进程实际仍使用 [{env_override}]。"
+            f"如需面板切换完全生效，请移除该环境变量并重启服务。"
+        )
     logger.info(
-        "切换 WAA 签名服务: id=%s, url=%s",
+        "切换 WAA 签名服务: id=%s, url=%s%s",
         active.get("id"),
         active.get("url"),
+        f"（运行时被环境变量锁定为 {env_override}）" if env_override else "",
     )
-    return {"ok": True, "active_server": active}
+    return {"ok": True, "active_server": active, "warning": warning}
 
 
 @protected_router.put("/config/signer-servers")
@@ -437,7 +496,16 @@ async def delete_signer_server(server_id: str) -> dict[str, bool]:
 
 @protected_router.post("/config/signer-servers/test")
 async def test_signer_server(req: TestSignerServerRequest) -> dict[str, object]:
-    """测试指定签名服务的连通性与健康状态。"""
+    """测试指定签名服务的连通性与健康状态。
+
+    兼容两代远程签名服务探活协议：
+    - 旧版（aistudio-pg-bridge 早期 / 自建 Go signer）：GET /health 无参返回 200。
+    - 新版（spinsnow 2026-10 起）：/health 必须携带 Cookie（X-Google-Cookies 头
+      或 cookies 查询参数），缺参返回 400 + "Missing cookies" 提示。该 400
+      恰恰证明服务在线，仅探活方式过时；有活跃账号时携带 Cookie 复测即可
+      得到完整的池化状态（account/poolState）。
+    """
+    import json as _json
     import time
 
     import httpx
@@ -448,19 +516,85 @@ async def test_signer_server(req: TestSignerServerRequest) -> dict[str, object]:
     is_local = "127.0.0.1" in target_url or "localhost" in target_url
     proxy = None if is_local else settings.proxy_url
 
+    def _extract_active_cookies() -> str:
+        """从当前活跃账号取核心 Cookie，用于新版协议的深度探活。"""
+        try:
+            from aistudio_api.infrastructure.account.account_store import (
+                AccountStore,
+            )
+            from aistudio_api.infrastructure.account.cookie_parser import (
+                filter_minimal_cookies,
+                load_cookies_from_auth_file,
+            )
+
+            store = AccountStore()
+            active = store.get_active_account()
+            if not active:
+                return ""
+            auth_path = store.get_auth_path_optional(active.id, require_exists=True)
+            if not auth_path:
+                return ""
+            cookies = filter_minimal_cookies(
+                load_cookies_from_auth_file(auth_path)
+            )
+            return "; ".join(f"{k}={v}" for k, v in cookies.items() if v)
+        except Exception:
+            return ""
+
     t0 = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=8.0, proxy=proxy) as client:
             resp = await client.get(f"{target_url}/health")
             elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
             is_ok = resp.status_code == 200
-            data = resp.json() if is_ok else {}
-            return {
+            data: dict[str, object] = {}
+            note = ""
+
+            if resp.status_code == 400:
+                # 新版协议：缺 Cookie 探活被拒，但服务本身在线
+                body_text = resp.text[:300]
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"raw": body_text}
+                err_text = str(data.get("error") or body_text).lower()
+                if "cookies" in err_text:
+                    is_ok = True
+                    note = (
+                        "服务在线（新版协议要求探活携带 Cookie，"
+                        "携带活跃账号 Cookie 复测中）"
+                    )
+                    # 携带活跃账号 Cookie 复测，获取完整池化状态
+                    cookie_header = _extract_active_cookies()
+                    if cookie_header:
+                        try:
+                            resp2 = await client.get(
+                                f"{target_url}/health",
+                                headers={"X-Google-Cookies": cookie_header},
+                            )
+                            if resp2.status_code == 200:
+                                data = resp2.json()
+                        except Exception:
+                            pass
+                else:
+                    note = str(data.get("error") or body_text)
+            elif is_ok:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {}
+
+            result: dict[str, object] = {
                 "ok": is_ok,
                 "status_code": resp.status_code,
                 "elapsed_ms": elapsed_ms,
                 "data": data,
             }
+            if note:
+                result["note"] = note
+            # 显式 dump 一遍保证 JSON 可序列化（data 可能含非 dict 项）
+            _json.dumps(result)
+            return result
     except Exception as e:
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
         return {
@@ -468,6 +602,69 @@ async def test_signer_server(req: TestSignerServerRequest) -> dict[str, object]:
             "error": str(e),
             "elapsed_ms": elapsed_ms,
         }
+
+
+# ========== 运行日志查看（内存环形缓冲） ==========
+
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
+@protected_router.get("/api/logs")
+async def get_runtime_logs(
+    level: str = "INFO",
+    limit: int = 300,
+    search: str | None = None,
+    order: str = "desc",
+) -> dict[str, object]:
+    """查询最近运行日志（内存环形缓冲），供面板展示运行日志与报错。
+
+    - ``level``: 最低日志级别过滤（DEBUG/INFO/WARNING/ERROR/CRITICAL）
+    - ``limit``: 返回条数上限（1~1000）
+    - ``search``: 关键字过滤（匹配消息、日志器名、级别）
+    - ``order``: ``desc`` 最新在前（默认），``asc`` 按时间正序
+    """
+    from aistudio_api.infrastructure.utils.logger import (
+        get_log_buffer_stats,
+        get_recent_logs,
+    )
+
+    clean_level = str(level or "INFO").strip().upper()
+    if clean_level not in _LOG_LEVELS:
+        clean_level = "INFO"
+    try:
+        clean_limit = max(1, min(int(limit), 1000))
+    except (TypeError, ValueError):
+        clean_limit = 300
+    clean_order = "asc" if str(order or "").strip().lower() == "asc" else "desc"
+
+    entries = get_recent_logs(
+        min_level=clean_level,
+        limit=clean_limit,
+        search=search,
+        order=clean_order,
+    )
+    stats = get_log_buffer_stats()
+    return {
+        "ok": True,
+        "count": len(entries),
+        "total": stats["size"],
+        "capacity": stats["capacity"],
+        "logs": entries,
+    }
+
+
+@protected_router.delete("/api/logs")
+async def clear_runtime_logs() -> dict[str, object]:
+    """清空内存日志缓冲。"""
+    from aistudio_api.infrastructure.utils.logger import (
+        clear_recent_logs,
+        get_log_buffer_stats,
+    )
+
+    removed = clear_recent_logs()
+    logger.info("内存日志缓冲已清空: 清除条数=%d", removed)
+    stats = get_log_buffer_stats()
+    return {"ok": True, "removed": removed, "total": stats["size"], "capacity": stats["capacity"]}
 
 
 class LoggingConfigRequest(BaseModel):
