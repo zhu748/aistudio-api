@@ -80,8 +80,45 @@ def _extract_model_aliases(raw: object) -> list[str]:
     return aliases
 
 
+# 本地补充模型：无论上游 ListModels 是否返回，都确保出现在模型列表中
+# （README 宣传的模型 / config.yaml 已配置对应付费规则与层级配额）
+_EXTRA_GUARANTEED_MODELS = [
+    {
+        "id": "gemini-4-argon",
+        "displayName": "Gemini 4 Argon",
+        "description": "Gemini 4 Argon flagship reasoning model",
+    },
+]
+
+
+def _merge_extra_models(
+    models: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """将本地补充模型合并进模型列表（按 id 与别名去重，上游已存在则跳过）。"""
+    known_ids: set[str] = set()
+    for item in models:
+        raw_id = str(item.get("id") or item.get("name") or "")
+        known_ids.add(raw_id.removeprefix("models/").lower())
+        raw_aliases = item.get("aliases")
+        if isinstance(raw_aliases, list):
+            known_ids.update(
+                str(a).removeprefix("models/").lower() for a in raw_aliases
+            )
+    merged = list(models)
+    for extra in _EXTRA_GUARANTEED_MODELS:
+        if str(extra.get("id", "")).lower() in known_ids:
+            continue
+        merged.append(dict(extra))
+    return merged
+
+
 # 本地保底默认模型列表（当网络未就绪或未配置账号时使用）
 _FALLBACK_MODELS = [
+    {
+        "id": "gemini-4-argon",
+        "displayName": "Gemini 4 Argon",
+        "description": "Gemini 4 Argon flagship reasoning model",
+    },
     {
         "id": "gemini-3.8-flash",
         "displayName": "Gemini 3.8 Flash",
@@ -234,15 +271,18 @@ class ModelDiscoveryService:
                         tier=effective_tier,
                     )
                     if models:
-                        self._cached_models = models
+                        merged = _merge_extra_models(models)
+                        self._cached_models = merged
                         self._last_fetched_at = time.time()
-                        logger.info("已更新上游模型列表: count=%d", len(models))
-                        return models
+                        logger.info("已更新上游模型列表: count=%d", len(merged))
+                        return merged
                 except Exception as e:
                     logger.debug("拉取模型列表失败: %s", e)
-            # 3. 保底返回本地默认模型列表
+            # 3. 保底返回本地默认模型列表（含本地补充模型）
             if not self._cached_models:
-                self._cached_models = [dict(m) for m in _FALLBACK_MODELS]
+                self._cached_models = _merge_extra_models(
+                    [dict(m) for m in _FALLBACK_MODELS]
+                )
                 self._last_fetched_at = time.time()
 
             return self._cached_models
@@ -261,7 +301,7 @@ class ModelDiscoveryService:
             raw_aliases = model_info.get("aliases")
             if isinstance(raw_aliases, list) and clean_target in raw_aliases:
                 return model_info
-        for model_info in _FALLBACK_MODELS:
+        for model_info in (*_FALLBACK_MODELS, *_EXTRA_GUARANTEED_MODELS):
             model_raw_id = str(model_info.get("id") or model_info.get("name") or "")
             model_clean_id = model_raw_id.removeprefix("models/")
             if model_clean_id == clean_target:
