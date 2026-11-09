@@ -11,10 +11,11 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from aistudio_api.application.api_service_gemini import classify_gemini_error_payload
+from aistudio_api.application.compat_service import build_compat_error_response
 from aistudio_api.config import settings
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.model_defaults import (
@@ -29,6 +30,7 @@ from aistudio_api.infrastructure.utils.logger import (
 
 from .dependencies import require_api_key, require_web_auth
 from .routes_accounts import router as accounts_router
+from .routes_compat import router as compat_router
 from .routes_gemini import router as gemini_router
 from .routes_models import router as models_router
 from .routes_system import (
@@ -329,11 +331,37 @@ app.include_router(
 app.include_router(accounts_router, dependencies=[Depends(require_web_auth)])
 app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
 app.include_router(models_router, dependencies=[Depends(require_api_key)])
+app.include_router(compat_router, dependencies=[Depends(require_api_key)])
 
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
     code, msg, status_str = classify_gemini_error_payload(exc)
+    # OpenAI / Claude 兼容路径按各自协议格式下发错误体
+    compat_response = build_compat_error_response(_request, exc)
+    if compat_response is not None:
+        if code >= 500:
+            logger.error(
+                "HTTP %d 异常: path=%s, message=%s",
+                code,
+                _request.url.path,
+                msg,
+            )
+        elif code in (401, 403, 429):
+            logger.warning(
+                "HTTP %d: path=%s, message=%s",
+                code,
+                _request.url.path,
+                msg,
+            )
+        else:
+            logger.info(
+                "HTTP %d: path=%s, message=%s",
+                code,
+                _request.url.path,
+                msg,
+            )
+        return compat_response
     if code >= 500:
         logger.error(
             "HTTP %d 异常: path=%s, message=%s",
@@ -372,6 +400,11 @@ async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONR
 async def validation_exception_handler(
     _request: Request, exc: RequestValidationError
 ) -> JSONResponse:
+    # OpenAI / Claude 兼容路径按各自协议格式下发校验错误体
+    compat_response = build_compat_error_response(_request, exc)
+    if compat_response is not None:
+        logger.warning("请求参数校验失败: path=%s, error=%s", _request.url.path, exc)
+        return compat_response
     code, msg, status_str = 400, str(exc), "INVALID_ARGUMENT"
     logger.warning("请求参数校验失败: path=%s, error=%s", _request.url.path, exc)
     return JSONResponse(
@@ -525,6 +558,7 @@ async def spa_navigation_middleware(request: Request, call_next):
         (
             "/api",
             "/v1beta",
+            "/v1",
             "/auth",
             "/assets",
             "/static",
@@ -571,6 +605,51 @@ async def root_index():
         )
         return response
     return JSONResponse({"message": "AI Studio API Web UI"})
+
+
+@app.middleware("http")
+async def compat_cors_middleware(request: Request, call_next):
+    """OpenAI / Claude 兼容路径的 CORS 支持（浏览器直连客户端）。
+
+    仅作用于 ``/v1/`` 前缀：OPTIONS 预检直接短路返回 204，
+    其余带 Origin 的响应回显跨域头。注册于最后使其成为最外层中间件，
+    保证错误响应同样携带 CORS 头。
+    """
+    if not request.url.path.startswith("/v1/"):
+        return await call_next(request)
+
+    if request.method == "OPTIONS":
+        origin = request.headers.get("origin") or "*"
+        preflight = Response(status_code=204)
+        preflight.headers["Access-Control-Allow-Origin"] = origin
+        if origin != "*":
+            preflight.headers["Access-Control-Allow-Credentials"] = "true"
+        preflight.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        preflight.headers["Access-Control-Allow-Headers"] = (
+            request.headers.get("access-control-request-headers")
+            or "Authorization, Content-Type, x-api-key, anthropic-version, "
+            "x-goog-api-key, x-anti-truncation"
+        )
+        preflight.headers["Access-Control-Max-Age"] = "86400"
+        return preflight
+
+    response = await call_next(request)
+    origin = request.headers.get("origin")
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        # 合并而非覆盖：保留上游已写入的 Vary（如 Accept），
+        # 避免命中同一 URL 的不同 Accept/Origin 变体被中间层缓存串包
+        existing_vary = response.headers.get("Vary")
+        vary_values = (
+            [v.strip() for v in existing_vary.split(",") if v.strip()]
+            if existing_vary
+            else []
+        )
+        if "Origin" not in vary_values:
+            vary_values.append("Origin")
+        response.headers["Vary"] = ", ".join(vary_values)
+    return response
 
 
 def main():
