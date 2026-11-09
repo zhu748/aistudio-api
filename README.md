@@ -239,6 +239,7 @@ docker compose up -d
 3. 首次部署会提示填写密钥环境变量：
    - `AISTUDIO_WEB_PASSWORD`（**必填**）：Web 管理面板登录密码，公网部署务必设置；
    - `AISTUDIO_COOKIES` / `AISTUDIO_COOKIES_2`（**推荐**）：环境变量注入账号 Cookie，重启后自动恢复，格式见[环境变量注入账号](#环境变量注入账号无磁盘部署)；更多账号可在面板继续添加 `AISTUDIO_COOKIES_3`、`AISTUDIO_COOKIES_4` ...；
+   - `AISTUDIO_API_KEYS`（**推荐**）：API 调用鉴权 Key（逗号分隔多个，如 `sk-aaa,sk-bbb`），重启后自动恢复，防止 API 接口裸奔；
    - `AISTUDIO_PROXY`（可选）：出站代理，如 `socks5://user:pass@host:port`，Google 对数据中心 IP 风控严格时配置；
 4. 等待构建完成（多阶段构建会自动编译本地 WAA 签名器，约 5~10 分钟）；
 5. 访问 Render 分配的 `https://<service>.onrender.com` 进入管理控制台，导入 Cookie 账号即可使用。
@@ -332,6 +333,7 @@ environment:
 |---|---|---|---|
 | `AISTUDIO_PORT` | int | `8080` | API 服务监听端口 |
 | `AISTUDIO_WEB_PASSWORD` | string | `""` | Web 控制台访问密码（亦可设置 `AISTUDIO_ADMIN_PASSWORD`） |
+| `AISTUDIO_API_KEYS` | string | `""` | API 调用鉴权 Key，多个用逗号/换行分隔或 JSON 数组（如 `sk-aaa,sk-bbb`）；亦可单数 `AISTUDIO_API_KEY` 注入单个。与 config.yaml 中配置的 Key 合并生效，无磁盘部署重启后自动恢复 |
 | `AISTUDIO_PROXY` | string | `""` | 出口代理地址，支持 `http://`、`https://` 或 `socks5://` |
 | `AISTUDIO_COOKIES` | string | `""` | 启动时注入的账号 Cookie，多条用换行分隔，单条支持 `代理+Cookie` / `Cookie` / `Cookie+代理` 三种格式（详见下方[环境变量注入账号](#环境变量注入账号无磁盘部署)） |
 | `AISTUDIO_COOKIES_<N>` | string | `""` | 编号变量注入（`AISTUDIO_COOKIES_1`、`AISTUDIO_COOKIES_2` ...），适合无法传入多行环境变量的平台，与 `AISTUDIO_COOKIES` 可同时使用 |

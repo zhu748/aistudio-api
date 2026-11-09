@@ -298,6 +298,7 @@ Open `http://localhost:8080` in your browser to access the Web Console.
 |---|---|---|---|
 | `AISTUDIO_PORT` | int | `8080` | HTTP service listening port |
 | `AISTUDIO_WEB_PASSWORD` | string | `""` | Web Console access password (also checks `AISTUDIO_ADMIN_PASSWORD`) |
+| `AISTUDIO_API_KEYS` | string | `""` | API auth keys, comma/newline separated or a JSON array (e.g. `sk-aaa,sk-bbb`); singular `AISTUDIO_API_KEY` also accepted. Merged with keys from config.yaml, survives diskless redeploys |
 | `AISTUDIO_PROXY` | string | `""` | Outbound proxy URL (`http://`, `https://`, or `socks5://`) |
 | `AISTUDIO_COOKIES` | string | `""` | Account cookies injected at startup; one entry per line, each entry supports `proxy+cookies` / `cookies` / `cookies+proxy` formats |
 | `AISTUDIO_COOKIES_<N>` | string | `""` | Numbered injection variables (`AISTUDIO_COOKIES_1`, `AISTUDIO_COOKIES_2`, ...) for platforms that cannot pass multi-line env vars |
