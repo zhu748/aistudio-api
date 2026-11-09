@@ -1,5 +1,5 @@
 # Stage 1: Build native Go WAA signer daemon
-FROM golang:1.23-bookworm AS signer-builder
+FROM golang:1.27-bookworm AS signer-builder
 
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
