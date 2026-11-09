@@ -268,7 +268,9 @@ async def test_transport_captures_set_cookie_and_updates_store(tmp_path):
         )
 
     transport = HTTPStreamTransport()
-    transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport._clients[transport.proxy_url or ""] = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    )
     try:
         status, _ = await transport.send_request(
             url="https://alkalimakersuite-pa.clients6.google.com/test",

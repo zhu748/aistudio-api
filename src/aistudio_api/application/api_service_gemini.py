@@ -24,6 +24,12 @@ from aistudio_api.application.account_orchestrator import (
     record_rotator_event,
     try_switch_account,
 )
+from aistudio_api.application.anti_truncation import (
+    prepare_anti_truncation,
+    resolve_model_variant,
+    restore_anti_truncation_output,
+    restore_anti_truncation_stream,
+)
 from aistudio_api.application.chat_service import (
     normalize_gemini_request,
 )
@@ -38,6 +44,7 @@ from aistudio_api.domain.errors import (
     is_transport_error,
     parse_upstream_grpc_error,
 )
+from aistudio_api.domain.models import ModelOutput
 from aistudio_api.infrastructure.gateway.client import (
     AIStudioClient,
     PreparedRequest,
@@ -420,16 +427,69 @@ async def handle_attempt_exception(
     ) from exc
 
 
+def _build_gemini_response_from_output(
+    output: ModelOutput, model_version: str
+) -> GeminiGenerateContentResponse:
+    """把缓冲完成的 ModelOutput 组装为 Gemini 完整响应（非流式 JSON 与
+    缓冲变体的单条 SSE 事件共用）。"""
+    return GeminiGenerateContentResponse(
+        candidates=[
+            GeminiCandidateResponse(
+                content=GeminiContentResponse(
+                    parts=to_gemini_parts(
+                        output.text,
+                        function_calls=output.function_calls,
+                        function_responses=output.function_responses,
+                        thinking=output.thinking,
+                        images=output.images,
+                        reasoning_images=output.reasoning_images,
+                    ),
+                ),
+                finishReason=to_gemini_finish_reason(
+                    output.candidates[0].finish_reason
+                    if output.candidates
+                    else None
+                ),
+                index=0,
+            )
+        ],
+        usageMetadata=to_gemini_usage_metadata(output.usage),
+        modelVersion=model_version,
+        responseId=output.response_id or None,
+    )
+
+
 async def handle_gemini_generate_content(
     model_path: str,
     req: GeminiGenerateContentRequest,
     client: AIStudioClient,
     *,
     stream: bool,
+    anti_truncation: bool | None = None,
 ):
+    # 抗截断模型变体：带后缀的模型强制开启抗截断；请求头 X-Anti-Truncation
+    # 显式传值时以请求头为准。非流式变体额外强制缓冲（非流式）上游传输。
+    force_buffer = False
+    variant = resolve_model_variant(model_path)
+    if variant is not None:
+        logger.info(
+            "抗截断模型变体: requested=%s, base=%s, buffered=%s",
+            model_path,
+            variant.model_path,
+            variant.buffered,
+        )
+        model_path = variant.model_path
+        if anti_truncation is None:
+            anti_truncation = True
+        force_buffer = variant.buffered
+
     if stream:
         return _build_gemini_streaming_response(
-            client=client, req=req, model_path=model_path
+            client=client,
+            req=req,
+            model_path=model_path,
+            anti_truncation=anti_truncation,
+            force_buffer=force_buffer,
         )
 
     last_error: Exception | None = None
@@ -441,6 +501,7 @@ async def handle_gemini_generate_content(
         normalized = None
         try:
             normalized = normalize_gemini_request(req, model_path)
+            at_ctx = prepare_anti_truncation(normalized, override=anti_truncation)
             logger.info(
                 "非流式请求: model=%s, 轮数=%d, 尝试=%d/%d",
                 normalized.model,
@@ -463,6 +524,7 @@ async def handle_gemini_generate_content(
                 prepared=auth_manager.current_prepared,
             )
             auth_manager.current_prepared = None
+            restore_anti_truncation_output(output, at_ctx)
 
             final_fr = to_gemini_finish_reason(
                 output.candidates[0].finish_reason if output.candidates else None
@@ -483,31 +545,7 @@ async def handle_gemini_generate_content(
                 pt,
                 ct,
             )
-            return GeminiGenerateContentResponse(
-                candidates=[
-                    GeminiCandidateResponse(
-                        content=GeminiContentResponse(
-                            parts=to_gemini_parts(
-                                output.text,
-                                function_calls=output.function_calls,
-                                function_responses=output.function_responses,
-                                thinking=output.thinking,
-                                images=output.images,
-                                reasoning_images=output.reasoning_images,
-                            ),
-                        ),
-                        finishReason=to_gemini_finish_reason(
-                            output.candidates[0].finish_reason
-                            if output.candidates
-                            else None
-                        ),
-                        index=0,
-                    )
-                ],
-                usageMetadata=to_gemini_usage_metadata(output.usage),
-                modelVersion=normalized.model,
-                responseId=output.response_id or None,
-            )
+            return _build_gemini_response_from_output(output, normalized.model)
         except Exception as exc:
             last_error = exc
             if isinstance(exc, AuthError) and not isinstance(exc, SessionExpiredError):
@@ -650,6 +688,8 @@ def _build_gemini_streaming_response(
     client: AIStudioClient,
     req: GeminiGenerateContentRequest,
     model_path: str,
+    anti_truncation: bool | None = None,
+    force_buffer: bool = False,
 ) -> StreamingResponse:
     async def stream_response():
         normalized = None
@@ -677,8 +717,57 @@ def _build_gemini_streaming_response(
                 buffered_thought_sig = None
                 await ensure_active_account(stream_attempt, model=model_path)
                 normalized = normalize_gemini_request(req, model_path)
+                at_ctx = prepare_anti_truncation(
+                    normalized, override=anti_truncation
+                )
                 try:
-                    async for event_type, text in client.stream_generate_content(
+                    if force_buffer:
+                        # 非流式抗截断变体：上游改走缓冲（非流式）传输，
+                        # 整体还原后打包为单条完整 SSE 事件下发。
+                        output = await client.generate_content(
+                            model=normalized.model,
+                            contents=normalized.contents,
+                            system_instruction_content=normalized.system_instruction,
+                            tools=normalized.tools,
+                            tool_config=normalized.tool_config,
+                            safety_settings=normalized.safety_settings,
+                            temperature=normalized.temperature,
+                            top_p=normalized.top_p,
+                            top_k=normalized.top_k,
+                            max_tokens=normalized.max_tokens,
+                            generation_config_overrides=normalized.generation_config_overrides,
+                            prepared=auth_manager.current_prepared,
+                        )
+                        auth_manager.current_prepared = None
+                        restore_anti_truncation_output(output, at_ctx)
+                        final_usage = (
+                            output.usage
+                            if isinstance(output.usage, dict)
+                            else None
+                        )
+                        final_finish_reason = to_gemini_finish_reason(
+                            output.candidates[0].finish_reason
+                            if output.candidates
+                            else None
+                        )
+                        latest_response_id = output.response_id
+                        buffered_resp = _build_gemini_response_from_output(
+                            output, normalized.model
+                        )
+                        has_yielded_data = True
+                        yield (
+                            "data: "
+                            + json.dumps(
+                                buffered_resp.model_dump(
+                                    mode="json", exclude_none=True
+                                ),
+                                ensure_ascii=False,
+                            )
+                            + "\n\n"
+                        )
+                        stream_completed = True
+                        break
+                    upstream_events = client.stream_generate_content(
                         model=normalized.model,
                         contents=normalized.contents,
                         system_instruction_content=normalized.system_instruction,
@@ -691,6 +780,9 @@ def _build_gemini_streaming_response(
                         max_tokens=normalized.max_tokens,
                         generation_config_overrides=normalized.generation_config_overrides,
                         prepared=auth_manager.current_prepared,
+                    )
+                    async for event_type, text in restore_anti_truncation_stream(
+                        upstream_events, at_ctx
                     ):
                         if event_type == "usage":
                             final_usage = text if isinstance(text, dict) else None

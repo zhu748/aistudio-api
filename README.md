@@ -226,6 +226,39 @@ docker compose up -d
 ```
 启动后访问 **`http://localhost:8080`**（或服务器 IP 端口）进入管理控制台。
 
+### Render 一键部署
+
+> [!NOTE]
+> 仓库内置 [`render.yaml`](./render.yaml) Blueprint，推送至 GitHub/GitLab 后在
+> Render 控制台 **New → Blueprint** 选择仓库即可自动完成构建与部署，无需服务器。
+
+**部署步骤：**
+
+1. 将本仓库 Fork / 推送到你的 GitHub 仓库；
+2. 在 [Render 控制台](https://dashboard.render.com) 选择 **New → Blueprint**，选中该仓库；
+3. 首次部署会提示填写密钥环境变量：
+   - `AISTUDIO_WEB_PASSWORD`（**必填**）：Web 管理面板登录密码，公网部署务必设置；
+   - `AISTUDIO_COOKIES` / `AISTUDIO_COOKIES_2`（**推荐**）：环境变量注入账号 Cookie，重启后自动恢复，格式见[环境变量注入账号](#环境变量注入账号无磁盘部署)；更多账号可在面板继续添加 `AISTUDIO_COOKIES_3`、`AISTUDIO_COOKIES_4` ...；
+   - `AISTUDIO_PROXY`（可选）：出站代理，如 `socks5://user:pass@host:port`，Google 对数据中心 IP 风控严格时配置；
+4. 等待构建完成（多阶段构建会自动编译本地 WAA 签名器，约 5~10 分钟）；
+5. 访问 Render 分配的 `https://<service>.onrender.com` 进入管理控制台，导入 Cookie 账号即可使用。
+
+**关键行为说明：**
+
+| 项目 | 说明 |
+| --- | --- |
+| 端口 | Render 注入 `PORT` 环境变量，entrypoint 自动映射为监听端口，无需手动配置 |
+| 健康检查 | `/healthz`（`/health` 等价别名），轻量无鉴权，零账号冷启动也可通过探活 |
+| 数据持久化 | **Free 计划无磁盘**：`/app/data` 随容器重启 / 重新部署清空 —— 账号用 `AISTUDIO_COOKIES` 环境变量注入，每次启动自动重建；调用统计等易失数据随重启归零 |
+| 配置初始化 | 每次启动自动将镜像内置的 `defaults/config.yaml` 模板初始化到 `/app/data`；Free 计划面板修改不持久，需固化的配置请用环境变量下发 |
+| 签名引擎 | 默认拉起容器内置的本地 Go 签名器（无需浏览器）；Free 计划建议设 `AISTUDIO_WAA_SERVER=remote_spinsnow` 改走远程签名器（更省内存） |
+
+**计划选择建议：**
+
+- **Free（512MB，Blueprint 默认）**：内存足够部署 —— 本引擎不需要浏览器（纯 Go + SpiderMonkey 本地签名）。无磁盘：账号用 `AISTUDIO_COOKIES` 环境变量注入，随重启自动恢复；15 分钟无流量自动休眠（唤醒约有几十秒冷启动）。建议设置 `AISTUDIO_WAA_SERVER=remote_spinsnow`（面板切换在 Free 计划不持久，必须用环境变量；同时跳过本地引擎进程更省内存）；
+- **Starter（$7/月）**：支持持久磁盘 —— 将 `render.yaml` 中注释掉的 `disk` 段恢复并把 `plan` 改为 `starter` 即可；服务常驻不休眠，面板修改与 UI 导入账号持久生效；
+- **Standard 及以上**：本地签名器与 Python 服务同容器运行更宽裕，适合多账号高频调用。
+
 ---
 
 ## 账号凭据 (Cookie) 获取与导入指引
@@ -246,6 +279,33 @@ docker compose up -d
 3. 点击右上角 **「+ 导入凭据」** 按钮；
 4. 将剪贴板中的 Cookie 数据直接粘贴到输入框中，点击 **「确认导入」**；
 5. 系统将自动完成连通性校验，并自动递归探测多登子账号（`u/0`, `u/1`...）完成多身份入库！
+
+### 方式三：环境变量注入（无磁盘 PaaS / 容器部署）
+
+无持久磁盘的平台（Render Free、Railway 重启、K8s 无状态 Pod 等）重新部署后账号会丢失，可通过环境变量在启动时自动注入 Cookie，与 Web 导入完全等价（同样享受自动轮换、探活与多登子账号发现）：
+
+```bash
+# docker-compose.yml 示例：多账号 + 每账号独立代理
+environment:
+  - AISTUDIO_COOKIES=|
+      socks5://user:pass@proxy-a.example.com:1080+SID=xxx; HSID=yyy; __Secure-3PSID=zzz
+      SID=aaa; HSID=bbb; __Secure-3PSID=ccc
+      SID=ddd; HSID=eee+http://proxy-b.example.com:8080
+```
+
+**单条格式（三种等价，`+` 为分隔符）：**
+
+| 格式 | 示例 | 说明 |
+| --- | --- | --- |
+| `代理+Cookie` | `socks5://127.0.0.1:1080+SID=xxx; HSID=yyy` | 代理在前 |
+| `Cookie` | `SID=xxx; HSID=yyy` | 不带代理，走全局 `AISTUDIO_PROXY` |
+| `Cookie+代理` | `SID=xxx; HSID=yyy+http://10.0.0.1:7890` | 代理在后 |
+
+- 代理支持 `http://` / `https://` / `socks5://` 完整地址，也支持 `127.0.0.1:7890` 简写（自动补全为 HTTP 代理）；
+- Cookie 内容支持任意常见格式：请求头 KV、JSON 数组（Cookie-Editor 导出）、Netscape 文本；
+- 绑定了独立代理的账号，其请求、Cookie 轮换、探活全部走该代理出口；
+- 同一账号重启后重复注入不会产生副本（按会话锚点确定性去重），从环境变量中移除则自动清理；
+- 多行环境变量不便时可改用编号变量（`AISTUDIO_COOKIES_1`、`AISTUDIO_COOKIES_2` ...）或 `AISTUDIO_COOKIES_FILE` 文件注入；单行内多条亦可用字面 `\n` 分隔。
 
 ---
 
@@ -273,6 +333,9 @@ docker compose up -d
 | `AISTUDIO_PORT` | int | `8080` | API 服务监听端口 |
 | `AISTUDIO_WEB_PASSWORD` | string | `""` | Web 控制台访问密码（亦可设置 `AISTUDIO_ADMIN_PASSWORD`） |
 | `AISTUDIO_PROXY` | string | `""` | 出口代理地址，支持 `http://`、`https://` 或 `socks5://` |
+| `AISTUDIO_COOKIES` | string | `""` | 启动时注入的账号 Cookie，多条用换行分隔，单条支持 `代理+Cookie` / `Cookie` / `Cookie+代理` 三种格式（详见下方[环境变量注入账号](#环境变量注入账号无磁盘部署)） |
+| `AISTUDIO_COOKIES_<N>` | string | `""` | 编号变量注入（`AISTUDIO_COOKIES_1`、`AISTUDIO_COOKIES_2` ...），适合无法传入多行环境变量的平台，与 `AISTUDIO_COOKIES` 可同时使用 |
+| `AISTUDIO_COOKIES_FILE` | string | `""` | Cookie 注入文件路径（内容格式与 `AISTUDIO_COOKIES` 相同，支持多行文本或 JSON 字符串数组），适合超出环境变量长度限制的批量凭据 |
 | `AISTUDIO_DATA_DIR` | string | `data/` | 主数据持久化根目录（Docker 下为 `/app/data`） |
 | `AISTUDIO_ACCOUNTS_DIR` | string | `data/accounts` | 账号持久化凭据目录 |
 | `AISTUDIO_STATS_FILE` | string | `data/stats.json` | 模型调用与 Token 使用量统计持久化文件 |
@@ -283,10 +346,37 @@ docker compose up -d
 | `AISTUDIO_PROOF_SERVER_URL` | string | `http://127.0.0.1:8081` | 签名服务器地址覆盖项；推荐在 `config.yaml` 的 `waa.servers` 中统一配置各节点及其特征 User-Agent 并手动切换 |
 | `AISTUDIO_DEFAULT_TEXT_MODEL` | string | `gemini-3.7-flash` | 默认文本模型 |
 | `AISTUDIO_TIMEZONE` | string | 自动探测 | Wire 协议交互时区（默认 `America/Los_Angeles`） |
+| `AISTUDIO_ANTI_TRUNCATION` | bool | `false` | 强制覆盖 `config.yaml` 中 `anti_truncation.enabled` 全局开关（1=开启，0=关闭，留空跟随配置文件） |
 | `AISTUDIO_DUMP_REQUESTS` | bool | `false` | 是否在终端转储每次 API 交互报文详情（支持 `DEBUG=1` 触发） |
 | `AISTUDIO_DUMP_FILE` | bool | `false` | 是否将请求与响应报文详情落盘保存 |
 | `AISTUDIO_DUMP_DIR` | string | `dumps/` | 报文转储保存目录 |
 ---
+
+### 抗截断传输 (Anti-Truncation Transport)
+
+针对上游正文文本通道偶发的吞字 / 流式截断问题，提供“工具调用参数运货”传输层：请求侧自动追加一个仅用于运货的合成函数声明（默认 `router_emit`），并指示模型把全部正文写入该函数调用的 `content` 字符串参数（上游对工具调用参数不做流式截断）；响应侧实时把参数内容还原为普通正文，客户端无感知。
+
+```yaml
+# config.yaml
+anti_truncation:
+  enabled: true          # 全局开关（默认关闭）
+  tool_name: router_emit # 合成工具名，与客户端工具名冲突时自动改用随机名
+  model_variants:        # 模型变体模式（也可在控制台「系统设置 → 抗截断传输」卡片配置）
+    enabled: true        # 开启后为选中模型暴露两个后缀变体
+    models:              # 选中的基础模型列表
+      - gemini-3.7-flash
+```
+
+- **按请求覆盖**：请求头 `X-Anti-Truncation: 1` 强制开启、`0` 强制关闭，优先级高于全局配置与模型变体。
+- **全局开启**：`enabled: true` 时所有模型请求默认启用抗截断。
+- **模型变体（按模型选择）**：`model_variants.enabled: true` 后，选中模型在 `GET /v1beta/models` 中额外暴露两个变体，选择变体模型即启用抗截断，原模型行为不变：
+  - `<model>-at-stream` —— 流式抗截断：SSE 端点走流式增量还原，客户端逐段看到正文；
+  - `<model>-at` —— 非流式抗截断：任意端点改走缓冲（非流式）上游，整体还原后单条完整响应下发（SSE 端点打包为一条事件，更抗截断但无逐段体验）。
+- **优雅降级**：模型未按指令走工具通道时，纯文本原样透传，不破坏请求。
+- **自动旁路**（与上游实现一致的安全条件）：工具历史轮次、结构化输出（`response_schema` / JSON `response_mime_type`）、停止序列、图片输出模型、内置服务端工具（如 Google Search）、强制 `tool_choice`（ANY）或 NONE 模式，一律跳过注入。
+- **流式兼容**：分片到达的参数字符串由增量 JSON 识别器实时解码为 `body` 增量事件，客户端仍可逐段看到正文；同时自适应“全量重发 / 增量追加”两种上游行为，避免重复正文。
+
+> 机制移植自 [ken050210/vertex-streaming-anti-truncation](https://github.com/ken050210/vertex-streaming-anti-truncation)，并适配本项目 AI Studio JSPB 线路协议（MakerSuite 协议无 `tool_choice` 强制字段，故依赖指令遵循 + 优雅降级）。
 
 ## API 调用示例
 
@@ -474,6 +564,7 @@ uv run pytest
 
 - **[Mag1cFall/AIStudio2API](https://github.com/Mag1cFall/AIStudio2API)**：提供了嵌入式 SpiderMonkey 152 运行时与 Firefox 152 DOM / WebIDL 宿主现场实现，以及基于 uTLS 的网络栈设计，`waa-signer` 服务基于其核心逻辑适配抽离。
 - **[Lianues/aistudio-pg-bridge](https://github.com/Lianues/aistudio-pg-bridge)**：开创了脱离本地浏览器的轻量化 WAA 证明签名服务思路，并确立了 `/v1/proof/mint` 接口规范。
+- **[ken050210/vertex-streaming-anti-truncation](https://github.com/ken050210/vertex-streaming-anti-truncation)**：抗截断传输（工具调用参数运货）的核心机制与流式增量 JSON 识别器来源，本项目将其适配至 AI Studio JSPB 线路协议。
 - **[spinsnow](https://waa.spinsnow.fun)**：提供了公开稳定的 Node.js VM WAA 签名中继服务与环境参考。
 - **[Camoufox](https://github.com/daijro/camoufox)** 与 **[go-browserforge](https://github.com/brainplusplus/go-browserforge)**：提供了真实浏览器环境指纹数据与反指纹追踪生成算法。
 

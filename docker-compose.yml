@@ -16,9 +16,13 @@ services:
       - AISTUDIO_STATS_FILE=/app/data/stats.json
       - AISTUDIO_ROTATOR_STATE_FILE=/app/data/rotator_state.json
       - AISTUDIO_CONFIG_FILE=/app/config.yaml
+      # Cookie 注入示例（也可写在挂载的 .env 中，支持多行）：
+      #   - AISTUDIO_COOKIES=socks5://user:pass@host:1080+SID=xxx; HSID=yyy
+      #   - AISTUDIO_COOKIES_1=SID=aaa; HSID=bbb
+      #   - AISTUDIO_COOKIES_2=SID=ccc; HSID=ddd+http://proxy:8080
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/v1beta/models"]
+      test: ["CMD-SHELL", "curl -f http://localhost:$${AISTUDIO_PORT:-8080}/healthz"]
       interval: 30s
       timeout: 10s
-      start_period: 10s
+      start_period: 15s
       retries: 3
