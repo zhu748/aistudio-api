@@ -163,6 +163,16 @@ class AistudioGenerationConfig:
         self._set_slot(GenerationConfigIndex.LOGPROBS, value)
 
     @property
+    def unknown_flag_13(self):
+        """上游未知开关字段（HAR 实测恒为 1，透传保真用）。"""
+        idx = GenerationConfigIndex.UNKNOWN_FLAG_13
+        return self.values[idx] if len(self.values) > idx else None
+
+    @unknown_flag_13.setter
+    def unknown_flag_13(self, value):
+        self._set_slot(GenerationConfigIndex.UNKNOWN_FLAG_13, value)
+
+    @property
     def image_output_mode(self):
         idx = GenerationConfigIndex.IMAGE_OUTPUT_MODE
         return self.values[idx] if len(self.values) > idx else None

@@ -57,6 +57,9 @@ class GenerationConfigIndex(IntEnum):
     FREQUENCY_PENALTY = 10
     RESPONSE_LOGPROBS = 11
     LOGPROBS = 12
+    # HAR 实测（2026-11）：所有 GenerateContent 请求该槽位恒为 1，
+    # 为上游新增的未知开关，语义待逆向；定义常量以便透传保真。
+    UNKNOWN_FLAG_13 = 13
     IMAGE_OUTPUT_MODE = 14
     THINKING_CONFIG = 16
     MEDIA_RESOLUTION = 17

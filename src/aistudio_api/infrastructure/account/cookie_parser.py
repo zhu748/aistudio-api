@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -21,12 +22,54 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 logger = get_logger("cookie_parser")
 
 DEFAULT_API_KEY = "AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs"
-DEFAULT_EXT_BIN = "CAASAUIwATgEQABQBFgDYgJKUHAAeAGQAQCYAQE="
 DEFAULT_ORIGIN = "https://aistudio.google.com"
 DEFAULT_USER_AGENT = "grpc-web-javascript/0.1"
 DEFAULT_BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
 )
+
+
+def _discover_region() -> str:
+    """读取 AISTUDIO_REGION 环境变量（ISO 3166-1 alpha-2，默认 US）。
+
+    地区码会写入 X-Goog-Ext-519733851-bin 头（protobuf field 12），
+    影响 Google 的地理路由（延迟与配额区域归属）。早期实现硬编码 JP，
+    与多数账号实际地区不符，故改为可配置。
+    """
+    raw = (os.getenv("AISTUDIO_REGION") or "US").strip().upper()
+    if len(raw) == 2 and raw.isascii() and raw.isalpha():
+        return raw
+    return "US"
+
+
+DEFAULT_REGION = _discover_region()
+
+# X-Goog-Ext-519733851-bin 二进制模板（protobuf）:
+#   08 00 12 01 42 30 01 38 04 40 00 50 04 58 03 62 02 <REG> 70 00 78 01 90 01 00 98 01 01
+# 其中 62 02 为 field 12 (wire type 2, len 2)，后接 2 字节地区码 ASCII。
+_EXT_BIN_PREFIX = bytes.fromhex("0800120142300138044000500458036202")
+_EXT_BIN_SUFFIX = bytes.fromhex("70007801900100980101")
+
+
+def build_ext_bin(region: str | None = None) -> str:
+    """按地区码构建 X-Goog-Ext-519733851-bin 头值。"""
+    reg = (region or DEFAULT_REGION).strip().upper()
+    if len(reg) != 2 or not reg.isascii() or not reg.isalpha():
+        reg = "US"
+    return base64.b64encode(_EXT_BIN_PREFIX + reg.encode("ascii") + _EXT_BIN_SUFFIX).decode("ascii")
+
+
+DEFAULT_EXT_BIN = build_ext_bin()
+
+# 真实 Chrome / Edge 发送 AI Studio 请求时附带的固定浏览器特征头。
+# 缺失这些头可能被风控指纹识别（HAR 实测于 2026-11）。
+# x-browser-validation 为会话级校验值；若 WAA 签名服务返回动态同名头，会覆盖此静态值。
+BROWSER_SIGNATURE_HEADERS: dict[str, str] = {
+    "X-Browser-Channel": "stable",
+    "X-Browser-Copyright": "Copyright 2026 Google LLC. All Rights Reserved.",
+    "X-Browser-Year": "2026",
+    "X-Browser-Validation": "Whavu7Z6lTQOg+XljzhS45x/NWQ=",
+}
 
 BENEFIT_TIER_TO_NAME: dict[int, str] = {
     0: "Free",
@@ -358,6 +401,7 @@ def build_makersuite_headers(
         "Origin": DEFAULT_ORIGIN,
         "Referer": f"{DEFAULT_ORIGIN}/",
         "User-Agent": DEFAULT_BROWSER_USER_AGENT,
+        **BROWSER_SIGNATURE_HEADERS,
     }
     if include_visit_id:
         headers["X-AIStudio-Visit-Id"] = f"v1_{uuid.uuid4()}"

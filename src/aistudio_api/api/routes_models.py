@@ -134,14 +134,22 @@ def _expand_anti_truncation_variants(
 @router.get("/v1beta/models", response_model=GeminiModelListResponse)
 async def list_models(
     runtime_state: RuntimeState = Depends(get_runtime_state),
+    force_refresh: bool = False,
 ) -> GeminiModelListResponse:
+    """列出可用模型。
+
+    查询参数 force_refresh=true 时跳过缓存向上游强制拉取（管理面板
+    「刷新模型列表」用）；常规调用仍走 10 分钟缓存。
+    """
     session = runtime_state.client.session if runtime_state.client else None
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
-    discovered = await model_discovery.get_models(session=session)
+    discovered = await model_discovery.get_models(
+        session=session, force_refresh=bool(force_refresh)
+    )
     models = [_to_gemini_model(item) for item in discovered]
     models.extend(_expand_anti_truncation_variants(discovered))
-    logger.debug("返回模型列表: count=%d", len(models))
+    logger.debug("返回模型列表: count=%d, force_refresh=%s", len(models), force_refresh)
     return GeminiModelListResponse(models=models)
 
 
@@ -166,6 +174,21 @@ async def get_model(
     model_info = await model_discovery.get_model_by_id(model_id, session=session)
     if model_info is not None:
         logger.debug("返回模型详情: model=%s", model_id)
-        return _to_gemini_model(model_info)
+        response = _to_gemini_model(model_info)
+        # 别名请求保持请求名（与官方 API 行为一致），
+        # 例: gemini-3.7-flash 已是 gemini-3.8-flash 的上游别名，
+        # 请求 3.7 时仍返回 name=models/gemini-3.7-flash。
+        clean_requested = model_id.removeprefix("models/")
+        clean_returned = (
+            str(model_info.get("id") or model_info.get("name") or "")
+            .removeprefix("models/")
+            .removesuffix(BUFFER_VARIANT_SUFFIX)
+            .removesuffix(STREAM_VARIANT_SUFFIX)
+        )
+        if clean_requested and clean_requested != clean_returned:
+            response = response.model_copy(
+                update={"name": f"models/{clean_requested}"}
+            )
+        return response
     logger.warning("模型不存在: model=%s", model_id)
     raise HTTPException(status_code=404, detail="Model not found")

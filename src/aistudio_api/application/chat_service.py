@@ -353,6 +353,109 @@ def _parse_thinking_level(raw_level: object) -> ThinkingLevel | None:
     return ThinkingLevel[label]
 
 
+# 思考档位逻辑顺序（数值与逻辑序不同：MINIMAL=4 但强度最低）。
+# 与 AI Studio 前端 pmi() 映射一致。
+_THINKING_LEVEL_ORDER: tuple[ThinkingLevel, ...] = (
+    ThinkingLevel.MINIMAL,
+    ThinkingLevel.LOW,
+    ThinkingLevel.MEDIUM,
+    ThinkingLevel.HIGH,
+)
+
+
+def _snap_thinking_level_to_supported(
+    model: str, level: ThinkingLevel
+) -> ThinkingLevel | None:
+    """将思考等级吸附到模型支持的最接近档位（自动升/降档）。
+
+    规则（依据上游 ListModels 的 thinkingLevels 元数据）:
+    - 档位已支持 → 原样返回
+    - 未支持 → 就近吸附；距离相同时优先升档（避免思考能力被意外削弱）
+      例: nano-banana-2.1 支持 MINIMAL/MEDIUM/HIGH，传入 LOW → 升到 MEDIUM
+    - 模型不支持任何思考等级 → 返回 None（丢弃配置，避免上游 400）
+    - 无模型元数据（未拉取/未命中）→ 原样返回（信任调用方）
+    """
+    try:
+        from aistudio_api.infrastructure.gateway.model_discovery import (
+            model_discovery,
+        )
+
+        info = model_discovery.get_cached_model_info(model)
+    except Exception:
+        return level
+    if not info:
+        return level
+    raw_levels = info.get("thinkingLevels")
+    if not isinstance(raw_levels, list):
+        return level
+    supported: list[int] = [
+        int(x)
+        for x in raw_levels
+        if isinstance(x, (int, float)) and not isinstance(x, bool)
+    ]
+    if not supported:
+        return None
+    if int(level) in supported:
+        return level
+    pos = _THINKING_LEVEL_ORDER.index(level)
+    best: ThinkingLevel | None = None
+    best_pos = -1
+    for i, lv in enumerate(_THINKING_LEVEL_ORDER):
+        if int(lv) not in supported:
+            continue
+        # 距离更近优先；距离相同取更强的档位（升档优先）
+        if best is None or abs(i - pos) < abs(best_pos - pos) or (
+            abs(i - pos) == abs(best_pos - pos) and i > best_pos
+        ):
+            best = lv
+            best_pos = i
+    if best is not None and best is not level:
+        from aistudio_api.infrastructure.utils.logger import get_logger
+
+        get_logger("chat_service").info(
+            "思考档位自动兼容: model=%s, 请求=%s → 实际=%s",
+            model,
+            level.name,
+            best.name,
+        )
+    return best
+
+
+def _snap_thinking_wire_to_model(
+    model: str, wire: list[object] | None
+) -> list[object] | None:
+    """对已编码的 thinking wire 数组做模型档位兼容吸附。
+
+    wire 结构: [mode, budget?, ..., level?]（level 在 index 3）。
+    - 含 level → 吸附档位（不支持任何思考则丢弃整段配置）
+    - 仅 budget → 模型不支持思考时丢弃（新目录已无预算模式模型）
+    """
+    if not isinstance(wire, list) or not wire:
+        return wire
+    level_raw = wire[3] if len(wire) > 3 else None
+    if isinstance(level_raw, int) and not isinstance(level_raw, bool):
+        snapped = _snap_thinking_level_to_supported(model, ThinkingLevel(level_raw))
+        if snapped is None:
+            return None
+        new_wire = list(wire)
+        new_wire[3] = int(snapped)
+        return new_wire
+    # 仅预算模式（无 level）：检查模型是否支持思考
+    try:
+        from aistudio_api.infrastructure.gateway.model_discovery import (
+            model_discovery,
+        )
+
+        info = model_discovery.get_cached_model_info(model)
+        if info is not None:
+            raw_levels = info.get("thinkingLevels")
+            if isinstance(raw_levels, list) and not raw_levels:
+                return None
+    except Exception:
+        pass
+    return wire
+
+
 def _normalize_gemini_thinking_config(
     value: object,
 ) -> list[object] | None:
@@ -852,6 +955,11 @@ def normalize_gemini_request(
                 generation_config.thinkingConfig
             )
             if normalized_thinking is not None:
+                # 模型档位兼容：等级不支持时自动升/降档，无思考能力则丢弃
+                normalized_thinking = _snap_thinking_wire_to_model(
+                    model, normalized_thinking
+                )
+            if normalized_thinking is not None:
                 generation_config_overrides["thinking_config"] = normalized_thinking
             elif "thinking_config" in generation_config_overrides:
                 generation_config_overrides["thinking_config"] = None
@@ -878,11 +986,14 @@ def normalize_gemini_request(
     ):
         level = _parse_thinking_level(effective_effort)
         if level is not None:
-            if generation_config_overrides is None:
-                generation_config_overrides = {}
-            generation_config_overrides["thinking_config"] = AistudioThinkingConfig(
-                level=level, mode=1
-            ).to_wire()
+            # 模型档位兼容：等级不支持时自动升/降档，无思考能力则不注入
+            snapped = _snap_thinking_level_to_supported(model, level)
+            if snapped is not None:
+                if generation_config_overrides is None:
+                    generation_config_overrides = {}
+                generation_config_overrides["thinking_config"] = (
+                    AistudioThinkingConfig(level=snapped, mode=1).to_wire()
+                )
         elif (
             generation_config_overrides is not None
             and "thinking_config" in generation_config_overrides
