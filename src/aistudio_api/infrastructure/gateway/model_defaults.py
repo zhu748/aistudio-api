@@ -10,7 +10,7 @@ from pathlib import Path
 
 import yaml
 
-from aistudio_api.config import resolve_config_file
+from aistudio_api.config import DEFAULT_TEXT_MODEL, resolve_config_file
 
 from .wire_types import (
     AistudioImageOutputMode,
@@ -509,9 +509,70 @@ def invalidate_config_cache() -> None:
     _compiled_profiles.cache_clear()
     _compiled_model_overrides.cache_clear()
     _anti_truncation_cache.clear()
+    _compat_cache.clear()
 
 
 _anti_truncation_cache: dict[str, tuple[float, dict[str, object]]] = {}
+_compat_cache: dict[str, tuple[float, dict[str, object]]] = {}
+
+
+def get_compat_settings(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """获取 config.yaml 中 OpenAI / Claude 协议兼容层设置 (compat)。
+
+    返回固定形状::
+
+        {
+            "openai_default_model": "gemini-3.7-flash",
+            "openai_model_mapping": {"gpt-4o": "gemini-3.7-flash", ...},
+            "claude_default_model": "gemini-3.7-flash",
+            "claude_model_mapping": {"claude-sonnet-*": "gemini-4-argon", ...},
+        }
+
+    - 默认模型缺省时回退到 ``DEFAULT_TEXT_MODEL``（支持
+      ``AISTUDIO_DEFAULT_TEXT_MODEL`` 环境变量）。
+    - ``model_mapping`` 支持精确匹配与最长前缀匹配两种命中方式。
+    - 基于 mtime 缓存，config.yaml 热重载后自动生效。
+    """
+    resolved_path = _resolve_config_path(config_path)
+    settings: dict[str, object] = {
+        "openai_default_model": DEFAULT_TEXT_MODEL,
+        "openai_model_mapping": {},
+        "claude_default_model": DEFAULT_TEXT_MODEL,
+        "claude_model_mapping": {},
+    }
+    if not resolved_path.exists():
+        return settings
+
+    path_key = str(resolved_path.resolve())
+    try:
+        mtime = resolved_path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    cached = _compat_cache.get(path_key)
+    if cached is not None and cached[0] == mtime:
+        return dict(cached[1])
+
+    config = _load_yaml_config(resolved_path)
+    raw_compat = config.get("compat")
+    if isinstance(raw_compat, dict):
+        for channel in ("openai", "claude"):
+            raw_channel = raw_compat.get(channel)
+            if not isinstance(raw_channel, dict):
+                continue
+            default_model = raw_channel.get("default_model")
+            if isinstance(default_model, str) and default_model.strip():
+                settings[f"{channel}_default_model"] = default_model.strip()
+            raw_mapping = raw_channel.get("model_mapping")
+            if isinstance(raw_mapping, dict):
+                settings[f"{channel}_model_mapping"] = {
+                    str(k).strip().removesuffix("*"): str(v).strip()
+                    for k, v in raw_mapping.items()
+                    if isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()
+                }
+    _compat_cache[path_key] = (mtime, dict(settings))
+    return dict(settings)
 
 
 def get_anti_truncation_settings(
