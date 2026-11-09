@@ -25,6 +25,33 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("transport")
 
+# httpx 的 HTTP/2 支持是可选依赖（h2 包）。若环境未安装 h2 而仍传
+# http2=True，AsyncClient 在创建时即抛 ImportError（"Using http2=True, but
+# the 'h2' package is not installed"），所有上游请求全部 500——曾在
+# Render 干净环境复现（requirements 只装了 httpx[socks]）。这里做一次性
+# 探测：缺失时打一条 WARNING（会进面板日志环形缓冲）并降级 HTTP/1.1，
+# 保证服务可用而不是整站瘫。安装 `pip install 'httpx[http2]'` 后重启
+# 即恢复 HTTP/2 多路复用。
+_H2_AVAILABLE: bool | None = None
+
+
+def _http2_enabled() -> bool:
+    """h2 包可用时启用 HTTP/2；缺失时告警一次并降级为 HTTP/1.1。"""
+    global _H2_AVAILABLE
+    if _H2_AVAILABLE is None:
+        try:
+            import h2  # noqa: F401  # 仅为探测可选依赖是否存在
+        except ImportError:
+            _H2_AVAILABLE = False
+            logger.warning(
+                "未安装 h2 包（httpx 的 http2 extra），上游连接已降级为 "
+                "HTTP/1.1；执行 `pip install 'httpx[http2]'` 并重启可启用 "
+                "HTTP/2 多路复用"
+            )
+        else:
+            _H2_AVAILABLE = True
+    return _H2_AVAILABLE
+
 
 def _get_auth_cookies(auth_file: str | None = None) -> dict[str, str] | None:
     """Read credentials from the bound auth_file or active account."""
@@ -172,7 +199,7 @@ class HTTPStreamTransport:
             client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.timeout, connect=15.0),
                 proxy=effective,
-                http2=True,
+                http2=_http2_enabled(),
                 limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
             )
             self._clients[key] = client
