@@ -80,6 +80,10 @@ func (dialer *connectDialer) DialContext(ctx context.Context, network, address s
 	var connection net.Conn
 	var err error
 	if strings.EqualFold(dialer.proxyURL.Scheme, "https") {
+		// HTTPS 代理的 TLS 握手必须有截止时间（3.16）：调用方传入的 ctx
+		// 可能无 deadline，黑洞代理会无限挂住拨号。
+		tlsCtx, tlsCancel := context.WithTimeout(ctx, connectTimeout)
+		defer tlsCancel()
 		tlsDialer := tls.Dialer{
 			NetDialer: dialer.direct,
 			Config: &tls.Config{
@@ -87,7 +91,7 @@ func (dialer *connectDialer) DialContext(ctx context.Context, network, address s
 				NextProtos: []string{"http/1.1"},
 			},
 		}
-		connection, err = tlsDialer.DialContext(ctx, network, dialer.proxyTarget)
+		connection, err = tlsDialer.DialContext(tlsCtx, network, dialer.proxyTarget)
 	} else {
 		connection, err = dialer.direct.DialContext(ctx, network, dialer.proxyTarget)
 	}

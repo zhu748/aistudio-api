@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -10,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -40,21 +42,31 @@ type workerEntry struct {
 }
 
 type WorkerPool struct {
-	mu       sync.RWMutex
-	entries  map[string]*workerEntry
-	stateDir string
-	proxy    string
-	locale   string
-	timezone string
+	mu         sync.RWMutex
+	entries    map[string]*workerEntry
+	stateDir   string
+	proxy      string
+	locale     string
+	timezone   string
+	maxWorkers int
+	idleTTL    time.Duration
 }
 
-func NewWorkerPool(stateDir, proxy, locale, timezone string) *WorkerPool {
+func NewWorkerPool(stateDir, proxy, locale, timezone string, maxWorkers int, idleTTL time.Duration) *WorkerPool {
+	if maxWorkers <= 0 {
+		maxWorkers = 32
+	}
+	if idleTTL <= 0 {
+		idleTTL = 30 * time.Minute
+	}
 	return &WorkerPool{
-		entries:  make(map[string]*workerEntry),
-		stateDir: stateDir,
-		proxy:    proxy,
-		locale:   locale,
-		timezone: timezone,
+		entries:    make(map[string]*workerEntry),
+		stateDir:   stateDir,
+		proxy:      proxy,
+		locale:     locale,
+		timezone:   timezone,
+		maxWorkers: maxWorkers,
+		idleTTL:    idleTTL,
 	}
 }
 
@@ -82,14 +94,71 @@ func (p *WorkerPool) ActiveCount() int {
 	defer p.mu.RUnlock()
 	count := 0
 	for _, entry := range p.entries {
-		if entry.worker != nil {
-			st := entry.worker.State()
+		// entry.worker 的写入发生在 entry.mu 下（AcquireWorker），
+		// 读取必须持同一把锁，否则是 Go 内存模型意义上的数据竞争
+		// （go test -race 必报，/health 每次探测都会触发）。
+		entry.mu.Lock()
+		worker := entry.worker
+		entry.mu.Unlock()
+		if worker != nil {
+			st := worker.State()
 			if st.Phase == aistudio.WorkerReady || st.Phase == aistudio.WorkerBusy {
 				count++
 			}
 		}
 	}
 	return count
+}
+
+// reapIdle 关闭超过空闲 TTL 的 worker 并移除条目（后台 reaper，2.6）。
+// 每个 worker 持有一个 SpiderMonkey VM（堆上限 1 GiB）、连接池与磁盘
+// 状态目录，只增不减会在多账号/随机 Cookie 洪水下确定性打爆内存与磁盘。
+func (p *WorkerPool) reapIdle() int {
+	now := time.Now()
+	p.mu.Lock()
+	var toClose []*workerEntry
+	for key, entry := range p.entries {
+		entry.mu.Lock()
+		idle := entry.worker != nil && now.Sub(entry.lastUsed) > p.idleTTL
+		worker := entry.worker
+		entry.mu.Unlock()
+		if idle {
+			toClose = append(toClose, entry)
+			delete(p.entries, key)
+		} else if worker == nil {
+			// 初始化失败残留的空条目直接回收
+			delete(p.entries, key)
+		}
+	}
+	p.mu.Unlock()
+
+	for _, entry := range toClose {
+		entry.mu.Lock()
+		if entry.worker != nil {
+			_ = entry.worker.Close()
+			entry.worker = nil
+		}
+		entry.mu.Unlock()
+	}
+	return len(toClose)
+}
+
+// StartReaper 启动后台空闲回收循环（每分钟扫描一次）。
+func (p *WorkerPool) StartReaper(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if n := p.reapIdle(); n > 0 {
+					slog.Info("回收空闲 WAA Worker", "count", n)
+				}
+			}
+		}
+	}()
 }
 
 func accountKeyFromState(state aistudio.StorageState, authUser int) string {
@@ -105,15 +174,53 @@ func accountKeyFromState(state aistudio.StorageState, authUser int) string {
 	return fmt.Sprintf("acc_%s_u%d", hex.EncodeToString(sum[:6]), authUser)
 }
 
-func (p *WorkerPool) getEntry(key string) *workerEntry {
+func (p *WorkerPool) getEntry(key string) (*workerEntry, error) {
+	var toClose *workerEntry
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	entry, ok := p.entries[key]
 	if !ok {
+		// worker 数硬上限（2.6）：每个 worker 持有 1 GiB 堆上限的 VM、
+		// 连接池与磁盘状态，随机 Cookie 洪水可无限生成键不同的 worker。
+		// 满额时优先回收一个空闲 worker，无空闲则拒绝。
+		if len(p.entries) >= p.maxWorkers {
+			var idleKey string
+			var idleEntry *workerEntry
+			var oldest time.Time
+			for k, e := range p.entries {
+				e.mu.Lock()
+				recentlyUsed := e.worker != nil && time.Since(e.lastUsed) < time.Minute
+				empty := e.worker == nil
+				lu := e.lastUsed
+				e.mu.Unlock()
+				if recentlyUsed {
+					continue
+				}
+				if empty || idleEntry == nil || lu.Before(oldest) {
+					idleKey, idleEntry, oldest = k, e, lu
+				}
+			}
+			if idleEntry == nil {
+				p.mu.Unlock()
+				return nil, fmt.Errorf("worker 池已满（%d）且无空闲可回收，拒绝创建新 worker", len(p.entries))
+			}
+			delete(p.entries, idleKey)
+			toClose = idleEntry
+		}
 		entry = &workerEntry{}
 		p.entries[key] = entry
 	}
-	return entry
+	p.mu.Unlock()
+
+	// 在池锁外关闭被淘汰的 worker（VM 拆除可能较慢，不能阻塞整个池）
+	if toClose != nil {
+		toClose.mu.Lock()
+		if toClose.worker != nil {
+			_ = toClose.worker.Close()
+			toClose.worker = nil
+		}
+		toClose.mu.Unlock()
+	}
+	return entry, nil
 }
 
 func (p *WorkerPool) AcquireWorker(
@@ -130,7 +237,10 @@ func (p *WorkerPool) AcquireWorker(
 	}
 
 	key := accountKeyFromState(state, authUser)
-	entry := p.getEntry(key)
+	entry, err := p.getEntry(key)
+	if err != nil {
+		return nil, "", err
+	}
 
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
@@ -218,9 +328,14 @@ type MintResponse struct {
 func parseAuthUser(val any) int {
 	switch v := val.(type) {
 	case float64:
-		return int(v)
+		// 与 string 分支行为一致：负数视为非法，回退 0（L14）
+		if v >= 0 {
+			return int(v)
+		}
 	case int:
-		return v
+		if v >= 0 {
+			return v
+		}
 	case string:
 		n, err := strconv.Atoi(strings.TrimSpace(v))
 		if err == nil && n >= 0 {
@@ -367,6 +482,41 @@ type SendRPCRequest struct {
 	Proxy      string            `json:"proxy"`
 }
 
+// validateGoogleURL 限制 /v1/rpc/send 的目标为 Google 域（SSRF 防护，2.5）。
+func validateGoogleURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("目标 URL 无法解析: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("仅允许 http/https 目标，拒绝 %q", u.Scheme)
+	}
+	host := strings.ToLower(u.Hostname())
+	allowed := false
+	for _, suffix := range []string{".google.com", ".googleapis.com", ".googlegen.ai"} {
+		if strings.HasSuffix(host, suffix) || host == strings.TrimPrefix(suffix, ".") {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return fmt.Errorf("目标域名 %q 不在 Google 域白名单内（仅允许 *.google.com / *.googleapis.com）", host)
+	}
+	return nil
+}
+
+func envInt(name string, defVal int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return defVal
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return defVal
+	}
+	return n
+}
+
 func discoverProxy() string {
 	for _, envName := range []string{"AISTUDIO_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"} {
 		if val := strings.TrimSpace(os.Getenv(envName)); val != "" {
@@ -388,6 +538,14 @@ func main() {
 	defaultListen := os.Getenv("LISTEN_ADDR")
 	if defaultListen == "" {
 		if port := os.Getenv("PORT"); port != "" {
+			// 显式安全声明（2.5）：PORT 由容器平台注入时意味着对外暴露，
+			// 此时必须同时配置 SIGNER_SHARED_SECRET，否则拒绝启动。
+			if os.Getenv("SIGNER_SHARED_SECRET") == "" {
+				slog.Error("检测到 PORT 环境变量（将绑定 0.0.0.0 对外监听）但未设置 SIGNER_SHARED_SECRET；" +
+					"签名器可携任意 Cookie 铸造 WAA 证明并作为 SSRF 中继，禁止裸奔对外。" +
+					"请设置 SIGNER_SHARED_SECRET 或改用 LISTEN_ADDR=127.0.0.1:8081")
+				os.Exit(1)
+			}
 			defaultListen = "0.0.0.0:" + port
 		} else {
 			defaultListen = "127.0.0.1:8081"
@@ -405,16 +563,52 @@ func main() {
 	if defaultTZ == "" {
 		defaultTZ = "America/Los_Angeles"
 	}
+	maxWorkers := envInt("WAA_MAX_WORKERS", 32)
+	idleTTLMinutes := envInt("WAA_IDLE_TTL_MINUTES", 30)
 
 	listenAddr := flag.String("listen", defaultListen, "HTTP listen address")
 	proxyURL := flag.String("proxy", discoverProxy(), "Upstream HTTP/HTTPS/SOCKS5 proxy URL")
 	stateDir := flag.String("state-dir", defaultStateDir, "Directory for worker fingerprints and interpreter cache")
 	locale := flag.String("locale", defaultLocale, "Browser profile locale")
 	timezone := flag.String("timezone", defaultTZ, "Browser profile IANA timezone")
+	sharedSecret := flag.String("shared-secret", os.Getenv("SIGNER_SHARED_SECRET"), "Bearer token required for /v1/* endpoints (empty = auth disabled, loopback-only recommended)")
 	flag.Parse()
 
-	pool := NewWorkerPool(*stateDir, *proxyURL, *locale, *timezone)
+	pool := NewWorkerPool(*stateDir, *proxyURL, *locale, *timezone, maxWorkers, time.Duration(idleTTLMinutes)*time.Minute)
 	defer pool.CloseAll()
+	reaperCtx, reaperCancel := context.WithCancel(context.Background())
+	defer reaperCancel()
+	pool.StartReaper(reaperCtx)
+
+	// 鉴权中间件（2.5）：/v1/* 端点要求 Bearer 共享密钥。
+	// /health 保持开放（探活无凭据，且仅暴露 worker 计数）。
+	requireAuth := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			secret := strings.TrimSpace(*sharedSecret)
+			if secret == "" {
+				next(w, r)
+				return
+			}
+			auth := r.Header.Get("Authorization")
+			token, ok := strings.CutPrefix(auth, "Bearer ")
+			if !ok || subtle.ConstantTimeCompare([]byte(strings.TrimSpace(token)), []byte(secret)) != 1 {
+				writeJSON(w, http.StatusUnauthorized, map[string]any{
+					"ok":    false,
+					"error": "unauthorized: missing or invalid bearer token",
+				})
+				return
+			}
+			next(w, r)
+		}
+	}
+	// 请求体上限（3.16）：wireContents 含 base64 图片可到 MB 级，
+	// 但绝不应超过 32MB；无上限时 GB 级 JSON 可直接 OOM。
+	withBodyLimit := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
+			next(w, r)
+		}
+	}
 
 	mux := http.NewServeMux()
 
@@ -427,7 +621,7 @@ func main() {
 		})
 	})
 
-	mux.HandleFunc("POST /v1/proof/mint", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/proof/mint", withBodyLimit(requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		var req MintRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, MintResponse{OK: false, Error: "invalid JSON body: " + err.Error()})
@@ -493,10 +687,10 @@ func main() {
 			PoolState: poolState,
 			Headers:   headers,
 		})
-	})
+	})))
 
 	// POST /v1/rpc/send: 使用同一个 SpiderMonkey Worker 的 Firefox 152 uTLS/HTTP2/HTTP3 连接池直接发送受保护 RPC
-	mux.HandleFunc("POST /v1/rpc/send", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/rpc/send", withBodyLimit(requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		var req SendRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid JSON body: " + err.Error()})
@@ -509,6 +703,13 @@ func main() {
 		targetURL := strings.TrimSpace(req.URL)
 		if targetURL == "" {
 			targetURL = generateContentURL
+		}
+		// SSRF 防护（2.5）：目标 URL 完全由调用方控制时，能触达签名器
+		// 的任何人都可以借它的 Firefox 指纹出口向任意 URL 发请求。
+		// 限制为 Google 域白名单（本端点的唯一合法用途）。
+		if err := validateGoogleURL(targetURL); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+			return
 		}
 		authUser := parseAuthUser(req.AuthUser)
 
@@ -577,7 +778,7 @@ func main() {
 				break
 			}
 		}
-	})
+	})))
 
 	server := &http.Server{
 		Addr:              *listenAddr,

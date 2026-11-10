@@ -260,10 +260,76 @@ class WaaSigner:
     ) -> None:
         url = proof_server_url or DEFAULT_PROOF_SERVER_URL
         self._remote_signer = RemoteProofSigner(server_url=url, proxy_url=proxy_url)
+        self._reconfigure_lock: asyncio.Lock | None = None
+        self._delayed_close_tasks: set[asyncio.Task[None]] = set()
+
+    def _get_reconfigure_lock(self) -> asyncio.Lock:
+        """惰性创建切换锁（避免 import 时无事件循环可用）。"""
+        if self._reconfigure_lock is None:
+            self._reconfigure_lock = asyncio.Lock()
+        return self._reconfigure_lock
+
+    async def reconfigure(
+        self,
+        server_url: str | None = None,
+        proxy_url: str | None = None,
+    ) -> None:
+        """热切换签名节点（3.5）。
+
+        旧实现直接改写 remote.server_url 并 close 共享连接池：正在途中的
+        并发签名请求会因连接池被关闭而失败，检查与赋值之间的 await 间隙
+        还存在双重进入竞态。改为整实例原子替换：新请求立即走新实例，
+        旧实例延迟一个宽限期（覆盖在途请求的最大超时）后关闭。
+        """
+        lock = self._get_reconfigure_lock()
+        current = self._remote_signer
+        target_url = (server_url or current.server_url).rstrip("/")
+        target_proxy = proxy_url if proxy_url is not None else current.proxy_url
+        if current.server_url == target_url and current.proxy_url == target_proxy:
+            return  # 快路径：目标未变，不进入切换序列
+
+        async with lock:
+            current = self._remote_signer
+            if current.server_url == target_url and current.proxy_url == target_proxy:
+                return  # 双重检查：并发切换已由先到者完成
+            new_signer = RemoteProofSigner(
+                server_url=target_url, proxy_url=target_proxy
+            )
+            # 原子替换：后续新请求立即使用新实例，在途请求仍持有旧实例引用
+            self._remote_signer = new_signer
+            logger.info(
+                "签名节点已切换: %s -> %s",
+                current.server_url,
+                target_url,
+            )
+
+        # 旧实例延迟关闭：给在途请求一个宽限期（其超时上限为 30s）
+        async def _delayed_close() -> None:
+            try:
+                await asyncio.sleep(35.0)
+                await current.close()
+            except Exception as e:
+                logger.debug("延迟关闭旧签名器失败: %s", e)
+
+        try:
+            task = asyncio.create_task(_delayed_close())
+            self._delayed_close_tasks.add(task)
+            task.add_done_callback(self._delayed_close_tasks.discard)
+        except RuntimeError:
+            # 无运行中的事件循环（如同步测试环境）：直接关闭
+            await current.close()
 
     async def close(self) -> None:
         """Close underlying remote signer resources."""
+        for task in list(self._delayed_close_tasks):
+            task.cancel()
+        self._delayed_close_tasks.clear()
         await self._remote_signer.close()
+
+    @property
+    def server_url(self) -> str:
+        """当前远程签名节点地址（只读，热切换请使用 reconfigure）。"""
+        return self._remote_signer.server_url
 
     @property
     def last_headers(self) -> dict[str, str]:

@@ -6,6 +6,7 @@ import asyncio
 import time
 
 from aistudio_api.api.state import runtime_state
+from aistudio_api.infrastructure.account.account_store import AccountMeta
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("orchestrator")
@@ -254,11 +255,23 @@ def record_rotator_event(
     event: str,
     model: str | None = None,
     usage: dict[str, object] | None = None,
+    account_id: str | None = None,
 ) -> None:
-    """记录调度器事件（成功、限流、错误、鉴权异常）。"""
+    """记录调度器事件（成功、限流、错误、鉴权异常）。
+
+    记账串号修复（3.9）：account_id 为实际服务本次请求的账号；
+    旧实现在请求收尾时重新读取全局活跃账号，并发场景下若其他请求
+    已触发切号，本次的成功/429/403 会被记到切换后的账号头上，
+    健康度与冷却状态全部失真。account_id 缺省时回退全局活跃账号
+    （兼容存量调用点）。
+    """
     rotator = runtime_state.rotator
     account_service = runtime_state.account_service
-    account = account_service.get_active_account() if account_service else None
+    account: AccountMeta | None = None
+    if account_id and account_service and hasattr(account_service, "get_account"):
+        account = account_service.get_account(account_id)
+    if account is None and account_service:
+        account = account_service.get_active_account()
     if not rotator or account is None:
         return
     if event == "success":

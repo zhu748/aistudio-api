@@ -199,11 +199,18 @@ ROTATING_SESSION_COOKIE_NAMES: tuple[str, ...] = (
 def filter_minimal_cookies(
     cookies: dict[str, str], *, include_account_host: bool = False
 ) -> dict[str, str]:
-    """过滤保留核心鉴权 Cookie；默认排除 accounts.google.com 专属 Cookie。"""
+    """过滤保留核心鉴权 Cookie；默认排除 accounts.google.com 专属 Cookie。
+
+    先做快照再迭代：``cookies`` 可能是被工作线程（Set-Cookie 回写）并发
+    更新的共享 SessionContext 字典，直接迭代会触发
+    "dictionary changed size during iteration"（dict(cookies) 是单次
+    C 级拷贝，原子可见）。
+    """
     allowed = (
         ROTATE_COOKIE_WHITELIST if include_account_host else MINIMAL_COOKIE_WHITELIST
     )
-    return {k: v for k, v in cookies.items() if k in allowed and v}
+    snapshot = dict(cookies)
+    return {k: v for k, v in snapshot.items() if k in allowed and v}
 
 
 def compute_session_anchor(cookies: dict[str, str]) -> str:
@@ -331,6 +338,11 @@ def parse_raw_cookies(raw: object) -> dict[str, str]:
 
     for line in lines:
         trimmed = line.strip()
+        # Netscape cookies.txt 标准：HttpOnly Cookie 以 #HttpOnly_ 前缀存储，
+        # 并非注释行。Google 的 SID/HSID/SSID/__Secure-*PSID 全部是 HttpOnly，
+        # 必须先剥离该前缀再走 Tab 分列解析，否则核心鉴权 Cookie 会被静默丢弃。
+        if trimmed.startswith("#HttpOnly_"):
+            trimmed = trimmed[len("#HttpOnly_") :].strip()
         if not trimmed or trimmed.startswith("#"):
             continue
 
@@ -411,10 +423,12 @@ def build_makersuite_headers(
     if tier_header:
         headers["X-AIStudio-G1-Tier"] = tier_header
     if cookies:
-        auth_header = calculate_sapisid_hash(cookies)
+        # 快照后拼接（cookies 可能是被工作线程并发更新的共享 dict）
+        snapshot = dict(cookies)
+        auth_header = calculate_sapisid_hash(snapshot)
         if auth_header:
             headers["Authorization"] = auth_header
-        headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items() if v)
+        headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in snapshot.items() if v)
     return headers
 
 
@@ -789,7 +803,11 @@ async def probe_account_emails_map(
     from aistudio_api.config import settings
 
     u_index = str(auth_user or "0")
-    cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
+    # 最小化 Cookie 白名单（L12）：探活只发核心鉴权 Cookie，避免把
+    # accounts.google.com 域专属 Cookie 多发给 makersuite 域，减少风控而。
+    cookie_header = "; ".join(
+        f"{k}={v}" for k, v in filter_minimal_cookies(cookie_dict).items()
+    )
     headers = {
         "User-Agent": DEFAULT_BROWSER_USER_AGENT,
         "Cookie": cookie_header,
@@ -1046,9 +1064,14 @@ async def probe_google_accounts_infinite(
     raw_or_dict: object,
     *,
     max_fails_in_a_row: int = 1,
+    max_sub_accounts: int = 16,
+    probe_deadline_seconds: float = 120.0,
     proxy_url: str | None = None,
 ) -> list[dict[str, object]]:
-    """一路向下探测多账号登录索引（u/0, u/1, u/2...），直到探测失败为止。
+    """向下探测多账号登录索引（u/0, u/1, u/2...），直到探测失败为止。
+
+    防护：设硬上限 max_sub_accounts 与总时长 deadline；连续多次 403
+    （中间从未出现 200/400）视为 IP/配额级封锁并停止，避免无限请求风暴。
 
     Returns:
         有效账号列表，例如 [{"auth_user": "0", "status_code": 200, "name": "Google Account (u/0)"}, ...]
@@ -1065,16 +1088,25 @@ async def probe_google_accounts_infinite(
 
     auth_user_idx = 0
     consecutive_failures = 0
+    consecutive_forbidden = 0
+    deadline = time.monotonic() + probe_deadline_seconds
     async with httpx.AsyncClient(
         timeout=10.0, proxy=proxy_url or settings.proxy_url
     ) as client:
         emails_map = await probe_account_emails_map(
             cookie_dict, auth_user="0", client=client
         )
-        while True:
+        while auth_user_idx < max_sub_accounts:
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "子账号探活达到总时长上限 %.0fs，已探测 %d 个索引后停止",
+                    probe_deadline_seconds,
+                    auth_user_idx,
+                )
+                break
             u_index = str(auth_user_idx)
             headers = build_makersuite_headers(
-                cookie_dict,
+                filter_minimal_cookies(cookie_dict),
                 auth_user=u_index,
                 include_visit_id=True,
             )
@@ -1085,6 +1117,18 @@ async def probe_google_accounts_infinite(
                 # 401 表示该 auth_user 未登录或 Session 无效
                 if resp.status_code in (200, 400, 403):
                     consecutive_failures = 0
+                    if resp.status_code == 403:
+                        consecutive_forbidden += 1
+                        if consecutive_forbidden >= 3:
+                            # 连续 403 且从未出现 200/400：大概率是出口 IP
+                            # 或账号整体被封锁，继续探测只会触发风控。
+                            logger.warning(
+                                "子账号探活连续 %d 次 HTTP 403（无成功响应），判定为 IP/配额级封锁，停止探测",
+                                consecutive_forbidden,
+                            )
+                            break
+                    else:
+                        consecutive_forbidden = 0
                     detected_tier = "Free"
                     tier_url = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GetAiStudioBenefitTier"
                     try:
@@ -1134,6 +1178,13 @@ async def probe_google_accounts_infinite(
                 logger.debug("子账号 u/%s 探活请求异常: %s", u_index, e)
 
             if consecutive_failures >= max_fails_in_a_row:
+                break
+
+            if auth_user_idx + 1 >= max_sub_accounts:
+                logger.info(
+                    "子账号探活达到硬上限 %d 个索引，停止（如需探测更多请调整 max_sub_accounts）",
+                    max_sub_accounts,
+                )
                 break
 
             auth_user_idx += 1

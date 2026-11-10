@@ -171,14 +171,15 @@ class GatewaySession:
 
         active_waa = get_active_waa_server()
         target_url = str(active_waa.get("url") or "").rstrip("/")
-        remote = getattr(self._signer, "_remote_signer", None)
-        if remote and target_url and getattr(remote, "server_url", None) != target_url:
-            close_fn = getattr(self._signer, "close", None)
-            if callable(close_fn):
-                res = close_fn()
+        # 面板切换签名节点后的热生效（3.5）：走 WaaSigner.reconfigure 的
+        # 原子替换路径。旧实现通过私有属性打洞就地改写 server_url 并关闭
+        # 共享连接池，会击落并发在途的签名请求且存在双重进入竞态。
+        if target_url and getattr(self._signer, "server_url", None) != target_url:
+            reconfigure_fn = getattr(self._signer, "reconfigure", None)
+            if callable(reconfigure_fn):
+                res = reconfigure_fn(server_url=target_url)
                 if inspect.isawaitable(res):
                     await res
-            remote.server_url = target_url
 
         if not active_ctx.cookies and active_ctx.auth_file:
             active_ctx.cookies = load_cookies_from_auth_file(active_ctx.auth_file)
@@ -283,7 +284,9 @@ class GatewaySession:
         req_headers["X-Goog-AuthUser"] = active_ctx.auth_user
         if headers:
             req_headers.update(headers)
-        async for event in self._transport.send_streaming_request(
+        # aclosing：上层丢弃本生成器时确定性关闭 transport 生成器，
+        # 释放上游 httpx 连接（async for 不保证关闭被迭代对象）。
+        upstream = self._transport.send_streaming_request(
             url=target_url,
             headers=req_headers,
             body=body,
@@ -292,8 +295,12 @@ class GatewaySession:
             auth_file=active_ctx.auth_file,
             cookies=active_ctx.cookies,
             proxy_url=active_ctx.proxy_url,
-        ):
-            yield event
+        )
+        try:
+            async for event in upstream:
+                yield event
+        finally:
+            await upstream.aclose()
 
     async def close(self) -> None:
         """Close transport, signer, and reset active context."""

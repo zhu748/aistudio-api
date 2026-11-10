@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -78,6 +79,12 @@ def _shrink_media_payloads(node: object) -> object:
     return node
 
 
+# CJK 单字符区间（与 _estimate_tokens 的加权估算配套）
+_CJK_CHAR_RE = re.compile(
+    "[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff]"
+)
+
+
 def _estimate_tokens(text: str) -> int:
     """按字符类别加权估算 token 数（不依赖外部 tokenizer）。
 
@@ -87,24 +94,19 @@ def _estimate_tokens(text: str) -> int:
     - 其它非 ASCII（emoji、带变音符的拉丁字母等）：约 1.5 字符 / token
 
     旧实现统一用 ``len(text) // 4``，对中文低估 4 倍以上。
+    计数全部下沉到 C 层（P6）：逐字符 Python 循环在数 MB 文本上会
+    占满 CPU 数秒——ASCII 用 encode-ignore 计数，CJK 用单字符正则
+    sub 前后长度差计数，均无逐字符解释器开销。
     """
-    ascii_chars = 0
-    cjk_chars = 0
-    other_chars = 0
-    for ch in text:
-        code = ord(ch)
-        if code < 128:
-            ascii_chars += 1
-        elif (
-            0x3040 <= code <= 0x30FF  # 日文假名
-            or 0x3400 <= code <= 0x4DBF  # CJK 扩展 A
-            or 0x4E00 <= code <= 0x9FFF  # CJK 基本区
-            or 0xAC00 <= code <= 0xD7AF  # 韩文音节
-            or 0xF900 <= code <= 0xFAFF  # CJK 兼容表意
-        ):
-            cjk_chars += 1
-        else:
-            other_chars += 1
+    if not text:
+        return 0
+    total = len(text)
+    ascii_chars = len(text.encode("ascii", errors="ignore"))
+    if ascii_chars == total:
+        # 纯 ASCII 快路径：免做 CJK 正则
+        return int(total / 4.0 + 0.5)
+    cjk_chars = total - len(_CJK_CHAR_RE.sub("", text))
+    other_chars = max(0, (total - ascii_chars) - cjk_chars)
     weighted = ascii_chars / 4.0 + cjk_chars + other_chars / 1.5
     return int(weighted + 0.5)
 

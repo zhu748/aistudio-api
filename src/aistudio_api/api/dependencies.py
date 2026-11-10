@@ -18,6 +18,66 @@ from .state import runtime_state
 logger = get_logger("auth")
 
 
+# ---------------------------------------------------------------------------
+# 管理端 401 速率限制（3.11）：固定窗口计数器，防止对管理密码的持续爆破。
+# 管理端凭据不设上限会配合 0.0.0.0 默认绑定形成爆破面。
+# ---------------------------------------------------------------------------
+_AUTH_FAIL_WINDOW_SECONDS = 60.0
+_AUTH_FAIL_MAX_PER_WINDOW = 10
+
+_auth_fail_counts: dict[str, list[float]] = {}
+_auth_fail_lock = threading.Lock()
+
+
+def _register_auth_failure_and_check(client_ip: str) -> bool:
+    """记录一次管理端鉴权失败。返回 True 表示该 IP 已超限应被限流。"""
+    now = time.monotonic()
+    with _auth_fail_lock:
+        hits = [
+            t
+            for t in _auth_fail_counts.get(client_ip, [])
+            if now - t < _AUTH_FAIL_WINDOW_SECONDS
+        ]
+        hits.append(now)
+        _auth_fail_counts[client_ip] = hits
+        if len(_auth_fail_counts) > 4096:
+            # 防止任意 IP 洪水把计数表撑爆
+            stale = [
+                k
+                for k, v in _auth_fail_counts.items()
+                if not v or now - v[-1] > _AUTH_FAIL_WINDOW_SECONDS
+            ]
+            for k in stale[:1024]:
+                _auth_fail_counts.pop(k, None)
+        return len(hits) > _AUTH_FAIL_MAX_PER_WINDOW
+
+
+def _reset_auth_failures(client_ip: str) -> None:
+    with _auth_fail_lock:
+        _auth_fail_counts.pop(client_ip, None)
+
+
+def _all_configured_api_keys() -> frozenset[str]:
+    """合并 config.yaml 与环境变量中的全部 API Key（结果缓存，P5）。"""
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_configured_api_keys,
+    )
+
+    return _merge_key_sets(get_configured_api_keys(), settings.api_keys)
+
+
+def web_auth_required() -> bool:
+    """管理控制台是否需要登录。
+
+    鉴权对称化（2.1）：只要配置了管理密码或任意 API Key（config.yaml 或
+    环境变量），管理端就必须鉴权——旧逻辑仅看管理密码，导致“只配置了
+    API Key”这一最常见部署形态下管理面板完全开放。
+    """
+    if (settings.web_password or "").strip():
+        return True
+    return bool(_all_configured_api_keys())
+
+
 @lru_cache(maxsize=32)
 def _encode_secret(value: str) -> bytes:
     """缓存凭据的 UTF-8 编码，避免每个请求对每个候选 Key 重复 encode。"""
@@ -27,6 +87,19 @@ def _encode_secret(value: str) -> bytes:
 @lru_cache(maxsize=32)
 def _encoded_keys(keys: frozenset[str]) -> frozenset[bytes]:
     return frozenset(_encode_secret(key) for key in keys)
+
+
+@lru_cache(maxsize=8)
+def _merge_key_sets(
+    config_keys: frozenset[str], env_keys: frozenset[str]
+) -> frozenset[str]:
+    """合并 config.yaml 与环境变量 Key 集合（P5）。
+
+    两个输入各自已是 mtime 缓存的稳定对象，配置不变时本缓存命中，
+    require_api_key 每请求的集合并集与重编码开销归零；任一侧变化
+    （新 frozenset 对象）自动落新缓存项，旧项被 LRU 淘汰。
+    """
+    return config_keys | env_keys
 
 
 # ---------------------------------------------------------------------------
@@ -68,11 +141,16 @@ def consume_stream_ticket(ticket: str) -> bool:
     return deadline is not None and deadline > time.monotonic()
 
 
-def _extract_request_token(request: Request) -> str | None:
-    # 1. Google Gemini standard query param: ?key=...
-    query_key = request.query_params.get("key")
-    if query_key and query_key.strip():
-        return query_key.strip()
+def _extract_request_token(
+    request: Request, *, include_query: bool = True
+) -> str | None:
+    if include_query:
+        # 1. Google Gemini standard query param: ?key=...
+        # 仅限对外 API 路由使用：查询参数会进入反代访问日志与浏览器历史，
+        # 管理密码绝不走此通道（管理端调用 include_query=False）。
+        query_key = request.query_params.get("key")
+        if query_key and query_key.strip():
+            return query_key.strip()
 
     # 2. Google Gemini standard header: x-goog-api-key
     goog_key = (request.headers.get("x-goog-api-key") or "").strip()
@@ -98,9 +176,30 @@ def _extract_request_token(request: Request) -> str | None:
 
 
 def require_web_auth(request: Request) -> None:
-    """保护管理控制台路由 (通过环境变量 AISTUDIO_WEB_PASSWORD 配置密码)。"""
-    if not settings.auth_enabled:
+    """保护管理控制台路由。
+
+    鉴权层级（2.1 对称化）：
+    1. 未配置任何凭据（管理密码与全部 API Key 均为空）：保持开放，
+       启动时会输出显著告警；
+    2. 已配置管理密码：仅接受管理密码（API Key 持有者不可越权进入管理端）；
+    3. 仅配置了 API Key：接受任意有效 API Key 登录管理端（封堵匿名访问洞，
+       同时不把未设管理密码的运维锁在面板外）；此时 /api-keys 与
+       /config 等敏感只读端点会对 Key 明文脱敏。
+
+    管理端凭据只接受 Header 形式（3.11）：?key= 查询参数会残留在反代
+    访问日志与浏览器历史中，SSE 票据端点除外。
+    """
+    web_password = (settings.web_password or "").strip()
+    if not web_password and not _all_configured_api_keys():
         return
+
+    client_ip = request.client.host if request.client else "unknown"
+
+    if _register_auth_failure_and_check(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="管理端鉴权失败次数过多，请 1 分钟后重试",
+        )
 
     # SSE 端点例外：浏览器 EventSource 无法携带请求头，允许使用一次性票据。
     # 用精确路径比较（容忍尾斜杠），避免 endswith 这类前缀式判断被
@@ -108,18 +207,24 @@ def require_web_auth(request: Request) -> None:
     if request.url.path.rstrip("/") == "/api/logs/stream":
         ticket = (request.query_params.get("ticket") or "").strip()
         if ticket and consume_stream_ticket(ticket):
+            _reset_auth_failures(client_ip)
             return
 
-    token = _extract_request_token(request)
-    web_password = settings.web_password
-    if (
-        token
-        and web_password
-        and web_password.strip()
-        and secrets.compare_digest(token.encode("utf-8"), _encode_secret(web_password))
-    ):
-        return
-    client_ip = request.client.host if request.client else "unknown"
+    # 管理端不采信 ?key= 查询参数，只接受 Header 凭据
+    token = _extract_request_token(request, include_query=False)
+    if token and web_password:
+        if secrets.compare_digest(token.encode("utf-8"), _encode_secret(web_password)):
+            _reset_auth_failures(client_ip)
+            return
+    elif token and not web_password:
+        # 无管理密码时的对称回退：任意有效 API Key 可进入管理端
+        token_bytes = token.encode("utf-8")
+        if any(
+            secrets.compare_digest(token_bytes, candidate)
+            for candidate in _encoded_keys(_all_configured_api_keys())
+        ):
+            _reset_auth_failures(client_ip)
+            return
     logger.warning("管理控制台鉴权失败: 客户端=%s", client_ip)
     raise HTTPException(
         status_code=401,
@@ -128,14 +233,58 @@ def require_web_auth(request: Request) -> None:
     )
 
 
-def require_api_key(request: Request) -> None:
-    """保护对外 Gemini API 路由 (通过 config.yaml 中的 api_keys 配置)。"""
-    from aistudio_api.infrastructure.gateway.model_defaults import (
-        get_configured_api_keys,
+def mask_api_key(key: str) -> str:
+    """脱敏展示 API Key：保留首尾少量字符，中间以 *** 代替。"""
+    clean = (key or "").strip()
+    if not clean:
+        return ""
+    if len(clean) <= 8:
+        return f"{clean[:2]}***{clean[-2:]}" if len(clean) > 4 else clean[:1] + "***"
+    return f"{clean[:6]}***{clean[-4:]}"
+
+
+def is_management_session(request: Request) -> bool:
+    """当前请求是否持有管理级凭据（层级判定与 require_web_auth 一致）。
+
+    供 force_refresh 等仅限管理端的能力做只读校验，不产生 401 副作用。
+    """
+    if not web_auth_required():
+        # 未配置任何凭据的开放部署：一切能力本来就开放
+        return True
+    token = _extract_request_token(request, include_query=False)
+    if not token:
+        return False
+    web_password = (settings.web_password or "").strip()
+    if web_password:
+        return secrets.compare_digest(
+            token.encode("utf-8"), _encode_secret(web_password)
+        )
+    token_bytes = token.encode("utf-8")
+    return any(
+        secrets.compare_digest(token_bytes, candidate)
+        for candidate in _encoded_keys(_all_configured_api_keys())
     )
 
-    configured_keys = get_configured_api_keys()
-    all_valid_keys = configured_keys | settings.api_keys
+
+def is_admin_password_session(request: Request) -> bool:
+    """当前请求是否以管理密码（而非 API Key 回退）通过管理端鉴权。
+
+    用于敏感只读端点（/api-keys、/config）判定是否返回 Key 明文：
+    仅配置了 API Key 的部署下，任意 Key 持有者不应看到其他 Key 的明文。
+    """
+    web_password = (settings.web_password or "").strip()
+    if not web_password:
+        return False
+    token = _extract_request_token(request, include_query=False)
+    return bool(
+        token
+        and secrets.compare_digest(token.encode("utf-8"), _encode_secret(web_password))
+    )
+
+
+def require_api_key(request: Request) -> None:
+    """保护对外 Gemini API 路由 (通过 config.yaml 中的 api_keys 配置)。"""
+    all_valid_keys = _all_configured_api_keys()
 
     # 如果 config.yaml 与环境变量均未配置任何 Key，则 API 免密开放
     if not all_valid_keys:
