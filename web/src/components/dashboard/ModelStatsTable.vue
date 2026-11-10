@@ -10,6 +10,7 @@ import {
   Brain,
   Database,
   Users,
+  Search,
 } from 'lucide-vue-next'
 
 const props = defineProps<{
@@ -17,117 +18,126 @@ const props = defineProps<{
 }>()
 
 const expandedModels = ref<Record<string, boolean>>({})
+const searchQuery = ref('')
 
 function toggleExpand(key: string) {
   expandedModels.value[key] = !expandedModels.value[key]
 }
 
 const statList = computed(() => {
-  return Object.entries(props.stats || {}).map(([rawName, item]) => ({
-    name: rawName.replace(/^models\//, ''),
-    rawName,
-    ...item,
-  }))
+  const kw = searchQuery.value.trim().toLowerCase()
+  return Object.entries(props.stats || {})
+    .map(([rawName, item]) => ({
+      name: rawName.replace(/^models\//, ''),
+      rawName,
+      ...item,
+    }))
+    .filter((item) => !kw || item.name.toLowerCase().includes(kw))
 })
 </script>
 
 <template>
-  <div class="bg-white border border-gray-200/80 rounded-2xl shadow-xs overflow-hidden">
-    <div class="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+  <div class="bg-white border border-slate-200/90 rounded-xl shadow-2xs overflow-hidden">
+    <!-- Table Header Toolbar -->
+    <div class="px-5 py-3.5 border-b border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
       <div class="flex items-center gap-2">
         <Layers class="w-4 h-4 text-brand-600" />
-        <h3 class="font-semibold text-gray-900 text-sm">
-          模型调用统计
+        <h3 class="font-semibold text-slate-900 text-sm">
+          模型路由与配额明细
         </h3>
+        <span class="px-2 py-0.5 text-[11px] font-mono tabular-nums bg-slate-100 text-slate-600 rounded-md">
+          {{ statList.length }} 个活跃模型
+        </span>
       </div>
-      <span class="text-xs text-gray-400 font-mono">
-        {{ statList.length }} 个模型记录
-      </span>
+
+      <div class="relative w-full sm:w-56">
+        <Search class="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+        <input
+          v-model="searchQuery"
+          type="text"
+          placeholder="筛选模型标识…"
+          class="w-full pl-8 pr-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
+        >
+      </div>
     </div>
 
     <div class="overflow-x-auto">
-      <table class="w-full text-left border-collapse text-sm">
+      <table class="w-full text-left border-collapse text-xs">
         <thead>
-          <tr class="bg-gray-50/70 border-b border-gray-100 text-xs font-semibold text-gray-500 uppercase tracking-wider">
-            <th class="py-3 px-4 w-8" />
-            <th class="py-3 px-4">
+          <tr class="bg-slate-50/80 border-b border-slate-200/70 text-[11px] font-semibold text-slate-500 uppercase tracking-wider">
+            <th class="py-2.5 px-3 w-8" />
+            <th class="py-2.5 px-3">
               模型标识
             </th>
-            <th class="py-3 px-3 text-center">
-              请求数
+            <th class="py-2.5 px-3 text-right">
+              请求总数
             </th>
-            <th class="py-3 px-3 text-center">
+            <th class="py-2.5 px-3 text-right">
               成功
             </th>
-            <th class="py-3 px-3 text-center">
-              429
+            <th class="py-2.5 px-3 text-right">
+              429 限流
             </th>
-            <th class="py-3 px-3 text-center">
+            <th class="py-2.5 px-3 text-right">
               错误
             </th>
-            <th class="py-3 px-4 text-center">
-              Tokens
+            <th class="py-2.5 px-4 text-right">
+              总 Tokens
             </th>
-            <th class="py-3 px-6 text-right">
+            <th class="py-2.5 px-5 text-right">
               最后调用
             </th>
           </tr>
         </thead>
-        <tbody class="divide-y divide-gray-100 font-mono text-xs">
+        <tbody class="divide-y divide-slate-100 font-mono text-xs tabular-nums">
           <template
             v-for="item in statList"
             :key="item.rawName"
           >
             <tr
-              class="hover:bg-gray-50/80 transition-colors cursor-pointer"
-              :class="{ 'bg-gray-50/40': expandedModels[item.rawName] }"
+              class="hover:bg-slate-50/80 transition-colors cursor-pointer"
+              :class="{ 'bg-slate-50/60': expandedModels[item.rawName] }"
               @click="toggleExpand(item.rawName)"
             >
-              <td class="py-3 px-3 text-center text-gray-400">
+              <td class="py-3 px-3 text-center text-slate-400">
                 <ChevronDown
                   v-if="expandedModels[item.rawName]"
-                  class="w-4 h-4 inline"
+                  class="w-3.5 h-3.5 inline"
                 />
                 <ChevronRight
                   v-else
-                  class="w-4 h-4 inline"
+                  class="w-3.5 h-3.5 inline"
                 />
               </td>
-              <td class="py-3.5 px-4 font-semibold text-gray-900">
-                <div class="flex items-center gap-1.5">
+              <td class="py-3 px-3 font-semibold text-slate-900">
+                <div class="flex items-center gap-2 flex-wrap">
                   <span>{{ item.name }}</span>
                   <span
                     v-if="item.account_breakdown && item.account_breakdown.length"
-                    class="px-1.5 py-0.2 rounded text-[10px] bg-gray-100 text-gray-600 font-normal"
+                    class="px-1.5 py-0.5 rounded text-[10px] bg-slate-100 text-slate-600 font-sans font-medium"
                   >
-                    {{ item.account_breakdown.length }} 账号
+                    {{ item.account_breakdown.length }} 节点
                   </span>
-                </div>
-                <!-- Reasoning / Cache Pills -->
-                <div
-                  v-if="(item.reasoning_tokens || 0) > 0 || (item.cached_tokens || 0) > 0"
-                  class="flex items-center gap-2 mt-1 text-[10px] font-normal"
-                >
                   <span
                     v-if="(item.reasoning_tokens || 0) > 0"
-                    class="text-purple-700 bg-purple-50 px-1.5 py-0.2 rounded flex items-center gap-0.5"
+                    class="text-brand-700 bg-brand-50 border border-brand-200/60 px-1.5 py-0.5 rounded text-[10px] font-normal inline-flex items-center gap-1"
                   >
                     <Brain class="w-2.5 h-2.5" />
-                    <span>思考: {{ item.reasoning_tokens?.toLocaleString() }}</span>
+                    <span>{{ item.reasoning_tokens?.toLocaleString() }}</span>
                   </span>
                   <span
                     v-if="(item.cached_tokens || 0) > 0"
-                    class="text-teal-700 bg-teal-50 px-1.5 py-0.2 rounded flex items-center gap-0.5"
+                    class="text-sky-700 bg-sky-50 border border-sky-200/60 px-1.5 py-0.5 rounded text-[10px] font-normal inline-flex items-center gap-1"
                   >
                     <Database class="w-2.5 h-2.5" />
-                    <span>缓存: {{ item.cached_tokens?.toLocaleString() }}</span>
+                    <span>{{ item.cached_tokens?.toLocaleString() }}</span>
                   </span>
                 </div>
               </td>
-              <td class="py-3.5 px-3 text-center font-medium text-gray-700">
+              <td class="py-3 px-3 text-right font-semibold text-slate-800">
                 {{ (item.requests || 0).toLocaleString() }}
               </td>
-              <td class="py-3.5 px-3 text-center">
+              <td class="py-3 px-3 text-right">
                 <Badge
                   variant="green"
                   size="sm"
@@ -135,28 +145,27 @@ const statList = computed(() => {
                   {{ (item.success || 0).toLocaleString() }}
                 </Badge>
               </td>
-              <td class="py-3.5 px-3 text-center">
+              <td class="py-3 px-3 text-right">
                 <Badge
-                  :variant="(item.rate_limited || 0) > 0 ? 'red' : 'gray'"
+                  :variant="(item.rate_limited || 0) > 0 ? 'amber' : 'gray'"
                   size="sm"
                 >
                   {{ (item.rate_limited || 0).toLocaleString() }}
                 </Badge>
               </td>
-              <td class="py-3.5 px-3 text-center">
+              <td class="py-3 px-3 text-right">
                 <span
-                  class="font-medium"
-                  :class="(item.errors || 0) > 0 ? 'text-rose-600 font-bold' : 'text-gray-400'"
+                  :class="(item.errors || 0) > 0 ? 'text-rose-600 font-bold' : 'text-slate-400'"
                 >
                   {{ (item.errors || 0).toLocaleString() }}
                 </span>
               </td>
-              <td class="py-3.5 px-4 text-center text-gray-600">
+              <td class="py-3 px-4 text-right text-slate-600">
                 <span :title="`Prompt: ${(item.prompt_tokens || 0).toLocaleString()} / Completion: ${(item.completion_tokens || 0).toLocaleString()}`">
                   {{ (item.total_tokens || 0).toLocaleString() }}
                 </span>
               </td>
-              <td class="py-3.5 px-6 text-right text-gray-500">
+              <td class="py-3 px-5 text-right text-slate-500">
                 {{ formatDate(item.last_used, { withSeconds: true }) }}
               </td>
             </tr>
@@ -164,17 +173,17 @@ const statList = computed(() => {
             <!-- Accordion Sub-Drawer: Account Breakdown for this Model -->
             <tr
               v-if="expandedModels[item.rawName]"
-              class="bg-gray-50/70 border-b border-gray-100"
+              class="bg-slate-50/70 border-b border-slate-100"
             >
               <td
                 colspan="8"
-                class="p-4"
+                class="p-3.5"
               >
-                <div class="bg-white rounded-xl border border-gray-200/90 p-4 shadow-2xs space-y-3">
-                  <div class="flex items-center justify-between text-xs font-semibold text-gray-700">
-                    <span class="flex items-center gap-1.5 font-sans">
+                <div class="bg-white rounded-lg border border-slate-200/90 p-3.5 shadow-2xs space-y-2.5">
+                  <div class="flex items-center justify-between text-xs font-semibold text-slate-700 font-sans">
+                    <span class="flex items-center gap-1.5">
                       <Users class="w-3.5 h-3.5 text-brand-600" />
-                      <span>各账号调用明细</span>
+                      <span>节点今日配额分摊明细</span>
                     </span>
                   </div>
 
@@ -182,117 +191,120 @@ const statList = computed(() => {
                     v-if="item.account_breakdown && item.account_breakdown.length"
                     class="overflow-x-auto"
                   >
-                    <table class="w-full text-left text-xs border-collapse">
+                    <table class="w-full text-left text-xs border-collapse tabular-nums">
                       <thead>
-                        <tr class="text-gray-400 border-b border-gray-100 pb-2">
+                        <tr class="text-slate-400 border-b border-slate-100 text-[11px] font-sans">
                           <th class="py-2 px-2">
                             子账号 / 邮箱
                           </th>
                           <th class="py-2 px-2 text-center">
-                            索引
+                            会话索引
                           </th>
                           <th class="py-2 px-2 text-center">
                             分组
                           </th>
                           <th class="py-2 px-2 text-center">
-                            订阅
-                          </th>
-                          <th class="py-2 px-2 text-center">
-                            今日请求
-                          </th>
-                          <th class="py-2 px-2 text-center">
-                            成功 / 429
-                          </th>
-                          <th class="py-2 px-2 text-center">
-                            消耗进度
+                            等级
                           </th>
                           <th class="py-2 px-2 text-right">
-                            状态
+                            今日请求
+                          </th>
+                          <th class="py-2 px-2 text-right">
+                            成功 / 429
+                          </th>
+                          <th class="py-2 px-3 text-center">
+                            配额水位
+                          </th>
+                          <th class="py-2 px-2 text-right">
+                            节点状态
                           </th>
                         </tr>
                       </thead>
-                      <tbody class="divide-y divide-gray-50">
+                      <tbody class="divide-y divide-slate-50">
                         <tr
                           v-for="acc in item.account_breakdown"
                           :key="acc.account_id"
-                          class="hover:bg-gray-50/60"
+                          class="hover:bg-slate-50/60"
                         >
                           <td class="py-2 px-2">
-                            <div class="font-medium text-gray-900 truncate max-w-[180px]">
+                            <div class="font-medium text-slate-900 truncate max-w-[200px]">
                               {{ acc.email || acc.name || acc.account_id }}
                             </div>
-                            <div class="text-[10px] text-gray-400 truncate">
+                            <div class="text-[10px] text-slate-400 truncate">
                               {{ acc.account_id }}
                             </div>
                           </td>
-                          <td class="py-2 px-2 text-center font-bold text-gray-600">
+                          <td class="py-2 px-2 text-center font-semibold text-slate-700">
                             u/{{ acc.auth_user }}
                           </td>
                           <td class="py-2 px-2 text-center">
-                            <span class="px-1.5 py-0.2 rounded text-[10px] bg-gray-100 text-gray-600">
+                            <span class="px-1.5 py-0.5 rounded text-[10px] bg-slate-100 text-slate-600">
                               {{ acc.group }}
                             </span>
                           </td>
                           <td class="py-2 px-2 text-center">
                             <span
-                              class="px-1.5 py-0.2 rounded text-[10px] font-semibold"
+                              class="px-1.5 py-0.5 rounded text-[10px] font-semibold"
                               :class="[
-                                acc.tier === 'Ultra' ? 'bg-purple-100 text-purple-800' :
-                                acc.tier === 'Pro' ? 'bg-amber-100 text-amber-800' :
-                                acc.tier === 'Plus' ? 'bg-emerald-100 text-emerald-800' :
-                                'bg-gray-100 text-gray-600',
+                                acc.tier === 'Ultra' || acc.tier === 'Ultra_20X'
+                                  ? 'bg-sky-50 text-sky-700 border border-sky-200/70'
+                                  : acc.tier === 'Pro'
+                                    ? 'bg-amber-50 text-amber-700 border border-amber-200/70'
+                                    : acc.tier === 'Plus'
+                                      ? 'bg-emerald-50 text-emerald-700 border border-emerald-200/70'
+                                      : 'bg-slate-100 text-slate-600',
                               ]"
                             >
                               {{ acc.tier }}
                             </span>
                           </td>
-                          <td class="py-2 px-2 text-center font-bold text-gray-900">
+                          <td class="py-2 px-2 text-right font-bold text-slate-900">
                             {{ acc.today_requests }}
                           </td>
-                          <td class="py-2 px-2 text-center">
+                          <td class="py-2 px-2 text-right">
                             <span class="text-emerald-600 font-semibold">{{ acc.today_success }}</span>
-                            <span class="text-gray-300 mx-1">/</span>
-                            <span :class="acc.today_rate_limited > 0 ? 'text-rose-600 font-bold' : 'text-gray-400'">
+                            <span class="text-slate-300 mx-1">/</span>
+                            <span :class="acc.today_rate_limited > 0 ? 'text-rose-600 font-bold' : 'text-slate-400'">
                               {{ acc.today_rate_limited }}
                             </span>
                           </td>
-                          <td class="py-2 px-2 text-center">
-                            <div class="w-24 mx-auto space-y-0.5">
-                              <div class="flex justify-between text-[10px] text-gray-500">
+                          <td class="py-2 px-3 text-center">
+                            <div class="w-28 mx-auto space-y-1">
+                              <div class="flex justify-between text-[10px] text-slate-500">
                                 <span>{{ acc.today_requests }}/{{ acc.configured_quota }}</span>
                                 <span>{{ Math.round(acc.quota_used_percent) }}%</span>
                               </div>
-                              <div class="w-full bg-gray-100 rounded-full h-1 overflow-hidden">
+                              <div class="w-full bg-slate-100 rounded-full h-1.5 overflow-hidden">
                                 <div
-                                  class="h-1 rounded-full"
-                                  :class="acc.quota_used_percent >= 100 ? 'bg-amber-500' : acc.quota_used_percent >= 80 ? 'bg-yellow-500' : 'bg-brand-500'"
+                                  class="h-1.5 rounded-full"
+                                  :class="acc.quota_used_percent >= 100 ? 'bg-amber-500' : acc.quota_used_percent >= 80 ? 'bg-amber-400' : 'bg-brand-500'"
                                   :style="{ width: `${Math.min(100, Math.round(acc.quota_used_percent))}%` }"
                                 />
                               </div>
                             </div>
                           </td>
-                          <td class="py-2 px-2 text-right">
+                          <td class="py-2 px-2 text-right font-sans">
                             <span
                               v-if="!acc.enabled"
-                              class="text-[10px] text-gray-400"
+                              class="text-[11px] text-slate-400"
                             >
-                              停用
+                              已停用
                             </span>
                             <span
                               v-else-if="acc.cooldown_remaining > 0"
-                              class="px-1.5 py-0.2 rounded text-[10px] bg-rose-50 text-rose-700 font-medium"
+                              class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-rose-50 text-rose-700 border border-rose-200/70 font-medium"
                             >
                               429 ({{ acc.cooldown_remaining }}s)
                             </span>
                             <span
                               v-else-if="acc.is_available"
-                              class="px-1.5 py-0.2 rounded text-[10px] bg-emerald-50 text-emerald-700 font-medium"
+                              class="px-1.5 py-0.5 rounded text-[10px] bg-emerald-50 text-emerald-700 border border-emerald-200/70 font-medium"
                             >
-                              可用
+                              就绪
                             </span>
                             <span
                               v-else
-                              class="text-[10px] text-amber-600"
+                              class="px-1.5 py-0.5 rounded text-[10px] bg-amber-50 text-amber-700 border border-amber-200/70 font-medium"
                             >
                               配额耗尽
                             </span>
@@ -303,7 +315,7 @@ const statList = computed(() => {
                   </div>
                   <div
                     v-else
-                    class="text-xs text-gray-400 italic py-2 text-center"
+                    class="text-xs text-slate-400 py-3 text-center font-sans"
                   >
                     今日尚无账号调用此模型
                   </div>
@@ -315,9 +327,9 @@ const statList = computed(() => {
           <tr v-if="!statList.length">
             <td
               colspan="8"
-              class="py-12 text-center text-gray-400 text-xs"
+              class="py-10 text-center text-slate-400 text-xs font-sans"
             >
-              无调用记录
+              {{ searchQuery ? '未找到匹配的模型统计记录' : '暂无模型调用记录，发起 API 请求后将在此展示实时吞吐' }}
             </td>
           </tr>
         </tbody>

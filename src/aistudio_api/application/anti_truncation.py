@@ -114,6 +114,7 @@ def resolve_model_variant(
             return None
     return None
 
+
 # 与上游 JS 实现一致的审计白名单：仅固定元数据可进入日志。
 AUDIT_SKIP_REASONS = frozenset(
     {
@@ -147,8 +148,12 @@ class AntiTruncationContext:
 
     def audit_fields(self) -> dict[str, object]:
         return {
-            "transport": "active" if self.active else (
-                self.skip_reason if self.skip_reason in AUDIT_SKIP_REASONS else "unknown"
+            "transport": "active"
+            if self.active
+            else (
+                self.skip_reason
+                if self.skip_reason in AUDIT_SKIP_REASONS
+                else "unknown"
             ),
             "restored": self.restored,
             "syntheticSeen": self.synthetic_seen,
@@ -302,8 +307,10 @@ def prepare_anti_truncation(
 
     # tool_config 检查：NONE / ANY(强制) 均不接管。
     tool_config = normalized.tool_config
-    if isinstance(tool_config, list) and len(tool_config) > 1 and isinstance(
-        tool_config[1], list
+    if (
+        isinstance(tool_config, list)
+        and len(tool_config) > 1
+        and isinstance(tool_config[1], list)
     ):
         fcc = tool_config[1]
         mode_code = fcc[0] if fcc else 1
@@ -373,7 +380,9 @@ def _extract_call_content(call: dict[str, object]) -> str:
     return ""
 
 
-def restore_anti_truncation_output(output: ModelOutput, ctx: AntiTruncationContext) -> None:
+def restore_anti_truncation_output(
+    output: ModelOutput, ctx: AntiTruncationContext
+) -> None:
     """非流式响应还原：把合成工具调用参数中的正文搬回 ``candidate.text``。"""
     if not ctx.active or not output.candidates:
         return
@@ -421,7 +430,16 @@ def restore_anti_truncation_output(output: ModelOutput, ctx: AntiTruncationConte
 # 流式增量 JSON 参数识别器（移植自 JS ContentDecoder）
 # ---------------------------------------------------------------------------
 
-_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+_ESCAPES = {
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
 
 
 class ContentDecoder:
@@ -469,7 +487,9 @@ class ContentDecoder:
             self.high = ""
             if 0xDC00 <= code <= 0xDFFF:
                 # 合并 UTF-16 代理对为单一码点（Python 字符串为码点序列）。
-                out.append(chr(0x10000 + ((high_code - 0xD800) << 10) + (code - 0xDC00)))
+                out.append(
+                    chr(0x10000 + ((high_code - 0xD800) << 10) + (code - 0xDC00))
+                )
                 return
             out.append(chr(high_code))
         if 0xD800 <= code <= 0xDBFF:
@@ -627,7 +647,9 @@ class ContentDecoder:
                 self.stack.pop()
                 self._value_done()
             else:
-                is_root = len(self.stack) == 1 and ftype == "{" and frame["key"] == "content"
+                is_root = (
+                    len(self.stack) == 1 and ftype == "{" and frame["key"] == "content"
+                )
                 self._start_value(ch, is_root)
             i += 1
         return "".join(out)
@@ -677,6 +699,23 @@ def _merge_content(state: _StreamCallState, new: str) -> str:
     return new
 
 
+async def _close_stream_quietly(stream: object) -> None:
+    """尽力关闭上游异步迭代器，让连接在客户端断连时确定性释放。
+
+    ``async for`` 退出（含被 aclose 打断）时不会自动关闭被迭代的异步生成器，
+    只能等事件循环的 asyncgen finalizer；高断连率下会积压未释放的上游连接。
+    上游 transport 的流式生成器在 finally 里 ``await resp.aclose()``，因此这里
+    显式 close 能让 httpx 连接立即释放。
+    """
+    aclose = getattr(stream, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception as exc:  # pragma: no cover - 关闭失败不应影响主流程
+        logger.debug("关闭上游流失败: %s", exc)
+
+
 async def restore_anti_truncation_stream(
     events: AsyncIterator[tuple[str, object | None]],
     ctx: AntiTruncationContext,
@@ -686,6 +725,17 @@ async def restore_anti_truncation_stream(
     频道仲裁与上游 JS 实现一致：先到的非空正文频道胜出，后到的重复文本被
     抑制，避免"纯文本 + 工具参数"双通道重复。
     """
+    try:
+        async for event in _restore_anti_truncation_stream_inner(events, ctx):
+            yield event
+    finally:
+        await _close_stream_quietly(events)
+
+
+async def _restore_anti_truncation_stream_inner(
+    events: AsyncIterator[tuple[str, object | None]],
+    ctx: AntiTruncationContext,
+) -> AsyncIterator[tuple[str, object | None]]:
     if not ctx.active:
         async for event in events:
             yield event
@@ -722,9 +772,7 @@ async def restore_anti_truncation_stream(
                 call_state, content if isinstance(content, str) else ""
             )
         else:
-            raw_fragment = (
-                args if isinstance(args, str) else call.get("arguments")
-            )
+            raw_fragment = args if isinstance(args, str) else call.get("arguments")
             if not isinstance(raw_fragment, str) or not raw_fragment:
                 delta = ""
             elif call_state.dict_seen:
@@ -769,9 +817,10 @@ async def restore_anti_truncation_stream(
                     if isinstance(sig, str) and sig:
                         signature = sig
                 elif (
-                    not name
-                    or ctx.tool_name.startswith(name)
-                ) and "args" not in call and "arguments" not in call:
+                    (not name or ctx.tool_name.startswith(name))
+                    and "args" not in call
+                    and "arguments" not in call
+                ):
                     # 名称尚为合成名前缀且未带参数：疑似名称分片，暂缓透传。
                     continue
                 else:
@@ -782,7 +831,11 @@ async def restore_anti_truncation_stream(
                     logger.info("抗截断：纯文本频道已胜出，抑制工具通道重复正文")
                 else:
                     channel = "synthetic"
-                    if signature and call_state is not None and not call_state.signature_emitted:
+                    if (
+                        signature
+                        and call_state is not None
+                        and not call_state.signature_emitted
+                    ):
                         call_state.signature_emitted = True
                         yield "thought_signature", signature
                     yield "body", text_delta

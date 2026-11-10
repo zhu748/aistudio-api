@@ -1,6 +1,18 @@
 name: Docker
 
 on:
+  # 推送与 PR 都构建：验证 Dockerfile 改动，避免镜像只在每日定时任务里
+  # 才被真正编译一次（旧写法 latest 滞后 24h、Dockerfile 错误长期不暴露）。
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+      - master
   schedule:
     - cron: "0 0 * * *"
   workflow_dispatch:
@@ -11,7 +23,6 @@ concurrency:
 
 env:
   DOCKERHUB_REPO: bedrockblock/aistudio-api
-  GHCR_REPO: ghcr.io/${{ github.repository }}
 
 jobs:
   docker:
@@ -24,6 +35,13 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # ghcr.io 要求仓库名全小写；github.repository 可能含大写字母
+      # （例如 DeconstructedCube），直接拼进镜像引用会报
+      # "invalid reference format: repository name must be lowercase"。
+      - name: Compute lowercase GHCR repository
+        run: |
+          echo "GHCR_REPO=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -44,6 +62,8 @@ jobs:
             type=sha,prefix=sha-
             type=raw,value=latest,enable=${{ github.ref_name == 'main' || github.ref_name == 'master' }}
 
+      # PR 只构建不登录、不推送：既验证 Dockerfile，又不让 fork PR 拿到
+      # 仓库 secrets / packages: write 权限。
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3

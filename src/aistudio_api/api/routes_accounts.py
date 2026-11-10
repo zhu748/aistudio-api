@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path as FastApiPath
@@ -129,6 +131,8 @@ class ImportCookiesRequest(BaseModel):
     account_id: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9_\-\.@]+$")
     auth_user: str = "0"
     tier: str | None = None
+    # 可选：导入时直接绑定出口代理；留空则尝试从 cookies 文本中自动识别
+    proxy_url: str | None = None
 
 
 class ImportCookiesResponse(BaseModel):
@@ -137,11 +141,14 @@ class ImportCookiesResponse(BaseModel):
     cookie_count: int
     auth_user: str = "0"
     tier: str = "Free"
+    proxy_url: str | None = None
 
 
 class ProbeAndImportRequest(BaseModel):
     cookies: str
     name_prefix: str | None = None
+    # 可选：探测与后续请求共用该代理；留空则从 cookies 文本中自动识别
+    proxy_url: str | None = None
 
 
 class ProbeAndImportResponse(BaseModel):
@@ -156,6 +163,7 @@ class BundleAccountItem(BaseModel):
     cookies: str
     auth_user: str = "0"
     tier: str | None = None
+    proxy_url: str | None = None
 
 
 class ImportBundleRequest(BaseModel):
@@ -622,7 +630,24 @@ async def import_cookies(
     account_service: AccountService = Depends(get_account_service),
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> ImportCookiesResponse:
-    """从 Cookie 导入账号（支持 JSON 数组、Netscape、KV 或 JSON 对象）。"""
+    """从 Cookie 导入账号（支持 JSON 数组、Netscape、KV 或 JSON 对象）。
+
+    Cookie 文本可同时携带出口代理：``代理 + Cookie`` 或 ``Cookie + 代理``，
+    分隔符支持 ``+``、换行、``|``、逗号、空格；也可用 ``proxy_url`` 显式
+    指定（显式参数优先）。识别到的代理会随账号一起入库。
+    """
+    from aistudio_api.infrastructure.account.cookie_parser import (
+        normalize_proxy_url,
+        split_proxy_from_paste,
+    )
+
+    auto_proxy, cookie_text = split_proxy_from_paste(req.cookies)
+    req.cookies = cookie_text
+    effective_proxy = auto_proxy
+    if req.proxy_url:
+        effective_proxy = normalize_proxy_url(req.proxy_url)
+        if effective_proxy is None:
+            raise HTTPException(status_code=400, detail="代理地址格式无法识别")
     raw_text = req.cookies.strip()
     if raw_text.startswith(("{", "[")):
         with contextlib.suppress(Exception):
@@ -656,6 +681,8 @@ async def import_cookies(
                                 a.get("auth_user") or a.get("authUser") or "0"
                             ),
                             tier=str(a.get("tier") or a.get("g1Tier") or "Free"),
+                            proxy_url=str(a.get("proxy_url") or effective_proxy or "")
+                            or None,
                         )
                         for a in bundle_list
                         if isinstance(a, dict) and a.get("cookies")
@@ -672,6 +699,7 @@ async def import_cookies(
                     name=f"已成功批量导入 {bundle_res.imported_count} 个账号",
                     cookie_count=bundle_res.imported_count,
                     auth_user="0",
+                    proxy_url=effective_proxy,
                 )
 
             # Single account JSON export
@@ -738,6 +766,7 @@ async def import_cookies(
         auth_user=req.auth_user or "0",
         cookie_id=cid,
         tier=detected_tier,
+        proxy_url=effective_proxy,
     )
     if runtime_state.rotator:
         runtime_state.rotator.add_account(account.id)
@@ -754,6 +783,7 @@ async def import_cookies(
         cookie_count=cookie_count,
         auth_user=account.auth_user,
         tier=account.tier,
+        proxy_url=account.proxy_url,
     )
 
 
@@ -765,12 +795,23 @@ async def probe_and_import(
 ) -> ProbeAndImportResponse:
     """探测 Cookie 中的多个已登录账号并批量导入。"""
     from aistudio_api.infrastructure.account.cookie_parser import (
+        normalize_proxy_url,
         parse_cookie_string,
         probe_google_accounts_infinite,
+        split_proxy_from_paste,
     )
 
+    auto_proxy, cookie_text = split_proxy_from_paste(req.cookies)
+    req.cookies = cookie_text
+    effective_proxy = auto_proxy
+    if req.proxy_url:
+        effective_proxy = normalize_proxy_url(req.proxy_url)
+        if effective_proxy is None:
+            raise HTTPException(status_code=400, detail="代理地址格式无法识别")
     had_active_account = account_service.get_active_account() is not None
-    probed = await probe_google_accounts_infinite(req.cookies)
+    probed = await probe_google_accounts_infinite(
+        req.cookies, proxy_url=effective_proxy
+    )
     if not probed:
         raise HTTPException(status_code=400, detail="未探测到有效已登录 Google 账号")
 
@@ -784,6 +825,7 @@ async def probe_and_import(
         storage_state=storage_state,
         prefix=prefix,
         cookie_id=cid,
+        proxy_url=effective_proxy,
     )
     rotator = getattr(runtime_state, "rotator", None)
     if rotator:
@@ -814,9 +856,12 @@ async def import_bundle(
     """批量导入多个账号的凭据 Bundle（支持传入 JSON 文本、直接解析列表或服务器本地文件路径）。"""
     import json
     import secrets
-    from pathlib import Path
 
-    from aistudio_api.infrastructure.account.cookie_parser import parse_cookie_string
+    from aistudio_api.infrastructure.account.cookie_parser import (
+        normalize_proxy_url,
+        parse_cookie_string,
+        split_proxy_from_paste,
+    )
 
     items_to_import: list[dict[str, object]] = []
 
@@ -829,6 +874,7 @@ async def import_bundle(
                     "cookies": a.cookies,
                     "auth_user": a.auth_user or "0",
                     "tier": a.tier or "Free",
+                    "proxy_url": a.proxy_url,
                 }
             )
     elif req.content:
@@ -848,16 +894,40 @@ async def import_bundle(
             if isinstance(item, dict) and item.get("cookies"):
                 items_to_import.append(item)
     elif req.file_path:
+        # 安全：file_path 只允许读取受信任的导入根目录下的 JSON 文件。
+        # 此前对任意绝对路径 read_text 并回显 str(e)/绝对路径，等价于
+        # 认证后的任意文件读 + 存在性探测。根目录默认取 cwd 与项目根下
+        # 的 data/ 目录，可通过 AISTUDIO_IMPORT_ROOTS（os.pathsep 分隔）
+        # 追加；前端示例里的 /sdcard/Download/... 需由部署者显式登记。
+        # 本文件位于 <repo>/src/aistudio_api/api/，因此 parents[3] 才是仓库根
+        # （parents[4] 会越界到盘符根，把 /data 之类放进白名单，同时也让
+        # 非仓库 cwd 启动时项目自身的 data/ 反而不在白名单内）。
+        project_root = Path(__file__).resolve().parents[3]
+        allowed_roots: list[Path] = [
+            (Path.cwd() / "data").resolve(),
+            (project_root / "data").resolve(),
+        ]
+        env_roots = os.getenv("AISTUDIO_IMPORT_ROOTS", "")
+        for raw_root in env_roots.split(os.pathsep):
+            if raw_root.strip():
+                allowed_roots.append(Path(raw_root.strip()).expanduser().resolve())
         fpath = Path(req.file_path).expanduser().resolve()
+        if (
+            not any(fpath.is_relative_to(root) for root in allowed_roots)
+            or fpath.suffix.lower() != ".json"
+        ):
+            raise HTTPException(status_code=400, detail="文件路径不在允许的导入目录内")
         if not fpath.is_file():
-            raise HTTPException(status_code=404, detail=f"文件不存在: {fpath}")
+            raise HTTPException(
+                status_code=400, detail="文件不存在或不是有效 JSON 文件"
+            )
         try:
             raw_text = fpath.read_text(encoding="utf-8")
             raw_data = json.loads(raw_text)
         except Exception as e:
-            raise HTTPException(
-                status_code=400, detail=f"读取或解析文件失败: {e}"
-            ) from e
+            # 不回显 str(e)（可能含绝对路径/内容片段），仅给固定文案
+            log.warning("导入文件读取/解析失败: %s", type(e).__name__)
+            raise HTTPException(status_code=400, detail="读取或解析导入文件失败") from e
         if isinstance(raw_data, list):
             raw_list = raw_data
         elif isinstance(raw_data, dict):
@@ -884,7 +954,14 @@ async def import_bundle(
         raw_cookie_str = str(item.get("cookies") or "")
         if not raw_cookie_str:
             continue
-        storage_state = parse_cookie_string(raw_cookie_str)
+        auto_proxy, cookie_text = split_proxy_from_paste(raw_cookie_str)
+        item_proxy = item.get("proxy_url")
+        effective_proxy = auto_proxy
+        if isinstance(item_proxy, str) and item_proxy.strip():
+            effective_proxy = normalize_proxy_url(item_proxy)
+            if effective_proxy is None:
+                raise HTTPException(status_code=400, detail="代理地址格式无法识别")
+        storage_state = parse_cookie_string(cookie_text)
         if not storage_state.get("cookies"):
             continue
 
@@ -923,6 +1000,7 @@ async def import_bundle(
             auth_user=acc_auth_user,
             cookie_id=cid,
             tier=acc_tier,
+            proxy_url=effective_proxy,
         )
         rotator = getattr(runtime_state, "rotator", None)
         if rotator:

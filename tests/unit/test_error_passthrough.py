@@ -64,10 +64,10 @@ def isolated_runtime(monkeypatch):
     """隔离账号编排与轮换：只测错误可见性，不测切号逻辑。"""
     from aistudio_api.api.state import runtime_state
 
-    monkeypatch.setattr(gemini_svc, "ensure_active_account",
-                        lambda attempt, model=None: _noop())
-    monkeypatch.setattr(gemini_svc, "try_switch_account",
-                        lambda *a, **k: _noop_false())
+    monkeypatch.setattr(
+        gemini_svc, "ensure_active_account", lambda attempt, model=None: _noop()
+    )
+    monkeypatch.setattr(gemini_svc, "try_switch_account", lambda *a, **k: _noop_false())
     monkeypatch.setattr(gemini_svc, "record_rotator_event", lambda *a, **k: None)
 
     old_client = runtime_state.client
@@ -102,7 +102,7 @@ async def _collect_sse(resp: httpx.Response) -> list[dict]:
     for block in resp.text.split("\n\n"):
         block = block.strip()
         if block.startswith("data: "):
-            events.append(json.loads(block[len("data: "):]))
+            events.append(json.loads(block[len("data: ") :]))
     return events
 
 
@@ -236,8 +236,10 @@ async def test_stream_upstream_200_empty_injects_diagnostic(isolated_runtime):
     class _EmptyStreamClient:
         async def stream_generate_content(self, **kwargs):
             # 只发 usage/finish 事件，无任何内容事件
-            yield ("usage", {"prompt_tokens": 10, "completion_tokens": 0,
-                             "total_tokens": 10})
+            yield (
+                "usage",
+                {"prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10},
+            )
             yield ("finish_reason", 1)
 
     isolated_runtime.client = _EmptyStreamClient()
@@ -288,8 +290,95 @@ async def test_nonstream_upstream_200_empty_injects_diagnostic(isolated_runtime)
 
     assert resp.status_code == 200
     data = resp.json()
-    parts = (
-        data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-    )
+    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
     joined = "\n".join(p.get("text", "") for p in parts)
     assert "空回诊断" in joined
+
+
+@pytest.mark.asyncio
+async def test_stream_empty_response_is_recorded_as_error_not_success(monkeypatch):
+    """上游 200 空回不能记为 success：否则被风控的账号健康度虚高。
+
+    回归点：旧实现无论是否有内容都 record_rotator_event("success")，
+    使被软封账号继续被调度器判为健康账号。
+    """
+
+    class _EmptyStreamClient:
+        async def stream_generate_content(self, **kwargs):
+            yield (
+                "usage",
+                {"prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10},
+            )
+            yield ("finish_reason", 1)
+
+    from aistudio_api.api.state import runtime_state
+
+    recorded: list[str] = []
+    monkeypatch.setattr(
+        gemini_svc, "record_rotator_event", lambda ev, **k: recorded.append(ev)
+    )
+    monkeypatch.setattr(
+        gemini_svc, "ensure_active_account", lambda attempt, model=None: _noop()
+    )
+    monkeypatch.setattr(gemini_svc, "try_switch_account", lambda *a, **k: _noop_false())
+
+    from typing import cast
+
+    from aistudio_api.infrastructure.gateway.client import AIStudioClient
+
+    original_client = runtime_state.client
+    runtime_state.client = cast(AIStudioClient, _EmptyStreamClient())
+    try:
+        async with _client() as client:
+            resp = await client.post(
+                "/v1beta/models/gemini-3.8-flash:streamGenerateContent",
+                json=_REQUEST_BODY,
+            )
+        await _collect_sse(resp)
+    finally:
+        runtime_state.client = original_client
+
+    assert "success" not in recorded, f"空回被记为成功: {recorded}"
+    assert "error" in recorded
+
+
+@pytest.mark.asyncio
+async def test_nonstream_empty_response_is_recorded_as_error_not_success(monkeypatch):
+    """非流式同理：零内容记 error。"""
+    from aistudio_api.api.state import runtime_state
+    from aistudio_api.domain.models import Candidate, ModelOutput
+
+    class _EmptyOutputClient:
+        async def generate_content(self, **kwargs):
+            return ModelOutput(
+                candidates=[Candidate(text="", finish_reason=1)],
+                model="models/gemini-3.8-flash",
+            )
+
+    recorded: list[str] = []
+    monkeypatch.setattr(
+        gemini_svc, "record_rotator_event", lambda ev, **k: recorded.append(ev)
+    )
+    monkeypatch.setattr(
+        gemini_svc, "ensure_active_account", lambda attempt, model=None: _noop()
+    )
+    monkeypatch.setattr(gemini_svc, "try_switch_account", lambda *a, **k: _noop_false())
+
+    from typing import cast
+
+    from aistudio_api.infrastructure.gateway.client import AIStudioClient
+
+    original_client = runtime_state.client
+    runtime_state.client = cast(AIStudioClient, _EmptyOutputClient())
+    try:
+        async with _client() as client:
+            resp = await client.post(
+                "/v1beta/models/gemini-3.8-flash:generateContent",
+                json=_REQUEST_BODY,
+            )
+        assert resp.status_code == 200
+    finally:
+        runtime_state.client = original_client
+
+    assert "success" not in recorded, f"空回被记为成功: {recorded}"
+    assert "error" in recorded

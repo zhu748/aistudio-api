@@ -22,6 +22,8 @@ export default defineConfig({
       '/config': 'http://localhost:8080',
       '/api-keys': 'http://localhost:8080',
       '/health': 'http://localhost:8080',
+      '/v1': 'http://localhost:8080',
+      '/v1beta': 'http://localhost:8080',
     },
   },
   build: {
@@ -29,9 +31,9 @@ export default defineConfig({
     emptyOutDir: true,
     rollupOptions: {
       output: {
-        entryFileNames: 'assets/[name].js',
-        chunkFileNames: 'assets/[name].js',
-        assetFileNames: 'assets/[name].[ext]',
+        entryFileNames: 'assets/[name]-[hash].js',
+        chunkFileNames: 'assets/[name]-[hash].js',
+        assetFileNames: 'assets/[name]-[hash].[ext]',
         manualChunks: {
           'vendor-vue': ['vue', 'vue-router', 'pinia'],
           'vendor-icons': ['lucide-vue-next'],

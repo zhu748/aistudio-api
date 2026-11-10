@@ -235,9 +235,7 @@ async def test_list_models_exposes_variants(variant_config, monkeypatch):
     # 未选中的模型不出现变体。
     assert "models/gemini-3.1-pro-preview-at" not in names
 
-    display = {
-        m["name"]: m["displayName"] for m in resp.json()["models"]
-    }
+    display = {m["name"]: m["displayName"] for m in resp.json()["models"]}
     assert "流式抗截断" in display["models/gemini-3.7-flash-at-stream"]
     assert "非流式抗截断" in display["models/gemini-3.7-flash-at"]
 
@@ -265,7 +263,9 @@ async def test_get_variant_model_detail(variant_config, monkeypatch):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        resp = await client.get(f"/v1beta/models/gemini-3.7-flash{BUFFER_VARIANT_SUFFIX}")
+        resp = await client.get(
+            f"/v1beta/models/gemini-3.7-flash{BUFFER_VARIANT_SUFFIX}"
+        )
 
     assert resp.status_code == 200
     data = resp.json()
@@ -320,9 +320,7 @@ def _tools_contain_router_emit(tools) -> bool:
 
 
 @pytest.mark.asyncio
-async def test_nonstream_variant_forces_anti_truncation(
-    variant_config, monkeypatch
-):
+async def test_nonstream_variant_forces_anti_truncation(variant_config, monkeypatch):
     captured: dict[str, object] = {}
 
     class StubClient:
@@ -348,9 +346,7 @@ async def test_nonstream_variant_forces_anti_truncation(
 
 
 @pytest.mark.asyncio
-async def test_stream_buffer_variant_yields_single_event(
-    variant_config, monkeypatch
-):
+async def test_stream_buffer_variant_yields_single_event(variant_config, monkeypatch):
     captured: dict[str, object] = {}
 
     class StubClient:
@@ -481,9 +477,7 @@ async def test_unselected_variant_model_passthrough(variant_config, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_panel_anti_truncation_api_round_trip(
-    tmp_path, monkeypatch
-):
+async def test_panel_anti_truncation_api_round_trip(tmp_path, monkeypatch):
     from unittest.mock import AsyncMock
 
     from aistudio_api.infrastructure.gateway import model_discovery as md

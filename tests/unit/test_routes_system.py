@@ -139,7 +139,7 @@ async def test_signer_server_test_legacy_200(monkeypatch):
     async with _client() as client:
         monkeypatch.setattr(httpx, "AsyncClient", _FakeSignerClient)
         resp = await client.post(
-            "/config/signer-servers/test", json={"url": "https://waa.example.com"}
+            "/config/signer-servers/test", json={"url": "https://waa.spinsnow.fun"}
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -159,8 +159,7 @@ async def test_signer_server_test_new_protocol_missing_cookies(monkeypatch):
             'X-Google-Cookies header"}',
             json_data={
                 "ok": False,
-                "error": "Missing `cookies` query parameter or "
-                "X-Google-Cookies header",
+                "error": "Missing `cookies` query parameter or X-Google-Cookies header",
             },
         )
     ]
@@ -221,7 +220,7 @@ async def test_signer_server_test_other_400_stays_failed(monkeypatch):
     async with _client() as client:
         monkeypatch.setattr(httpx, "AsyncClient", _FakeSignerClient)
         resp = await client.post(
-            "/config/signer-servers/test", json={"url": "https://waa.example.com"}
+            "/config/signer-servers/test", json={"url": "https://waa.spinsnow.fun"}
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -249,9 +248,78 @@ async def test_signer_server_test_network_error(monkeypatch):
     async with _client() as client:
         monkeypatch.setattr(httpx, "AsyncClient", _BrokenClient)
         resp = await client.post(
-            "/config/signer-servers/test", json={"url": "https://waa.example.com"}
+            "/config/signer-servers/test", json={"url": "https://waa.spinsnow.fun"}
         )
         assert resp.status_code == 200
         data = resp.json()
         assert data["ok"] is False
         assert "error" in data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://waa.example.com",
+        "http://127.0.0.1.evil.com:8081",
+        "http://2130706433:8081",
+        "file:///etc/passwd",
+        "http://169.254.169.254/latest/meta-data/",
+    ],
+)
+async def test_signer_server_test_rejects_unregistered_url(monkeypatch, url):
+    """SSRF 防护：未登记/非 http(s) 的目标必须在发出任何请求前被拒绝。"""
+
+    class _NoCallClient:
+        def __init__(self, timeout: float = 8.0, proxy: str | None = None):
+            raise AssertionError("未登记的地址不应创建网络客户端")
+
+    async with _client() as client:
+        monkeypatch.setattr(httpx, "AsyncClient", _NoCallClient)
+        resp = await client.post("/config/signer-servers/test", json={"url": url})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is False
+        assert "未在签名服务器配置中登记" in data["error"]
+
+
+@pytest.mark.asyncio
+async def test_signer_server_test_no_cookie_exfiltration_to_remote(monkeypatch):
+    """远程节点缺 Cookie 时判定在线，但绝不发 X-Google-Cookies 复测。"""
+    seen_headers: list[dict | None] = []
+
+    class _RecordingClient:
+        responses: ClassVar[list] = []
+
+        def __init__(self, timeout: float = 8.0, proxy: str | None = None):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url: str, headers: dict | None = None):
+            seen_headers.append(headers)
+            return type(self).responses.pop(0)
+
+    _RecordingClient.responses = [
+        _FakeSignerResponse(
+            400,
+            text='{"ok":false,"error":"Missing `cookies` query parameter"}',
+            json_data={"ok": False, "error": "Missing `cookies` query parameter"},
+        )
+    ]
+    async with _client() as client:
+        monkeypatch.setattr(httpx, "AsyncClient", _RecordingClient)
+        resp = await client.post(
+            "/config/signer-servers/test", json={"url": "https://waa.spinsnow.fun"}
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        # 只发了 1 次 GET（缺 Cookie 的首次探活），且未携带任何 Cookie 头
+        assert len(seen_headers) == 1
+        assert seen_headers[0] is None
+        assert "禁止向远程节点发送账号 Cookie" in data.get("note", "")

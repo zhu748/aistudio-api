@@ -4,6 +4,7 @@ import { useAccountsStore } from '@/stores/accounts.ts'
 import Modal from '@/components/ui/Modal.vue'
 import Button from '@/components/ui/Button.vue'
 import { Sparkles, FileText, Upload, FolderOpen, CheckCircle2 } from 'lucide-vue-next'
+
 defineProps<{
   modelValue: boolean
 }>()
@@ -16,13 +17,14 @@ const accountsStore = useAccountsStore()
 
 const activeTab = ref<'text' | 'file'>('text')
 
-// 文本导入状态
+// Text paste state
 const cookieInput = ref('')
 const namePrefix = ref('')
 const singleEmail = ref('')
 const autoProbe = ref(true)
+const proxyInput = ref('')
 
-// 文件导入状态
+// File import state
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const selectedFileName = ref('')
 const selectedFileSize = ref('')
@@ -68,6 +70,7 @@ function clearSelectedFile() {
     fileInputRef.value.value = ''
   }
 }
+
 async function handleSubmit() {
   if (activeTab.value === 'file') {
     const content = selectedFileContent.value.trim()
@@ -99,21 +102,25 @@ async function handleSubmit() {
     }
     return
   }
+  const proxy = proxyInput.value.trim() || undefined
   const ok = autoProbe.value
     ? await accountsStore.probeAndImport({
         cookies: raw,
         name_prefix: namePrefix.value.trim() || undefined,
+        proxy_url: proxy,
       })
     : await accountsStore.importCookies({
         cookies: raw,
         name: namePrefix.value.trim() || undefined,
         email: singleEmail.value.trim() || undefined,
+        proxy_url: proxy,
       })
 
   if (ok) {
     cookieInput.value = ''
     namePrefix.value = ''
     singleEmail.value = ''
+    proxyInput.value = ''
     emit('update:modelValue', false)
   }
 }
@@ -124,15 +131,16 @@ async function handleSubmit() {
     :model-value="modelValue"
     max-width="lg"
     title="导入 Google 账号凭据"
+    subtitle="支持单条 Cookie 递归探测多登录身份 (u/0, u/1) 或 JSON 凭据包批量导入"
     @update:model-value="emit('update:modelValue', $event)"
   >
     <div class="space-y-4">
       <!-- Tab Switcher -->
-      <div class="flex items-center p-1 bg-gray-100 rounded-xl">
+      <div class="flex items-center p-1 bg-slate-100 rounded-lg">
         <button
           type="button"
-          class="flex-1 flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-lg transition-all"
-          :class="activeTab === 'text' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-900'"
+          class="flex-1 flex items-center justify-center gap-1.5 py-1.5 text-xs font-medium rounded-md transition-all cursor-pointer"
+          :class="activeTab === 'text' ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-500 hover:text-slate-900'"
           @click="activeTab = 'text'"
         >
           <FileText class="w-3.5 h-3.5" />
@@ -140,8 +148,8 @@ async function handleSubmit() {
         </button>
         <button
           type="button"
-          class="flex-1 flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-lg transition-all"
-          :class="activeTab === 'file' ? 'bg-white text-brand-600 shadow-sm' : 'text-gray-500 hover:text-gray-900'"
+          class="flex-1 flex items-center justify-center gap-1.5 py-1.5 text-xs font-medium rounded-md transition-all cursor-pointer"
+          :class="activeTab === 'file' ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-500 hover:text-slate-900'"
           @click="activeTab = 'file'"
         >
           <Upload class="w-3.5 h-3.5" />
@@ -154,9 +162,8 @@ async function handleSubmit() {
         v-if="activeTab === 'file'"
         class="space-y-4"
       >
-        <!-- File Picker Drag & Drop Box -->
         <div
-          class="border-2 border-dashed border-gray-200 hover:border-brand-400 bg-gray-50/70 hover:bg-brand-50/30 rounded-2xl p-5 text-center transition-all cursor-pointer relative"
+          class="border border-dashed border-slate-300 hover:border-brand-500 bg-slate-50/70 hover:bg-brand-50/20 rounded-xl p-5 text-center transition-all cursor-pointer relative"
           @click="fileInputRef?.click()"
         >
           <input
@@ -170,14 +177,14 @@ async function handleSubmit() {
             v-if="!selectedFileName"
             class="flex flex-col items-center gap-2"
           >
-            <div class="w-10 h-10 rounded-full bg-brand-100 text-brand-600 flex items-center justify-center">
-              <Upload class="w-5 h-5" />
+            <div class="w-9 h-9 rounded-lg bg-slate-900 text-white flex items-center justify-center">
+              <Upload class="w-4 h-4 text-brand-400" />
             </div>
             <div>
-              <p class="text-xs font-semibold text-gray-800">
+              <p class="text-xs font-semibold text-slate-800">
                 点击选择凭据包文件 (.json)
               </p>
-              <p class="text-[11px] text-gray-400 mt-0.5">
+              <p class="text-[11px] text-slate-400 mt-0.5">
                 支持批量账号凭据包 (.json) 或 Cookie JSON 数组文件
               </p>
             </div>
@@ -185,18 +192,18 @@ async function handleSubmit() {
 
           <div
             v-else
-            class="flex items-center justify-between bg-white p-3 rounded-xl border border-brand-200"
+            class="flex items-center justify-between bg-white p-3 rounded-lg border border-slate-200"
           >
             <div class="flex items-center gap-2.5 text-left">
-              <div class="w-8 h-8 rounded-lg bg-emerald-100 text-emerald-600 flex items-center justify-center">
+              <div class="w-8 h-8 rounded-lg bg-emerald-50 text-emerald-600 border border-emerald-200/70 flex items-center justify-center">
                 <CheckCircle2 class="w-4 h-4" />
               </div>
               <div>
-                <p class="text-xs font-semibold text-gray-800">
+                <p class="text-xs font-semibold text-slate-800 font-mono">
                   {{ selectedFileName }}
                 </p>
-                <p class="text-[11px] text-gray-400">
-                  大小: {{ selectedFileSize }}
+                <p class="text-[11px] text-slate-400 tabular-nums">
+                  {{ selectedFileSize }}
                   <span
                     v-if="detectedCount !== null"
                     class="ml-1 text-brand-600 font-medium"
@@ -206,7 +213,7 @@ async function handleSubmit() {
             </div>
             <button
               type="button"
-              class="text-xs text-gray-400 hover:text-rose-500 px-2 py-1"
+              class="text-xs text-slate-400 hover:text-rose-600 px-2 py-1 cursor-pointer"
               @click.stop="clearSelectedFile"
             >
               移除
@@ -214,72 +221,68 @@ async function handleSubmit() {
           </div>
         </div>
 
-        <!-- Alternative: Local File Path on Server -->
         <div class="space-y-1.5">
-          <label class="block text-xs font-semibold text-gray-700 uppercase tracking-wider flex items-center justify-between">
-            <span class="flex items-center gap-1">
-              <FolderOpen class="w-3.5 h-3.5 text-gray-500" />
-              <span>直接填入本地文件绝对路径</span>
-            </span>
+          <label class="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+            <FolderOpen class="w-3.5 h-3.5 text-slate-400" />
+            <span>或读取服务端 data/ 目录下的 JSON 文件</span>
           </label>
           <input
             v-model="localFilePath"
             type="text"
-            placeholder="/sdcard/Download/aistudio_accounts.json"
-            class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-mono outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
+            placeholder="data/aistudio_accounts.json"
+            class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
           >
-          <div class="flex items-center gap-1.5 flex-wrap pt-0.5 text-[11px] font-mono">
-            <span class="text-gray-400 font-sans">快捷路径:</span>
-            <button
-              type="button"
-              class="px-2 py-0.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-md transition-colors cursor-pointer"
-              @click="localFilePath = '/sdcard/Download/aistudio_accounts.json'"
-            >
-              /sdcard/Download/aistudio_accounts.json
-            </button>
-            <button
-              type="button"
-              class="px-2 py-0.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-md transition-colors cursor-pointer"
-              @click="localFilePath = 'data/aistudio_accounts.json'"
-            >
-              data/aistudio_accounts.json
-            </button>
-          </div>
+          <p class="text-[11px] text-slate-400 leading-relaxed">
+            仅可读取服务端 <code class="font-mono">data/</code> 目录（或 <code class="font-mono">AISTUDIO_IMPORT_ROOTS</code> 白名单目录）下的 .json 文件。
+          </p>
         </div>
       </div>
 
       <!-- Mode: Text Paste -->
       <div
         v-else
-        class="space-y-4"
+        class="space-y-3.5"
       >
         <div class="space-y-1.5">
-          <label class="block text-xs font-semibold text-gray-700 uppercase tracking-wider flex items-center justify-between">
-            <span>Cookie 数据</span>
-            <span class="text-[11px] text-gray-400 font-normal">支持 JSON 数组、Netscape 或 KV 文本</span>
+          <label class="text-xs font-semibold text-slate-700 flex items-center justify-between">
+            <span>Cookie 凭据内容</span>
+            <span class="text-[11px] text-slate-400 font-normal">支持 JSON 数组、Netscape 或 Key=Value 格式</span>
           </label>
           <textarea
             v-model="cookieInput"
-            rows="6"
+            rows="5"
             placeholder="[ { &quot;name&quot;: &quot;SAPISID&quot;, &quot;value&quot;: &quot;...&quot; }, ... ] 或&#10;SID=xxx; SSID=xxx; HSID=xxx; SAPISID=xxx; ..."
-            class="w-full p-3 font-mono text-xs bg-gray-50 border border-gray-200 rounded-xl outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
+            class="w-full p-3 font-mono text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
           />
         </div>
 
+        <div class="space-y-1.5">
+          <label class="text-xs font-semibold text-slate-700 flex items-center justify-between">
+            <span>独立出口代理 <span class="text-slate-400 font-normal">(可选)</span></span>
+            <span class="text-[11px] text-slate-400 font-normal">也可直接附在 Cookie 文本首尾</span>
+          </label>
+          <input
+            v-model="proxyInput"
+            type="text"
+            placeholder="socks5://user:pass@127.0.0.1:1080 或 127.0.0.1:7890"
+            class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
+          >
+        </div>
+
         <!-- Auto Probe Toggle -->
-        <label class="flex items-start gap-3 p-3 bg-brand-50/50 rounded-xl border border-brand-200/60 cursor-pointer select-none">
+        <label class="flex items-start gap-2.5 p-3 bg-brand-50/50 rounded-lg border border-brand-200/70 cursor-pointer select-none">
           <input
             v-model="autoProbe"
             type="checkbox"
-            class="mt-0.5 rounded text-brand-600 focus:ring-brand-500 focus:ring-offset-0"
+            class="mt-0.5 rounded accent-brand-600 cursor-pointer"
           >
           <div class="flex-1 text-xs">
-            <div class="font-semibold text-brand-900 flex items-center gap-1.5">
+            <div class="font-semibold text-slate-900 flex items-center gap-1.5">
               <Sparkles class="w-3.5 h-3.5 text-brand-600" />
-              <span>递归探测多身份登录账号 (u/0, u/1, u/2...)</span>
+              <span>自动递归探测多身份子账号 (u/0, u/1, u/2…)</span>
             </div>
-            <div class="text-brand-700/80 mt-0.5">
-              针对包含多登录身份的凭据，自动探测全部有效子账号并建立独立配置。
+            <div class="text-slate-500 mt-0.5 text-[11px]">
+              针对包含多个 Google 登录会话的 Cookie，自动探测全部有效子账号并独立建档。
             </div>
           </div>
         </label>
@@ -287,14 +290,14 @@ async function handleSubmit() {
         <!-- Account Name / Email Inputs -->
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div class="space-y-1.5">
-            <label class="block text-xs font-semibold text-gray-700 uppercase tracking-wider">
-              账号名称前缀 <span class="text-gray-400 font-normal">(可选)</span>
+            <label class="block text-xs font-semibold text-slate-700">
+              名称前缀 <span class="text-slate-400 font-normal">(可选)</span>
             </label>
             <input
               v-model="namePrefix"
               type="text"
               placeholder="Google Account"
-              class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
+              class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
             >
           </div>
 
@@ -302,14 +305,14 @@ async function handleSubmit() {
             v-if="!autoProbe"
             class="space-y-1.5"
           >
-            <label class="block text-xs font-semibold text-gray-700 uppercase tracking-wider">
-              邮箱地址 <span class="text-gray-400 font-normal">(可选)</span>
+            <label class="block text-xs font-semibold text-slate-700">
+              邮箱地址 <span class="text-slate-400 font-normal">(可选)</span>
             </label>
             <input
               v-model="singleEmail"
               type="email"
               placeholder="user@gmail.com"
-              class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
+              class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
             >
           </div>
         </div>
@@ -332,11 +335,9 @@ async function handleSubmit() {
         :disabled="activeTab === 'file' ? (!selectedFileContent && !localFilePath.trim()) : !cookieInput.trim()"
         @click="handleSubmit"
       >
-        <template #default>
-          <span v-if="activeTab === 'file'">确认批量导入</span>
-          <span v-else-if="autoProbe">探测并导入</span>
-          <span v-else>导入 Cookie</span>
-        </template>
+        <span v-if="activeTab === 'file'">确认批量导入</span>
+        <span v-else-if="autoProbe">探测并导入</span>
+        <span v-else>导入 Cookie</span>
       </Button>
     </template>
   </Modal>

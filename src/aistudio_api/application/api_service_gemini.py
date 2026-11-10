@@ -50,6 +50,9 @@ from aistudio_api.infrastructure.gateway.client import (
     AIStudioClient,
     PreparedRequest,
 )
+from aistudio_api.infrastructure.gateway.wire_spec import (
+    WIRE_FINISH_REASON_CONTINUING,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("api.gemini")
@@ -81,7 +84,10 @@ class Auth403RetryManager:
             ) from exc
 
         self.count += 1
-        record_rotator_event("auth_error", model=model)
+        # 每次 403 重试都记账会让单个请求放大成 5 次惩罚（auth_errors*200 权重），
+        # 同一请求首个 403 已足以让账号降权，后续重试只做恢复动作、不重复记罚。
+        if self.count == 1:
+            record_rotator_event("auth_error", model=model)
 
         # 1. 前 2 次 403: 重放已签名请求
         if self.count <= 2:
@@ -136,6 +142,15 @@ class Auth403RetryManager:
         raise HTTPException(
             403, detail={"message": str(exc), "type": "auth_error"}
         ) from exc
+
+
+# 上游占位/中间态的 finish_reason 编码：不是最终结论，必须跳过，
+# 否则续写中间态（22 = WIRE_FINISH_REASON_CONTINUING）会在流里伪造出 STOP。
+_IGNORED_WIRE_FINISH_REASONS: tuple[object, ...] = (
+    None,
+    0,
+    WIRE_FINISH_REASON_CONTINUING,
+)
 
 
 WIRE_TO_GEMINI_FINISH_REASON: dict[int, str] = {
@@ -387,7 +402,7 @@ async def handle_attempt_exception(
         ):
             logger.info("已切换账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
             return True
-        if isinstance(exc, TransportError):
+        if is_transport_error(exc):
             runtime_state.record(target_model, "errors")
             record_rotator_event("error", model=target_model)
             logger.warning("上游传输中断 (502): %s", exc)
@@ -447,9 +462,7 @@ def _build_gemini_response_from_output(
                     ),
                 ),
                 finishReason=to_gemini_finish_reason(
-                    output.candidates[0].finish_reason
-                    if output.candidates
-                    else None
+                    output.candidates[0].finish_reason if output.candidates else None
                 ),
                 index=0,
             )
@@ -547,10 +560,15 @@ async def handle_gemini_generate_content(
                     attempt + 1,
                     total_attempts,
                 )
-            record_rotator_event("success", model=normalized.model, usage=output.usage)
+            # 空回不能记为成功：上游 200 但零内容通常意味着风控/安全拦截，
+            # 记 success 会让账号健康度虚高、掩盖被软封的账号。
+            rotator_event = "success" if has_any_output else "error"
+            record_rotator_event(
+                rotator_event, model=normalized.model, usage=output.usage
+            )
             runtime_state.record(
                 normalized.model,
-                "success",
+                rotator_event,
                 usage=output.usage,
                 finish_reason=final_fr,
             )
@@ -767,9 +785,7 @@ def _build_gemini_streaming_response(
                 buffered_thought_sig = None
                 await ensure_active_account(stream_attempt, model=model_path)
                 normalized = normalize_gemini_request(req, model_path)
-                at_ctx = prepare_anti_truncation(
-                    normalized, override=anti_truncation
-                )
+                at_ctx = prepare_anti_truncation(normalized, override=anti_truncation)
                 try:
                     if force_buffer:
                         # 非流式抗截断变体：上游改走缓冲（非流式）传输，
@@ -791,9 +807,7 @@ def _build_gemini_streaming_response(
                         auth_manager.current_prepared = None
                         restore_anti_truncation_output(output, at_ctx)
                         final_usage = (
-                            output.usage
-                            if isinstance(output.usage, dict)
-                            else None
+                            output.usage if isinstance(output.usage, dict) else None
                         )
                         final_finish_reason = to_gemini_finish_reason(
                             output.candidates[0].finish_reason
@@ -838,7 +852,7 @@ def _build_gemini_streaming_response(
                         if event_type == "usage":
                             final_usage = text if isinstance(text, dict) else None
                         elif event_type == "finish_reason":
-                            if text not in (None, 0, 22):
+                            if text not in _IGNORED_WIRE_FINISH_REASONS:
                                 final_finish_reason = (
                                     to_gemini_finish_reason(text)
                                     if isinstance(text, int)
@@ -920,11 +934,13 @@ def _build_gemini_streaming_response(
                 if diagnostic_chunk:
                     has_yielded_any = True
                     yield diagnostic_chunk
-            record_rotator_event("success", model=target_model, usage=final_usage)
+            # 与空回防护一致：零内容不能记为 success（见上方流式空回诊断）
+            stream_event = "success" if has_yielded_data else "error"
+            record_rotator_event(stream_event, model=target_model, usage=final_usage)
             if normalized is not None:
                 runtime_state.record(
                     normalized.model,
-                    "success",
+                    stream_event,
                     usage=final_usage,
                     finish_reason=final_finish_reason,
                 )

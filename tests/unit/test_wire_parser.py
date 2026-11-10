@@ -161,7 +161,7 @@ def test_parse_text_output_fallback():
 
 
 def test_parse_image_output_keeps_only_final_images_in_images_field():
-    raw = (FIXTURES / "test_image_output.json").read_text()
+    raw = (FIXTURES / "test_image_output.json").read_text(encoding="utf-8")
     output = parse_text_output(raw)
 
     assert len(output.images) == 1
@@ -369,3 +369,31 @@ def test_parse_response_chunk_with_ask_tool_payload():
             }
         ]
     }
+
+
+def test_decode_wire_value_handles_deep_nesting_without_recursion_error():
+    """恶意/异常的深层嵌套不得把 RecursionError 冒泡成 HTTP 500。"""
+    from aistudio_api.infrastructure.gateway.wire_parser import _decode_wire_value
+
+    nested: object = "leaf"
+    for _ in range(1500):
+        nested = [nested]
+
+    # 不抛异常即为通过（超深项被替换为 None/占位）
+    result = _decode_wire_value(nested)
+    assert result is not None
+
+
+def test_wire_spec_get_at_negative_index_returns_default():
+    """负索引必须返回默认值，而不是 Python 语义上的「最后一个元素」。"""
+    from aistudio_api.infrastructure.gateway.wire_spec import JspbArray
+
+    arr = JspbArray()
+    arr[0] = 1
+    arr[1] = 2
+    arr[2] = 3
+
+    assert arr.get_at(1) == 2
+    assert arr.get_at(-1) is None
+    assert arr.get_at(-1, "default") == "default"
+    assert arr.get_at(99, "default") == "default"

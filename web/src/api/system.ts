@@ -158,7 +158,16 @@ export const systemApi = {
     return request<LogsResponse>(`/api/logs${qs ? `?${qs}` : ''}`)
   },
 
-  clearLogs(): Promise<{ ok: boolean; removed: number }> {
+  clearLogs(): Promise<{ ok: boolean; removed: number; total: number; capacity: number }> {
     return request('/api/logs', { method: 'DELETE' })
+  },
+
+  /**
+   * 换取一次性 SSE 票据（POST，携带 Authorization 头）。
+   * EventSource 无法带请求头，且不应把管理密码放进 URL，
+   * 因此先用正常鉴权换取短时一次性票据，再附加到 SSE 的 URL 上。
+   */
+  createLogStreamTicket(): Promise<{ ok: boolean; ticket: string }> {
+    return request('/api/logs/stream-ticket', { method: 'POST' })
   },
 }

@@ -221,8 +221,9 @@ class AccountService:
         storage_state: dict[str, object],
         prefix: str = "Google Account",
         cookie_id: str | None = None,
+        proxy_url: str | None = None,
     ) -> list[AccountMeta]:
-        """批量导入探活到的账号列表。"""
+        """批量导入探活到的账号列表（可统一指定出口代理）。"""
         imported: list[AccountMeta] = []
         for p in probed_list:
             u_idx = str(p.get("auth_user") or "0")
@@ -240,6 +241,7 @@ class AccountService:
                 auth_user=u_idx,
                 cookie_id=cookie_id,
                 tier=tier,
+                proxy_url=proxy_url,
             )
             imported.append(account)
 

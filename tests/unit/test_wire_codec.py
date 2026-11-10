@@ -246,7 +246,7 @@ def test_encode_request_body_keeps_structured_generation_config_for_gemini_mode(
 
 def test_decode_image_request_maps_generation_config_fields_from_proto_indexes():
     codec = AistudioWireCodec()
-    raw = (FIXTURES / "test_image_input.json").read_text()
+    raw = (FIXTURES / "test_image_input.json").read_text(encoding="utf-8")
 
     request = codec.decode(raw)
 
@@ -264,7 +264,7 @@ def test_decode_image_request_maps_generation_config_fields_from_proto_indexes()
 
 def test_encode_preserves_newly_mapped_proto_fields():
     codec = AistudioWireCodec()
-    raw = (FIXTURES / "test_image_input.json").read_text()
+    raw = (FIXTURES / "test_image_input.json").read_text(encoding="utf-8")
 
     request = codec.decode(raw)
     encoded = codec.encode(request)
@@ -358,3 +358,94 @@ def test_encode_request_body_handles_tool_config_semantically_and_preserves_ever
     body_none = json.loads(rewritten_none)
     assert len(body_none) <= 6 or body_none[6] is None
     assert len(body_none) <= 7 or body_none[7] is None
+
+
+def test_executable_code_and_result_strings_round_trip():
+    """上游把代码/执行结果作为裸字符串下发时不得被丢弃（下标 8/9）。
+
+    回归点：旧实现用 elif 串联两个分支，同一条 part 同时带代码与执行结果时
+    只会保留其中一个，decode→encode 后另一半静默消失。
+    """
+    codec = AistudioWireCodec()
+    part = [None, None, None, None, None, None, None, None, "print(1)", "out1"]
+    raw = json.dumps(["models/x", [[[part], "model"]]])
+
+    decoded = codec.decode(raw)
+    decoded_part = decoded.contents[0].parts[0]
+    assert decoded_part.executable_code == ("PYTHON", "print(1)")
+    assert decoded_part.code_execution_result == ("OUTCOME_OK", "out1")
+    assert decoded_part.text is None
+
+    rewritten = json.loads(codec.encode(decoded))
+    encoded_part = rewritten[1][0][0][0]
+    assert encoded_part[8] == [1, "print(1)"]
+    assert encoded_part[9] == [1, "out1"]
+
+    # 再解一次确认往返稳定
+    again = codec.decode(json.dumps(rewritten)).contents[0].parts[0]
+    assert again.executable_code == ("PYTHON", "print(1)")
+    assert again.code_execution_result == ("OUTCOME_OK", "out1")
+
+
+def test_build_tools_from_names_returns_isolated_copies():
+    """工具模板必须深拷贝：共享全局 list 会让改动跨请求污染。"""
+    first = build_tools_from_names(["google_search"])
+    second = build_tools_from_names(["google_search"])
+
+    assert first[0] is not second[0]
+    assert first[0][3] is not second[0][3]
+
+    # 污染第一个副本后，新调用必须仍然干净
+    first[0][3][0] = "POLLUTED"
+    third = build_tools_from_names(["google_search"])
+    assert third[0][3][0] is None
+
+
+def test_build_image_generation_search_tool_returns_isolated_copy():
+    first = build_image_generation_search_tool(google_search=True)
+    assert first is not None
+    second = build_image_generation_search_tool(google_search=True)
+    assert second is not None
+    assert first is not second
+    assert first[3] is not second[3]
+
+
+def test_part_to_wire_tolerates_short_tuples():
+    """单元素/空元组不得触发 IndexError/ValueError（防御上游畸形数据）。
+
+    上游数据不可信，这里刻意用 cast 构造与类型标注不符的元组，
+    验证 to_wire 的边界保护真的存在。
+    """
+    from typing import Any, cast
+
+    from aistudio_api.infrastructure.gateway.wire_types import AistudioPart
+
+    # 单元素 function_call：缺 args 时补空 dict，不抛异常
+    call_part = AistudioPart(function_call=cast("Any", ("only_name",)))
+    call_wire = cast("list[Any]", call_part.to_wire())
+    assert call_wire[10][0] == "only_name"
+    assert call_wire[10][1] == [[]]  # 空 dict 编码成单层键值对列表
+
+    # 单元素 function_response
+    resp_part = AistudioPart(function_response=cast("Any", ("only_name",)))
+    resp_wire = cast("list[Any]", resp_part.to_wire())
+    assert resp_wire[11][0] == "only_name"
+
+    # 单元素 executable_code / code_execution_result
+    code_part = AistudioPart(executable_code=cast("Any", ("PYTHON",)))
+    assert cast("list[Any]", code_part.to_wire())[8] == [1, ""]
+    result_part = AistudioPart(code_execution_result=cast("Any", ("OUTCOME_OK",)))
+    assert cast("list[Any]", result_part.to_wire())[9] == [1, ""]
+
+
+def test_part_to_wire_emits_both_code_and_result():
+    """同时带代码与执行结果时必须两个下标都写。"""
+    from aistudio_api.infrastructure.gateway.wire_types import AistudioPart
+
+    part = AistudioPart(
+        executable_code=("PYTHON", "print(1)"),
+        code_execution_result=("OUTCOME_OK", "1"),
+    )
+    encoded = part.to_wire()
+    assert encoded[8] == [1, "print(1)"]
+    assert encoded[9] == [1, "1"]

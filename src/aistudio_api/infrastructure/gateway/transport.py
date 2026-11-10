@@ -6,7 +6,10 @@ using connection pooling and chunk streaming.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import re
+import ssl
 import time
 from collections.abc import AsyncGenerator
 
@@ -55,13 +58,29 @@ def _http2_enabled() -> bool:
     return _h2_available
 
 
+# httpx.AsyncClient 未显式传 verify 时会为每个实例调用
+# ssl.create_default_context()，在 Windows 上枚举系统证书库实测单次
+# 0.7~1.4 秒（同步阻塞事件循环；带 proxy 时更慢）。进程级共享同一个
+# SSLContext 可把这个开销降到亚毫秒级，语义与默认行为一致（仍校验证书，
+# 仍加载系统 CA）。证书更新在进程重启后生效。
+_ssl_context: ssl.SSLContext | None = None
+
+
+def _shared_ssl_context() -> ssl.SSLContext:
+    """返回进程级共享的 SSL 上下文，避免反复枚举系统证书库。"""
+    global _ssl_context
+    if _ssl_context is None:
+        _ssl_context = ssl.create_default_context()
+    return _ssl_context
+
+
 def _get_auth_cookies(auth_file: str | None = None) -> dict[str, str] | None:
     """Read credentials from the bound auth_file or active account."""
     if auth_file:
         cookies = load_cookies_from_auth_file(auth_file)
         if cookies:
             return cookies
-    try:
+    with contextlib.suppress(Exception):
         from aistudio_api.infrastructure.account.account_store import AccountStore
 
         store = AccountStore()
@@ -73,22 +92,18 @@ def _get_auth_cookies(auth_file: str | None = None) -> dict[str, str] | None:
             cookies = load_cookies_from_auth_file(auth_path)
             if cookies:
                 return cookies
-    except Exception:
-        pass
     return None
 
 
 def _get_active_account_tier() -> str:
     """Read active account's subscription tier."""
-    try:
+    with contextlib.suppress(Exception):
         from aistudio_api.infrastructure.account.account_store import AccountStore
 
         store = AccountStore()
         active = store.get_active_account()
         if active and getattr(active, "tier", None):
             return str(active.tier)
-    except Exception:
-        pass
     return "Free"
 
 
@@ -185,6 +200,18 @@ class HTTPStreamTransport:
         self.timeout = timeout
         # 按代理地址分池的客户端缓存：key 为代理 URL（空串表示直连）
         self._clients: dict[str, httpx.AsyncClient] = {}
+        # 首次并发调用会同时走到建池分支，若不互斥会创建多个客户端并泄漏未关闭的连接池；
+        # 锁按事件循环惰性创建，避免跨 loop 复用同一个 Lock 对象。
+        self._client_lock: asyncio.Lock | None = None
+        self._client_lock_loop: asyncio.AbstractEventLoop | None = None
+
+    def _get_client_lock(self) -> asyncio.Lock:
+        """返回与当前事件循环绑定的建池互斥锁。"""
+        loop = asyncio.get_running_loop()
+        if self._client_lock is None or self._client_lock_loop is not loop:
+            self._client_lock = asyncio.Lock()
+            self._client_lock_loop = loop
+        return self._client_lock
 
     async def close(self) -> None:
         for client in self._clients.values():
@@ -197,15 +224,21 @@ class HTTPStreamTransport:
         effective = self.proxy_url if proxy_url is None else (proxy_url or None)
         key = effective or ""
         client = self._clients.get(key)
-        if client is None or client.is_closed:
+        if client is not None and not client.is_closed:
+            return client
+        async with self._get_client_lock():
+            client = self._clients.get(key)
+            if client is not None and not client.is_closed:
+                return client
             client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.timeout, connect=15.0),
                 proxy=effective,
                 http2=_http2_enabled(),
+                verify=_shared_ssl_context(),
                 limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
             )
             self._clients[key] = client
-        return client
+            return client
 
     async def send_request(
         self,

@@ -1,4 +1,5 @@
 import { ref } from 'vue'
+import { request } from '@/api/client.ts'
 import { usePolling } from './usePolling.ts'
 
 export type SystemHealthState = 'checking' | 'online' | 'offline'
@@ -12,8 +13,10 @@ export function useSystemHealth(intervalMs = 15000) {
 
   async function check() {
     try {
-      const res = await fetch('/health')
-      state.value = res.ok ? 'online' : 'offline'
+      // 必须走统一 request：裸 fetch 没有超时，服务端接受连接却不响应时
+      // Promise 永不 settle，usePolling 的 running 标志会永久卡住整条轮询链。
+      await request<{ status: string }>('/health', { timeoutMs: 8000 })
+      state.value = 'online'
     } catch {
       state.value = 'offline'
     }

@@ -5,7 +5,7 @@ import { useAuthStore } from '@/stores/auth.ts'
 import { useToastStore } from '@/stores/toast.ts'
 import Button from '@/components/ui/Button.vue'
 import ToastContainer from '@/components/ui/ToastContainer.vue'
-import { Lock, Eye, EyeOff, ShieldCheck, AlertCircle } from 'lucide-vue-next'
+import { Lock, Eye, EyeOff, ShieldCheck, AlertCircle, Terminal } from 'lucide-vue-next'
 
 const router = useRouter()
 const route = useRoute()
@@ -17,16 +17,23 @@ const showPassword = ref(false)
 const loading = ref(false)
 const errorMsg = ref('')
 
+/** Only allow relative in-app paths to prevent open redirect via ?redirect=//evil.com. */
+function safeRedirect(raw: unknown): string {
+  const value = typeof raw === 'string' ? raw : ''
+  if (!value.startsWith('/') || value.startsWith('//') || value.startsWith('/\\')) {
+    return '/'
+  }
+  return value
+}
+
 onMounted(async () => {
-  // 如果已存在 token，且通过验证，自动跳转
   if (authStore.token) {
     inputToken.value = authStore.token
     loading.value = true
     const ok = await authStore.login(authStore.token)
     loading.value = false
     if (ok) {
-      const redirect = (route.query.redirect as string) || '/'
-      router.replace(redirect)
+      router.replace(safeRedirect(route.query.redirect))
     }
   }
 })
@@ -44,16 +51,15 @@ async function handleLogin() {
   try {
     const ok = await authStore.login(token)
     if (ok) {
-      toast.success('登录成功')
-      const redirect = (route.query.redirect as string) || '/'
-      router.replace(redirect)
+      toast.success('身份验证通过')
+      router.replace(safeRedirect(route.query.redirect))
     } else {
-      errorMsg.value = '密码错误或无权访问'
-      toast.error('密码校验失败，请检查后重试')
+      errorMsg.value = '管理密码校验失败，请检查 AISTUDIO_WEB_PASSWORD 配置'
+      toast.error('密码错误或无权访问')
     }
   } catch {
-    errorMsg.value = '网络请求异常，请检查服务状态'
-    toast.error('登录异常')
+    errorMsg.value = '网络请求异常，请确认后端网关服务在线'
+    toast.error('登录请求失败')
   } finally {
     loading.value = false
   }
@@ -61,27 +67,27 @@ async function handleLogin() {
 </script>
 
 <template>
-  <div class="min-h-screen bg-gray-100/90 flex flex-col justify-center items-center p-4 sm:p-6">
+  <div class="min-h-screen bg-slate-50 flex flex-col justify-center items-center p-4 sm:p-6">
     <ToastContainer />
 
-    <div class="w-full max-w-md bg-white rounded-3xl shadow-xl border border-gray-100 p-8 sm:p-10 transition-all">
+    <div class="w-full max-w-sm bg-white rounded-2xl shadow-lg border border-slate-200/90 p-7 sm:p-8">
       <!-- Header / Logo -->
-      <div class="text-center mb-8">
-        <div class="w-14 h-14 bg-brand-500 text-white rounded-2xl flex items-center justify-center font-bold text-2xl mx-auto mb-4 shadow-md shadow-brand-500/20">
-          AI
+      <div class="flex flex-col items-center text-center mb-6">
+        <div class="w-11 h-11 bg-slate-900 text-white rounded-xl flex items-center justify-center mb-3.5 shadow-sm">
+          <Terminal class="w-5 h-5 text-brand-400" />
         </div>
-        <h1 class="text-2xl font-extrabold text-gray-900 tracking-tight">
-          AI Studio Proxy
+        <h1 class="text-lg font-bold text-slate-900 tracking-tight">
+          AI Studio Gateway
         </h1>
-        <p class="text-xs text-gray-400 mt-1.5">
-          请输入控制台管理密码
+        <p class="text-xs text-slate-500 mt-1">
+          多协议反向代理与凭据调度控制台
         </p>
       </div>
 
       <!-- Error Alert -->
       <div
         v-if="errorMsg"
-        class="mb-6 p-3.5 bg-rose-50 border border-rose-200/80 rounded-xl text-xs font-medium text-rose-800 flex items-start gap-2.5 animate-shake"
+        class="mb-5 p-3 bg-rose-50 border border-rose-200/80 rounded-xl text-xs font-medium text-rose-800 flex items-start gap-2"
       >
         <AlertCircle class="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
         <span>{{ errorMsg }}</span>
@@ -89,28 +95,28 @@ async function handleLogin() {
 
       <!-- Form -->
       <form
-        class="space-y-5"
+        class="space-y-4"
         @submit.prevent="handleLogin"
       >
         <div class="space-y-1.5">
-          <label class="block text-xs font-semibold text-gray-700 uppercase tracking-wider">
-            访问密码
+          <label class="block text-xs font-semibold text-slate-700">
+            管理访问密码 (Web Password)
           </label>
           <div class="relative">
-            <div class="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-gray-400">
+            <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-400">
               <Lock class="w-4 h-4" />
             </div>
             <input
               v-model="inputToken"
               :type="showPassword ? 'text' : 'password'"
-              placeholder="输入访问密码"
+              placeholder="输入 AISTUDIO_WEB_PASSWORD"
               autocomplete="current-password"
               autofocus
-              class="w-full pl-10 pr-10 py-3 bg-gray-50 border border-gray-200 rounded-xl text-sm outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all font-mono"
+              class="w-full pl-9 pr-9 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all font-mono"
             >
             <button
               type="button"
-              class="absolute inset-y-0 right-0 pr-3.5 flex items-center text-gray-400 hover:text-gray-600 transition-colors"
+              class="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-slate-600 transition-colors cursor-pointer"
               @click="showPassword = !showPassword"
             >
               <EyeOff
@@ -129,12 +135,12 @@ async function handleLogin() {
           type="submit"
           variant="primary"
           size="lg"
-          class="w-full justify-center text-sm font-semibold shadow-md shadow-brand-500/10"
+          class="w-full justify-center text-xs font-semibold"
           :loading="loading"
           :disabled="!inputToken.trim()"
         >
           <ShieldCheck class="w-4 h-4" />
-          <span>登录</span>
+          <span>进入控制台</span>
         </Button>
       </form>
     </div>

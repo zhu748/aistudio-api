@@ -56,7 +56,9 @@ def build_ext_bin(region: str | None = None) -> str:
     reg = (region or DEFAULT_REGION).strip().upper()
     if len(reg) != 2 or not reg.isascii() or not reg.isalpha():
         reg = "US"
-    return base64.b64encode(_EXT_BIN_PREFIX + reg.encode("ascii") + _EXT_BIN_SUFFIX).decode("ascii")
+    return base64.b64encode(
+        _EXT_BIN_PREFIX + reg.encode("ascii") + _EXT_BIN_SUFFIX
+    ).decode("ascii")
 
 
 DEFAULT_EXT_BIN = build_ext_bin()
@@ -444,9 +446,21 @@ _PROXY_SCHEMES: tuple[str, ...] = (
     "socks5h://",
 )
 
+# host:port（如 127.0.0.1:7890 / proxy.example.com:8080）
+_HOST_PORT_RE = re.compile(r"[A-Za-z0-9_.\-]+:\d{2,5}")
+# user:pass@host:port（无协议头，如 user:pass@1.2.3.4:1080）
+_USERINFO_HOST_PORT_RE = re.compile(r"[^@\s]+@[A-Za-z0-9_.\-]+:\d{2,5}")
+# host:port:user:pass（curl -x 风格，如 1.2.3.4:1080:user:pass）
+_HOST_PORT_USERINFO_RE = re.compile(r"[A-Za-z0-9_.\-]+:\d{2,5}:[^:\s]+:[^:\s]+")
+
 
 def normalize_proxy_url(candidate: str | None) -> str | None:
-    """规整代理地址：补全 ``http://`` 前缀，无法识别时返回 None。"""
+    """规整代理地址：无法识别时返回 None。
+
+    支持：带协议头（``socks5://user:pass@host:port``，原样保留）、隐式 HTTP
+    （``127.0.0.1:7890``）、无协议头带凭据（``user:pass@host:port``）、
+    curl -x 风格（``host:port:user:pass`` → ``http://user:pass@host:port``）。
+    """
     if not candidate:
         return None
     text = candidate.strip().rstrip("/")
@@ -454,20 +468,22 @@ def normalize_proxy_url(candidate: str | None) -> str | None:
         return None
     if text.lower().startswith(_PROXY_SCHEMES):
         return text
-    # host:port 形式视为隐式 HTTP 代理（如 127.0.0.1:7890）
-    if re.fullmatch(r"[A-Za-z0-9_.\-]+:\d{2,5}", text):
+    if _USERINFO_HOST_PORT_RE.fullmatch(text):
         return f"http://{text}"
+    if _HOST_PORT_RE.fullmatch(text):
+        return f"http://{text}"
+    if _HOST_PORT_USERINFO_RE.fullmatch(text):
+        host, port, user, password = text.split(":", 3)
+        return f"http://{user}:{password}@{host}:{port}"
     return None
 
 
 def _looks_like_proxy(candidate: str) -> bool:
-    """判断片段是否形似代理地址：含协议头或 host:port，且不含 Cookie 特征（= / ;）。"""
+    """判断片段是否形似代理地址：不含 Cookie 特征（= / ; / 空白）且可规整。"""
     text = candidate.strip()
-    if not text or "=" in text or ";" in text:
+    if not text or "=" in text or ";" in text or re.search(r"\s", text):
         return False
-    if "://" in text:
-        return True
-    return bool(re.fullmatch(r"[A-Za-z0-9_.\-]+:\d{2,5}", text))
+    return normalize_proxy_url(text) is not None
 
 
 def _has_core_cookies(raw: object) -> bool:
@@ -511,6 +527,45 @@ def split_proxy_cookie_entry(entry: str) -> tuple[str | None, str]:
             return normalize_proxy_url(right), left.strip()
         pos = idx
 
+    return None, text
+
+
+# 粘贴文本里代理与 Cookie 之间允许的分隔符（按优先级尝试）
+_PASTE_PROXY_SEPARATORS: tuple[str, ...] = ("+", "\n", "|", ",", " ")
+
+# 允许「代理：」「proxy=」这类前缀标签
+_PROXY_LABEL_RE = re.compile(r"^(?:proxy|代理)\s*[:=]\s*", re.IGNORECASE)
+
+
+def _strip_proxy_label(text: str) -> str:
+    """去掉「代理：」「proxy=」之类的前缀标签。"""
+    return _PROXY_LABEL_RE.sub("", text.strip()).strip()
+
+
+def split_proxy_from_paste(text: str) -> tuple[str | None, str]:
+    """从粘贴的 Cookie 文本中拆出代理地址，返回 ``(proxy_url, 纯 Cookie 文本)``。
+
+    支持代理在前或在后，分隔符 ``+``、换行、``|``、逗号、空格；空格分隔只认
+    首尾两个片段（移除中间片段会把相邻 Cookie 键值粘在一起）。JSON 数组/
+    对象视为完整凭据包，不参与拆分。识别不出代理时原样返回文本。
+    """
+    raw = text.strip()
+    if not raw or raw.startswith(("{", "[")):
+        return None, text
+    for sep in _PASTE_PROXY_SEPARATORS:
+        if sep not in raw:
+            continue
+        parts = raw.split(sep)
+        candidates = range(len(parts)) if sep != " " else (0, len(parts) - 1)
+        for idx in candidates:
+            if idx < 0 or idx >= len(parts):
+                continue
+            candidate = _strip_proxy_label(parts[idx])
+            if not _looks_like_proxy(candidate):
+                continue
+            rest = sep.join(part for i, part in enumerate(parts) if i != idx).strip()
+            if _has_core_cookies(rest):
+                return normalize_proxy_url(candidate), rest
     return None, text
 
 
@@ -612,13 +667,32 @@ def parse_env_cookie_entries(raw_values: list[str]) -> list[EnvCookieEntry]:
     return entries
 
 
+def load_account_meta(auth_file: str | Path | None) -> dict[str, object]:
+    """一次性读取 auth_file 同目录的 meta.json。
+
+    切换账号时原先分别调用 get_auth_user_from_meta / get_tier_from_meta /
+    get_proxy_from_meta，同一个 1KB 的 meta.json 被解析三遍（实测 0.28ms
+    纯浪费）。这里提供单次读取入口，三个兼容包装函数复用它。
+    """
+    if not auth_file:
+        return {}
+    try:
+        meta_path = Path(auth_file).parent / "meta.json"
+        if meta_path.is_file():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(meta, dict):
+                return meta
+    except Exception:
+        pass
+    return {}
+
+
 def get_auth_user_from_meta(auth_file: str | Path | None) -> str:
     """Read auth_user index from meta.json adjacent to auth_file."""
     if auth_file:
         try:
-            meta_path = Path(auth_file).parent / "meta.json"
-            if meta_path.is_file():
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta = load_account_meta(auth_file)
+            if meta:
                 return str(meta.get("auth_user") or "0")
         except Exception:
             pass
@@ -629,9 +703,8 @@ def get_tier_from_meta(auth_file: str | Path | None) -> str:
     """Read benefit tier from meta.json adjacent to auth_file."""
     if auth_file:
         try:
-            meta_path = Path(auth_file).parent / "meta.json"
-            if meta_path.is_file():
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta = load_account_meta(auth_file)
+            if meta:
                 return normalize_benefit_tier(str(meta.get("tier") or "Free"))
         except Exception:
             pass
@@ -642,12 +715,9 @@ def get_proxy_from_meta(auth_file: str | Path | None) -> str | None:
     """Read per-account proxy URL from meta.json adjacent to auth_file."""
     if auth_file:
         try:
-            meta_path = Path(auth_file).parent / "meta.json"
-            if meta_path.is_file():
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                raw = meta.get("proxy_url")
-                if raw:
-                    return normalize_proxy_url(str(raw))
+            raw = load_account_meta(auth_file).get("proxy_url")
+            if raw:
+                return normalize_proxy_url(str(raw))
         except Exception:
             pass
     return None

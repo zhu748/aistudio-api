@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import secrets
 import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -19,6 +21,7 @@ from aistudio_api.application.compat_service import build_compat_error_response
 from aistudio_api.config import settings
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.model_defaults import (
+    get_configured_api_keys,
     get_configured_logging_settings,
 )
 from aistudio_api.infrastructure.utils.logger import (
@@ -38,6 +41,9 @@ from .routes_system import (
     public_router as system_public_router,
 )
 from .state import runtime_state
+
+if TYPE_CHECKING:
+    from aistudio_api.infrastructure.account.account_store import AccountMeta
 
 _log_cfg = get_configured_logging_settings()
 setup_logging(str(_log_cfg.get("level", "INFO")))
@@ -142,7 +148,7 @@ async def lifespan(_app: FastAPI):
 
         try:
 
-            async def _check_one(a):
+            async def _check_one(a: AccountMeta) -> None:
                 nonlocal checked_count, upgraded_count
                 apath = account_store.get_auth_path(a.id)
                 if not apath:
@@ -308,15 +314,28 @@ async def lifespan(_app: FastAPI):
 
     yield
     logger.info("正在关闭服务")
-    for bg_task in (tier_task, rotate_task, env_probe_task):
-        if bg_task and not bg_task.done():
+    bg_tasks = [t for t in (tier_task, rotate_task, env_probe_task) if t]
+    for bg_task in bg_tasks:
+        if not bg_task.done():
             bg_task.cancel()
+    # 等待取消真正落地，避免残留 pending task 在事件循环关闭时告警
+    if bg_tasks:
+        await asyncio.gather(*bg_tasks, return_exceptions=True)
     if client:
         try:
             await client.close()
         except Exception as e:
             logger.debug("关闭客户端异常: %s", e)
     stop_signer_daemon()
+    # 统计与调度状态都改成了防抖写入（record 后 2s 才落盘）；若进程在最后一次
+    # 记账后 2s 内退出，最后一次增量会丢失。关闭时显式刷新一次内存态。
+    try:
+        runtime_state.save_stats()
+        pending_rotator = runtime_state.rotator
+        if pending_rotator is not None:
+            pending_rotator.save_state()
+    except Exception as e:
+        logger.debug("关闭时刷新统计/调度状态失败: %s", e)
     runtime_state.client = None
     runtime_state.account_service = None
     runtime_state.rotator = None
@@ -334,55 +353,24 @@ app.include_router(models_router, dependencies=[Depends(require_api_key)])
 app.include_router(compat_router, dependencies=[Depends(require_api_key)])
 
 
+def _log_http_exception(request: Request, code: int, msg: str) -> None:
+    """按状态码分级记录 HTTP 异常（兼容与非兼容分支共用）。"""
+    if code >= 500:
+        logger.error("HTTP %d 异常: path=%s, message=%s", code, request.url.path, msg)
+    elif code in (401, 403, 429):
+        logger.warning("HTTP %d: path=%s, message=%s", code, request.url.path, msg)
+    else:
+        logger.info("HTTP %d: path=%s, message=%s", code, request.url.path, msg)
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
     code, msg, status_str = classify_gemini_error_payload(exc)
+    _log_http_exception(_request, code, msg)
     # OpenAI / Claude 兼容路径按各自协议格式下发错误体
     compat_response = build_compat_error_response(_request, exc)
     if compat_response is not None:
-        if code >= 500:
-            logger.error(
-                "HTTP %d 异常: path=%s, message=%s",
-                code,
-                _request.url.path,
-                msg,
-            )
-        elif code in (401, 403, 429):
-            logger.warning(
-                "HTTP %d: path=%s, message=%s",
-                code,
-                _request.url.path,
-                msg,
-            )
-        else:
-            logger.info(
-                "HTTP %d: path=%s, message=%s",
-                code,
-                _request.url.path,
-                msg,
-            )
         return compat_response
-    if code >= 500:
-        logger.error(
-            "HTTP %d 异常: path=%s, message=%s",
-            code,
-            _request.url.path,
-            msg,
-        )
-    elif code in (401, 403, 429):
-        logger.warning(
-            "HTTP %d: path=%s, message=%s",
-            code,
-            _request.url.path,
-            msg,
-        )
-    else:
-        logger.info(
-            "HTTP %d: path=%s, message=%s",
-            code,
-            _request.url.path,
-            msg,
-        )
     return JSONResponse(
         status_code=code,
         content={
@@ -607,6 +595,21 @@ async def root_index():
     return JSONResponse({"message": "AI Studio API Web UI"})
 
 
+_cors_allowlist_cache: tuple[str, frozenset[str]] | None = None
+
+
+def _allowed_cors_origins() -> frozenset[str]:
+    """解析 CORS 白名单；按原始环境变量字符串缓存，配置变更时自动失效。"""
+    global _cors_allowlist_cache
+    raw = os.getenv("AISTUDIO_CORS_ALLOWED_ORIGINS", "")
+    cached = _cors_allowlist_cache
+    if cached is not None and cached[0] == raw:
+        return cached[1]
+    parsed = frozenset(origin.strip() for origin in raw.split(",") if origin.strip())
+    _cors_allowlist_cache = (raw, parsed)
+    return parsed
+
+
 @app.middleware("http")
 async def compat_cors_middleware(request: Request, call_next):
     """OpenAI / Claude 兼容路径的 CORS 支持（浏览器直连客户端）。
@@ -618,25 +621,33 @@ async def compat_cors_middleware(request: Request, call_next):
     if not request.url.path.startswith("/v1/"):
         return await call_next(request)
 
+    # 安全：默认不反射任意 Origin，也不无条件附带 Credentials。
+    # 需要浏览器跨域的部署可通过 AISTUDIO_CORS_ALLOWED_ORIGINS
+    # （逗号分隔的精确 Origin 列表）显式放行；留空时 /v1/ 仅允许同源。
+    allowed_origins = _allowed_cors_origins()
+
+    origin = request.headers.get("origin")
+    allowed_origin = origin if (origin and origin in allowed_origins) else None
+
     if request.method == "OPTIONS":
-        origin = request.headers.get("origin") or "*"
+        # 未被允许的跨域预检不给任何 Allow-* 头，直接短路，
+        # 避免把任意站点的预检请求当作可信来源。
         preflight = Response(status_code=204)
-        preflight.headers["Access-Control-Allow-Origin"] = origin
-        if origin != "*":
+        if allowed_origin:
+            preflight.headers["Access-Control-Allow-Origin"] = allowed_origin
             preflight.headers["Access-Control-Allow-Credentials"] = "true"
-        preflight.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        preflight.headers["Access-Control-Allow-Headers"] = (
-            request.headers.get("access-control-request-headers")
-            or "Authorization, Content-Type, x-api-key, anthropic-version, "
-            "x-goog-api-key, x-anti-truncation"
-        )
-        preflight.headers["Access-Control-Max-Age"] = "86400"
+            preflight.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            preflight.headers["Access-Control-Allow-Headers"] = (
+                request.headers.get("access-control-request-headers")
+                or "Authorization, Content-Type, x-api-key, anthropic-version, "
+                "x-goog-api-key, x-anti-truncation"
+            )
+            preflight.headers["Access-Control-Max-Age"] = "86400"
         return preflight
 
     response = await call_next(request)
-    origin = request.headers.get("origin")
-    if origin:
-        response.headers["Access-Control-Allow-Origin"] = origin
+    if allowed_origin:
+        response.headers["Access-Control-Allow-Origin"] = allowed_origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         # 合并而非覆盖：保留上游已写入的 Vary（如 Accept），
         # 避免命中同一 URL 的不同 Accept/Origin 变体被中间层缓存串包
@@ -652,12 +663,17 @@ async def compat_cors_middleware(request: Request, call_next):
     return response
 
 
-def main():
-    from aistudio_api.config import settings
-
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="AI Studio API Server")
     parser.add_argument("--port", type=int, default=settings.port)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    web_password_set = bool((settings.web_password or "").strip())
+    if not settings.api_keys and not web_password_set and not get_configured_api_keys():
+        logger.warning(
+            "未配置任何鉴权（AISTUDIO_API_KEYS / AISTUDIO_WEB_PASSWORD / "
+            "config.yaml api_keys）：服务将对网络开放，请仅在可信内网使用"
+        )
 
     import uvicorn
 

@@ -702,3 +702,41 @@ async def test_e2e_claude_paid_model_gate_error_format(
         assert body["error"]["type"] == "permission_error"
     finally:
         app.dependency_overrides.clear()
+
+
+def test_build_claude_message_reports_cache_read_tokens() -> None:
+    """上游缓存命中数必须映射为 Anthropic 的 cache_read_input_tokens。
+
+    回归点：旧实现只发 input_tokens/output_tokens，缓存命中数全链路丢失，
+    客户端据此算成本会偏高。
+    """
+    response = _gemini_response(
+        [GeminiPartResponse(text="cached answer")],
+        usage=GeminiUsageMetadata(
+            promptTokenCount=100,
+            candidatesTokenCount=20,
+            totalTokenCount=120,
+            cachedContentTokenCount=64,
+        ),
+    )
+    message = cast(dict[str, Any], build_claude_message(response, "m", None))
+    usage = cast(dict[str, Any], message["usage"])
+    assert usage["input_tokens"] == 100
+    assert usage["output_tokens"] == 20
+    assert usage["cache_read_input_tokens"] == 64
+
+
+def test_claude_stop_reason_refusal_beats_tool_use() -> None:
+    """安全拦截必须压过 tool_use：否则客户端会把被拦断的回复当成正常工具调用。"""
+    from aistudio_api.application.compat_service import _claude_stop_reason
+
+    def reason(finish: str, *, tool_use: bool) -> str:
+        return _claude_stop_reason(
+            finish, has_tool_use=tool_use, full_text="", stop_sequences=None
+        )[0]
+
+    assert reason("SAFETY", tool_use=True) == "refusal"
+    assert reason("PROHIBITED_CONTENT", tool_use=True) == "refusal"
+    assert reason("STOP", tool_use=True) == "tool_use"
+    assert reason("STOP", tool_use=False) == "end_turn"
+    assert reason("MAX_TOKENS", tool_use=False) == "max_tokens"

@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
-import { RefreshCw, Trash2, Search, ArrowDownToLine } from 'lucide-vue-next'
+import { RefreshCw, Trash2, Search, ArrowDownToLine, Radio, Pause } from 'lucide-vue-next'
 import { systemApi } from '@/api/system.ts'
-import { getToken } from '@/api/client.ts'
+import { useAuthStore } from '@/stores/auth.ts'
+import { useToastStore } from '@/stores/toast.ts'
 import type { LogEntry } from '@/types'
 
-// 本地日志列表：内部始终按时间正序维护；展示顺序由 order 控制（desc 时反转渲染）
 const entries = ref<LogEntry[]>([])
 const total = ref(0)
 const capacity = ref(0)
@@ -16,55 +16,54 @@ const search = ref('')
 const order = ref<'desc' | 'asc'>('desc')
 const live = ref(true)
 const autoScroll = ref(false)
-// 连接状态：idle=已暂停 connecting=连接中 open=实时 retrying=重连中
 const connState = ref<'idle' | 'connecting' | 'open' | 'retrying'>('idle')
 
-// 本地保留的日志条数上限（超出后丢弃最旧，保持渲染性能）
 const MAX_LOCAL_ENTRIES = 1000
-// 建立连接时向后端请求的历史快照条数
 const SNAPSHOT_LIMIT = 500
 
 const logContainer = ref<HTMLElement | null>(null)
+const authStore = useAuthStore()
+const toast = useToastStore()
 let es: EventSource | null = null
 let retryTimer: ReturnType<typeof setTimeout> | null = null
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
+let connectSeq = 0
 
 const levelOptions = [
-  { value: 'DEBUG', label: '全部 (DEBUG+)' },
+  { value: 'DEBUG', label: 'DEBUG+' },
   { value: 'INFO', label: 'INFO+' },
-  { value: 'WARNING', label: '警告+' },
-  { value: 'ERROR', label: '仅错误' },
+  { value: 'WARNING', label: 'WARN+' },
+  { value: 'ERROR', label: 'ERROR' },
 ]
 
 const levelBadgeClass: Record<string, string> = {
-  ERROR: 'bg-rose-50 text-rose-700 border-rose-200',
-  CRITICAL: 'bg-rose-100 text-rose-800 border-rose-300',
-  WARNING: 'bg-amber-50 text-amber-700 border-amber-200',
-  INFO: 'bg-sky-50 text-sky-700 border-sky-200',
-  DEBUG: 'bg-gray-100 text-gray-600 border-gray-200',
+  ERROR: 'bg-rose-500/15 text-rose-400 border-rose-500/30',
+  CRITICAL: 'bg-rose-500/25 text-rose-300 border-rose-500/40',
+  WARNING: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
+  INFO: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
+  DEBUG: 'bg-slate-800 text-slate-400 border-slate-700',
 }
 
 const rowAccentClass: Record<string, string> = {
-  ERROR: 'border-l-2 border-l-rose-400',
-  CRITICAL: 'border-l-2 border-l-rose-500',
-  WARNING: 'border-l-2 border-l-amber-400',
+  ERROR: 'border-l-2 border-l-rose-500 bg-rose-950/20',
+  CRITICAL: 'border-l-2 border-l-rose-500 bg-rose-950/30',
+  WARNING: 'border-l-2 border-l-amber-400 bg-amber-950/15',
 }
 
 const connDotClass: Record<string, string> = {
-  idle: 'bg-gray-300',
+  idle: 'bg-slate-400',
   connecting: 'bg-amber-400 animate-pulse',
   open: 'bg-emerald-500 animate-pulse',
-  retrying: 'bg-rose-400 animate-pulse',
+  retrying: 'bg-rose-500 animate-pulse',
 }
 
 const connLabel: Record<string, string> = {
   idle: '已暂停',
   connecting: '连接中…',
-  open: '实时',
-  retrying: '重连中…',
+  open: 'SSE 实时流',
+  retrying: '断线重连…',
 }
 
-// 展示列表：关键字过滤在前端实时生效，排序仅影响渲染方向
 const visibleLogs = computed(() => {
   const needle = search.value.trim().toLowerCase()
   let list = entries.value
@@ -74,7 +73,6 @@ const visibleLogs = computed(() => {
   return order.value === 'desc' ? [...list].reverse() : list
 })
 
-// 稳定行键：按对象身份分配递增序号，避免 desc 模式下追加日志导致全列表重渲染
 const keyMap = new WeakMap<LogEntry, number>()
 let seqCounter = 0
 function keyOf(entry: LogEntry): number {
@@ -124,6 +122,7 @@ function appendEntries(incoming: LogEntry[]) {
 }
 
 function closeStream() {
+  connectSeq += 1
   if (es) {
     es.close()
     es = null
@@ -134,8 +133,9 @@ function closeStream() {
   }
 }
 
-function connectStream() {
+async function connectStream() {
   closeStream()
+  const seq = connectSeq
   if (!live.value) {
     connState.value = 'idle'
     return
@@ -145,37 +145,58 @@ function connectStream() {
   const params = new URLSearchParams()
   params.set('level', level.value)
   params.set('limit', String(SNAPSHOT_LIMIT))
-  // EventSource 无法携带自定义请求头，通过 ?key= 查询参数传递管理密码（后端原生支持）
-  const token = getToken()
-  if (token) params.set('key', token)
+
+  const authRequired = authStore.authEnabled
+  if (authRequired) {
+    try {
+      const res = await systemApi.createLogStreamTicket()
+      if (!isCurrent(seq)) return
+      if (!res.ticket) {
+        loadError.value = '无法获取日志流访问票据'
+        connState.value = 'idle'
+        return
+      }
+      params.set('ticket', res.ticket)
+    } catch {
+      if (!isCurrent(seq)) return
+      loadError.value = '无法获取日志流访问票据，请确认登录状态'
+      connState.value = 'idle'
+      return
+    }
+  }
+
+  if (!isCurrent(seq)) return
   const source = new EventSource(`/api/logs/stream?${params.toString()}`)
   es = source
 
   source.onopen = () => {
+    if (!isCurrent(seq)) return
     connState.value = 'open'
   }
   source.addEventListener('ready', (ev) => {
+    if (!isCurrent(seq)) return
     connState.value = 'open'
     applyStats(parseEventData<StreamStats>(ev))
   })
   source.addEventListener('snapshot', (ev) => {
+    if (!isCurrent(seq)) return
     const data = parseEventData<{ logs?: LogEntry[] }>(ev)
-    // 快照整体替换本地列表（重连场景下天然去重）
     const logs = data?.logs
     entries.value = Array.isArray(logs) ? logs.slice(-MAX_LOCAL_ENTRIES) : []
     if (autoScroll.value && order.value === 'asc') scrollToEnd()
   })
   source.addEventListener('log', (ev) => {
+    if (!isCurrent(seq)) return
     const entry = parseEventData<LogEntry>(ev)
     if (entry) appendEntries([entry])
   })
   source.addEventListener('ping', (ev) => {
+    if (!isCurrent(seq)) return
     applyStats(parseEventData<StreamStats>(ev))
   })
   source.onerror = () => {
-    if (!es) return
-    if (es.readyState === EventSource.CLOSED) {
-      // 连接被服务端拒绝或彻底关闭（如 401 / 服务停止）：退避后手动重连
+    if (!isCurrent(seq)) return
+    if (source.readyState === EventSource.CLOSED) {
       if (!live.value) {
         connState.value = 'idle'
         return
@@ -183,15 +204,30 @@ function connectStream() {
       connState.value = 'retrying'
       if (retryTimer) clearTimeout(retryTimer)
       retryTimer = setTimeout(() => {
-        // 顺带探测鉴权状态：token 失效时 client.ts 会自动跳转登录页
+        retryTimer = null
         void systemApi.getStats().catch(() => {})
-        connectStream()
+        void connectStream()
+      }, 5000)
+    } else if (authRequired) {
+      if (!live.value) {
+        connState.value = 'idle'
+        return
+      }
+      connState.value = 'retrying'
+      source.close()
+      if (retryTimer) clearTimeout(retryTimer)
+      retryTimer = setTimeout(() => {
+        retryTimer = null
+        void connectStream()
       }, 5000)
     } else {
-      // 浏览器内建自动重连（网络抖动），重连成功后会收到新的快照
       connState.value = 'retrying'
     }
   }
+}
+
+function isCurrent(seq: number): boolean {
+  return seq === connectSeq
 }
 
 async function handleClear() {
@@ -199,19 +235,20 @@ async function handleClear() {
     const res = await systemApi.clearLogs()
     entries.value = []
     total.value = res.total ?? 0
-  } catch {
-    // 清空失败时静默处理，实时流会继续同步服务端状态
+    toast.success('环形日志缓冲区已清空')
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : '清空日志失败'
+    toast.error(msg)
   }
 }
 
 function handleRefresh() {
-  // 手动刷新 = 重新建立连接（服务端会重新下发最新快照）
-  connectStream()
+  void connectStream()
 }
 
-watch(level, () => connectStream())
+watch(level, () => void connectStream())
 watch(live, (enabled) => {
-  if (enabled) connectStream()
+  if (enabled) void connectStream()
   else {
     closeStream()
     connState.value = 'idle'
@@ -224,11 +261,11 @@ watch(searchInput, (val) => {
   if (debounceTimer) clearTimeout(debounceTimer)
   debounceTimer = setTimeout(() => {
     search.value = val
-  }, 400)
+  }, 300)
 })
 
 onMounted(() => {
-  connectStream()
+  void connectStream()
 })
 
 onUnmounted(() => {
@@ -238,83 +275,125 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="flex flex-col gap-4">
-    <!-- 工具栏 -->
-    <div class="bg-white border border-gray-200/80 rounded-2xl p-4 shadow-xs">
-      <div class="flex flex-wrap items-center gap-3">
-        <div class="flex items-center gap-2 min-w-0">
-          <div class="w-2 h-2 rounded-full transition-colors" :class="connDotClass[connState]" />
-          <span class="text-sm font-semibold text-gray-900">运行日志</span>
-          <span class="text-[10px] font-medium px-1.5 py-px rounded border" :class="connState === 'open' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-gray-50 text-gray-500 border-gray-200'">
-            {{ connLabel[connState] }}
+  <div class="flex flex-col gap-3.5">
+    <!-- Consolidated Log Control Bar -->
+    <div class="bg-white border border-slate-200/90 rounded-xl p-3.5 shadow-2xs space-y-3">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <!-- Connection Status & Buffer Telemetry -->
+        <div class="flex items-center gap-2.5 min-w-0">
+          <span
+            class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-xs font-semibold"
+            :class="
+              connState === 'open'
+                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                : connState === 'retrying'
+                  ? 'bg-rose-50 text-rose-700 border-rose-200'
+                  : 'bg-slate-100 text-slate-600 border-slate-200'
+            "
+          >
+            <span
+              class="w-2 h-2 rounded-full"
+              :class="connDotClass[connState]"
+            />
+            <span>{{ connLabel[connState] }}</span>
           </span>
-          <span class="text-xs text-gray-400 font-mono truncate">
-            缓冲 {{ total }} / {{ capacity }} 条 · 本地 {{ entries.length }} 条
+
+          <span class="text-xs text-slate-500 font-mono tabular-nums truncate">
+            缓冲 <strong class="text-slate-800">{{ total }}</strong> / {{ capacity }} · 视图 <strong class="text-slate-800">{{ visibleLogs.length }}</strong> 条
           </span>
         </div>
 
-        <div class="flex-1" />
-
-        <label class="flex items-center gap-2 text-xs text-gray-600">
-          <select
-            v-model="level"
-            class="border border-gray-200 rounded-lg px-2.5 py-1.5 text-xs bg-white text-gray-700 focus:outline-none focus:ring-2 focus:ring-brand-200 cursor-pointer"
-          >
-            <option v-for="opt in levelOptions" :key="opt.value" :value="opt.value">
+        <!-- Level Segmented Selector & Stream Actions -->
+        <div class="flex items-center gap-2 flex-wrap">
+          <!-- Level Pills -->
+          <div class="flex items-center bg-slate-100 p-0.5 rounded-lg text-xs font-mono font-medium">
+            <button
+              v-for="opt in levelOptions"
+              :key="opt.value"
+              type="button"
+              class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
+              :class="
+                level === opt.value
+                  ? 'bg-white text-slate-900 font-bold shadow-2xs'
+                  : 'text-slate-500 hover:text-slate-900'
+              "
+              @click="level = opt.value"
+            >
               {{ opt.label }}
-            </option>
-          </select>
-        </label>
+            </button>
+          </div>
 
-        <label class="flex items-center gap-2 text-xs text-gray-600 cursor-pointer select-none">
-          <input v-model="live" type="checkbox" class="accent-brand-500 w-3.5 h-3.5 cursor-pointer" />
-          实时推送
-        </label>
+          <!-- Live Toggle Button -->
+          <button
+            type="button"
+            class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors cursor-pointer"
+            :class="
+              live
+                ? 'bg-brand-50 text-brand-700 border-brand-200'
+                : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+            "
+            @click="live = !live"
+          >
+            <Radio
+              v-if="live"
+              class="w-3.5 h-3.5"
+            />
+            <Pause
+              v-else
+              class="w-3.5 h-3.5"
+            />
+            <span>{{ live ? '实时订阅中' : '已暂停' }}</span>
+          </button>
 
-        <button
-          type="button"
-          class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-gray-600 hover:bg-gray-100 transition-colors cursor-pointer"
-          :class="{ 'opacity-60 pointer-events-none': connState === 'connecting' }"
-          @click="handleRefresh"
-        >
-          <RefreshCw class="w-3.5 h-3.5" :class="{ 'animate-spin': connState === 'connecting' }" />
-          刷新
-        </button>
+          <button
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium text-slate-600 bg-white border border-slate-200 hover:bg-slate-50 transition-colors cursor-pointer"
+            :class="{ 'opacity-60 pointer-events-none': connState === 'connecting' }"
+            @click="handleRefresh"
+          >
+            <RefreshCw
+              class="w-3.5 h-3.5"
+              :class="{ 'animate-spin': connState === 'connecting' }"
+            />
+            <span>重连</span>
+          </button>
 
-        <button
-          type="button"
-          class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
-          @click="handleClear"
-        >
-          <Trash2 class="w-3.5 h-3.5" />
-          清空
-        </button>
+          <button
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
+            @click="handleClear"
+          >
+            <Trash2 class="w-3.5 h-3.5" />
+            <span>清空</span>
+          </button>
+        </div>
       </div>
 
-      <div class="flex flex-wrap items-center gap-3 mt-3">
+      <!-- Second Row: Search Input & Sort Direction -->
+      <div class="flex flex-wrap items-center gap-2.5 pt-2.5 border-t border-slate-100">
         <div class="relative flex-1 min-w-[200px]">
-          <Search class="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+          <Search class="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
           <input
             v-model="searchInput"
             type="text"
-            placeholder="搜索日志（消息 / 模块 / 级别）…"
-            class="w-full border border-gray-200 rounded-lg pl-9 pr-3 py-1.5 text-xs text-gray-700 placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-brand-200"
-          />
+            placeholder="过滤日志内容、模块名称或级别…"
+            class="w-full bg-slate-50 border border-slate-200 rounded-lg pl-8 pr-3 py-1.5 text-xs font-mono text-slate-700 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
+          >
         </div>
 
-        <div class="inline-flex rounded-lg border border-gray-200 overflow-hidden text-xs">
+        <div class="inline-flex rounded-lg bg-slate-100 p-0.5 text-xs font-medium">
           <button
             type="button"
-            class="px-3 py-1.5 font-medium transition-colors cursor-pointer"
-            :class="order === 'desc' ? 'bg-brand-50 text-brand-700' : 'bg-white text-gray-600 hover:bg-gray-50'"
+            class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
+            :class="order === 'desc' ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-500 hover:text-slate-900'"
             @click="order = 'desc'"
           >
             最新在前
           </button>
           <button
             type="button"
-            class="px-3 py-1.5 font-medium transition-colors cursor-pointer border-l border-gray-200"
-            :class="order === 'asc' ? 'bg-brand-50 text-brand-700' : 'bg-white text-gray-600 hover:bg-gray-50'"
+            class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
+            :class="order === 'asc' ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-500 hover:text-slate-900'"
             @click="order = 'asc'"
           >
             时间正序
@@ -323,53 +402,70 @@ onUnmounted(() => {
 
         <label
           v-if="order === 'asc'"
-          class="flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer select-none"
+          class="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer select-none px-2 py-1 rounded-lg hover:bg-slate-50"
         >
-          <ArrowDownToLine class="w-3.5 h-3.5 text-gray-400" />
-          <input v-model="autoScroll" type="checkbox" class="accent-brand-500 w-3.5 h-3.5 cursor-pointer" />
-          跟随滚动
+          <ArrowDownToLine class="w-3.5 h-3.5 text-slate-400" />
+          <input
+            v-model="autoScroll"
+            type="checkbox"
+            class="accent-brand-600 w-3.5 h-3.5 cursor-pointer"
+          >
+          <span>跟随底部</span>
         </label>
       </div>
     </div>
 
-    <!-- 连接异常提示 -->
+    <!-- Connection Error Banner -->
     <div
       v-if="loadError"
-      class="bg-rose-50 border border-rose-200 rounded-2xl px-4 py-3 text-sm text-rose-700"
+      class="bg-rose-50 border border-rose-200 rounded-xl px-4 py-3 text-xs text-rose-800"
     >
-      日志流连接失败：{{ loadError }}（请确认控制台鉴权状态与服务是否在线）
+      日志流连接失败：{{ loadError }}（请确认控制台登录状态与后端网关服务在线）
     </div>
 
-    <!-- 日志列表 -->
+    <!-- Terminal Log Stream Viewport -->
     <div
       ref="logContainer"
-      class="bg-gray-950 rounded-2xl border border-gray-800 p-4 font-mono text-xs leading-relaxed overflow-y-auto"
-      style="max-height: calc(100vh - 320px); min-height: 320px"
+      class="bg-slate-950 rounded-xl border border-slate-800 p-3.5 font-mono text-xs leading-relaxed overflow-y-auto shadow-inner"
+      style="max-height: calc(100vh - 280px); min-height: 360px"
     >
-      <div v-if="visibleLogs.length === 0" class="h-full flex flex-col items-center justify-center gap-2 text-gray-500 py-12">
-        <span class="text-sm">{{ connState === 'connecting' ? '正在连接实时日志流…' : '暂无匹配的日志' }}</span>
-        <span v-if="connState !== 'connecting'" class="text-[11px] text-gray-600">
-          空回复排查提示：调高上方级别到“全部 (DEBUG+)”，或检查系统配置中的日志级别设置
+      <div
+        v-if="visibleLogs.length === 0"
+        class="h-full flex flex-col items-center justify-center gap-2 text-slate-500 py-16 font-sans"
+      >
+        <span class="text-sm font-medium text-slate-400">
+          {{ connState === 'connecting' ? '正在接入实时日志流…' : '当前过滤条件下暂无日志' }}
+        </span>
+        <span
+          v-if="connState !== 'connecting'"
+          class="text-xs text-slate-600"
+        >
+          可切换上方级别至「DEBUG+」，或在「系统与协议配置 → 日志与调试」中调整输出级别
         </span>
       </div>
 
       <div
         v-for="entry in visibleLogs"
         :key="keyOf(entry)"
-        class="py-1.5 px-2 rounded-md hover:bg-white/5"
+        class="py-1.5 px-2.5 rounded hover:bg-white/[0.04] transition-colors"
         :class="rowAccentClass[entry.level]"
       >
-        <div class="flex items-start gap-2 flex-wrap">
-          <span class="text-gray-500 shrink-0 tabular-nums">{{ entry.ts }}</span>
+        <div class="flex items-baseline gap-2 flex-wrap">
+          <span class="text-slate-500 shrink-0 tabular-nums text-[11px]">{{ entry.ts }}</span>
           <span
-            class="shrink-0 inline-flex items-center px-1.5 py-px rounded border text-[10px] font-semibold font-sans"
+            class="shrink-0 inline-flex items-center px-1.5 py-px rounded border text-[10px] font-semibold"
             :class="levelBadgeClass[entry.level] || levelBadgeClass.DEBUG"
           >
             {{ entry.level }}
           </span>
-          <span class="text-gray-400 shrink-0 max-w-[220px] truncate" :title="entry.name">{{ entry.name }}</span>
+          <span
+            class="text-brand-400/90 shrink-0 max-w-[240px] truncate text-[11px]"
+            :title="entry.name"
+          >{{ entry.name }}</span>
+          <span class="text-slate-200 whitespace-pre-wrap break-all flex-1 min-w-[260px]">
+            {{ entry.message }}
+          </span>
         </div>
-        <div class="text-gray-200 whitespace-pre-wrap break-all mt-0.5 pl-2">{{ entry.message }}</div>
       </div>
     </div>
   </div>

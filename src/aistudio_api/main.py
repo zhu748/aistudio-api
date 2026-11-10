@@ -16,24 +16,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main():
+def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    import sys
-
     from aistudio_api.api.app import main as server_main
-
-    port = getattr(args, "port", None)
     from aistudio_api.config import settings
 
+    port = getattr(args, "port", None)
     port_val = port if port is not None else settings.port
-    sys.argv = [
-        "aistudio-api-server",
-        "--port",
-        str(port_val),
-    ]
-    server_main()
+    server_main(["--port", str(port_val)])
 
 
 if __name__ == "__main__":

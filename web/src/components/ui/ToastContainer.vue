@@ -18,41 +18,41 @@ const toastStore = useToastStore()
       <div
         v-for="toast in toastStore.toasts"
         :key="toast.id"
-        class="pointer-events-auto flex items-start gap-3 p-3.5 rounded-xl shadow-lg border text-sm font-medium transition-all"
+        class="pointer-events-auto flex items-start gap-2.5 p-3 rounded-xl shadow-lg border bg-white/95 backdrop-blur-md text-xs font-medium transition-all"
         :class="{
-          'bg-white border-green-200 text-green-800': toast.type === 'success',
-          'bg-white border-red-200 text-red-800': toast.type === 'error',
-          'bg-white border-amber-200 text-amber-800': toast.type === 'warning',
-          'bg-white border-blue-200 text-blue-800': toast.type === 'info',
+          'border-emerald-200/90 text-slate-800': toast.type === 'success',
+          'border-rose-200/90 text-slate-800': toast.type === 'error',
+          'border-amber-200/90 text-slate-800': toast.type === 'warning',
+          'border-sky-200/90 text-slate-800': toast.type === 'info',
         }"
       >
         <CheckCircle2
           v-if="toast.type === 'success'"
-          class="w-5 h-5 text-green-500 shrink-0 mt-0.5"
+          class="w-4 h-4 text-emerald-500 shrink-0 mt-0.5"
         />
         <AlertCircle
           v-else-if="toast.type === 'error'"
-          class="w-5 h-5 text-red-500 shrink-0 mt-0.5"
+          class="w-4 h-4 text-rose-500 shrink-0 mt-0.5"
         />
         <AlertTriangle
           v-else-if="toast.type === 'warning'"
-          class="w-5 h-5 text-amber-500 shrink-0 mt-0.5"
+          class="w-4 h-4 text-amber-500 shrink-0 mt-0.5"
         />
         <Info
           v-else
-          class="w-5 h-5 text-blue-500 shrink-0 mt-0.5"
+          class="w-4 h-4 text-sky-500 shrink-0 mt-0.5"
         />
 
-        <div class="flex-1 leading-snug break-words">
+        <div class="flex-1 leading-relaxed break-words pt-px">
           {{ toast.message }}
         </div>
 
         <button
           type="button"
-          class="text-gray-400 hover:text-gray-600 rounded-lg p-0.5 transition-colors"
+          class="text-slate-400 hover:text-slate-600 rounded-md p-0.5 transition-colors cursor-pointer"
           @click="toastStore.remove(toast.id)"
         >
-          <X class="w-4 h-4" />
+          <X class="w-3.5 h-3.5" />
         </button>
       </div>
     </TransitionGroup>

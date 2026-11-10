@@ -8,6 +8,8 @@ export const useSystemStore = defineStore('system', () => {
   const stats = ref<StatsResponse | null>(null)
   const rotation = ref<RotationStatusResponse | null>(null)
   const loading = ref(false)
+  // 最近一次统计请求的错误；持续失败时只提示一次，避免轮询刷屏
+  const statsError = ref<string | null>(null)
   const resettingCooldown = ref(false)
   const switchingNext = ref(false)
   const health = ref<'checking' | 'online' | 'offline'>('checking')
@@ -23,8 +25,11 @@ export const useSystemStore = defineStore('system', () => {
     loading.value = true
     try {
       stats.value = await systemApi.getStats()
-    } catch {
-      // ignore
+      statsError.value = null
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '获取统计数据失败'
+      if (statsError.value === null) useToastStore().error(msg)
+      statsError.value = msg
     } finally {
       loading.value = false
     }
@@ -33,8 +38,11 @@ export const useSystemStore = defineStore('system', () => {
   async function fetchRotation() {
     try {
       rotation.value = await systemApi.getRotation()
-    } catch {
-      // ignore
+      statsError.value = null
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '获取轮换状态失败'
+      if (statsError.value === null) useToastStore().error(msg)
+      statsError.value = msg
     }
   }
   async function checkHealth() {
@@ -93,6 +101,7 @@ export const useSystemStore = defineStore('system', () => {
     promptTokens,
     completionTokens,
     health,
+    statsError,
     fetchStats,
     fetchRotation,
     clearCooldown,

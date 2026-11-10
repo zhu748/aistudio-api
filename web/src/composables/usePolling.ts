@@ -1,7 +1,7 @@
 import { onUnmounted } from 'vue'
 
 export interface PollingOptions {
-  /** 任务唯一标识（可选，用于跨组件去重） */
+  /** 任务标识（可选，仅用于调试标注；去重由调用方自行保证） */
   key?: string
   /** 是否在挂载或恢复可见时立即执行一次（默认 true） */
   immediate?: boolean
@@ -28,7 +28,9 @@ interface ActiveTask {
   failureCount: number
 }
 
-const activeTasks = new Map<string, ActiveTask>()
+// 用 Set 而非以 key 为键的 Map：以 key 为键时两个同 key 消费者会互相覆盖
+// 注册项，先卸载者还会无条件删掉共享条目，使另一个的计时器不再被页面隐藏冻结。
+const activeTasks = new Set<ActiveTask>()
 let visibilityListenerRegistered = false
 
 function setupGlobalVisibilityListener() {
@@ -89,8 +91,6 @@ function stopTaskTimer(task: ActiveTask) {
   }
 }
 
-let autoKeyCounter = 0
-
 /**
  * 页面可见时周期性调度的统一轮询管理。
  * 支持页面隐藏自动冻结、失败指数退避与销毁自动释放。
@@ -102,7 +102,6 @@ export function usePolling(
 ): PollingHandle {
   setupGlobalVisibilityListener()
 
-  const taskId = options.key || `poll_${++autoKeyCounter}`
   const immediate = options.immediate !== false
   const maxBackoffMs = options.maxBackoffMs || 60000
 
@@ -114,7 +113,7 @@ export function usePolling(
     running: false,
     failureCount: 0,
   }
-  activeTasks.set(taskId, task)
+  activeTasks.add(task)
 
   if (typeof window !== 'undefined' && window.location.protocol.startsWith('http')) {
     if (!document.hidden) {
@@ -144,8 +143,11 @@ export function usePolling(
   }
 
   onUnmounted(() => {
+    // 先置 paused：在途任务的 `.then(() => scheduleNext(task))` 会读取该标志，
+    // 否则卸载后仍会被重新排期成脱离 activeTasks 管理的「僵尸轮询」。
+    task.paused = true
     stopTaskTimer(task)
-    activeTasks.delete(taskId)
+    activeTasks.delete(task)
   })
 
   return handle

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 from dataclasses import dataclass
 
 from aistudio_api.config import DEFAULT_TEXT_MODEL
@@ -37,13 +38,29 @@ class PreparedRequest:
     ctx: SessionContext | None = None
 
 
+# Per-task storage: AIStudioClient is a process-wide singleton, so a plain
+# instance attribute would let concurrent requests overwrite each other's
+# signed request and replay the wrong user's body/proof on a 403 retry.
+_LAST_PREPARED_REQUEST: contextvars.ContextVar[PreparedRequest | None] = (
+    contextvars.ContextVar("aistudio_last_prepared_request", default=None)
+)
+
+
 class AIStudioClient:
     def __init__(self):
         from aistudio_api.infrastructure.gateway.streaming import StreamingGateway
 
         self._session = GatewaySession()
         self._streaming_gateway = StreamingGateway(session=self._session)
-        self.last_prepared_request: PreparedRequest | None = None
+
+    @property
+    def last_prepared_request(self) -> PreparedRequest | None:
+        """Return the signed request prepared by the *current* asyncio task."""
+        return _LAST_PREPARED_REQUEST.get()
+
+    @last_prepared_request.setter
+    def last_prepared_request(self, value: PreparedRequest | None) -> None:
+        _LAST_PREPARED_REQUEST.set(value)
 
     @property
     def session(self) -> GatewaySession:

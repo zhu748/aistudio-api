@@ -56,9 +56,12 @@ router.beforeEach(async (to, _from, next) => {
 
   const authStore = useAuthStore()
 
-  // 初始化鉴权状态
-  if (!authStore.initialized) {
-    await authStore.checkAuth()
+  // 初始化鉴权状态。上一次探测失败时允许重试，但加冷却期，
+  // 避免服务不可达时每次导航都同步等待一次网络超时。
+  if (!authStore.initialized || (authStore.checkFailed && !to.meta.public)) {
+    if (authStore.shouldRetryCheck()) {
+      await authStore.checkAuth()
+    }
   }
 
   const isPublic = to.meta.public === true
@@ -72,6 +75,12 @@ router.beforeEach(async (to, _from, next) => {
       if (to.name === 'login') {
         return next({ name: 'dashboard' })
       }
+    }
+  } else if (authStore.checkFailed) {
+    // 鉴权状态探测失败：无法确认服务端是否要求密码。
+    // 按“未确认即拒绝”处理，避免网络异常被当成「鉴权已关闭」而放行全部受保护路由。
+    if (!isPublic) {
+      return next({ name: 'login', query: { redirect: to.fullPath } })
     }
   } else {
     if (to.name === 'login') {

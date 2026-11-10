@@ -15,7 +15,7 @@ interface Props {
 const props = withDefaults(defineProps<Props>(), {
   modelValue: () => [],
   description: '',
-  placeholder: '输入并按回车添加...',
+  placeholder: '输入并按回车添加…',
   suggestions: () => [],
   isNumber: false,
   disabled: false,
@@ -59,31 +59,31 @@ function handleKeydown(e: KeyboardEvent) {
 </script>
 
 <template>
-  <div class="space-y-2">
+  <div class="space-y-1.5">
     <div class="flex items-center justify-between">
-      <label class="block text-xs font-semibold text-gray-700">
+      <label class="block text-xs font-semibold text-slate-700">
         {{ label }}
       </label>
       <span
         v-if="description"
-        class="text-[11px] text-gray-400"
+        class="text-[11px] text-slate-400"
       >
         {{ description }}
       </span>
     </div>
 
     <!-- Active Tag Pills -->
-    <div class="flex flex-wrap items-center gap-1.5 min-h-[32px] p-1.5 bg-gray-50 border border-gray-200 rounded-xl">
+    <div class="flex flex-wrap items-center gap-1.5 min-h-[32px] p-1.5 bg-white border border-slate-200 rounded-lg">
       <span
         v-for="(tag, idx) in modelValue || []"
         :key="idx"
-        class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-mono font-medium bg-white text-gray-800 border border-gray-200 shadow-2xs group"
+        class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-mono font-medium bg-slate-50 text-slate-800 border border-slate-200/80"
       >
         <span>{{ tag }}</span>
         <button
           v-if="!disabled"
           type="button"
-          class="text-gray-400 hover:text-rose-600 rounded p-0.5 transition-colors cursor-pointer"
+          class="text-slate-400 hover:text-rose-600 rounded p-0.5 transition-colors cursor-pointer"
           @click="removeTag(idx)"
         >
           <X class="w-3 h-3" />
@@ -99,13 +99,13 @@ function handleKeydown(e: KeyboardEvent) {
           v-model="inputVal"
           type="text"
           :placeholder="modelValue?.length ? '+ 继续添加' : placeholder"
-          class="w-full px-2 py-1 text-xs bg-transparent outline-none font-mono text-gray-700 placeholder:text-gray-400"
+          class="w-full px-2 py-0.5 text-xs bg-transparent outline-none font-mono text-slate-700 placeholder:text-slate-400"
           @keydown="handleKeydown"
         >
         <button
           v-if="inputVal.trim()"
           type="button"
-          class="px-2 py-0.5 text-xs bg-brand-50 text-brand-700 hover:bg-brand-100 rounded font-medium shrink-0 cursor-pointer"
+          class="px-2 py-0.5 text-[11px] bg-brand-50 text-brand-700 hover:bg-brand-100 rounded font-medium shrink-0 cursor-pointer"
           @click="addTag()"
         >
           添加
@@ -114,7 +114,7 @@ function handleKeydown(e: KeyboardEvent) {
 
       <span
         v-else-if="!modelValue?.length"
-        class="text-xs text-gray-400 px-2 py-1 italic"
+        class="text-xs text-slate-400 px-2 py-0.5"
       >
         未配置
       </span>
@@ -125,14 +125,14 @@ function handleKeydown(e: KeyboardEvent) {
       v-if="suggestions.length && !disabled"
       class="flex flex-wrap items-center gap-1.5 pt-0.5"
     >
-      <span class="text-[10px] text-gray-400 font-semibold uppercase tracking-wider mr-1">快捷添加:</span>
+      <span class="text-[10px] text-slate-400 font-semibold uppercase tracking-wider mr-1">快捷添加:</span>
       <button
         v-for="sug in suggestions"
         :key="String(sug.value)"
         type="button"
         :disabled="modelValue?.includes(sug.value)"
-        class="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-mono rounded-md border transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-        :class="modelValue?.includes(sug.value) ? 'bg-gray-100 text-gray-400 border-gray-200' : 'bg-white text-gray-700 border-gray-200 hover:border-brand-300 hover:text-brand-700 hover:bg-brand-50/50'"
+        class="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-mono rounded border transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+        :class="modelValue?.includes(sug.value) ? 'bg-slate-100 text-slate-400 border-slate-200' : 'bg-white text-slate-700 border-slate-200 hover:border-brand-300 hover:text-brand-700 hover:bg-brand-50/50'"
         :title="sug.description"
         @click="addTag(sug.value)"
       >

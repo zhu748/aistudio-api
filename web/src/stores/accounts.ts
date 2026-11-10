@@ -38,7 +38,11 @@ export const useAccountsStore = defineStore('accounts', () => {
     })
   })
 
+  // 请求代次：轮询与操作后的 fetchAll 可能乱序返回，只让最新一次写状态。
+  let fetchSeq = 0
+
   async function fetchAll() {
+    const seq = ++fetchSeq
     loading.value = true
     try {
       const [accsRes, activeRes] = await Promise.allSettled([
@@ -46,6 +50,7 @@ export const useAccountsStore = defineStore('accounts', () => {
         accountsApi.getActive(),
         systemStore.fetchRotation(),
       ])
+      if (seq !== fetchSeq) return
 
       if (accsRes.status === 'fulfilled') {
         accounts.value = accsRes.value
@@ -58,10 +63,11 @@ export const useAccountsStore = defineStore('accounts', () => {
       if (activeRes.status === 'fulfilled') {
         activeAccount.value = activeRes.value
       } else {
-        activeAccount.value = null
+        // 瞬时失败不代表没有激活账号：保留旧值，避免面板谎报「无激活账号」
+        console.warn('获取激活账号失败，保留当前展示数据:', activeRes.reason)
       }
     } finally {
-      loading.value = false
+      if (seq === fetchSeq) loading.value = false
     }
   }
 

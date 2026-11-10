@@ -2,7 +2,10 @@
 import { onMounted, ref, computed } from 'vue'
 import { systemApi } from '@/api/system.ts'
 import { useToastStore } from '@/stores/toast.ts'
+import { useConfirm } from '@/composables/useConfirm.ts'
 import type { SignerServerItem } from '@/types/system.ts'
+import Modal from '@/components/ui/Modal.vue'
+import Button from '@/components/ui/Button.vue'
 import {
   KeyRound,
   CheckCircle2,
@@ -22,6 +25,7 @@ const emit = defineEmits<{
 }>()
 
 const toast = useToastStore()
+const { confirm } = useConfirm()
 
 const loading = ref(false)
 const switching = ref<string | null>(null)
@@ -33,11 +37,10 @@ const envOverride = ref<string | null>(null)
 const runtimeOverride = ref<string | null>(null)
 const servers = ref<SignerServerItem[]>([])
 
-/** 运行时已切离默认节点时，提供一键恢复默认入口 */
 const showResetButton = computed(() => {
   if (!runtimeOverride.value) return false
   const defaultId = envOverride.value
-    ?? servers.value.find(s => s.id === activeServerId.value)?.id
+    ?? servers.value.find((s) => s.id === activeServerId.value)?.id
     ?? activeServerId.value
   return runtimeOverride.value !== defaultId
 })
@@ -80,18 +83,17 @@ async function handleSwitch(serverId: string) {
   try {
     const res = await systemApi.switchSignerServer(serverId)
     if (res.ok) {
-      // 以运行时实际生效的节点为准（本地二进制回退时可能与点击目标不同）
       const activeId = res.active_server.id
       activeServerId.value = activeId
       runtimeOverride.value = res.runtime_override ?? activeId
-      servers.value = servers.value.map(s => ({
+      servers.value = servers.value.map((s) => ({
         ...s,
         is_active: s.id === activeId,
       }))
       if (res.note) {
         toast.info(res.note, 8000)
       } else {
-        toast.success(`已切换至签名服务器: ${res.active_server.name}`)
+        toast.success(`已切换至签名节点: ${res.active_server.name}`)
       }
       emit('switched')
     }
@@ -130,7 +132,7 @@ async function handleTest(server: SignerServerItem) {
     const res = await systemApi.testSignerServer(server.url)
     if (res.ok) {
       testResults.value[server.id] = { ok: true, ms: res.elapsed_ms }
-      toast.success(`${server.name}: 连通成功 (${res.elapsed_ms}ms)`)
+      toast.success(`${server.name}: 连通正常 (${res.elapsed_ms}ms)`)
     } else {
       const errMsg = res.error || `HTTP ${res.status_code || '异常'}`
       testResults.value[server.id] = { ok: false, ms: res.elapsed_ms, err: errMsg }
@@ -168,7 +170,7 @@ function openEditModal(server: SignerServerItem) {
 
 async function handleSaveServer() {
   if (!form.value.name?.trim() || !form.value.url?.trim()) {
-    toast.error('名称与服务地址为必填项')
+    toast.error('节点名称与服务地址为必填项')
     return
   }
 
@@ -209,11 +211,17 @@ async function handleDeleteServer(server: SignerServerItem) {
     toast.error('无法删除当前处于激活状态的签名服务器')
     return
   }
-  if (!confirm(`确认删除签名服务器 "${server.name}" 吗？`)) return
+  const ok = await confirm({
+    title: '删除签名服务节点',
+    message: `确认删除签名服务节点「${server.name}」吗？`,
+    confirmText: '确认删除',
+    variant: 'danger',
+  })
+  if (!ok) return
 
   try {
     await systemApi.deleteSignerServer(server.id)
-    toast.success('已删除签名服务器')
+    toast.success('已删除签名服务节点')
     await fetchServers()
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : '删除失败'
@@ -227,45 +235,51 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="bg-white border border-gray-200/80 rounded-2xl p-5 shadow-xs">
+  <div class="bg-white border border-slate-200/90 rounded-xl p-5 shadow-2xs space-y-4">
     <!-- Header -->
-    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-gray-100">
-      <div class="space-y-1">
-        <div class="flex items-center gap-2">
-          <KeyRound class="w-5 h-5 text-indigo-600" />
-          <h3 class="text-base font-bold text-gray-900 tracking-tight">
-            WAA 证明签名服务与特征绑定
-          </h3>
-          <span class="px-2 py-0.5 text-[11px] font-semibold bg-gray-100 text-gray-700 rounded-md">
-            纯手动切换
-          </span>
+    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-100">
+      <div class="flex items-start gap-2.5">
+        <div class="w-8 h-8 rounded-lg bg-slate-900 text-brand-400 flex items-center justify-center shrink-0 mt-0.5">
+          <KeyRound class="w-4 h-4" />
         </div>
-        <p class="text-xs text-gray-500">
-          管理与切换 WAA 签名服务节点。各签名节点底层环境（SpiderMonkey / NodeVM 等）不同，已绑定各自特征 User-Agent，切换时外层请求头将自动精确对齐，防 403 鉴权拦截。
-        </p>
+        <div>
+          <div class="flex items-center gap-2 flex-wrap">
+            <h3 class="text-sm font-semibold text-slate-900">
+              WAA 证明签名服务与特征绑定
+            </h3>
+            <span class="px-2 py-0.5 text-[10px] font-semibold bg-slate-100 text-slate-600 rounded">
+              手动切换
+            </span>
+          </div>
+          <p class="text-[11px] text-slate-400 mt-0.5">
+            管理无头 WAA 签名节点（SpiderMonkey / NodeVM）。切换节点时自动对齐绑定的 User-Agent 与指纹请求头，防止 403 拦截。
+          </p>
+        </div>
       </div>
-      <button
-        type="button"
-        class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-lg transition-colors cursor-pointer self-start sm:self-auto shrink-0"
+
+      <Button
+        variant="secondary"
+        size="sm"
+        class="self-start sm:self-auto shrink-0"
         @click="openCreateModal"
       >
         <Plus class="w-3.5 h-3.5" />
-        <span>添加服务器</span>
-      </button>
+        <span>添加签名节点</span>
+      </Button>
     </div>
 
-    <!-- Env Default Banner（信息式：面板切换即时生效，重启后恢复默认） -->
+    <!-- Env Default / Runtime Override Banner -->
     <div
       v-if="envOverride"
-      class="mt-3 flex items-start gap-2 px-3.5 py-2.5 rounded-xl bg-sky-50 border border-sky-200"
+      class="flex items-start gap-2.5 px-3.5 py-2.5 rounded-lg bg-sky-50/80 border border-sky-200/80"
     >
       <Settings2 class="w-4 h-4 text-sky-600 shrink-0 mt-0.5" />
-      <div class="text-xs text-sky-800 leading-relaxed flex-1">
-        启动默认节点由环境变量 <code class="font-mono font-semibold">AISTUDIO_WAA_SERVER={{ envOverride }}</code> 指定（本地或远程均可）。面板手动切换对当前进程<b>即时生效</b>，重启后自动恢复该默认；有盘部署的切换结果会同时持久化到 config.yaml。
+      <div class="text-xs text-sky-900 leading-relaxed flex-1">
+        启动默认节点由环境变量 <code class="font-mono font-semibold bg-white/80 px-1 py-0.5 rounded border border-sky-200">AISTUDIO_WAA_SERVER={{ envOverride }}</code> 指定。面板手动切换对当前进程即时生效，重启后自动恢复该默认。
         <button
           v-if="showResetButton"
           type="button"
-          class="inline-flex items-center gap-1 ml-2 px-2 py-0.5 text-[11px] font-semibold text-sky-700 bg-white/70 hover:bg-white rounded-md border border-sky-200 transition-colors cursor-pointer disabled:opacity-50"
+          class="inline-flex items-center gap-1 ml-2 px-2 py-0.5 text-[11px] font-semibold text-sky-700 bg-white hover:bg-sky-50 rounded border border-sky-200 transition-colors cursor-pointer disabled:opacity-50"
           :disabled="resetting"
           @click="handleReset"
         >
@@ -281,17 +295,16 @@ onMounted(() => {
         </button>
       </div>
     </div>
-    <!-- 无环境变量但设置了运行时覆盖：也提供恢复入口（回到配置文件默认） -->
     <div
       v-else-if="runtimeOverride"
-      class="mt-3 flex items-start gap-2 px-3.5 py-2.5 rounded-xl bg-sky-50 border border-sky-200"
+      class="flex items-start gap-2.5 px-3.5 py-2.5 rounded-lg bg-sky-50/80 border border-sky-200/80"
     >
       <Settings2 class="w-4 h-4 text-sky-600 shrink-0 mt-0.5" />
-      <div class="text-xs text-sky-800 leading-relaxed flex-1">
+      <div class="text-xs text-sky-900 leading-relaxed flex-1">
         当前节点由面板手动切换指定（运行时覆盖），重启后恢复配置文件默认。
         <button
           type="button"
-          class="inline-flex items-center gap-1 ml-2 px-2 py-0.5 text-[11px] font-semibold text-sky-700 bg-white/70 hover:bg-white rounded-md border border-sky-200 transition-colors cursor-pointer disabled:opacity-50"
+          class="inline-flex items-center gap-1 ml-2 px-2 py-0.5 text-[11px] font-semibold text-sky-700 bg-white hover:bg-sky-50 rounded border border-sky-200 transition-colors cursor-pointer disabled:opacity-50"
           :disabled="resetting"
           @click="handleReset"
         >
@@ -309,47 +322,51 @@ onMounted(() => {
     </div>
 
     <!-- Server List -->
-    <div class="mt-4 space-y-3">
+    <div class="space-y-3">
       <div
         v-for="server in servers"
         :key="server.id"
         class="p-4 rounded-xl border transition-all"
         :class="[
           server.is_active
-            ? 'border-indigo-300 bg-indigo-50/30 ring-1 ring-indigo-200/50'
-            : 'border-gray-200 bg-white hover:border-gray-300'
+            ? 'border-brand-400 bg-brand-50/20 ring-1 ring-brand-500/15'
+            : 'border-slate-200/90 bg-white hover:border-slate-300',
         ]"
       >
         <div class="flex flex-col md:flex-row md:items-center justify-between gap-3">
           <!-- Info -->
           <div class="space-y-1.5 min-w-0">
             <div class="flex items-center gap-2 flex-wrap">
-              <span class="text-sm font-semibold text-gray-900">
+              <span class="text-xs font-bold text-slate-900">
                 {{ server.name }}
               </span>
               <span
                 v-if="server.is_active"
-                class="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium bg-emerald-100 text-emerald-800 rounded-md"
+                class="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-md"
               >
                 <Check class="w-3 h-3" />
                 当前激活
               </span>
               <span
                 v-if="server.is_env_default"
-                class="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium bg-sky-100 text-sky-800 rounded-md"
-                title="环境变量 AISTUDIO_WAA_SERVER 指定的启动默认节点，重启后自动恢复"
+                class="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold bg-sky-50 text-sky-700 border border-sky-200 rounded-md"
+                title="环境变量 AISTUDIO_WAA_SERVER 指定的启动默认节点"
               >
                 <Settings2 class="w-3 h-3" />
                 环境变量默认
               </span>
-              <span class="text-xs font-mono text-gray-500 bg-gray-100 px-1.5 py-0.5 rounded">
+              <span class="text-[11px] font-mono text-slate-600 bg-slate-100 border border-slate-200/70 px-1.5 py-0.5 rounded">
                 {{ server.url }}
               </span>
               <!-- Test Result Indicator -->
               <span
                 v-if="testResults[server.id]"
-                class="inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded"
-                :class="testResults[server.id].ok ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'"
+                class="inline-flex items-center gap-1 text-[11px] font-mono tabular-nums px-1.5 py-0.5 rounded border"
+                :class="
+                  testResults[server.id].ok
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    : 'bg-rose-50 text-rose-700 border-rose-200'
+                "
               >
                 <CheckCircle2
                   v-if="testResults[server.id].ok"
@@ -359,67 +376,59 @@ onMounted(() => {
                   v-else
                   class="w-3 h-3"
                 />
-                {{ testResults[server.id].ok ? `${testResults[server.id].ms}ms` : '失败' }}
+                {{ testResults[server.id].ok ? `${testResults[server.id].ms}ms` : '连接失败' }}
               </span>
             </div>
 
             <p
               v-if="server.description"
-              class="text-xs text-gray-500"
+              class="text-xs text-slate-500"
             >
               {{ server.description }}
             </p>
 
             <!-- Bound User-Agent & Features -->
-            <div class="text-[11px] text-gray-600 bg-gray-50/80 p-2 rounded-lg border border-gray-100 space-y-1 font-mono break-all">
+            <div class="text-[11px] text-slate-600 bg-slate-50 p-2.5 rounded-lg border border-slate-200/70 space-y-1 font-mono break-all">
               <div>
-                <span class="text-gray-400 select-none">User-Agent: </span>
-                <span>{{ server.user_agent || '未设置 (默认跟随全局)' }}</span>
+                <span class="text-slate-400 select-none">User-Agent: </span>
+                <span>{{ server.user_agent || '未设置 (跟随全局默认)' }}</span>
               </div>
               <div v-if="server.headers && Object.keys(server.headers).length > 0">
-                <span class="text-gray-400 select-none">绑定头部: </span>
+                <span class="text-slate-400 select-none">绑定请求头: </span>
                 <span>{{ Object.entries(server.headers).map(([k, v]) => `${k}: ${v}`).join('; ') }}</span>
               </div>
             </div>
           </div>
 
           <!-- Actions -->
-          <div class="flex items-center gap-2 shrink-0 self-end md:self-center">
-            <button
-              type="button"
-              class="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-gray-600 hover:text-gray-900 bg-gray-100 hover:bg-gray-200/80 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
-              :disabled="testingId === server.id"
+          <div class="flex items-center gap-1.5 shrink-0 self-end md:self-center">
+            <Button
+              variant="secondary"
+              size="xs"
+              :loading="testingId === server.id"
               @click="handleTest(server)"
             >
-              <Loader2
-                v-if="testingId === server.id"
-                class="w-3.5 h-3.5 animate-spin"
-              />
               <Activity
-                v-else
-                class="w-3.5 h-3.5 text-gray-500"
+                v-if="testingId !== server.id"
+                class="w-3 h-3 text-slate-500"
               />
-              <span>测试连接</span>
-            </button>
+              <span>测试连通</span>
+            </Button>
 
-            <button
+            <Button
               v-if="!server.is_active"
-              type="button"
-              class="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-xs transition-colors cursor-pointer disabled:opacity-50"
-              :disabled="switching === server.id"
+              variant="primary"
+              size="xs"
+              :loading="switching === server.id"
               @click="handleSwitch(server.id)"
             >
-              <Loader2
-                v-if="switching === server.id"
-                class="w-3.5 h-3.5 animate-spin"
-              />
-              <span>手动切换</span>
-            </button>
+              <span>切换至此节点</span>
+            </Button>
 
             <button
               type="button"
-              class="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors cursor-pointer"
-              title="编辑"
+              class="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
+              title="编辑节点配置"
               @click="openEditModal(server)"
             >
               <Edit2 class="w-3.5 h-3.5" />
@@ -428,8 +437,8 @@ onMounted(() => {
             <button
               v-if="!server.is_active"
               type="button"
-              class="p-1.5 text-gray-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
-              title="删除"
+              class="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
+              title="删除节点"
               @click="handleDeleteServer(server)"
             >
               <Trash2 class="w-3.5 h-3.5" />
@@ -439,109 +448,98 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- Edit/Add Modal -->
-    <div
-      v-if="showModal"
-      class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-xs"
+    <!-- Edit/Add Modal (Unified Modal Component) -->
+    <Modal
+      v-model="showModal"
+      max-width="lg"
+      :title="isEditing ? '编辑 WAA 签名服务节点' : '添加 WAA 签名服务节点'"
+      subtitle="配置签名服务 HTTP 地址及其对应的浏览器指纹请求头"
     >
-      <div class="bg-white rounded-2xl max-w-lg w-full p-5 shadow-xl border border-gray-100 space-y-4">
-        <div class="flex items-center justify-between pb-3 border-b border-gray-100">
-          <h4 class="text-sm font-bold text-gray-900">
-            {{ isEditing ? '编辑签名服务器' : '添加签名服务器' }}
-          </h4>
-          <button
-            type="button"
-            class="text-gray-400 hover:text-gray-600 cursor-pointer"
-            @click="showModal = false"
-          >
-            ✕
-          </button>
-        </div>
-
-        <div class="space-y-3 text-xs">
-          <div>
-            <label class="block font-medium text-gray-700 mb-1">服务器标识 (ID)</label>
+      <div class="space-y-3.5 text-xs">
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div class="space-y-1.5">
+            <label class="block font-semibold text-slate-700">节点标识 (ID)</label>
             <input
               v-model="form.id"
               type="text"
               :disabled="isEditing"
-              placeholder="如 local_spidermonkey 或 custom_nodevm"
-              class="w-full px-3 py-2 border border-gray-200 rounded-lg font-mono focus:outline-hidden focus:border-indigo-500 disabled:bg-gray-50"
+              placeholder="如 local_spidermonkey"
+              class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg font-mono outline-none focus:bg-white focus:border-brand-500 disabled:opacity-60"
             >
           </div>
 
-          <div>
-            <label class="block font-medium text-gray-700 mb-1">名称 *</label>
+          <div class="space-y-1.5">
+            <label class="block font-semibold text-slate-700">节点名称 *</label>
             <input
               v-model="form.name"
               type="text"
               placeholder="如 本地 Go 签名服务"
-              class="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-hidden focus:border-indigo-500"
-            >
-          </div>
-
-          <div>
-            <label class="block font-medium text-gray-700 mb-1">服务地址 (URL) *</label>
-            <input
-              v-model="form.url"
-              type="text"
-              placeholder="http://127.0.0.1:8081"
-              class="w-full px-3 py-2 border border-gray-200 rounded-lg font-mono focus:outline-hidden focus:border-indigo-500"
-            >
-          </div>
-
-          <div>
-            <label class="block font-medium text-gray-700 mb-1">绑定的特征 User-Agent</label>
-            <textarea
-              v-model="form.user_agent"
-              rows="2"
-              placeholder="在此处填写该签名机底层模拟的真实 User-Agent"
-              class="w-full px-3 py-2 border border-gray-200 rounded-lg font-mono text-[11px] focus:outline-hidden focus:border-indigo-500"
-            />
-            <p class="text-[11px] text-gray-400 mt-0.5">
-              提示：SpiderMonkey 152 对应 Firefox 152 UA；NodeVM / Playwright 对应其模拟的 Chrome UA。
-            </p>
-          </div>
-
-          <div>
-            <label class="block font-medium text-gray-700 mb-1">自定义特征请求头 (JSON 格式)</label>
-            <textarea
-              v-model="customHeadersText"
-              rows="3"
-              :placeholder="JSON.stringify({ 'X-User-Agent': 'grpc-web-javascript/0.1' })"
-              class="w-full px-3 py-2 border border-gray-200 rounded-lg font-mono text-[11px] focus:outline-hidden focus:border-indigo-500"
-            />
-          </div>
-
-          <div>
-            <label class="block font-medium text-gray-700 mb-1">描述说明</label>
-            <input
-              v-model="form.description"
-              type="text"
-              placeholder="选填，关于该签名节点的补充说明"
-              class="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-hidden focus:border-indigo-500"
+              class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-brand-500"
             >
           </div>
         </div>
 
-        <div class="flex items-center justify-end gap-2 pt-3 border-t border-gray-100">
-          <button
-            type="button"
-            class="px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-100 rounded-lg cursor-pointer"
-            @click="showModal = false"
+        <div class="space-y-1.5">
+          <label class="block font-semibold text-slate-700">服务地址 (URL) *</label>
+          <input
+            v-model="form.url"
+            type="text"
+            placeholder="http://127.0.0.1:8081"
+            class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg font-mono outline-none focus:bg-white focus:border-brand-500"
           >
-            取消
-          </button>
-          <button
-            type="button"
-            class="px-4 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-xs cursor-pointer disabled:opacity-50"
-            :disabled="saving"
-            @click="handleSaveServer"
+        </div>
+
+        <div class="space-y-1.5">
+          <label class="block font-semibold text-slate-700">绑定的特征 User-Agent</label>
+          <textarea
+            v-model="form.user_agent"
+            rows="2"
+            placeholder="填写该签名机底层模拟的真实浏览器 User-Agent"
+            class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg font-mono text-[11px] outline-none focus:bg-white focus:border-brand-500"
+          />
+          <p class="text-[11px] text-slate-400">
+            SpiderMonkey 152 对应 Firefox 152 UA；NodeVM 对应其模拟的 Chromium UA。
+          </p>
+        </div>
+
+        <div class="space-y-1.5">
+          <label class="block font-semibold text-slate-700">自定义特征请求头 (JSON)</label>
+          <textarea
+            v-model="customHeadersText"
+            rows="3"
+            :placeholder="JSON.stringify({ 'X-User-Agent': 'grpc-web-javascript/0.1' })"
+            class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg font-mono text-[11px] outline-none focus:bg-white focus:border-brand-500"
+          />
+        </div>
+
+        <div class="space-y-1.5">
+          <label class="block font-semibold text-slate-700">备注说明</label>
+          <input
+            v-model="form.description"
+            type="text"
+            placeholder="选填，关于该签名节点的补充说明"
+            class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-brand-500"
           >
-            {{ saving ? '保存中...' : '保存配置' }}
-          </button>
         </div>
       </div>
-    </div>
+
+      <template #footer>
+        <Button
+          variant="ghost"
+          size="sm"
+          @click="showModal = false"
+        >
+          取消
+        </Button>
+        <Button
+          variant="primary"
+          size="sm"
+          :loading="saving"
+          @click="handleSaveServer"
+        >
+          保存节点
+        </Button>
+      </template>
+    </Modal>
   </div>
 </template>

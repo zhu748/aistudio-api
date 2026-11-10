@@ -27,6 +27,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
+from aistudio_api.infrastructure.utils.common import atomic_write_json
+
 # ---------------------------------------------------------------------------
 # 内存日志环形缓冲（供 Web 面板 /api/logs 查询运行日志与报错）
 # ---------------------------------------------------------------------------
@@ -265,15 +267,19 @@ def is_dump_to_file_enabled() -> bool:
         )
 
         cfg = get_configured_logging_settings()
-        if "dump_to_file" in cfg:
-            return bool(cfg["dump_to_file"])
+        # get_configured_logging_settings() 恒返回 dump_to_file 键，故旧的
+        # `if "dump_to_file" in cfg` 分支永远命中、其后的 dump_requests 联动是死代码。
+        # 这里改为：显式开启则 True；否则按优先级 4 随 dump_requests 联动。
+        if cfg.get("dump_to_file"):
+            return True
         return bool(cfg.get("dump_requests", False))
     except Exception:
         return False
 
 
 def set_dump_to_file(enabled: bool | None) -> None:
-    """动态设置是否将转储数据持久化为文件。"""
+    """动态设置是否将转储数据持久化为文件；传 None 清除运行时覆盖。"""
+    global _dump_to_file_override
     _dump_to_file_override = enabled
     if enabled is not None:
         from aistudio_api.config import settings
@@ -383,13 +389,14 @@ def is_dump_requests_enabled() -> bool:
         return False
 
 
-def set_dump_requests(enabled: bool) -> None:
-    """动态更新请求转储开关。"""
+def set_dump_requests(enabled: bool | None) -> None:
+    """动态更新请求转储开关；传 None 清除运行时覆盖，恢复 env/config 优先级。"""
     global _dump_requests_override
     _dump_requests_override = enabled
-    from aistudio_api.config import settings
+    if enabled is not None:
+        from aistudio_api.config import settings
 
-    settings.dump_requests = enabled
+        settings.dump_requests = enabled
 
 
 def get_log_level() -> str:
@@ -435,7 +442,13 @@ def setup_logging(level: str | int = "INFO") -> None:
     formatter = UnifiedFormatter()
 
     if _root_handler is None:
-        _root_handler = logging.StreamHandler(sys.stderr)
+        # 强制 UTF-8 输出，避免 cp936 等 locale 下中文/emoji 触发
+        # UnicodeEncodeError 刷屏。
+        stderr = sys.stderr
+        if hasattr(stderr, "reconfigure"):
+            with contextlib.suppress(Exception):
+                stderr.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        _root_handler = logging.StreamHandler(stderr)
         _root_handler.setFormatter(formatter)
         root = logging.getLogger()
         root.handlers.clear()
@@ -464,6 +477,10 @@ def setup_logging(level: str | int = "INFO") -> None:
         lgr.handlers.clear()
         if _root_handler not in lgr.handlers:
             lgr.addHandler(_root_handler)
+        # 同时也挂环形缓冲 handler，让上游/uvicorn 错误能进 /api/logs。
+        # 这些 logger 的 propagate 关闭，仅靠 root 无法镜像到 ring。
+        if _ring_handler is not None and _ring_handler not in lgr.handlers:
+            lgr.addHandler(_ring_handler)
         lgr.propagate = False
 
     set_log_level(level)
@@ -480,20 +497,88 @@ def get_logger(name: str = "aistudio") -> logging.Logger:
 
 dump_logger = get_logger("dump")
 
-_SENSITIVE_FIELD_RE = re.compile(
-    r"(?i)(authorization|api[_-]?key|(^|[^a-z0-9])key|cookie|set-cookie|token|secret|password|auth)"
+# 敏感键名匹配：按非字母数字边界切词后整体比对，避免子串误伤。
+# 旧实现用无边界正则，把 max_tokens / total_tokens / cached_tokens /
+# promptTokenCount / token_count / author / session_id / ticket 之外的
+# 大量无关字段一并打成 "***"，导致 dump 里 token 计量与参数上限失真。
+_STRONG_SENSITIVE_SEGMENTS = frozenset(
+    {
+        "authorization",
+        "cookie",
+        "password",
+        "passwd",
+        "secret",
+        "credential",
+        "credentials",
+        "proof",
+        "ticket",
+        "sapisid",
+        "apisid",
+        "sapisidhash",
+        # Google 会话 Cookie 名（__Secure-1PSIDTS 等），dump 里若以键名出现同样属于凭据
+        "psid",
+        "psidts",
+        "osid",
+        "hsid",
+        "ssid",
+        # Google 会话 Cookie 的变体与复数形式（__Secure-3PAPISID、X-Google-Cookies）
+        "papisid",
+        "sid",
+        "sidcc",
+        "cookies",
+    }
 )
+# 这些词过于常见（key=分页键、token=计量、auth=作者等），只有出现在
+# 键名末尾（api_key / x-goog-api-key / token / auth）才视为凭据。
+_WEAK_SENSITIVE_SEGMENTS = frozenset({"key", "keys", "token", "auth", "session"})
+
+_SEGMENT_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+# camelCase / PascalCase 边界：refreshToken -> refresh Token，APIKey -> API Key
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _key_segments(key: str) -> list[str]:
+    """把键名切成小写词段（api_key / api-key / refreshToken / APIKey 均可切）。"""
+    spaced = _CAMEL_BOUNDARY_RE.sub(" ", key.strip())
+    return [seg for seg in _SEGMENT_SPLIT_RE.split(spaced.lower()) if seg]
+
+
+def _is_sensitive_key(key: str) -> bool:
+    """判断键名是否代表凭据类字段。"""
+    segments = _key_segments(key)
+    if not segments:
+        return False
+    # 强段（cookie/password/secret/... 与 Google 会话 Cookie 名）命中即凭据，
+    # 不受分页豁免影响：否则 pagePassword / page_cookie 这类键会把真实凭据
+    # 原样写进 dump。
+    if any(seg in _STRONG_SENSITIVE_SEGMENTS for seg in segments):
+        return True
+    # nextPageToken / pageToken 是分页游标，不是凭据；脱敏只会干扰排查。
+    # 该豁免只对弱规则（末段 key/token/auth/session）生效。
+    if "page" in segments:
+        return False
+    return segments[-1] in _WEAK_SENSITIVE_SEGMENTS
 
 
 def _mask_sensitive_value(key: str, val: str) -> str:
+    """对敏感字段值做固定掩码，绝不保留任何原始前缀。"""
     if not val:
         return "***"
-    k_lower = key.lower()
-    if "authorization" in k_lower:
-        return val[:12] + "..." if len(val) > 12 else "***"
-    if _SENSITIVE_FIELD_RE.search(k_lower):
-        return val[:6] + "..." if len(val) > 6 else "***"
+    if _is_sensitive_key(key):
+        return "***"
     return val
+
+
+def _mask_url(url: str) -> str:
+    """脱敏 URL 查询串中的敏感参数（如 ?key=<管理密码>）。"""
+    if "?" not in url:
+        return url
+    base, _, query = url.partition("?")
+    parts: list[str] = []
+    for pair in query.split("&"):
+        name, sep, value = pair.partition("=")
+        parts.append(f"{name}{sep}{_mask_sensitive_value(name, value)}")
+    return f"{base}?{'&'.join(parts)}"
 
 
 def _mask_headers(h: dict[str, str] | None) -> dict[str, str]:
@@ -506,6 +591,22 @@ def _mask_query_params(qp: dict[str, str] | None) -> dict[str, str]:
     if not qp:
         return {}
     return {k: _mask_sensitive_value(k, str(v)) for k, v in qp.items()}
+
+
+def _mask_json_value(value: object) -> object:
+    """递归脱敏 JSON 结构：键名命中敏感词的值整体替换为 '***'。
+
+    用于请求/响应体，避免 Authorization/Cookie/API Key 等凭据随 Dump
+    落到控制台、内存环形缓冲（/api/logs、SSE）或磁盘文件。
+    """
+    if isinstance(value, dict):
+        return {
+            str(k): ("***" if _is_sensitive_key(str(k)) else _mask_json_value(v))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_mask_json_value(item) for item in value]
+    return value
 
 
 def dump_request_exchange(
@@ -534,36 +635,40 @@ def dump_request_exchange(
 
     safe_headers = _mask_headers(headers)
     safe_query_params = _mask_query_params(query_params)
+    safe_url = _mask_url(url)
     header_lines = "\n".join(f"    {k}: {v}" for k, v in safe_headers.items())
 
-    # 格式化请求体
-    pretty_body = ""
-    if body_text:
+    # 解析 + 脱敏：请求/响应体都可能携带凭据，不能直接打印/落盘原文。
+    def _parse_and_mask(text: str | None) -> object | None:
+        if not text:
+            return None
         try:
-            parsed = json.loads(body_text)
-            pretty_body = json.dumps(parsed, ensure_ascii=False, indent=2)
+            return _mask_json_value(json.loads(text))
         except Exception:
-            pretty_body = body_text
+            return "(non-JSON payload omitted)"
+
+    parsed_body = _parse_and_mask(body_text)
+    parsed_resp = None if is_stream else _parse_and_mask(response_text)
+
+    # 格式化请求体（基于脱敏后的结构）
+    if parsed_body is not None:
+        pretty_body = json.dumps(parsed_body, ensure_ascii=False, indent=2)
         if len(pretty_body) > 4000:
             pretty_body = (
-                pretty_body[:4000] + f"\n... [truncated, total {len(body_text)} chars]"
+                pretty_body[:4000]
+                + f"\n... [truncated, total {len(body_text or '')} chars]"
             )
     else:
         pretty_body = "(空请求体)"
-    # 格式化响应体
-    pretty_resp = ""
+    # 格式化响应体（基于脱敏后的结构）
     if is_stream:
         pretty_resp = f"(流式传输中，已开始分发，截至首包耗时 {elapsed_ms:.1f}ms)"
-    elif response_text:
-        try:
-            parsed = json.loads(response_text)
-            pretty_resp = json.dumps(parsed, ensure_ascii=False, indent=2)
-        except Exception:
-            pretty_resp = response_text
+    elif parsed_resp is not None:
+        pretty_resp = json.dumps(parsed_resp, ensure_ascii=False, indent=2)
         if len(pretty_resp) > 4000:
             pretty_resp = (
                 pretty_resp[:4000]
-                + f"\n... [truncated, total {len(response_text)} chars]"
+                + f"\n... [truncated, total {len(response_text or '')} chars]"
             )
     else:
         pretty_resp = "(空响应体)"
@@ -582,52 +687,49 @@ def dump_request_exchange(
             clean_id = re.sub(r"[^\w\-.]", "_", req_id)
             dump_file_path = dump_folder / f"{clean_id}.json"
 
-            parsed_body = None
-            if body_text:
-                try:
-                    parsed_body = json.loads(body_text)
-                except Exception:
-                    parsed_body = body_text
+            # 落盘一律写脱敏值：绝不把 Authorization/Cookie/API Key/正文原文
+            # 写入磁盘；控制台同样已脱敏，避免脱敏形同虚设。
+            def _masked_text(text: str | None, parsed: object | None) -> str | None:
+                if not text:
+                    return None
+                if isinstance(parsed, (dict, list)):
+                    return json.dumps(parsed, ensure_ascii=False)
+                return "(non-JSON payload omitted)"
 
-            parsed_resp = None
-            if response_text:
-                try:
-                    parsed_resp = json.loads(response_text)
-                except Exception:
-                    parsed_resp = response_text
+            safe_body_text = _masked_text(body_text, parsed_body)
+            safe_resp_text = _masked_text(response_text, parsed_resp)
 
             record_data = {
                 "req_id": req_id,
                 "timestamp": timestamp,
                 "iso_timestamp": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "method": method,
-                "url": url,
+                "url": safe_url,
                 "client": client,
                 "model": model,
                 "account_id": account_id,
                 "auth_user": auth_user,
-                "headers": headers,
+                "headers": safe_headers,
                 "safe_headers": safe_headers,
-                "query_params": query_params,
+                "query_params": safe_query_params,
                 "safe_query_params": safe_query_params,
                 "body": parsed_body,
-                "raw_body": body_text,
+                "raw_body": safe_body_text,
                 "status_code": status_code,
                 "elapsed_ms": elapsed_ms,
                 "is_stream": is_stream,
-                "response_headers": response_headers if response_headers else {},
-                "safe_response_headers": safe_resp_headers if response_headers else {},
+                "response_headers": safe_resp_headers,
+                "safe_response_headers": safe_resp_headers,
                 "response_body": parsed_resp,
-                "raw_response_body": response_text,
+                "raw_response_body": safe_resp_text,
                 "token_usage": token_usage,
                 "finish_reason": finish_reason,
                 "error_detail": error_detail,
             }
-            serialized = json.dumps(record_data, ensure_ascii=False, indent=2)
-            dump_file_path.write_text(serialized, encoding="utf-8")
+            atomic_write_json(dump_file_path, record_data)
 
             latest_file = dump_folder / "latest_request.json"
-            latest_file.write_text(serialized, encoding="utf-8")
+            atomic_write_json(latest_file, record_data)
         except Exception as e:
             dump_logger.warning("请求文件转储失败: %s", e)
 
@@ -647,7 +749,7 @@ def dump_request_exchange(
         f"\n==================== [请求报文转储: {req_id}] ====================\n"
         f"记录时间:     {timestamp}\n"
         f"客户端:       {client}\n"
-        f"请求接口:     {method} {url}\n"
+        f"请求接口:     {method} {safe_url}\n"
         f"{model_line}"
         f"{acc_line}"
         f"{file_line}"

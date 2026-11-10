@@ -7,12 +7,22 @@ services:
       - "8080:8080"
     volumes:
       - aistudio-api-data:/app/data
+    env_file:
+      - path: ./.env
+        required: false
     environment:
+      - AISTUDIO_PORT=8080
       - AISTUDIO_DATA_DIR=/app/data
       - AISTUDIO_ACCOUNTS_DIR=/app/data/accounts
       - AISTUDIO_STATS_FILE=/app/data/stats.json
       - AISTUDIO_ROTATOR_STATE_FILE=/app/data/rotator_state.json
       - AISTUDIO_CONFIG_FILE=/app/data/config.yaml
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f \"http://localhost:$${AISTUDIO_PORT:-$${PORT:-8080}}/healthz\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
 
 volumes:
   aistudio-api-data:

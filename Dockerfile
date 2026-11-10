@@ -55,7 +55,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
-# Copy requirements first for better caching
+# 依赖版本由 uv export 从 uv.lock 生成（勿手工编辑 requirements.txt），
+# 复制在前以便利用 Docker 层缓存。
 COPY requirements.txt .
 
 # Install Python dependencies
@@ -79,6 +80,17 @@ RUN mkdir -p /app/data /tmp
 # Set permissions
 RUN chmod +x /app/main.py /app/docker-entrypoint.sh
 
+# 安全：以非 root 用户运行。创建专用系统账号并把运行期需要写入的
+# /app（data/、config.yaml、dumps/、静态资源等）授权给它；/tmp 保持
+# 全局可写（1777），tempfile.gettempdir() 仍可正常工作。
+# 同时兜底剥离 entrypoint 可能的 CRLF（.gitattributes 已保证 LF，
+# 这里防御手工拷贝/旧 checkout 导致的 "bad interpreter: /bin/sh^M"）。
+RUN groupadd --system app \
+    && useradd --system --gid app --home-dir /app --no-create-home app \
+    && sed -i 's/\r$//' /app/docker-entrypoint.sh \
+    && chown -R app:app /app
+USER app
+
 # Expose API server port (实际端口由 AISTUDIO_PORT / PORT 环境变量决定;
 # Render 等 PaaS 平台会注入 PORT, 未注入时默认 8080)
 EXPOSE 8080
@@ -86,8 +98,11 @@ EXPOSE 8080
 # Health check: /healthz 为轻量无鉴权端点（k8s/PaaS 探活命名惯例，
 # /health 为等价别名），不依赖上游账号与外部网络。
 # 旧版用 /v1beta/models 会在“零账号首次启动”时探活失败导致部署误判。
+# 注意 HEALTHCHECK 是独立进程，继承的是镜像/容器原始 ENV，看不到
+# entrypoint 里 export 的 AISTUDIO_PORT；PaaS 只注入 PORT，因此必须
+# 用 ${AISTUDIO_PORT:-${PORT:-8080}} 才能与实际监听端口一致。
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD curl -f "http://localhost:${AISTUDIO_PORT:-8080}/healthz" || exit 1
+    CMD curl -f "http://localhost:${AISTUDIO_PORT:-${PORT:-8080}}/healthz" || exit 1
 
 # Container entrypoint and default command
 # 不硬编码端口：entrypoint 已把平台注入的 PORT 映射为 AISTUDIO_PORT，
