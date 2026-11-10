@@ -34,7 +34,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # ghcr.io 要求仓库名全小写；github.repository 可能含大写字母
       # （例如 DeconstructedCube），直接拼进镜像引用会报
