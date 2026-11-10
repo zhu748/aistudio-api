@@ -144,7 +144,7 @@ async def test_list_api_keys_merges_env_injected(monkeypatch):
     class _StubRequest:
         headers: ClassVar[dict[str, str]] = {"authorization": "Bearer sk-env-a"}
 
-    items = await routes_system.list_api_keys(_StubRequest())
+    items = await routes_system.list_api_keys(_StubRequest())  # type: ignore[arg-type]
     by_key = {i.key: i for i in items}
 
     # 无管理密码：脱敏展示，但保留首尾可辨识字符

@@ -40,7 +40,9 @@ class _FakeAccount:
 class _FakeAccountService:
     """最小账号服务桩：只实现 handle_attempt_exception 用到的接口。"""
 
-    def __init__(self, accounts: dict[str, _FakeAccount], active_id: str | None) -> None:
+    def __init__(
+        self, accounts: dict[str, _FakeAccount], active_id: str | None
+    ) -> None:
         self._accounts = accounts
         self._active_id = active_id
         self.rotated: list[str] = []
