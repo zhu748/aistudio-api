@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncGenerator
+from typing import cast
 
 import pytest
 from starlette.requests import Request
 
 # 导入 app 以触发 setup_logging()（挂载 RingBufferHandler 与订阅广播链路）
-from aistudio_api.api.app import app  # noqa: F401
+from aistudio_api.api.app import (  # noqa: F401
+    app,  # pyright: ignore[reportUnusedImport]
+)
 from aistudio_api.api.routes_system import protected_router, stream_runtime_logs
 from aistudio_api.infrastructure.utils.logger import (
     get_log_subscriber_count,
@@ -45,7 +49,7 @@ def _make_stream_request() -> Request:
         "server": ("test", 80),
     }
 
-    async def receive() -> dict[str, str]:
+    async def receive() -> dict[str, object]:
         return {"type": "http.request", "body": "", "more_body": False}
 
     return Request(scope, receive=receive)
@@ -185,7 +189,7 @@ async def test_stream_protocol_ready_snapshot_live_and_cleanup():
     resp = await stream_runtime_logs(request=_make_stream_request(), level="INFO")
     assert resp.media_type == "text/event-stream"
     assert resp.headers["cache-control"] == "no-cache"
-    agen = resp.body_iterator
+    agen = cast(AsyncGenerator[str, None], resp.body_iterator)
 
     seen_ready = False
     seen_snapshot = False
@@ -243,7 +247,7 @@ async def test_stream_level_filter_blocks_lower_levels():
     resp = await stream_runtime_logs(
         request=_make_stream_request(), level="WARNING", limit=5
     )
-    agen = resp.body_iterator
+    agen = cast(AsyncGenerator[str, None], resp.body_iterator)
     collected: list[str] = []
     found_warn = False
     try:
@@ -273,7 +277,7 @@ async def test_stream_invalid_params_fall_back_to_defaults():
     resp = await stream_runtime_logs(
         request=_make_stream_request(), level="not-a-level", limit=999999
     )
-    agen = resp.body_iterator
+    agen = cast(AsyncGenerator[str, None], resp.body_iterator)
     try:
         event, payload = await _next_event(agen)
         assert event == "ready"

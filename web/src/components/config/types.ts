@@ -54,6 +54,16 @@ export interface ModelDefaultsConfig {
   models?: ModelOverrideMap
 }
 
+export interface CompatProtocolConfig {
+  default_model?: string
+  model_mapping?: Record<string, string>
+}
+
+export interface CompatConfig {
+  openai?: CompatProtocolConfig
+  claude?: CompatProtocolConfig
+}
+
 export interface ApiKeyConfigItem {
   name?: string
   key: string
@@ -62,6 +72,7 @@ export interface ApiKeyConfigItem {
 
 export interface ParsedConfigYaml {
   api_keys?: (ApiKeyConfigItem | string)[]
+  compat?: CompatConfig
   model_defaults?: ModelDefaultsConfig
   [key: string]: unknown
 }

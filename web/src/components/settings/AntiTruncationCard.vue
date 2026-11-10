@@ -80,7 +80,7 @@ async function handleSave() {
     globalEnabled.value = Boolean(res.enabled)
     variantsEnabled.value = Boolean(res.variants?.enabled)
     selectedModels.value = [...(res.variants?.models || [])]
-    toast.success('抗截断配置已保存')
+    toast.success('抗截断传输配置已保存')
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : '保存抗截断配置失败'
     toast.error(msg)
@@ -95,19 +95,19 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="bg-white border border-gray-200/80 rounded-2xl p-6 shadow-xs space-y-5">
+  <div class="bg-white border border-slate-200/90 rounded-xl p-5 shadow-2xs space-y-5">
     <!-- Card Header -->
-    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-gray-100 pb-4">
+    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">
       <div class="flex items-center gap-2.5">
-        <div class="p-2 rounded-xl bg-emerald-50 text-emerald-600 border border-emerald-100">
-          <ShieldCheck class="w-5 h-5" />
+        <div class="w-8 h-8 rounded-lg bg-slate-900 text-brand-400 flex items-center justify-center shrink-0">
+          <ShieldCheck class="w-4 h-4" />
         </div>
         <div>
-          <h3 class="font-semibold text-gray-900 text-sm">
-            抗截断传输
+          <h3 class="font-semibold text-slate-900 text-sm">
+            抗截断传输 (Anti-Truncation Transport)
           </h3>
-          <p class="text-[11px] text-gray-400 mt-0.5">
-            把正文藏进工具调用参数绕开上游截断，响应侧自动还原，客户端无感知
+          <p class="text-[11px] text-slate-400 mt-0.5">
+            将模型正文封装至工具调用参数以绕开上游内容审查截断，网关侧自动无感还原
           </p>
         </div>
       </div>
@@ -127,19 +127,19 @@ onMounted(() => {
 
     <!-- Mode Switches -->
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-      <div class="p-4 bg-gray-50/60 border border-gray-200/70 rounded-2xl space-y-2">
+      <div class="p-3.5 bg-slate-50/70 border border-slate-200/80 rounded-xl">
         <ConfigSwitch
           :model-value="globalEnabled"
           label="全局开启（所有模型）"
-          description="所有模型请求默认启用抗截断，无需选择变体"
+          description="所有模型请求默认启用抗截断传输，无需选择后缀变体"
           @update:model-value="globalEnabled = $event"
         />
       </div>
-      <div class="p-4 bg-gray-50/60 border border-gray-200/70 rounded-2xl space-y-2">
+      <div class="p-3.5 bg-slate-50/70 border border-slate-200/80 rounded-xl">
         <ConfigSwitch
           :model-value="variantsEnabled"
-          label="模型变体模式（按模型选择）"
-          description="为下方选中的模型暴露「流式抗截断 / 非流式抗截断」两个后缀变体"
+          label="模型变体模式（按模型挂载后缀）"
+          description="为下方勾选的模型暴露 -at-stream（流式）与 -at（非流式）两个变体"
           @update:model-value="variantsEnabled = $event"
         />
       </div>
@@ -148,28 +148,28 @@ onMounted(() => {
     <!-- Variant Explanation -->
     <div
       v-if="variantsEnabled"
-      class="p-3.5 bg-emerald-50/70 border border-emerald-200/80 rounded-xl flex items-start gap-2.5 text-xs text-emerald-900 leading-relaxed"
+      class="p-3 bg-brand-50/60 border border-brand-200/70 rounded-lg flex items-start gap-2.5 text-xs text-slate-700 leading-relaxed"
     >
-      <Info class="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+      <Info class="w-4 h-4 text-brand-600 shrink-0 mt-0.5" />
       <div>
-        选中模型后，模型列表会额外出现两个变体：<code class="px-1 py-0.5 rounded bg-emerald-100/80">模型名-at-stream</code>（流式抗截断：SSE 逐段增量还原）与
-        <code class="px-1 py-0.5 rounded bg-emerald-100/80">模型名-at</code>（非流式抗截断：缓冲完整回复后一次性下发）。选择变体模型即启用抗截断，原模型行为不变；也可用请求头 <code>X-Anti-Truncation: 0</code> 按请求关闭。
+        勾选模型后，客户端模型列表将额外暴露 <code class="font-mono px-1 py-0.5 rounded bg-white border border-brand-200/70 text-brand-700">&lt;model&gt;-at-stream</code>（流式逐段还原）与
+        <code class="font-mono px-1 py-0.5 rounded bg-white border border-brand-200/70 text-brand-700">&lt;model&gt;-at</code>（完整缓冲下发）。也可通过请求头 <code class="font-mono">X-Anti-Truncation: 1/0</code> 按次覆盖。
       </div>
     </div>
 
     <!-- Model Multi-Select -->
     <div
-      class="p-4 bg-gray-50/60 border border-gray-200/70 rounded-2xl space-y-3 transition-opacity"
+      class="p-4 bg-slate-50/70 border border-slate-200/80 rounded-xl space-y-3 transition-opacity"
       :class="{ 'opacity-50 pointer-events-none': !variantsEnabled }"
     >
       <div class="flex items-center justify-between gap-3">
-        <div class="flex items-center gap-1.5 text-xs font-semibold text-gray-700">
+        <div class="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
           <Boxes class="w-3.5 h-3.5 text-brand-600" />
-          <span>选择启用变体的模型</span>
+          <span>选择暴露抗截断变体的模型</span>
         </div>
         <span
           v-if="selectedCount > 0"
-          class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-brand-50 text-brand-700 border border-brand-100"
+          class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-mono tabular-nums font-semibold bg-brand-50 text-brand-700 border border-brand-200/70"
         >
           已选 {{ selectedCount }} 个
         </span>
@@ -177,12 +177,12 @@ onMounted(() => {
 
       <!-- Search -->
       <div class="relative">
-        <Search class="w-3.5 h-3.5 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+        <Search class="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
         <input
           v-model="searchKeyword"
           type="text"
-          placeholder="搜索模型 ID 或名称..."
-          class="w-full pl-9 pr-3 py-2 text-xs bg-white border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand-400/40 focus:border-brand-300 transition-all"
+          placeholder="搜索模型 ID 或名称…"
+          class="w-full pl-8 pr-3 py-1.5 text-xs bg-white border border-slate-200 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 transition-all"
         >
       </div>
 
@@ -194,12 +194,12 @@ onMounted(() => {
         <span
           v-for="id in selectedModels"
           :key="id"
-          class="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium bg-emerald-100 text-emerald-800 border border-emerald-200"
+          class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-mono font-medium bg-white text-slate-800 border border-slate-200 shadow-2xs"
         >
-          <span class="font-mono">{{ id }}</span>
+          <span>{{ id }}</span>
           <button
             type="button"
-            class="text-emerald-500 hover:text-emerald-700 cursor-pointer"
+            class="text-slate-400 hover:text-rose-600 cursor-pointer ml-0.5"
             @click="toggleModel(id)"
           >
             ×
@@ -208,34 +208,34 @@ onMounted(() => {
       </div>
 
       <!-- Model Checkbox List -->
-      <div class="max-h-64 overflow-y-auto bg-white border border-gray-200 rounded-xl divide-y divide-gray-100">
+      <div class="max-h-60 overflow-y-auto bg-white border border-slate-200 rounded-lg divide-y divide-slate-100">
         <div
           v-if="filteredModels.length === 0"
-          class="px-3 py-6 text-center text-xs text-gray-400"
+          class="px-3 py-6 text-center text-xs text-slate-400"
         >
-          {{ loading ? '加载模型列表中...' : '无匹配模型' }}
+          {{ loading ? '加载模型列表中…' : '无匹配模型' }}
         </div>
         <button
           v-for="m in filteredModels"
           :key="m.id"
           type="button"
-          class="w-full flex items-center justify-between gap-3 px-3 py-2.5 text-left hover:bg-gray-50 cursor-pointer transition-colors"
-          :class="{ 'bg-emerald-50/60': isSelected(m.id) }"
+          class="w-full flex items-center justify-between gap-3 px-3 py-2 text-left hover:bg-slate-50 cursor-pointer transition-colors"
+          :class="{ 'bg-brand-50/40': isSelected(m.id) }"
           @click="toggleModel(m.id)"
         >
           <div class="min-w-0">
-            <div class="text-xs font-medium text-gray-900 font-mono truncate">
+            <div class="text-xs font-medium text-slate-900 font-mono truncate">
               {{ m.id }}
             </div>
-            <div class="text-[11px] text-gray-400 truncate">
+            <div class="text-[11px] text-slate-400 truncate">
               {{ m.displayName }}
             </div>
           </div>
           <span
-            class="w-4.5 h-4.5 w-[18px] h-[18px] shrink-0 rounded-md border flex items-center justify-center transition-all"
+            class="w-[18px] h-[18px] shrink-0 rounded border flex items-center justify-center transition-all"
             :class="isSelected(m.id)
-              ? 'bg-emerald-500 border-emerald-500 text-white'
-              : 'border-gray-300 text-transparent'"
+              ? 'bg-brand-600 border-brand-600 text-white'
+              : 'border-slate-300 text-transparent'"
           >
             <Check class="w-3 h-3" />
           </span>

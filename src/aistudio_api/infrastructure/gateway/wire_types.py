@@ -262,7 +262,8 @@ class AistudioPart:
             wire[PartIndex.INLINE_DATA] = [mime, b64]
             return wire.compact()
         if self.function_call:
-            name, args = self.function_call[0], self.function_call[1]
+            name = self.function_call[0]
+            args = self.function_call[1] if len(self.function_call) > 1 else {}
             call_id = self.function_call[2] if len(self.function_call) > 2 else None
             function_call = [name, _encode_wire_args(args)]
             if call_id:
@@ -270,7 +271,10 @@ class AistudioPart:
             wire[PartIndex.FUNCTION_CALL_ALT] = function_call
             return wire.compact()
         if self.function_response:
-            name, response = self.function_response[0], self.function_response[1]
+            name = self.function_response[0]
+            response = (
+                self.function_response[1] if len(self.function_response) > 1 else {}
+            )
             call_id = (
                 self.function_response[2] if len(self.function_response) > 2 else None
             )
@@ -280,12 +284,19 @@ class AistudioPart:
             wire[PartIndex.FUNCTION_RESPONSE_ALT] = function_response
             return wire.compact()
         if self.executable_code:
-            lang, code = self.executable_code
+            lang = self.executable_code[0]
+            code = self.executable_code[1] if len(self.executable_code) > 1 else ""
             lang_code = 1 if str(lang).upper() in ("1", "PYTHON") else 0
             wire[PartIndex.EXECUTABLE_CODE] = [lang_code, code]
-            return wire.compact()
+        # 一条上游 part 常同时带代码与执行结果（下标 8/9），必须分别写入，
+        # 用 if/return 串联会丢掉后半部分。
         if self.code_execution_result:
-            outcome, output = self.code_execution_result
+            outcome = self.code_execution_result[0]
+            output = (
+                self.code_execution_result[1]
+                if len(self.code_execution_result) > 1
+                else ""
+            )
             outcome_map = {
                 "OUTCOME_OK": 1,
                 "OUTCOME_FAILED": 2,
@@ -297,6 +308,7 @@ class AistudioPart:
                 else int(outcome)
             )
             wire[PartIndex.CODE_RESULT] = [outcome_code, output]
+        if self.executable_code or self.code_execution_result:
             return wire.compact()
         wire[PartIndex.TEXT] = self.text
         return wire.compact()

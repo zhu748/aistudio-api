@@ -78,40 +78,81 @@ async def test_missing_or_invalid_api_key_returns_401(monkeypatch):
         assert response.headers["www-authenticate"] == "Bearer"
 
 
+def _stub_request(
+    path: str, *, headers: dict[str, str], query: dict[str, str] | None = None
+) -> MagicMock:
+    """构造一个显式带 url.path 的请求桩。
+
+    必须显式设置 ``url.path``：否则 MagicMock 会让
+    ``request.url.path.endswith("/api/logs/stream")`` 返回真值，
+    从而误入一次性票据快速路径，使下面的鉴权断言其实没走到密码校验。
+    """
+    req = MagicMock(spec=Request)
+    req.method = "POST"
+    req.headers = headers
+    req.query_params = query or {}
+    req.url = MagicMock()
+    req.url.path = path
+    return req
+
+
 def test_dependencies_timing_safe_auth(monkeypatch):
     """Verify constant-time comparison and empty password guard."""
     monkeypatch.setattr(settings, "web_password", "super_secret_admin_pass")
     monkeypatch.setattr(settings, "api_keys", frozenset({"key123"}))
 
     # require_web_auth with correct password
-    req_good = MagicMock(spec=Request)
-    req_good.method = "POST"
-    req_good.headers = {"authorization": "Bearer super_secret_admin_pass"}
-    req_good.query_params = {}
-    require_web_auth(req_good)
+    require_web_auth(
+        _stub_request(
+            "/stats", headers={"authorization": "Bearer super_secret_admin_pass"}
+        )
+    )
 
     # require_web_auth with wrong password
-    req_bad = MagicMock(spec=Request)
-    req_bad.method = "POST"
-    req_bad.headers = {"authorization": "Bearer wrong"}
-    req_bad.query_params = {}
     with pytest.raises(HTTPException) as exc_info:
-        require_web_auth(req_bad)
+        require_web_auth(
+            _stub_request("/stats", headers={"authorization": "Bearer wrong"})
+        )
     assert exc_info.value.status_code == 401
 
     # require_api_key matching admin web_password
-    req_admin_api = MagicMock(spec=Request)
-    req_admin_api.headers = {"x-api-key": "super_secret_admin_pass"}
-    req_admin_api.query_params = {}
-    require_api_key(req_admin_api)
+    require_api_key(
+        _stub_request("/v1/models", headers={"x-api-key": "super_secret_admin_pass"})
+    )
 
     # Empty web_password guard
     monkeypatch.setattr(settings, "web_password", "")
-    req_empty_pass = MagicMock(spec=Request)
-    req_empty_pass.headers = {"x-api-key": ""}
-    req_empty_pass.query_params = {}
     with pytest.raises(HTTPException):
-        require_api_key(req_empty_pass)
+        require_api_key(_stub_request("/v1/models", headers={"x-api-key": ""}))
+
+
+def test_api_key_comparison_uses_compare_digest_with_bytes(monkeypatch):
+    """常量时间比较的契约：以 bytes 形式调用 secrets.compare_digest。
+
+    不做时序测量（CI 上必然 flaky），而是钉住实现方式。
+    """
+    import secrets as secrets_module
+
+    monkeypatch.setattr(settings, "web_password", "")
+    monkeypatch.setattr(settings, "api_keys", frozenset({"key123", "key456"}))
+
+    calls: list[tuple[object, object]] = []
+    real_compare = secrets_module.compare_digest
+
+    def _spy(a: bytes, b: bytes) -> bool:
+        calls.append((a, b))
+        return bool(real_compare(a, b))
+
+    monkeypatch.setattr(secrets_module, "compare_digest", _spy)
+
+    require_api_key(_stub_request("/v1/models", headers={"x-api-key": "key456"}))
+    assert calls, "未调用 secrets.compare_digest"
+    assert all(isinstance(a, bytes) and isinstance(b, bytes) for a, b in calls)
+
+    calls.clear()
+    with pytest.raises(HTTPException):
+        require_api_key(_stub_request("/v1/models", headers={"x-api-key": "nope"}))
+    assert calls
 
 
 def test_require_web_auth_rejects_html_accept_spoofing(monkeypatch):

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -11,6 +13,7 @@ from pathlib import Path
 import yaml
 
 from aistudio_api.config import DEFAULT_TEXT_MODEL, resolve_config_file
+from aistudio_api.infrastructure.utils.common import atomic_write_text
 
 from .wire_types import (
     AistudioImageOutputMode,
@@ -133,6 +136,46 @@ def normalize_model_name(model: str) -> str:
 
 
 _normalize_model_name = normalize_model_name
+
+
+def _safe_int(value: object, default: int) -> int:
+    """把配置里的数值字段稳妥转成 int，坏值回退默认值而不是抛异常。
+
+    config.yaml 由用户手写，``daily_limit: "20/天"`` 这类脏值会直接让
+    ``/api/stats`` 与选路热路径 500，因此这里统一兜底。
+    """
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def canonicalize_model_alias(model: str) -> str:
+    """Resolve a well-known model alias to its canonical id for profile matching.
+
+    e.g. ``nano-banana`` → ``gemini-3.1-flash-lite-image``. Unlike
+    :func:`normalize_model_name` this is NOT used as a state key (daily stats,
+    rotator keys), so callers that need a stable identity must keep using the
+    plain normalizer.
+    """
+    name = normalize_model_name(model)
+    if not name:
+        return name
+    try:
+        from .model_discovery import _EXTRA_GUARANTEED_MODELS, _FALLBACK_MODELS
+
+        for info in (*_FALLBACK_MODELS, *_EXTRA_GUARANTEED_MODELS):
+            canonical = str(info.get("id") or info.get("name") or "").lower()
+            aliases = info.get("aliases")
+            if isinstance(aliases, list) and any(
+                str(a).lower() == name for a in aliases
+            ):
+                return canonical.removeprefix("models/")
+    except Exception:
+        pass
+    return name
 
 
 def _coerce_thinking_level(value: object) -> ThinkingLevel:
@@ -506,14 +549,38 @@ def invalidate_config_cache() -> None:
     """Clear in-memory configuration and API keys cache."""
     _CONFIG_CACHE.clear()
     _API_KEYS_CACHE.clear()
+    _TIER_QUOTA_CACHE.clear()
     _compiled_profiles.cache_clear()
     _compiled_model_overrides.cache_clear()
     _anti_truncation_cache.clear()
     _compat_cache.clear()
 
 
+# resolve_tier_quota 的结果只依赖 (tier, model, 配置文件内容)。它被
+# /api/stats（模型数 × 账号数 次）与账号打分（每候选账号 × 2 次）反复调用，
+# 单次约 120µs，50 账号 × 10 模型时单次 /api/stats 就要 70ms+ 同步阻塞
+# 事件循环。这里按 (路径, mtime, tier, model) 做记忆化：mtime 变化即失效，
+# 与 _CONFIG_CACHE 的失效语义保持一致。
+_TIER_QUOTA_CACHE: dict[tuple[str, float, str, str], int] = {}
+_TIER_QUOTA_CACHE_MAX = 512
+
+
 _anti_truncation_cache: dict[str, tuple[float, dict[str, object]]] = {}
 _compat_cache: dict[str, tuple[float, dict[str, object]]] = {}
+
+
+# config.yaml 的写入方不止本模块：api/routes_system.py 的 PUT /config/yaml 与
+# api-keys 增删改同样在做「读整份 YAML → 改内存 → 整文件覆盖」。两边若各持
+# 一把锁，跨模块并发仍会互相覆盖。这里提供进程级共享写锁，双方共用同一把；
+# 用 RLock 允许同线程重入，路由内嵌套调用配置写函数不会自锁。
+_CONFIG_FILE_WRITE_LOCK = threading.RLock()
+
+
+@contextlib.contextmanager
+def config_file_write_lock() -> Iterator[None]:
+    """跨模块共享的 config.yaml 读改写锁（进程级、可重入）。"""
+    with _CONFIG_FILE_WRITE_LOCK:
+        yield
 
 
 def get_compat_settings(
@@ -545,7 +612,7 @@ def get_compat_settings(
     if not resolved_path.exists():
         return settings
 
-    path_key = str(resolved_path.resolve())
+    path_key = str(resolved_path.absolute())
     try:
         mtime = resolved_path.stat().st_mtime
     except OSError:
@@ -569,7 +636,10 @@ def get_compat_settings(
                 settings[f"{channel}_model_mapping"] = {
                     str(k).strip().removesuffix("*"): str(v).strip()
                     for k, v in raw_mapping.items()
-                    if isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()
+                    if isinstance(k, str)
+                    and k.strip()
+                    and isinstance(v, str)
+                    and v.strip()
                 }
     _compat_cache[path_key] = (mtime, dict(settings))
     return dict(settings)
@@ -592,7 +662,7 @@ def get_anti_truncation_settings(
         "model_variants": {"enabled": False, "models": []},
     }
     if resolved_path.exists():
-        path_key = str(resolved_path.resolve())
+        path_key = str(resolved_path.absolute())
         try:
             mtime = resolved_path.stat().st_mtime
         except OSError:
@@ -648,35 +718,35 @@ def update_anti_truncation_settings(
     开关与选中模型列表。仅写入显式传入的字段，其余保持原值。
     """
     resolved_path = _resolve_config_path(config_path)
-    content = (
-        resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
-    )
-    parsed = yaml.safe_load(content) or {}
-    if not isinstance(parsed, dict):
-        parsed = {}
+    with config_file_write_lock():
+        content = (
+            resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
+        )
+        parsed = yaml.safe_load(content) or {}
+        if not isinstance(parsed, dict):
+            parsed = {}
 
-    raw_at = parsed.get("anti_truncation")
-    at_dict = dict(raw_at) if isinstance(raw_at, dict) else {}
-    if enabled is not None:
-        at_dict["enabled"] = bool(enabled)
-    if tool_name is not None and tool_name.strip():
-        at_dict["tool_name"] = tool_name.strip()
-    if variants_enabled is not None or models is not None:
-        raw_variants = at_dict.get("model_variants")
-        variants_dict = dict(raw_variants) if isinstance(raw_variants, dict) else {}
-        if variants_enabled is not None:
-            variants_dict["enabled"] = bool(variants_enabled)
-        if models is not None:
-            variants_dict["models"] = [
-                str(m).strip() for m in models if str(m).strip()
-            ]
-        at_dict["model_variants"] = variants_dict
+        raw_at = parsed.get("anti_truncation")
+        at_dict = dict(raw_at) if isinstance(raw_at, dict) else {}
+        if enabled is not None:
+            at_dict["enabled"] = bool(enabled)
+        if tool_name is not None and tool_name.strip():
+            at_dict["tool_name"] = tool_name.strip()
+        if variants_enabled is not None or models is not None:
+            raw_variants = at_dict.get("model_variants")
+            variants_dict = dict(raw_variants) if isinstance(raw_variants, dict) else {}
+            if variants_enabled is not None:
+                variants_dict["enabled"] = bool(variants_enabled)
+            if models is not None:
+                variants_dict["models"] = [
+                    str(m).strip() for m in models if str(m).strip()
+                ]
+            at_dict["model_variants"] = variants_dict
 
-    parsed["anti_truncation"] = at_dict
-    resolved_path.write_text(
-        yaml.dump(parsed, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
-    )
+        parsed["anti_truncation"] = at_dict
+        atomic_write_text(
+            resolved_path, yaml.dump(parsed, allow_unicode=True, sort_keys=False)
+        )
     invalidate_config_cache()
     return get_anti_truncation_settings(config_path)
 
@@ -685,7 +755,11 @@ def _load_yaml_config(config_path: Path) -> dict[str, object]:
     if not config_path.exists():
         return _default_config()
 
-    path_key = str(config_path.resolve())
+    # 缓存键用 absolute() 而非 resolve()：Windows 上 resolve() 会逐段做
+    # 符号链接/大小写归一化（实测 96~141µs/次，比 absolute() 慢 300 倍以上），
+    # 而这条路径每处理一个配置项都要走一次（resolve_model_defaults、
+    # get_configured_api_keys、get_active_waa_server 等），是本项目的头号热点。
+    path_key = str(config_path.absolute())
     try:
         mtime = config_path.stat().st_mtime
     except OSError:
@@ -752,12 +826,19 @@ def resolve_model_defaults(
     elif "drop_unsupported_params" in config:
         global_drop = bool(config["drop_unsupported_params"])
 
+    # Match profiles/overrides against both the plain name and its canonical
+    # alias target (e.g. "nano-banana" must inherit the image-model profile of
+    # "gemini-3.1-flash-lite-image"). Keep the plain name first so any
+    # model-specific override still wins over the canonical-derived one.
+    canonical = canonicalize_model_alias(model)
+    candidates = (normalized,) if canonical == normalized else (normalized, canonical)
     profiles = _compiled_profiles(resolved_path)
     resolved = ModelDefaults(drop_unsupported_params=global_drop)
     for profile in profiles:
-        if profile.matches(normalized):
+        if any(profile.matches(c) for c in candidates):
             resolved = resolved.merged(profile.defaults)
-    override = _compiled_model_overrides(resolved_path).get(normalized)
+    overrides = _compiled_model_overrides(resolved_path)
+    override = next((overrides.get(c) for c in candidates if c in overrides), None)
     if override is not None:
         resolved = resolved.overridden(override)
 
@@ -777,7 +858,7 @@ def get_configured_api_key_items(
 ) -> list[dict[str, str]]:
     """获取 config.yaml 中配置的结构化 API Key 列表（含备注名与创建时间）。"""
     resolved_path = _resolve_config_path(config_path)
-    path_key = str(resolved_path.resolve())
+    path_key = str(resolved_path.absolute())
     try:
         mtime = resolved_path.stat().st_mtime if resolved_path.exists() else 0.0
     except OSError:
@@ -819,7 +900,7 @@ def get_configured_api_keys(
 ) -> frozenset[str]:
     """获取 config.yaml 中配置的所有有效 API Key 集合。"""
     resolved_path = _resolve_config_path(config_path)
-    path_key = str(resolved_path.resolve())
+    path_key = str(resolved_path.absolute())
     try:
         mtime = resolved_path.stat().st_mtime if resolved_path.exists() else 0.0
     except OSError:
@@ -864,29 +945,29 @@ def update_configured_logging_settings(
 ) -> dict[str, object]:
     """更新 config.yaml 中的 logging 设置并刷新缓存。"""
     resolved_path = _resolve_config_path(config_path)
-    content = (
-        resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
-    )
-    parsed = yaml.safe_load(content) or {}
-    if not isinstance(parsed, dict):
-        parsed = {}
+    with config_file_write_lock():
+        content = (
+            resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
+        )
+        parsed = yaml.safe_load(content) or {}
+        if not isinstance(parsed, dict):
+            parsed = {}
 
-    raw_logging = parsed.get("logging")
-    logging_dict = dict(raw_logging) if isinstance(raw_logging, dict) else {}
-    if level is not None:
-        logging_dict["level"] = level.strip().upper()
-    if dump_requests is not None:
-        logging_dict["dump_requests"] = dump_requests
-    if dump_to_file is not None:
-        logging_dict["dump_to_file"] = dump_to_file
-    if dump_dir is not None:
-        logging_dict["dump_dir"] = dump_dir
+        raw_logging = parsed.get("logging")
+        logging_dict = dict(raw_logging) if isinstance(raw_logging, dict) else {}
+        if level is not None:
+            logging_dict["level"] = level.strip().upper()
+        if dump_requests is not None:
+            logging_dict["dump_requests"] = dump_requests
+        if dump_to_file is not None:
+            logging_dict["dump_to_file"] = dump_to_file
+        if dump_dir is not None:
+            logging_dict["dump_dir"] = dump_dir
 
-    parsed["logging"] = logging_dict
-    resolved_path.write_text(
-        yaml.dump(parsed, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
-    )
+        parsed["logging"] = logging_dict
+        atomic_write_text(
+            resolved_path, yaml.dump(parsed, allow_unicode=True, sort_keys=False)
+        )
     invalidate_config_cache()
     return logging_dict
 
@@ -914,8 +995,35 @@ def resolve_tier_quota(
 ) -> int:
     """计算指定账号层级在目标模型上的每日软额度限制（仅用于轮询打分权重，超额绝不禁用账号）。"""
     normalized_model = _normalize_model_name(model) if model else ""
-    quotas = get_configured_tier_quotas(config_path)
+    resolved_path = _resolve_config_path(config_path)
+    try:
+        mtime = resolved_path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    cache_key = (
+        str(resolved_path.absolute()),
+        mtime,
+        (tier or "").strip().lower(),
+        normalized_model,
+    )
+    cached_quota = _TIER_QUOTA_CACHE.get(cache_key)
+    if cached_quota is not None:
+        return cached_quota
 
+    quota = _resolve_tier_quota_uncached(tier, normalized_model, resolved_path)
+    if len(_TIER_QUOTA_CACHE) >= _TIER_QUOTA_CACHE_MAX:
+        _TIER_QUOTA_CACHE.clear()
+    _TIER_QUOTA_CACHE[cache_key] = quota
+    return quota
+
+
+def _resolve_tier_quota_uncached(
+    tier: str | None,
+    normalized_model: str,
+    resolved_path: Path,
+) -> int:
+    """resolve_tier_quota 的实际计算（已归一化模型名与配置文件路径）。"""
+    quotas = get_configured_tier_quotas(resolved_path)
     # 1. 精确模型覆盖 overrides (优先级最高)
     raw_overrides = quotas.get("overrides")
     if isinstance(raw_overrides, dict):
@@ -945,7 +1053,7 @@ def resolve_tier_quota(
     if not isinstance(tier_rules, dict):
         return 20
 
-    default_limit = int(str(tier_rules.get("default_limit", 20)))
+    default_limit = _safe_int(tier_rules.get("default_limit", 20), 20)
     if not normalized_model:
         return default_limit
 
@@ -974,7 +1082,9 @@ def resolve_tier_quota(
                 or any(normalized_model.startswith(p) for p in prefixes)
                 or any(c in normalized_model for c in contains)
             ):
-                return int(str(rule_data.get("daily_limit", default_limit)))
+                return _safe_int(
+                    rule_data.get("daily_limit", default_limit), default_limit
+                )
 
     return default_limit
 
@@ -1039,7 +1149,9 @@ _runtime_waa_override_lock = threading.Lock()
 def set_runtime_waa_override(server_id: str | None) -> None:
     """设置（或清除）运行时 WAA 签名服务覆盖，进程内立即生效。"""
     global _runtime_waa_override
-    cleaned = server_id.strip() if isinstance(server_id, str) and server_id.strip() else None
+    cleaned = (
+        server_id.strip() if isinstance(server_id, str) and server_id.strip() else None
+    )
     with _runtime_waa_override_lock:
         _runtime_waa_override = cleaned
 
@@ -1133,23 +1245,23 @@ def switch_active_waa_server(
     默认节点，切换也对当前进程立即生效（重启后回到环境变量默认）。
     """
     resolved_path = _resolve_config_path(config_path)
-    content = (
-        resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
-    )
-    parsed = yaml.safe_load(content) or {}
-    if not isinstance(parsed, dict):
-        parsed = {}
+    with config_file_write_lock():
+        content = (
+            resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
+        )
+        parsed = yaml.safe_load(content) or {}
+        if not isinstance(parsed, dict):
+            parsed = {}
 
-    raw_waa = parsed.get("waa")
-    waa_dict = dict(raw_waa) if isinstance(raw_waa, dict) else {}
-    target_id = server_id.strip()
-    waa_dict["active_server"] = target_id
-    parsed["waa"] = waa_dict
+        raw_waa = parsed.get("waa")
+        waa_dict = dict(raw_waa) if isinstance(raw_waa, dict) else {}
+        target_id = server_id.strip()
+        waa_dict["active_server"] = target_id
+        parsed["waa"] = waa_dict
 
-    resolved_path.write_text(
-        yaml.dump(parsed, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
-    )
+        atomic_write_text(
+            resolved_path, yaml.dump(parsed, allow_unicode=True, sort_keys=False)
+        )
     # 运行时覆盖：确保环境变量指定默认节点的场景下，切换同样立即生效
     set_runtime_waa_override(target_id)
     invalidate_config_cache()
@@ -1164,38 +1276,38 @@ def upsert_waa_server(
     import uuid
 
     resolved_path = _resolve_config_path(config_path)
-    content = (
-        resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
-    )
-    parsed = yaml.safe_load(content) or {}
-    if not isinstance(parsed, dict):
-        parsed = {}
+    with config_file_write_lock():
+        content = (
+            resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
+        )
+        parsed = yaml.safe_load(content) or {}
+        if not isinstance(parsed, dict):
+            parsed = {}
 
-    raw_waa = parsed.get("waa")
-    waa_dict = dict(raw_waa) if isinstance(raw_waa, dict) else {}
-    raw_servers = waa_dict.get("servers")
-    servers = list(raw_servers) if isinstance(raw_servers, list) else []
+        raw_waa = parsed.get("waa")
+        waa_dict = dict(raw_waa) if isinstance(raw_waa, dict) else {}
+        raw_servers = waa_dict.get("servers")
+        servers = list(raw_servers) if isinstance(raw_servers, list) else []
 
-    target_id = str(server_data.get("id") or "").strip()
-    if not target_id:
-        target_id = f"server_{uuid.uuid4().hex[:8]}"
-        server_data["id"] = target_id
+        target_id = str(server_data.get("id") or "").strip()
+        if not target_id:
+            target_id = f"server_{uuid.uuid4().hex[:8]}"
+            server_data["id"] = target_id
 
-    updated = False
-    for idx, s in enumerate(servers):
-        if isinstance(s, dict) and str(s.get("id") or "").strip() == target_id:
-            servers[idx] = server_data
-            updated = True
-            break
-    if not updated:
-        servers.append(server_data)
+        updated = False
+        for idx, s in enumerate(servers):
+            if isinstance(s, dict) and str(s.get("id") or "").strip() == target_id:
+                servers[idx] = server_data
+                updated = True
+                break
+        if not updated:
+            servers.append(server_data)
 
-    waa_dict["servers"] = servers
-    parsed["waa"] = waa_dict
-    resolved_path.write_text(
-        yaml.dump(parsed, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
-    )
+        waa_dict["servers"] = servers
+        parsed["waa"] = waa_dict
+        atomic_write_text(
+            resolved_path, yaml.dump(parsed, allow_unicode=True, sort_keys=False)
+        )
     invalidate_config_cache()
     return server_data
 
@@ -1206,43 +1318,42 @@ def delete_waa_server(
 ) -> bool:
     """删除指定 ID 的 WAA 签名服务器。"""
     resolved_path = _resolve_config_path(config_path)
-    content = (
-        resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
-    )
-    parsed = yaml.safe_load(content) or {}
-    if not isinstance(parsed, dict):
-        return False
+    with config_file_write_lock():
+        content = (
+            resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
+        )
+        parsed = yaml.safe_load(content) or {}
+        if not isinstance(parsed, dict):
+            return False
 
-    raw_waa = parsed.get("waa")
-    if not isinstance(raw_waa, dict):
-        return False
+        raw_waa = parsed.get("waa")
+        if not isinstance(raw_waa, dict):
+            return False
 
-    raw_servers = raw_waa.get("servers")
-    if not isinstance(raw_servers, list):
-        return False
+        raw_servers = raw_waa.get("servers")
+        if not isinstance(raw_servers, list):
+            return False
 
-    target_id = server_id.strip()
-    new_servers = [
-        s
-        for s in raw_servers
-        if isinstance(s, dict) and str(s.get("id") or "").strip() != target_id
-    ]
-    if len(new_servers) == len(raw_servers):
-        return False
+        target_id = server_id.strip()
+        new_servers = [
+            s
+            for s in raw_servers
+            if isinstance(s, dict) and str(s.get("id") or "").strip() != target_id
+        ]
+        if len(new_servers) == len(raw_servers):
+            return False
 
-    raw_waa["servers"] = new_servers
-    if str(raw_waa.get("active_server") or "").strip() == target_id and new_servers:
-        raw_waa["active_server"] = str(new_servers[0].get("id") or "")
+        raw_waa["servers"] = new_servers
+        if str(raw_waa.get("active_server") or "").strip() == target_id and new_servers:
+            raw_waa["active_server"] = str(new_servers[0].get("id") or "")
 
+        parsed["waa"] = raw_waa
+        atomic_write_text(
+            resolved_path, yaml.dump(parsed, allow_unicode=True, sort_keys=False)
+        )
     # 删除的节点若正是运行时覆盖指向的节点，同步清掉避免悬空
     # （清除后自动回到“环境变量 > 配置文件”的默认优先级）
     if get_runtime_waa_override() == target_id:
         set_runtime_waa_override(None)
-
-    parsed["waa"] = raw_waa
-    resolved_path.write_text(
-        yaml.dump(parsed, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
-    )
     invalidate_config_cache()
     return True

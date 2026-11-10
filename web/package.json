@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "bun --bun vite",
-    "build": "bun --bun x vue-tsc -b && bun --bun vite build",
-    "type-check": "bun --bun x vue-tsc -b",
+    "build": "bun x vue-tsc --noEmit -p tsconfig.json && bun --bun vite build",
+    "type-check": "bun x vue-tsc --noEmit -p tsconfig.json",
     "lint": "bun --bun x eslint src --max-warnings 0",
     "preview": "bun --bun vite preview"
   },

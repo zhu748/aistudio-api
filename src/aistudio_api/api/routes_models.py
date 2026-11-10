@@ -27,6 +27,19 @@ if TYPE_CHECKING:
 router = APIRouter()
 
 
+def _safe_int(value: object, default: int) -> int:
+    """把上游可能为字符串/脏值的整数配置转为 int，失败回退安全默认值。
+
+    上游若返回非数字字符串（脏数据/协议变更），映射不应 500。
+    """
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def _to_gemini_model(model_data: Mapping[str, object]) -> GeminiModelResponse:
     raw_id = str(model_data.get("id") or model_data.get("name") or "")
     clean_id = raw_id.removeprefix("models/")
@@ -34,8 +47,9 @@ def _to_gemini_model(model_data: Mapping[str, object]) -> GeminiModelResponse:
     version = str(model_data.get("version") or "001")
     display_name = str(model_data.get("displayName") or clean_id)
     description = str(model_data.get("description") or f"Google {display_name} model")
-    input_tokens = int(str(model_data.get("inputTokenLimit") or 1048576))
-    output_tokens = int(str(model_data.get("outputTokenLimit") or 8192))
+
+    input_tokens = _safe_int(model_data.get("inputTokenLimit"), 1048576)
+    output_tokens = _safe_int(model_data.get("outputTokenLimit"), 8192)
     raw_methods = model_data.get("supportedGenerationMethods")
     methods = (
         [str(x) for x in raw_methods]
@@ -108,16 +122,14 @@ def _expand_anti_truncation_variants(
 ) -> list[GeminiModelResponse]:
     """为面板选中的模型生成流式 / 非流式两个抗截断变体条目。
 
-    变体功能关闭时返回空；生图 / 视频 / 音频模型会被抗截断传输安全
-   旁路，不暴露变体以免误导。"""
+     变体功能关闭时返回空；生图 / 视频 / 音频模型会被抗截断传输安全
+    旁路，不暴露变体以免误导。"""
     selected = get_selected_variant_models()
     if not selected:
         return []
     variants: list[GeminiModelResponse] = []
     for item in discovered:
-        clean_id = str(item.get("id") or item.get("name") or "").removeprefix(
-            "models/"
-        )
+        clean_id = str(item.get("id") or item.get("name") or "").removeprefix("models/")
         if clean_id.lower() not in selected:
             continue
         if (
@@ -186,9 +198,7 @@ async def get_model(
             .removesuffix(STREAM_VARIANT_SUFFIX)
         )
         if clean_requested and clean_requested != clean_returned:
-            response = response.model_copy(
-                update={"name": f"models/{clean_requested}"}
-            )
+            response = response.model_copy(update={"name": f"models/{clean_requested}"})
         return response
     logger.warning("模型不存在: model=%s", model_id)
     raise HTTPException(status_code=404, detail="Model not found")

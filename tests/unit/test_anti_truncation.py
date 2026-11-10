@@ -7,6 +7,9 @@ finish_reason 归一与请求头覆盖解析。
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
+from typing import cast
+
 import pytest
 from starlette.requests import Request
 
@@ -173,9 +176,7 @@ def test_prepare_skips_image_model(at_enabled):
     ],
 )
 def test_prepare_skips_structured_or_stopped(at_enabled, overrides, reason):
-    normalized = _make_normalized(
-        generation_config_overrides=dict(overrides)
-    )
+    normalized = _make_normalized(generation_config_overrides=dict(overrides))
     ctx = prepare_anti_truncation(normalized)
     assert ctx.active is False
     assert ctx.skip_reason == reason
@@ -196,9 +197,7 @@ def test_prepare_skips_tool_history(at_enabled):
             AistudioContent(
                 role="model",
                 parts=[
-                    AistudioPart(
-                        function_call=("get_weather", {"city": "Shanghai"})
-                    )
+                    AistudioPart(function_call=("get_weather", {"city": "Shanghai"}))
                 ],
             ),
         ]
@@ -233,9 +232,7 @@ def test_prepare_coexists_with_client_function_declarations(at_enabled):
 
 
 def test_prepare_random_name_on_prefix_conflict(at_enabled):
-    normalized = _make_normalized(
-        tools=[[None, [_decl("router_emit_v2")]]]
-    )
+    normalized = _make_normalized(tools=[[None, [_decl("router_emit_v2")]]])
     ctx = prepare_anti_truncation(normalized)
     assert ctx.active is True
     assert ctx.tool_name != "router_emit"
@@ -307,9 +304,7 @@ def test_restore_nonstream_from_dict_args():
 def test_restore_nonstream_from_json_string_arguments():
     ctx = _active_ctx()
     output = _make_output(
-        function_calls=[
-            {"name": "router_emit", "arguments": '{"content": "abc"}'}
-        ]
+        function_calls=[{"name": "router_emit", "arguments": '{"content": "abc"}'}]
     )
     restore_anti_truncation_output(output, ctx)
     assert output.candidates[0].text == "abc"
@@ -413,6 +408,32 @@ async def _collect(stream):
     return [item async for item in stream]
 
 
+async def test_stream_restore_closes_upstream_on_early_exit():
+    """消费者提前关闭时必须确定性关闭上游流。
+
+    否则被迭代的异步生成器只能等 asyncgen finalizer，上游 httpx 连接
+    （transport 里的 ``resp.aclose()``）无法在客户端断连时立即释放。
+    """
+
+    closed = False
+
+    async def upstream():
+        nonlocal closed
+        try:
+            yield ("body", "a")
+            yield ("body", "b")
+        finally:
+            closed = True
+
+    ctx = _active_ctx()
+    stream = restore_anti_truncation_stream(upstream(), ctx)
+    assert await stream.__anext__() == ("body", "a")
+    assert closed is False
+    gen = cast(AsyncGenerator[tuple[str, object | None], None], stream)
+    await gen.aclose()
+    assert closed is True
+
+
 async def test_stream_restore_string_fragments():
     ctx = _active_ctx()
     events = restore_anti_truncation_stream(
@@ -445,7 +466,10 @@ async def test_stream_restore_dict_after_fragments_no_duplicate():
     events = restore_anti_truncation_stream(
         _events(
             ("tool_calls", [{"name": "router_emit", "arguments": '{"content": "Hel'}]),
-            ("tool_calls", [{"name": "router_emit", "args": {"content": "Hello world"}}]),
+            (
+                "tool_calls",
+                [{"name": "router_emit", "args": {"content": "Hello world"}}],
+            ),
             ("done", None),
         ),
         ctx,
@@ -461,7 +485,10 @@ async def test_stream_restore_dict_snapshot_resend():
     events = restore_anti_truncation_stream(
         _events(
             ("tool_calls", [{"name": "router_emit", "args": {"content": "Hello"}}]),
-            ("tool_calls", [{"name": "router_emit", "args": {"content": "Hello world"}}]),
+            (
+                "tool_calls",
+                [{"name": "router_emit", "args": {"content": "Hello world"}}],
+            ),
             ("done", None),
         ),
         ctx,
@@ -495,7 +522,10 @@ async def test_stream_plain_channel_wins_arbitration():
     events = restore_anti_truncation_stream(
         _events(
             ("body", "Hello"),
-            ("tool_calls", [{"name": "router_emit", "arguments": '{"content": "Hello"}'}]),
+            (
+                "tool_calls",
+                [{"name": "router_emit", "arguments": '{"content": "Hello"}'}],
+            ),
             ("done", None),
         ),
         ctx,

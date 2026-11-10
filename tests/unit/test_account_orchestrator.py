@@ -516,3 +516,52 @@ async def test_auth_403_five_stage_retry_mechanism():
     with pytest.raises(HTTPException) as exc_info:
         await manager.handle_403(err, model="gemini-3.8-flash", client=mock_client)
     assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_auth_403_penalty_is_recorded_once_per_request():
+    """单个请求的 403 重试链只应记一次 auth_error，避免惩罚被放大 5 倍。"""
+    from unittest.mock import AsyncMock, patch
+
+    from fastapi import HTTPException
+
+    from aistudio_api.application.api_service_gemini import Auth403RetryManager
+    from aistudio_api.domain.errors import AuthError
+    from aistudio_api.infrastructure.gateway.client import PreparedRequest
+
+    manager = Auth403RetryManager()
+    mock_client = MagicMock(spec=AIStudioClient)
+    mock_client.last_prepared_request = PreparedRequest(
+        url="https://test",
+        headers={"User-Agent": "test"},
+        body="{}",
+        model="models/gemini-3.8-flash",
+    )
+    err = AuthError("Permission denied")
+
+    with (
+        patch(
+            "aistudio_api.application.api_service_gemini.record_rotator_event"
+        ) as mock_record,
+        patch(
+            "aistudio_api.application.api_service_gemini.try_switch_account",
+            new_callable=AsyncMock,
+        ) as mock_switch,
+    ):
+        mock_switch.return_value = True
+        for _ in range(5):
+            assert (
+                await manager.handle_403(
+                    err, model="gemini-3.8-flash", client=mock_client
+                )
+                is True
+            )
+        with pytest.raises(HTTPException):
+            await manager.handle_403(err, model="gemini-3.8-flash", client=mock_client)
+
+    auth_error_calls = [
+        call
+        for call in mock_record.call_args_list
+        if call.args and call.args[0] == "auth_error"
+    ]
+    assert len(auth_error_calls) == 1

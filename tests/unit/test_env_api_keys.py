@@ -134,9 +134,7 @@ async def test_list_api_keys_merges_env_injected(monkeypatch):
             {"name": "面板创建", "key": "sk-from-config", "created_at": "2026-01-01"}
         ],
     )
-    monkeypatch.setattr(
-        settings, "api_keys", frozenset({"sk-env-a", "sk-env-b"})
-    )
+    monkeypatch.setattr(settings, "api_keys", frozenset({"sk-env-a", "sk-env-b"}))
 
     items = await routes_system.list_api_keys()
     by_key = {i.key: i for i in items}

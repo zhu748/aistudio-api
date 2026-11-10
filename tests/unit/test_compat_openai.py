@@ -549,7 +549,157 @@ async def test_openai_stream_adapter_error_frame() -> None:
     error_payload = json.loads(chunks[1].removeprefix("data: ").strip())
     assert error_payload["error"]["type"] == "rate_limit_error"
     assert error_payload["error"]["code"] == 429
+    # 错误帧必须是合法 ChatCompletionChunk（SDK 会 model_validate 每个 chunk）：
+    # 带完整 id/object/created/model/choices + 终止 finish_reason。
+    assert error_payload["object"] == "chat.completion.chunk"
+    assert error_payload["id"].startswith("chatcmpl-")
+    assert error_payload["model"] == "gpt-4o"
+    assert error_payload["choices"][0]["finish_reason"] == "stop"
     assert chunks[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_adapter_no_usage_when_include_usage_false() -> None:
+    """include_usage=False 时任何 chunk 都不得携带 usage 字段（OpenAI 协议）。"""
+    frames: list[dict[str, object]] = [
+        {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "hi"}]},
+                    "finishReason": "STOP",
+                    "index": 0,
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 7,
+                "totalTokenCount": 12,
+            },
+        }
+    ]
+    payloads: list[dict[str, Any]] = []
+    async for sse in openai_stream_adapter(
+        _sse_frames(frames), requested_model="gpt-4o", include_usage=False
+    ):
+        if sse.startswith("data: ") and sse.strip() != "data: [DONE]":
+            payloads.append(json.loads(sse.removeprefix("data: ").strip()))
+    assert payloads
+    assert all("usage" not in p for p in payloads)
+    assert payloads[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_adapter_reassembles_split_sse_frames() -> None:
+    """单个 SSE 事件被网络拆成多个 chunk 时必须重组，而非静默丢整帧。"""
+    frame = {"candidates": [{"content": {"parts": [{"text": "hello"}]}, "index": 0}]}
+    full = "data: " + json.dumps(frame, ensure_ascii=False) + "\n\n"
+
+    async def split_source() -> AsyncGenerator[str, None]:
+        # 在 JSON 中间、data 行中间、事件边界处任意切分
+        for i in range(0, len(full), 7):
+            yield full[i : i + 7]
+
+    texts: list[str] = []
+    async for sse in openai_stream_adapter(
+        split_source(), requested_model="gpt-4o", include_usage=False
+    ):
+        if sse.startswith("data: ") and sse.strip() != "data: [DONE]":
+            p = json.loads(sse.removeprefix("data: ").strip())
+            delta = p["choices"][0]["delta"]
+            if "content" in delta:
+                texts.append(delta["content"])
+    assert "".join(texts) == "hello"
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_adapter_multiline_data() -> None:
+    """同一 SSE 事件内多行 data: 需合并后再 json.loads。"""
+    parts = [
+        '{"candidates": [{"content": {"parts": [{"text": "A"}]},',
+        '"index": 0}]}',
+    ]
+    event = "\n".join("data: " + p for p in parts) + "\n\n"
+
+    async def source() -> AsyncGenerator[str, None]:
+        yield event
+
+    texts: list[str] = []
+    async for sse in openai_stream_adapter(
+        source(), requested_model="gpt-4o", include_usage=False
+    ):
+        if sse.startswith("data: ") and sse.strip() != "data: [DONE]":
+            p = json.loads(sse.removeprefix("data: ").strip())
+            delta = p["choices"][0]["delta"]
+            if delta.get("content"):
+                texts.append(delta["content"])
+    assert texts == ["A"]
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_adapter_tolerates_indented_data_lines() -> None:
+    """SSE 允许行首空白；`line[5:]` 式硬切会把 payload 首字符吃掉。"""
+    frame = {"candidates": [{"content": {"parts": [{"text": "B"}]}, "index": 0}]}
+    payload = json.dumps(frame, ensure_ascii=False)
+    # 在 JSON 的逗号后断开（SSE 多行 data 以换行重新拼接，逗号后的换行是
+    # 合法 JSON 空白），同时给两行加不同的行首空白与 CRLF 行尾。
+    head, tail = payload.split(', "index"', 1)
+    event = f'  data: {head},\n\tdata:  "index"{tail}\r\n\r\n'
+
+    async def source() -> AsyncGenerator[str, None]:
+        yield event
+
+    texts: list[str] = []
+    async for sse in openai_stream_adapter(
+        source(), requested_model="gpt-4o", include_usage=False
+    ):
+        if sse.startswith("data: ") and sse.strip() != "data: [DONE]":
+            p = json.loads(sse.removeprefix("data: ").strip())
+            delta = p["choices"][0]["delta"]
+            if delta.get("content"):
+                texts.append(delta["content"])
+    assert texts == ["B"]
+
+
+@pytest.mark.asyncio
+async def test_iter_gemini_sse_frames_drops_oversized_buffer() -> None:
+    """上游持续不发事件边界时，缓冲区必须有上限（否则内存被拖垮）。"""
+    from aistudio_api.application import compat_service
+
+    async def source() -> AsyncGenerator[str, None]:
+        # 无空行的超大片段
+        for _ in range(4):
+            yield "data: " + ("x" * (8 * 1024 * 1024))
+
+    frames = [
+        frame
+        async for frame in compat_service._iter_gemini_sse_frames(source())  # pyright: ignore[reportPrivateUsage]
+    ]
+    assert frames == []
+
+
+def test_openai_finish_reason_safety_beats_tool_calls() -> None:
+    """同一帧带 functionCall 但被安全拦截时必须报 content_filter。"""
+    from aistudio_api.application.compat_service import _openai_finish_reason
+
+    assert _openai_finish_reason("SAFETY", has_tool_calls=True) == "content_filter"
+    assert _openai_finish_reason("MISSING_THOUGHT_SIGNATURE", has_tool_calls=True) == (
+        "content_filter"
+    )
+    assert _openai_finish_reason("STOP", has_tool_calls=True) == "tool_calls"
+
+
+def test_resolve_compat_model_family_boundaries() -> None:
+    """家族回退覆盖 ft:/Bedrock 前缀，且前缀映射不误命中无边界后缀。"""
+    assert (
+        resolve_compat_model("ft:gpt-4o-mini", channel="openai") == "gemini-3.8-flash"
+    )
+    assert (
+        resolve_compat_model("us.anthropic.claude-sonnet-4-5", channel="claude")
+        == "gemini-3.8-flash"
+    )
+    # "claude-opus" 是 conftest 前缀映射，不应误命中 "claude-opusx-foo" 之外，
+    # 但 "claude-opus-4-1" 仍应命中映射（原有测试已覆盖）。
+    assert resolve_compat_model("claude-opus-4-1", channel="claude") == "gemini-4-argon"
 
 
 # ---------------------------------------------------------------------------

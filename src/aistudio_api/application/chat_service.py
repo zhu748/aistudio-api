@@ -404,8 +404,10 @@ def _snap_thinking_level_to_supported(
         if int(lv) not in supported:
             continue
         # 距离更近优先；距离相同取更强的档位（升档优先）
-        if best is None or abs(i - pos) < abs(best_pos - pos) or (
-            abs(i - pos) == abs(best_pos - pos) and i > best_pos
+        if (
+            best is None
+            or abs(i - pos) < abs(best_pos - pos)
+            or (abs(i - pos) == abs(best_pos - pos) and i > best_pos)
         ):
             best = lv
             best_pos = i
@@ -434,7 +436,13 @@ def _snap_thinking_wire_to_model(
         return wire
     level_raw = wire[3] if len(wire) > 3 else None
     if isinstance(level_raw, int) and not isinstance(level_raw, bool):
-        snapped = _snap_thinking_level_to_supported(model, ThinkingLevel(level_raw))
+        try:
+            level = ThinkingLevel(level_raw)
+        except ValueError:
+            # Unknown upstream level code: keep the wire unchanged rather than
+            # raising ValueError out of the request path (→ HTTP 500).
+            return wire
+        snapped = _snap_thinking_level_to_supported(model, level)
         if snapped is None:
             return None
         new_wire = list(wire)
@@ -888,10 +896,14 @@ def normalize_gemini_request(
             if m_val in (3, "NONE", "none"):
                 is_mode_none = True
     elif (
-        isinstance(tool_config, list)
-        and len(tool_config) > 1
-        and isinstance(tool_config[1], list)
-    ) and tool_config[1] and tool_config[1][0] == 3:
+        (
+            isinstance(tool_config, list)
+            and len(tool_config) > 1
+            and isinstance(tool_config[1], list)
+        )
+        and tool_config[1]
+        and tool_config[1][0] == 3
+    ):
         is_mode_none = True
 
     if is_mode_none:
@@ -991,9 +1003,9 @@ def normalize_gemini_request(
             if snapped is not None:
                 if generation_config_overrides is None:
                     generation_config_overrides = {}
-                generation_config_overrides["thinking_config"] = (
-                    AistudioThinkingConfig(level=snapped, mode=1).to_wire()
-                )
+                generation_config_overrides["thinking_config"] = AistudioThinkingConfig(
+                    level=snapped, mode=1
+                ).to_wire()
         elif (
             generation_config_overrides is not None
             and "thinking_config" in generation_config_overrides

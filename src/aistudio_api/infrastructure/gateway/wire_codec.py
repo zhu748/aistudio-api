@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 
 from aistudio_api.config import DEFAULT_TEXT_MODEL, settings
@@ -35,7 +36,7 @@ def build_image_generation_search_tool(
     if google_search and image_search:
         return [None, None, None, [None, [[], []]]]
     if google_search:
-        return TOOLS_TEMPLATES["google_search"]
+        return copy.deepcopy(TOOLS_TEMPLATES["google_search"])
     return [None, None, None, [None, [None, []]]]
 
 
@@ -137,7 +138,7 @@ def build_tools_from_names(
             if drop_unsupported:
                 continue
             raise ValueError(f"Unsupported tool name: {raw_name!r}")
-        tools.append(TOOLS_TEMPLATES[name])
+        tools.append(copy.deepcopy(TOOLS_TEMPLATES[name]))
     return tools
 
 
@@ -411,33 +412,62 @@ class AistudioWireCodec:
                     if len(raw) > 2 and isinstance(raw[2], str)
                     else (name, response)
                 )
-        elif (
-            isinstance(parsed.executable_code, list) and len(parsed.executable_code) > 1
+
+        # executable_code / code_execution_result 必须独立判定：上游一条 part 通常
+        # 同时带代码与其执行结果（下标 8 与 9），用 elif 串联会只保留其中一个，
+        # 导致 decode→encode 静默丢掉另一半。字符串形态也要保留——响应里
+        # 上游常直接给裸字符串而非请求侧的 [lang, code] 列表。
+        code_part_handled = part.file_id is not None or part.function_call is not None
+        code_part_handled = code_part_handled or part.function_response is not None
+        if not code_part_handled and part.inline_data is None:
+            if isinstance(parsed.executable_code, str) and parsed.executable_code:
+                part.executable_code = ("PYTHON", parsed.executable_code)
+            elif (
+                isinstance(parsed.executable_code, list)
+                and len(parsed.executable_code) > 1
+            ):
+                raw_lang = parsed.executable_code[0]
+                # 上游用整数语言码（1 = PYTHON）；解码成稳定语义名，避免
+                # decode→encode→decode 时语言标签在 "1" / "PYTHON" 之间抖动。
+                lang_str = "PYTHON" if raw_lang == 1 else str(raw_lang)
+                part.executable_code = (
+                    lang_str,
+                    str(parsed.executable_code[1]),
+                )
+            if (
+                isinstance(parsed.code_execution_result, str)
+                and parsed.code_execution_result
+            ):
+                part.code_execution_result = (
+                    "OUTCOME_OK",
+                    parsed.code_execution_result,
+                )
+            elif (
+                isinstance(parsed.code_execution_result, list)
+                and len(parsed.code_execution_result) > 1
+            ):
+                outcomes = {
+                    1: "OUTCOME_OK",
+                    2: "OUTCOME_FAILED",
+                    3: "OUTCOME_DEADLINE_EXCEEDED",
+                }
+                raw_outcome = parsed.code_execution_result[0]
+                outcome_str = (
+                    outcomes.get(raw_outcome, str(raw_outcome))
+                    if isinstance(raw_outcome, int)
+                    else str(raw_outcome)
+                )
+                part.code_execution_result = (
+                    outcome_str,
+                    str(parsed.code_execution_result[1]),
+                )
+
+        if (
+            not code_part_handled
+            and part.inline_data is None
+            and part.executable_code is None
+            and part.code_execution_result is None
         ):
-            part.executable_code = (
-                str(parsed.executable_code[0]),
-                str(parsed.executable_code[1]),
-            )
-        elif (
-            isinstance(parsed.code_execution_result, list)
-            and len(parsed.code_execution_result) > 1
-        ):
-            outcomes = {
-                1: "OUTCOME_OK",
-                2: "OUTCOME_FAILED",
-                3: "OUTCOME_DEADLINE_EXCEEDED",
-            }
-            raw_outcome = parsed.code_execution_result[0]
-            outcome_str = (
-                outcomes.get(raw_outcome, str(raw_outcome))
-                if isinstance(raw_outcome, int)
-                else str(raw_outcome)
-            )
-            part.code_execution_result = (
-                outcome_str,
-                str(parsed.code_execution_result[1]),
-            )
-        else:
             part.text = parsed.text
         return part
 

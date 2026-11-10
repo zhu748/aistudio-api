@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 from unittest.mock import patch
@@ -161,7 +162,8 @@ def test_dump_request_exchange_output():
             "请求接口:     POST /v1beta/models/gemini-3.7-flash:generateContent"
             in output
         )
-        assert "Bearer secre..." in output  # 敏感 Token 适度脱敏
+        assert "***" in output  # 敏感 Token 固定掩码（绝不保留前缀）
+        assert "Bearer secret1234567890" not in output
         assert "你好" in output
         assert (
             "-------------------- [响应报文转储: req_test123] --------------------"
@@ -307,3 +309,137 @@ def test_dump_request_to_file_by_req_id(tmp_path):
     finally:
         set_dump_to_file(None)
         set_dump_dir(None)
+
+
+def test_dump_request_to_file_masks_sensitive_values(tmp_path):
+    """落盘脱敏必须端到端生效：URL 查询串 / 请求头 / 请求体都不能留明文。
+
+    回归点：旧用例的 URL 不含 "?"，_mask_url 直接早退；请求头虽传了
+    x-goog-api-key 却只断言 content-type；请求体没有敏感键 —— 三者叠加
+    导致「脱敏」实际一行都没被验证过。
+    """
+    from aistudio_api.infrastructure.utils.logger import (
+        set_dump_dir,
+        set_dump_to_file,
+    )
+
+    dump_test_dir = tmp_path / "mask_dumps"
+    set_dump_dir(dump_test_dir)
+    set_dump_to_file(True)
+
+    secret = "SECRETKEY-should-never-be-written"
+    try:
+        dump_request_exchange(
+            req_id="req_mask001",
+            method="POST",
+            url=f"/v1beta/models/x:streamGenerateContent?key={secret}&alt=sse",
+            client="127.0.0.1:1",
+            headers={"x-goog-api-key": secret, "content-type": "application/json"},
+            query_params={"key": secret, "alt": "sse"},
+            body_text=json.dumps({"api_key": secret, "contents": []}),
+            status_code=200,
+            elapsed_ms=1.0,
+            response_headers={"content-type": "application/json"},
+            response_text=json.dumps({"candidates": [{"token": secret}]}),
+            is_stream=False,
+        )
+
+        target = dump_test_dir / "req_mask001.json"
+        raw = target.read_text(encoding="utf-8")
+        assert secret not in raw
+        data = json.loads(raw)
+        assert data["url"].endswith("?key=***&alt=sse")
+        assert data["query_params"]["key"] == "***"
+        assert data["query_params"]["alt"] == "sse"
+        assert data["headers"]["x-goog-api-key"] == "***"
+        assert data["headers"]["content-type"] == "application/json"
+        assert data["body"]["api_key"] == "***"
+        assert data["response_body"]["candidates"][0]["token"] == "***"
+        assert secret not in data["raw_body"]
+    finally:
+        set_dump_to_file(None)
+        set_dump_dir(None)
+
+
+def test_dump_request_omits_non_json_body(tmp_path):
+    """非 JSON 正文不落原文，避免脱敏规则失效时泄漏任意文本。"""
+    from aistudio_api.infrastructure.utils.logger import (
+        set_dump_dir,
+        set_dump_to_file,
+    )
+
+    dump_test_dir = tmp_path / "mask_dumps2"
+    set_dump_dir(dump_test_dir)
+    set_dump_to_file(True)
+
+    try:
+        dump_request_exchange(
+            req_id="req_mask002",
+            method="POST",
+            url="/v1beta/models/x:generateContent",
+            client="127.0.0.1:1",
+            headers={"content-type": "text/plain"},
+            query_params={},
+            body_text="password=SECRETKEY-raw-text",
+            status_code=200,
+            elapsed_ms=1.0,
+            is_stream=False,
+        )
+        raw = (dump_test_dir / "req_mask002.json").read_text(encoding="utf-8")
+        assert "SECRETKEY-raw-text" not in raw
+        data = json.loads(raw)
+        assert data["raw_body"] == "(non-JSON payload omitted)"
+        assert data["body"] == "(non-JSON payload omitted)"
+    finally:
+        set_dump_to_file(None)
+        set_dump_dir(None)
+
+
+def test_sensitive_key_detection_covers_camel_case_and_cookies() -> None:
+    """凭据键名识别必须覆盖 camelCase 与 Google 会话 Cookie 名。
+
+    回归点：旧实现只按 [^a-z0-9] 切词，``apiKey`` / ``refreshToken`` /
+    ``__Secure-1PSIDTS`` 都不会命中，dump 会把整条凭据明文落盘；
+    同时 ``nextPageToken`` / ``max_tokens`` 这类非凭据字段不能被误伤。
+    """
+    from aistudio_api.infrastructure.utils.logger import (
+        _is_sensitive_key,
+        _mask_url,
+    )
+
+    for key in (
+        "apiKey",
+        "refreshToken",
+        "access_token",
+        "id_token",
+        "csrfToken",
+        "sessionToken",
+        "x-goog-api-key",
+        "SAPISIDHASH",
+        "__Secure-1PSIDTS",
+        "__Secure-3PSID",
+        "HSID",
+        # 审计补报：PAPISID 变体、SID/SIDCC、复数 Cookies、page 前缀的凭据键
+        "__Secure-3PAPISID",
+        "SID",
+        "SIDCC",
+        "X-Google-Cookies",
+        "pagePassword",
+    ):
+        assert _is_sensitive_key(key) is True, key
+
+    for key in (
+        "max_tokens",
+        "total_tokens",
+        "promptTokenCount",
+        "maxOutputTokens",
+        "nextPageToken",
+        "pageToken",
+        "pageSize",
+        "author",
+        "secretary",
+    ):
+        assert _is_sensitive_key(key) is False, key
+
+    assert _mask_url("https://x/y?key=SECRET&alt=sse") == "https://x/y?key=***&alt=sse"
+    assert _mask_url("https://x/y?max_tokens=100") == "https://x/y?max_tokens=100"

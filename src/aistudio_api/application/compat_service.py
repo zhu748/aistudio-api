@@ -45,12 +45,17 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 logger = get_logger("compat")
 
 _MAX_MEDIA_BYTES = 20 * 1024 * 1024
+# 单个 SSE 事件的上限（防御上游不发空行导致缓冲区无限增长）
+_MAX_SSE_EVENT_BYTES = 16 * 1024 * 1024
 
 # OpenAI 家族模型名（命中则回退到配置的默认 Gemini 模型）
 _OPENAI_FAMILY_RE = re.compile(
-    r"^(gpt-|o\d|chatgpt|davinci|babbage|text-|tts-|whisper|dall-e|sora|computer-use)",
+    r"^(?:ft:)?(?:gpt-|o\d|chatgpt|davinci|babbage|text-|tts-|whisper|dall-e|sora|computer-use)",
     re.IGNORECASE,
 )
+
+# Claude 家族（含 Bedrock/Vertex 的 "anthropic.claude-" / "us.anthropic.claude-"）
+_CLAUDE_FAMILY_RE = re.compile(r"(?:^|\.)claude", re.IGNORECASE)
 
 # 魔数嗅探：无 Content-Type / 无 data URL mime 时的兜底识别
 _MAGIC_SNIFFERS: tuple[tuple[bytes, str], ...] = (
@@ -80,6 +85,15 @@ _GEMINI_TO_OPENAI_FINISH: dict[str, str] = {
     "IMAGE_OTHER": "content_filter",
     "IMAGE_RECITATION": "content_filter",
     "LANGUAGE": "content_filter",
+    # 上游 WIRE 枚举（非正常结束）统一按内容过滤/长度等异常终结处理，
+    # 避免经 .get(..., "stop") 静默变成正常 "stop" 误导客户端。
+    "MALFORMED_FUNCTION_CALL": "content_filter",
+    "UNEXPECTED_TOOL_CALL": "content_filter",
+    "TOO_MANY_TOOL_CALLS": "content_filter",
+    "NO_IMAGE": "content_filter",
+    "MISSING_THOUGHT_SIGNATURE": "content_filter",
+    "OTHER": "stop",
+    "FINISH_REASON_UNSPECIFIED": "stop",
 }
 
 # 视为内容安全拦截的 Gemini finishReason（Claude 侧映射为 refusal）
@@ -255,12 +269,14 @@ def resolve_compat_model(requested: str, *, channel: str) -> str:
         if str(key).lower() == lowered:
             return str(value)
     # 2. 最长前缀匹配（键长优先，支持 "claude-sonnet" 命中 "claude-sonnet-4-5"）
+    #    加 "-" 边界，避免 "claude-sonnet" 误命中 "claude-sonnetic-foo"。
     for key in sorted((str(k) for k in mapping), key=len, reverse=True):
-        if lowered.startswith(str(key).lower()):
+        key_lower = str(key).lower()
+        if lowered == key_lower or lowered.startswith(key_lower + "-"):
             return str(mapping[key])
     # 3. 家族回退
     default_model = _as_str(compat.get(f"{channel}_default_model"))
-    if channel == "claude" and lowered.startswith("claude") and default_model:
+    if channel == "claude" and _CLAUDE_FAMILY_RE.search(lowered) and default_model:
         logger.info("Claude 模型映射: %s → %s（默认模型）", clean, default_model)
         return default_model
     if channel == "openai" and _OPENAI_FAMILY_RE.match(clean) and default_model:
@@ -656,7 +672,7 @@ async def _claude_blocks_to_parts(
                 GeminiPart(
                     functionCall=GeminiFunctionCall(
                         name=name,
-                        args=tool_input if isinstance(tool_input, dict) else {},
+                        args=tool_input if tool_input is not None else {},
                         id=_as_str(block.get("id")) or None,
                     )
                 )
@@ -889,11 +905,17 @@ def _usage_from_gemini(
 
 
 def _openai_finish_reason(finish_reason: str | None, *, has_tool_calls: bool) -> str:
-    if finish_reason == "MAX_TOKENS":
+    raw = finish_reason or "STOP"
+    # 安全/异常终结优先于 tool_calls：同一帧带 functionCall 但被 SAFETY 拦截时
+    # 必须报 content_filter，不能误报成成功完成的 tool_calls。
+    mapped = _GEMINI_TO_OPENAI_FINISH.get(raw)
+    if mapped == "content_filter":
+        return "content_filter"
+    if raw == "MAX_TOKENS":
         return "length"
     if has_tool_calls:
         return "tool_calls"
-    return _GEMINI_TO_OPENAI_FINISH.get(finish_reason or "STOP", "stop")
+    return mapped or "stop"
 
 
 def _iter_response_parts(
@@ -1006,14 +1028,16 @@ def _claude_stop_reason(
             if sequence and full_text.endswith(sequence):
                 stop_seq = sequence
                 break
+    raw = finish_reason or "STOP"
     if stop_seq is not None:
         return "stop_sequence", stop_seq
-    if finish_reason == "MAX_TOKENS":
+    # 安全/异常拦截优先于 tool_use，避免把被风控终止的响应误报成正常工具调用。
+    if raw in _CLAUDE_REFUSAL_FINISH:
+        return "refusal", None
+    if raw == "MAX_TOKENS":
         return "max_tokens", None
     if has_tool_use:
         return "tool_use", None
-    if (finish_reason or "STOP") in _CLAUDE_REFUSAL_FINISH:
-        return "refusal", None
     return "end_turn", None
 
 
@@ -1064,9 +1088,7 @@ def build_claude_message(
         if function_call is not None:
             has_tool_use = True
             call_id = function_call.id or f"toolu_{secrets.token_hex(12)}"
-            tool_input = (
-                function_call.args if isinstance(function_call.args, dict) else {}
-            )
+            tool_input = function_call.args if function_call.args is not None else {}
             blocks.append(
                 {
                     "type": "tool_use",
@@ -1083,6 +1105,12 @@ def build_claude_message(
         stop_sequences=stop_sequences,
     )
     usage = _usage_from_gemini(response.usageMetadata)
+    usage_payload: dict[str, object] = {
+        "input_tokens": usage["prompt"],
+        "output_tokens": usage["completion"],
+    }
+    if usage["cached"]:
+        usage_payload["cache_read_input_tokens"] = usage["cached"]
     return {
         "id": f"msg_{secrets.token_hex(12)}",
         "type": "message",
@@ -1091,10 +1119,7 @@ def build_claude_message(
         "content": blocks or [{"type": "text", "text": ""}],
         "stop_reason": stop_reason,
         "stop_sequence": stop_seq,
-        "usage": {
-            "input_tokens": usage["prompt"],
-            "output_tokens": usage["completion"],
-        },
+        "usage": usage_payload,
     }
 
 
@@ -1106,27 +1131,59 @@ def build_claude_message(
 async def _iter_gemini_sse_frames(
     source: AsyncIterable[object],
 ) -> AsyncGenerator[dict[str, object], None]:
-    """解析内部 Gemini SSE 字符串流 → JSON 帧对象流。"""
+    """解析内部 Gemini SSE 字符串流 → JSON 帧对象流。
+
+    按 SSE 事件边界（空行）缓冲，支持被 TCP/代理拆分的单个事件，以及同一
+    事件内的多行 ``data:`` 合并。残帧不会静默丢弃整条消息。
+    """
+
+    def _parse_event(event: str) -> dict[str, object] | None:
+        data_lines = []
+        for line in event.splitlines():
+            stripped = line.strip()
+            # 先 strip 再切 "data:"：SSE 允许行首有空白，直接 line[5:] 会在
+            # 前置空白时切错位置（把 payload 首字符一起吃掉）。
+            if stripped.startswith("data:"):
+                data_lines.append(stripped[5:].strip())
+        if not data_lines:
+            return None
+        payload = "\n".join(data_lines)
+        if not payload or payload == "[DONE]":
+            return None
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            logger.warning("丢弃无法解析的 Gemini SSE 帧: %.120s", payload)
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    buffer = ""
     async for raw in source:
         if isinstance(raw, (bytes, bytearray)):
-            text = bytes(raw).decode("utf-8", errors="replace")
+            buffer += bytes(raw).decode("utf-8", errors="replace")
         elif isinstance(raw, str):
-            text = raw
+            buffer += raw
         else:
             continue
-        for line in text.splitlines():
-            line = line.strip()
-            if not line.startswith("data:"):
-                continue
-            payload = line[5:].strip()
-            if not payload or payload == "[DONE]":
-                continue
-            try:
-                parsed = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(parsed, dict):
+        buffer = buffer.replace("\r\n", "\n")
+        while "\n\n" in buffer:
+            event, buffer = buffer.split("\n\n", 1)
+            parsed = _parse_event(event)
+            if parsed is not None:
                 yield parsed
+        # 防御：上游若持续发送一个不含空行终止符的超大事件，缓冲区会无限增长。
+        # 单帧超过 16MB 说明协议已损坏，直接清空并告警，避免内存被拖垮。
+        if len(buffer) > _MAX_SSE_EVENT_BYTES:
+            logger.warning(
+                "Gemini SSE 缓冲区超过 %d 字节仍无事件边界，已丢弃累积内容",
+                _MAX_SSE_EVENT_BYTES,
+            )
+            buffer = ""
+    # 处理流结束时未以空行收尾的最后一个事件
+    if buffer.strip():
+        parsed = _parse_event(buffer)
+        if parsed is not None:
+            yield parsed
 
 
 def _frame_candidate(frame: dict[str, object]) -> dict[str, object]:
@@ -1194,6 +1251,21 @@ async def openai_stream_adapter(
             payload["usage"] = None
         return payload
 
+    def _error_chunk(message: str, error_type: str, code: int) -> dict[str, object]:
+        # 错误必须包装成合法的 ChatCompletionChunk：SDK 会用
+        # ChatCompletionChunk.model_validate 校验每个 chunk，裸 error 帧缺
+        # id/object/created/model/choices 会直接抛 ValidationError。error 字段
+        # 作为附加信息保留（SDK 默认忽略未知字段），finish_reason 用终止态，
+        # 保证流以正常终结块收尾而不是异常断流。
+        payload = _chunk({}, "stop")
+        payload["error"] = {
+            "message": message,
+            "type": error_type,
+            "param": None,
+            "code": code,
+        }
+        return payload
+
     yield _sse(_chunk({"role": "assistant", "content": ""}, None))
 
     finish_reason_raw: str | None = None
@@ -1210,14 +1282,9 @@ async def openai_stream_adapter(
                 code = _as_int(error_obj.get("code")) or 500
                 message = _as_str(error_obj.get("message")) or "Upstream error"
                 yield _sse(
-                    {
-                        "error": {
-                            "message": message,
-                            "type": _OPENAI_ERROR_TYPE.get(code, "api_error"),
-                            "param": None,
-                            "code": code,
-                        }
-                    }
+                    _error_chunk(
+                        message, _OPENAI_ERROR_TYPE.get(code, "api_error"), code
+                    )
                 )
                 break
             candidate = _frame_candidate(frame)
@@ -1236,7 +1303,7 @@ async def openai_stream_adapter(
                     )
                     name = _as_str(function_call.get("name")) or "unknown"
                     args = function_call.get("args")
-                    if not isinstance(args, (dict, list)):
+                    if args is None:
                         args = {}
                     yield _sse(
                         _chunk(
@@ -1285,16 +1352,7 @@ async def openai_stream_adapter(
     except Exception as exc:
         saw_error = True
         logger.warning("OpenAI 流式转换异常: %s", exc)
-        yield _sse(
-            {
-                "error": {
-                    "message": f"{type(exc).__name__}: {exc}",
-                    "type": "internal_error",
-                    "param": None,
-                    "code": 500,
-                }
-            }
-        )
+        yield _sse(_error_chunk(f"{type(exc).__name__}: {exc}", "internal_error", 500))
 
     if saw_error:
         yield "data: [DONE]\n\n"
@@ -1307,8 +1365,9 @@ async def openai_stream_adapter(
         _openai_usage_from_frame(usage_frame) if usage_frame is not None else None
     )
     final_chunk = _chunk({}, finish_reason)
-    if usage_payload is not None and not include_usage:
-        final_chunk["usage"] = usage_payload
+    # OpenAI 语义：仅 include_usage=True 时发送 usage（且以 choices 为空的
+    # 独立尾块形式）。False 时任何 chunk 都不得携带 usage 字段，否则 SDK
+    # 会把带 finish_reason 的终结块解析成混合块（协议不允许）。
     yield _sse(final_chunk)
     if include_usage and usage_payload is not None:
         yield _sse(
@@ -1475,7 +1534,7 @@ class _ClaudeStreamEmitter:
                     "delta": {
                         "type": "input_json_delta",
                         "partial_json": json.dumps(
-                            args if isinstance(args, (dict, list)) else {},
+                            args if args is not None else {},
                             ensure_ascii=False,
                         ),
                     },
@@ -1546,16 +1605,19 @@ class _ClaudeStreamEmitter:
             stop_sequences=stop_sequences,
         )
         usage = _usage_from_gemini(self.usage_frame)
+        usage_payload: dict[str, object] = {
+            "input_tokens": usage["prompt"],
+            "output_tokens": usage["completion"],
+        }
+        if usage["cached"]:
+            usage_payload["cache_read_input_tokens"] = usage["cached"]
         events.append(
             self.sse(
                 "message_delta",
                 {
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason, "stop_sequence": stop_seq},
-                    "usage": {
-                        "input_tokens": usage["prompt"],
-                        "output_tokens": usage["completion"],
-                    },
+                    "usage": usage_payload,
                 },
             )
         )

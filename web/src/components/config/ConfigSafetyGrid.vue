@@ -25,11 +25,11 @@ const categories = [
 ]
 
 const levels = [
-  { val: 1, label: '1 - 严苛', desc: '最强过滤强度', color: 'border-rose-300 text-rose-700 bg-rose-50' },
-  { val: 2, label: '2 - 较严', desc: '较高过滤强度', color: 'border-amber-300 text-amber-700 bg-amber-50' },
-  { val: 3, label: '3 - 中等', desc: '标准中等强度', color: 'border-blue-300 text-blue-700 bg-blue-50' },
-  { val: 4, label: '4 - 宽松', desc: '宽松低强度', color: 'border-emerald-300 text-emerald-700 bg-emerald-50' },
-  { val: 5, label: '5 - 关闭', desc: '完全不拦截', color: 'border-gray-400 text-gray-800 bg-gray-100 font-bold' },
+  { val: 1, label: '最严', desc: '最强过滤强度', color: 'border-rose-300 text-rose-700 bg-rose-50' },
+  { val: 2, label: '较严', desc: '较高过滤强度', color: 'border-amber-300 text-amber-700 bg-amber-50' },
+  { val: 3, label: '中等', desc: '标准中等强度', color: 'border-sky-300 text-sky-700 bg-sky-50' },
+  { val: 4, label: '宽松', desc: '宽松低强度', color: 'border-emerald-300 text-emerald-700 bg-emerald-50' },
+  { val: 5, label: '关闭', desc: '完全不拦截', color: 'border-slate-400 text-slate-900 bg-slate-100 font-bold' },
 ]
 
 function getLevel(catKey: string): number {
@@ -54,15 +54,13 @@ function setAll(val: number) {
 </script>
 
 <template>
-  <div class="space-y-3 p-4 bg-gray-50/70 border border-gray-200/80 rounded-xl">
-    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-gray-200/60 pb-2.5">
+  <div class="space-y-3 p-3.5 bg-slate-50/70 border border-slate-200/80 rounded-xl">
+    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-200/60 pb-2">
       <div class="flex items-center gap-2">
         <Shield class="w-4 h-4 text-brand-600" />
-        <div>
-          <h4 class="text-xs font-bold text-gray-900">
-            安全拦截等级
-          </h4>
-        </div>
+        <h4 class="text-xs font-bold text-slate-900">
+          安全审查阈值 (Safety Settings)
+        </h4>
       </div>
 
       <!-- Batch Actions -->
@@ -72,64 +70,59 @@ function setAll(val: number) {
       >
         <button
           type="button"
-          class="px-2 py-1 text-[11px] font-medium bg-white text-emerald-700 border border-emerald-200 rounded-lg hover:bg-emerald-50 transition-colors flex items-center gap-1 cursor-pointer"
+          class="px-2 py-1 text-[11px] font-medium bg-white text-emerald-700 border border-emerald-200 rounded-md hover:bg-emerald-50 transition-colors flex items-center gap-1 cursor-pointer"
           @click="setAll(5)"
         >
           <ShieldAlert class="w-3 h-3 text-emerald-600" />
-          <span>全设为关闭拦截 (5)</span>
+          <span>全部关闭拦截 (5)</span>
         </button>
         <button
           type="button"
-          class="px-2 py-1 text-[11px] font-medium bg-white text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-100 transition-colors flex items-center gap-1 cursor-pointer"
+          class="px-2 py-1 text-[11px] font-medium bg-white text-slate-600 border border-slate-200 rounded-md hover:bg-slate-100 transition-colors flex items-center gap-1 cursor-pointer"
           @click="setAll(3)"
         >
-          <ShieldCheck class="w-3 h-3 text-gray-500" />
-          <span>全设为中等 (3)</span>
+          <ShieldCheck class="w-3 h-3 text-slate-500" />
+          <span>全部设为中等 (3)</span>
         </button>
       </div>
     </div>
 
     <!-- 4 Categories Grid -->
-    <div class="space-y-3 pt-1">
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-2.5 pt-0.5">
       <div
         v-for="cat in categories"
         :key="cat.key"
-        class="p-2.5 bg-white border border-gray-200/60 rounded-xl space-y-1.5 shadow-2xs"
+        class="p-2.5 bg-white border border-slate-200/70 rounded-lg space-y-1.5"
       >
         <div class="flex items-center justify-between">
           <div>
-            <span class="text-xs font-semibold text-gray-800">{{ cat.label }}</span>
-            <span class="text-[11px] text-gray-400 ml-2">{{ cat.desc }}</span>
+            <span class="text-xs font-semibold text-slate-800">{{ cat.label }}</span>
+            <span class="text-[11px] text-slate-400 ml-1.5">{{ cat.desc }}</span>
           </div>
           <span
-            class="text-[11px] font-mono font-bold px-2 py-0.5 rounded"
+            class="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded tabular-nums"
             :class="getLevel(cat.key) === 5 ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-800'"
           >
-            当前: {{ getLevel(cat.key) === 5 ? '已关闭拦截 (5)' : `等级 ${getLevel(cat.key)}` }}
+            {{ getLevel(cat.key) === 5 ? '关闭 (5)' : `等级 ${getLevel(cat.key)}` }}
           </span>
         </div>
 
-        <div class="grid grid-cols-5 gap-1.5 pt-1">
+        <div class="grid grid-cols-5 gap-1 pt-0.5">
           <button
             v-for="lvl in levels"
             :key="lvl.val"
             type="button"
             :disabled="disabled"
-            class="py-1.5 px-1 text-center rounded-lg border text-xs font-mono transition-all cursor-pointer select-none disabled:opacity-50"
+            class="py-1 px-1 text-center rounded border text-[11px] font-mono transition-all cursor-pointer select-none disabled:opacity-50"
             :class="[
               getLevel(cat.key) === lvl.val
-                ? `${lvl.color} ring-2 ring-brand-500/20 shadow-xs font-bold`
-                : 'bg-gray-50/80 text-gray-600 border-gray-200/80 hover:bg-gray-100',
+                ? `${lvl.color} ring-1 ring-brand-500/20 font-semibold`
+                : 'bg-slate-50/80 text-slate-600 border-slate-200/80 hover:bg-slate-100',
             ]"
             :title="lvl.desc"
             @click="setLevel(cat.key, lvl.val)"
           >
-            <div class="font-bold">
-              {{ lvl.val }}
-            </div>
-            <div class="text-[9px] truncate">
-              {{ lvl.val === 5 ? '关闭' : lvl.val === 1 ? '最严' : '中等' }}
-            </div>
+            {{ lvl.val }} · {{ lvl.label }}
           </button>
         </div>
       </div>

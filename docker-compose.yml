@@ -6,22 +6,37 @@ services:
     ports:
       - "8080:8080"    # API server
     volumes:
-      - ./data:/app/data           # Account data, stats.json and rotator_state.json persistence
-      - ./config.yaml:/app/config.yaml  # Model configuration file
-      - ./.env:/app/.env:ro        # Environment config (read-only)
+      # 只挂载持久数据目录。配置由 entrypoint 从镜像内置的
+      # defaults/config.yaml 纯净模板初始化到 /app/data/config.yaml，
+      # 不再把仓库根目录的开发用 config.yaml 绑挂进容器（旧写法会绕过
+      # 模板，把本地调试配置带进分发环境）。需要改配置直接编辑
+      # ./data/config.yaml 即可（已持久化、可热重载）。
+      - ./data:/app/data           # 账号、stats.json、rotator_state.json、config.yaml
+    # .env 可选：required:false 避免文件不存在时 Compose 自动创建同名
+    # 目录并把它当目录挂载（旧写法 ./.env:/app/.env:ro 的坑：之后就再
+    # 也无法在宿主机创建真正的 .env 文件了）。
+    env_file:
+      - path: ./.env
+        required: false
     environment:
       - AISTUDIO_PORT=8080
       - AISTUDIO_DATA_DIR=/app/data
       - AISTUDIO_ACCOUNTS_DIR=/app/data/accounts
       - AISTUDIO_STATS_FILE=/app/data/stats.json
       - AISTUDIO_ROTATOR_STATE_FILE=/app/data/rotator_state.json
-      - AISTUDIO_CONFIG_FILE=/app/config.yaml
-      # Cookie 注入示例（也可写在挂载的 .env 中，支持多行）：
+      - AISTUDIO_CONFIG_FILE=/app/data/config.yaml
+      # Linux 主机注意：镜像以非 root 的 app 用户运行，请确保 ./data
+      # 对该用户可写（例如 `mkdir -p data && sudo chown -R 999:999 data`，
+      # 或在 compose 覆盖 `user: "${UID:-1000}:${GID:-1000}"`）。
+      # Cookie 注入示例（也可写在 .env 中，支持多行）：
       #   - AISTUDIO_COOKIES=socks5://user:pass@host:1080+SID=xxx; HSID=yyy
       #   - AISTUDIO_COOKIES_1=SID=aaa; HSID=bbb
       #   - AISTUDIO_COOKIES_2=SID=ccc; HSID=ddd+http://proxy:8080
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:$${AISTUDIO_PORT:-8080}/healthz"]
+      # 与 Dockerfile HEALTHCHECK 一致：HEALTHCHECK/healthcheck 是独立
+      # 进程，继承容器原始 ENV，看不到 entrypoint 里 export 的值，
+      # 因此必须同时兼容 PaaS 注入的 PORT。
+      test: ["CMD-SHELL", "curl -f \"http://localhost:$${AISTUDIO_PORT:-$${PORT:-8080}}/healthz\" || exit 1"]
       interval: 30s
       timeout: 10s
       start_period: 15s

@@ -289,15 +289,20 @@ def _is_wire_value(val: object) -> bool:
     return False
 
 
-def _decode_wire_struct(raw_struct: object) -> dict[str, object]:
+_MAX_WIRE_DEPTH = 100
+
+
+def _decode_wire_struct(raw_struct: object, depth: int = 0) -> dict[str, object]:
     if isinstance(raw_struct, dict):
         return raw_struct
     if not isinstance(raw_struct, list) or not raw_struct:
         return {}
+    if depth >= _MAX_WIRE_DEPTH:
+        return {}
 
     # Single unboxed key-value pair [key, wire_value]
     if len(raw_struct) >= 2 and isinstance(raw_struct[0], str):
-        return {raw_struct[0]: _decode_wire_value(raw_struct[1])}
+        return {raw_struct[0]: _decode_wire_value(raw_struct[1], depth + 1)}
     entries: list[object] = raw_struct
     while (
         len(entries) == 1
@@ -309,12 +314,14 @@ def _decode_wire_struct(raw_struct: object) -> dict[str, object]:
     result: dict[str, object] = {}
     for item in entries:
         if isinstance(item, list) and len(item) >= 2 and isinstance(item[0], str):
-            result[item[0]] = _decode_wire_value(item[1])
+            result[item[0]] = _decode_wire_value(item[1], depth + 1)
     return result
 
 
-def _decode_wire_list(raw_list: object) -> list[object]:
+def _decode_wire_list(raw_list: object, depth: int = 0) -> list[object]:
     if not isinstance(raw_list, list) or not raw_list:
+        return []
+    if depth >= _MAX_WIRE_DEPTH:
         return []
 
     if (
@@ -326,14 +333,16 @@ def _decode_wire_list(raw_list: object) -> list[object]:
     else:
         items = raw_list
 
-    return [_decode_wire_value(item) for item in items]
+    return [_decode_wire_value(item, depth + 1) for item in items]
 
 
-def _decode_wire_value(value: object) -> object:
+def _decode_wire_value(value: object, depth: int = 0) -> object:
     if not isinstance(value, list):
         return value
     if len(value) == 0:
         return []
+    if depth >= _MAX_WIRE_DEPTH:
+        return None
     if len(value) == 1 and value[0] == 0:
         return None
     if (
@@ -350,12 +359,12 @@ def _decode_wire_value(value: object) -> object:
         if value[3] in (0, 1):
             return bool(value[3])
     if len(value) >= 5 and value[4] is not None:
-        return _decode_wire_struct(value[4])
+        return _decode_wire_struct(value[4], depth + 1)
     if len(value) >= 6 and value[5] is not None:
-        return _decode_wire_list(value[5])
+        return _decode_wire_list(value[5], depth + 1)
     if len(value) >= 3 and value[2] is not None:
         return value[2]
-    return [_decode_wire_value(item) for item in value]
+    return [_decode_wire_value(item, depth + 1) for item in value]
 
 
 def parse_usage_metadata(raw_usage: object) -> dict[str, object]:
@@ -550,6 +559,9 @@ def parse_text_output(raw: str) -> ModelOutput:
         return output
 
     merged = Candidate()
+    text_parts: list[str] = []
+    thinking_parts: list[str] = []
+    code_output_parts: list[str] = []
     for chunk in chunks:
         usage = parse_chunk_usage(chunk)
         if usage:
@@ -560,9 +572,9 @@ def parse_text_output(raw: str) -> ModelOutput:
                 output.response_id = raw_rid
         parsed = parse_response_chunk(chunk)
         if parsed.text:
-            merged.text += parsed.text
+            text_parts.append(parsed.text)
         if parsed.thinking:
-            merged.thinking += parsed.thinking
+            thinking_parts.append(parsed.thinking)
         if parsed.images:
             merged.images.extend(parsed.images)
         if parsed.reasoning_images:
@@ -574,9 +586,7 @@ def parse_text_output(raw: str) -> ModelOutput:
         if parsed.thought_signature:
             merged.thought_signature = parsed.thought_signature
         if parsed.code_output:
-            merged.code_output = "\n".join(
-                filter(None, [merged.code_output, parsed.code_output])
-            )
+            code_output_parts.append(parsed.code_output)
         if parsed.finish_reason is not None:
             merged.finish_reason = parsed.finish_reason
         if parsed.finish_message:
@@ -584,6 +594,9 @@ def parse_text_output(raw: str) -> ModelOutput:
         if parsed.safety_ratings:
             merged.safety_ratings = parsed.safety_ratings
 
+    merged.text = "".join(text_parts)
+    merged.thinking = "".join(thinking_parts)
+    merged.code_output = "\n".join(code_output_parts)
     output.candidates = [merged]
     return output
 

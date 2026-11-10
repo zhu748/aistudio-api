@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import threading
@@ -224,7 +225,10 @@ class AccountStore:
     _initialized: bool = False
 
     def __new__(cls, accounts_dir: Path | None = None) -> AccountStore:
-        resolved_dir = (accounts_dir or _resolve_accounts_dir()).resolve()
+        # absolute() 而非 resolve()：resolve 在 Windows 上逐段做符号链接与
+        # 大小写归一化（约 85µs/次），而 AccountStore() 在请求热路径上被
+        # 反复构造（单例命中也要付这个开销）。
+        resolved_dir = (accounts_dir or _resolve_accounts_dir()).absolute()
         with cls._singleton_lock:
             if resolved_dir not in cls._instances:
                 instance = super().__new__(cls)
@@ -234,12 +238,17 @@ class AccountStore:
     def __init__(self, accounts_dir: Path | None = None) -> None:
         if getattr(self, "_initialized", False):
             return
-        self._accounts_dir = (accounts_dir or _resolve_accounts_dir()).resolve()
+        self._accounts_dir = (accounts_dir or _resolve_accounts_dir()).absolute()
         self._registry_path = self._accounts_dir / "registry.json"
         self._presets_path = self._accounts_dir / "presets.json"
         self._registry: Registry | None = None
         self._presets: dict[str, AccountPreset] | None = None
         self._lock = threading.Lock()
+        # 一旦检测到损坏的 registry.json 即置位：隔离后文件不再存在，后续
+        # _load_registry 若只靠 exists() 判断就会静默返回空注册表，进而把
+        # {"accounts": {}} 写回磁盘。该标志让「拒绝静默清空」在所有后续调用
+        # 中持续生效，直到人工恢复文件并重启。
+        self._corrupt_registry: bool = False
         self._ensure_dirs()
         self._ensure_default_presets()
         self._initialized = True
@@ -253,12 +262,44 @@ class AccountStore:
         with self._lock:
             if self._registry is not None:
                 return self._registry
+            if self._corrupt_registry:
+                # 坏文件已在先前调用中被隔离，此时文件不存在 ≠ 首次启动。
+                # 必须继续失败，否则空注册表会被 _save_registry 写回。
+                raise RuntimeError(
+                    "账号注册表 registry.json 此前已判定损坏并被隔离；"
+                    "请人工恢复备份后重启（拒绝静默清空以免丢失全部账号）"
+                )
             if not self._registry_path.exists():
+                if self._has_corrupt_marker():
+                    # registry.json 被隔离后文件不存在 ≠ 首次启动。目录里残留的
+                    # 隔离备份是持久标记，重启后也必须继续拒绝，否则一次
+                    # _save_registry 就会把空注册表写回，永久丢掉全部账号。
+                    self._corrupt_registry = True
+                    raise RuntimeError(
+                        "账号注册表 registry.json 已被隔离但尚未人工恢复；"
+                        "请恢复备份后重启（拒绝静默清空以免丢失全部账号）"
+                    )
                 self._registry = Registry(accounts={})
                 return self._registry
             try:
-                data = json.loads(self._registry_path.read_text(encoding="utf-8"))
-                self._registry = Registry.from_dict(data)
+                raw_text = self._registry_path.read_text(encoding="utf-8")
+                data = json.loads(raw_text)
+                registry = Registry.from_dict(data)
+            except Exception as e:
+                # 损坏/不可解析的注册表绝不静默重置为空：那样下一次
+                # _save_registry 会把 {"accounts": {}} 写回，永久丢失全部账号。
+                # 隔离坏文件 + 抛错，让启动/写入失败而非静默抹除数据。
+                self._corrupt_registry = True
+                self._quarantine_corrupt_registry(e)
+                raise RuntimeError(
+                    "账号注册表 registry.json 损坏，已隔离备份；"
+                    "请人工恢复后重启（拒绝静默清空以免丢失全部账号）"
+                ) from e
+
+            self._registry = registry
+            # 以下为一致的尽力补齐（补齐邮箱/档位/兄弟账号 Cookie）。
+            # 失败不应被当成「注册表损坏」——否则会隔离一个好文件并阻断启动。
+            try:
                 reconciled = False
                 for acc_id, acc in self._registry.accounts.items():
                     account_dir = self._accounts_dir / acc_id
@@ -283,9 +324,47 @@ class AccountStore:
                     reconciled = True
                 if reconciled:
                     _atomic_write_json(self._registry_path, self._registry.to_dict())
-            except Exception:
-                self._registry = Registry(accounts={})
+            except Exception as e:
+                # 补齐失败只记录，不影响本次加载结果（内存态已可用）
+                logging.getLogger("account_store").warning(
+                    "注册表一致化补齐失败(%s)", type(e).__name__
+                )
             return self._registry
+
+    def _has_corrupt_marker(self) -> bool:
+        """目录里是否残留此前隔离的损坏注册表备份。
+
+        registry.json 被隔离改名后原文件已不存在，单靠 ``exists()`` 会把它
+        误判成首次启动；隔离备份本身就是可以跨重启存活的持久标记。
+        """
+        try:
+            return any(self._accounts_dir.glob("registry.corrupt.*.json"))
+        except OSError:
+            return False
+
+    def _quarantine_corrupt_registry(self, error: Exception) -> None:
+        """把损坏的 registry.json 改名隔离，避免下次 _save_registry 覆盖它。"""
+        # 用微秒 + 递增后缀：秒级时间戳在同一秒内二次隔离会撞名，
+        # shutil.move 会失败并被忽略，坏文件留在原地继续挡住启动。
+        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
+        for suffix in range(16):
+            name = (
+                f".corrupt.{stamp}.json"
+                if suffix == 0
+                else f".corrupt.{stamp}.{suffix}.json"
+            )
+            backup = self._registry_path.with_suffix(name)
+            if backup.exists():
+                continue
+            try:
+                shutil.move(str(self._registry_path), str(backup))
+            except Exception:
+                # 隔离失败也不能掩盖原始错误；仍由调用方抛出 RuntimeError
+                return
+            logging.getLogger("account_store").error(
+                "registry.json 解析失败(%s)，已隔离到 %s", type(error).__name__, backup
+            )
+            return
 
     def _save_registry(self, registry: Registry) -> None:
         """保存注册表（线程安全+原子写入）。"""
@@ -416,10 +495,17 @@ class AccountStore:
         account_dir = _safe_account_dir(self._accounts_dir, account_id)
         safe_id = account_dir.name
         existing_meta = registry.accounts.get(safe_id)
+        # 已探测到的邮箱不应被调用方传 None 抹掉：环境变量注入账号每次启动都会
+        # 用 email=None 重建，若直接覆盖会让面板里探活到的邮箱反复消失。
+        resolved_email = (
+            email
+            if email is not None
+            else (existing_meta.email if existing_meta else None)
+        )
         meta = AccountMeta(
             id=safe_id,
             name=name,
-            email=email,
+            email=resolved_email,
             created_at=created_at,
             last_used=now,
             auth_user=auth_user,

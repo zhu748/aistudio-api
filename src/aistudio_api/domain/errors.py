@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 
 
@@ -61,7 +62,7 @@ def parse_upstream_grpc_error(raw_response: str) -> tuple[int | None, str]:
     if normalized.startswith("[,"):
         normalized = "[null," + normalized[2:]
 
-    try:
+    with contextlib.suppress(Exception):
         data = json.loads(normalized)
         if isinstance(data, list):
 
@@ -90,8 +91,6 @@ def parse_upstream_grpc_error(raw_response: str) -> tuple[int | None, str]:
             found = _find_grpc(data)
             if found is not None:
                 return found
-    except Exception:
-        pass
 
     return None, text
 
