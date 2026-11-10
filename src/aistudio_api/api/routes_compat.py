@@ -78,6 +78,37 @@ def _shrink_media_payloads(node: object) -> object:
     return node
 
 
+def _estimate_tokens(text: str) -> int:
+    """按字符类别加权估算 token 数（不依赖外部 tokenizer）。
+
+    经验折算（与主流 BPE 分词器偏差在 ±20% 内）：
+    - ASCII 及拉丁字母：约 4 字符 / token
+    - CJK（含日文假名、韩文）：约 1 字符 / token
+    - 其它非 ASCII（emoji、带变音符的拉丁字母等）：约 1.5 字符 / token
+
+    旧实现统一用 ``len(text) // 4``，对中文低估 4 倍以上。
+    """
+    ascii_chars = 0
+    cjk_chars = 0
+    other_chars = 0
+    for ch in text:
+        code = ord(ch)
+        if code < 128:
+            ascii_chars += 1
+        elif (
+            0x3040 <= code <= 0x30FF  # 日文假名
+            or 0x3400 <= code <= 0x4DBF  # CJK 扩展 A
+            or 0x4E00 <= code <= 0x9FFF  # CJK 基本区
+            or 0xAC00 <= code <= 0xD7AF  # 韩文音节
+            or 0xF900 <= code <= 0xFAFF  # CJK 兼容表意
+        ):
+            cjk_chars += 1
+        else:
+            other_chars += 1
+    weighted = ascii_chars / 4.0 + cjk_chars + other_chars / 1.5
+    return int(weighted + 0.5)
+
+
 @router.post("/v1/chat/completions")
 async def openai_chat_completions(
     req: OpenAIChatCompletionRequest,
@@ -186,7 +217,13 @@ async def claude_messages(
 
 @router.post("/v1/messages/count_tokens")
 async def claude_count_tokens(req: ClaudeMessagesRequest):
-    """Claude token 计数端点：粗略估算（JSON 序列化长度 / 4）。"""
+    """Claude token 计数端点：按字符类别加权估算。
+
+    早先实现是 ``len(json.dumps(payload)) // 4``，对中文会低估约 4~6 倍
+    （Claude Code 用本端点预判上下文余量，低估会导致实际请求超限）。
+    改为显式分类计数：ASCII 约 4 字符/token，CJK 等宽字符约 1 字符/token，
+    其它非 ASCII 按 1.5 字符/token 折算，比转义长度启发式更贴近 BPE 实际。
+    """
     try:
         payload = {
             "system": _shrink_media_payloads(req.system),
@@ -198,7 +235,7 @@ async def claude_count_tokens(req: ClaudeMessagesRequest):
         serialized = json.dumps(payload, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
         serialized = str(req.messages)
-    estimate = max(1, len(serialized) // 4)
+    estimate = max(1, _estimate_tokens(serialized))
     return JSONResponse(content={"input_tokens": estimate})
 
 

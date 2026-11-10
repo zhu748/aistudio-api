@@ -124,3 +124,10 @@ async def test_streaming_gateway_split_utf8_chunks():
         == "嗨！我是你的酒馆工程搭档。平时在这套工作区里，一起搞的事情挺多的：🎉🚀"
     )
     assert "\ufffd" not in joined
+
+
+def test_shared_ssl_context_is_created_once():
+    """httpx client 若自行创建 SSLContext 会枚举系统证书库（Windows 上 0.7~1.4s）。"""
+    from aistudio_api.infrastructure.gateway import transport
+
+    assert transport._shared_ssl_context() is transport._shared_ssl_context()

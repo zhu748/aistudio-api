@@ -183,7 +183,18 @@ _FALLBACK_MODELS = [
         "outputTokenLimit": 65536,
         "defaultThinkingLevel": 2,
         "thinkingLevels": [1, 2, 3],
-        "aliases": ["gemini-3.7-flash", "gemini-2.5-flash", "gemini-2.5-flash-preview-05-20", "gemini-2.5-flash-preview-04-17", "gemini-2.0-flash-thinking-exp-1219", "gemini-2.0-flash-thinking-exp-01-21", "gemini-1.5-flash", "gemini-1.5-flash-8b", "learnlm-2.0-flash-experimental", "learnlm-1.5-pro-experimental"],
+        "aliases": [
+            "gemini-3.7-flash",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-preview-05-20",
+            "gemini-2.5-flash-preview-04-17",
+            "gemini-2.0-flash-thinking-exp-1219",
+            "gemini-2.0-flash-thinking-exp-01-21",
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-8b",
+            "learnlm-2.0-flash-experimental",
+            "learnlm-1.5-pro-experimental",
+        ],
         "paid": False,
         "is_image_model": False,
         "is_video_model": False,
@@ -212,7 +223,15 @@ _FALLBACK_MODELS = [
         "outputTokenLimit": 65536,
         "defaultThinkingLevel": 4,
         "thinkingLevels": [4, 1, 2, 3],
-        "aliases": ["thorin", "gemini-2.5-flash-lite", "gemini-2.5-flash-lite-preview-06-17", "gemini-2.0-flash-lite", "gemini-2.0-flash-lite-001", "gemini-2.0-flash-lite-preview", "gemini-2.0-flash-lite-preview-02-05"],
+        "aliases": [
+            "thorin",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-flash-lite-preview-06-17",
+            "gemini-2.0-flash-lite",
+            "gemini-2.0-flash-lite-001",
+            "gemini-2.0-flash-lite-preview",
+            "gemini-2.0-flash-lite-preview-02-05",
+        ],
         "paid": False,
         "is_image_model": False,
         "is_video_model": False,
@@ -227,7 +246,17 @@ _FALLBACK_MODELS = [
         "outputTokenLimit": 65536,
         "defaultThinkingLevel": 3,
         "thinkingLevels": [1, 2, 3],
-        "aliases": ["gemini-3-pro-preview", "gemini-2.5-pro", "gemini-2.5-pro-preview-06-05", "gemini-exp-1206", "gemini-2.0-pro-exp-02-05", "gemini-2.5-pro-exp-03-25", "gemini-2.5-pro-preview-03-25", "gemini-1.5-pro", "gemini-2.5-pro-preview-05-06"],
+        "aliases": [
+            "gemini-3-pro-preview",
+            "gemini-2.5-pro",
+            "gemini-2.5-pro-preview-06-05",
+            "gemini-exp-1206",
+            "gemini-2.0-pro-exp-02-05",
+            "gemini-2.5-pro-exp-03-25",
+            "gemini-2.5-pro-preview-03-25",
+            "gemini-1.5-pro",
+            "gemini-2.5-pro-preview-05-06",
+        ],
         "paid": False,
         "is_image_model": False,
         "is_video_model": False,
@@ -315,7 +344,12 @@ _FALLBACK_MODELS = [
         "outputTokenLimit": 65536,
         "defaultThinkingLevel": 4,
         "thinkingLevels": [4, 3],
-        "aliases": ["nano-banana", "gemini-2.0-flash-preview-image-generation", "gemini-2.0-flash-exp", "gemini-2.0-flash-exp-image-generation"],
+        "aliases": [
+            "nano-banana",
+            "gemini-2.0-flash-preview-image-generation",
+            "gemini-2.0-flash-exp",
+            "gemini-2.0-flash-exp-image-generation",
+        ],
         "paid": False,
         "is_image_model": True,
         "is_video_model": False,
@@ -631,7 +665,13 @@ _FALLBACK_MODELS = [
         "outputTokenLimit": 65536,
         "defaultThinkingLevel": 3,
         "thinkingLevels": [3, 1],
-        "aliases": ["veo-3.1-generate-preview", "veo-3.1-fast-generate-preview", "veo-3.1-lite-generate-preview", "veo-2.0-generate-001", "gemini-omni-flash-preview"],
+        "aliases": [
+            "veo-3.1-generate-preview",
+            "veo-3.1-fast-generate-preview",
+            "veo-3.1-lite-generate-preview",
+            "veo-2.0-generate-001",
+            "gemini-omni-flash-preview",
+        ],
         "paid": True,
         "is_image_model": False,
         "is_video_model": True,
@@ -787,14 +827,23 @@ class ModelDiscoveryService:
     def get_cached_model_info(self, model_id: str) -> Mapping[str, object] | None:
         """同步查询已缓存的模型元数据（不触发网络请求）。"""
         clean_target = model_id.removeprefix("models/").lower()
-        for model_info in self._cached_models:
+
+        def _matches(model_info: Mapping[str, object]) -> bool:
             model_raw_id = str(model_info.get("id") or model_info.get("name") or "")
             if model_raw_id.removeprefix("models/").lower() == clean_target:
-                return model_info
+                return True
             raw_aliases = model_info.get("aliases")
-            if isinstance(raw_aliases, list) and any(
+            return isinstance(raw_aliases, list) and any(
                 str(a).lower() == clean_target for a in raw_aliases
-            ):
+            )
+
+        for model_info in self._cached_models:
+            if _matches(model_info):
+                return model_info
+        # Cold cache: fall back to the guaranteed static catalogue so thinking
+        # snapping / paid-tier detection still work before the first ListModels.
+        for model_info in (*_FALLBACK_MODELS, *_EXTRA_GUARANTEED_MODELS):
+            if _matches(model_info):
                 return model_info
         return None
 

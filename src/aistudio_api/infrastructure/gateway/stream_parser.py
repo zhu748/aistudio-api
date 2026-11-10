@@ -158,6 +158,9 @@ class IncrementalJSONStreamParser:
     """
 
     def __init__(self) -> None:
+        # 缓冲区与游标全部使用「绝对下标」，只在 feed 结束时压缩已消费前缀。
+        # 旧实现每切出一个 chunk 就 self.buffer = self.buffer[pos+1:]，
+        # 在大量小块场景下是 O(n²) 的字符串拷贝（实测 20k 分块耗时数十毫秒）。
         self.buffer: str = ""
         self.depth: int = 0
         self.in_string: bool = False
@@ -165,6 +168,8 @@ class IncrementalJSONStreamParser:
         self.chunk_start: int | None = None
         self.preamble_skipped: bool = False
         self._pos: int = 0
+        # 已消费前缀的长度，用于按需压缩 buffer
+        self._offset: int = 0
 
     @staticmethod
     def _parse_chunk(chunk_str: str) -> object | None:
@@ -173,14 +178,39 @@ class IncrementalJSONStreamParser:
         except (TypeError, ValueError):
             return _repair_truncated_json(chunk_str)
 
+    def _compact(self) -> None:
+        """丢弃已消费前缀，避免缓冲区随流长度无限增长。
+
+        只在 feed 末尾调用：此时剩余内容只是尚未形成完整分块的尾部，
+        因此整体复杂度仍是 O(已接收字节数)。
+        """
+        if self._offset == 0:
+            return
+        offset = self._offset
+        self.buffer = self.buffer[offset:]
+        self._pos -= offset
+        if self.chunk_start is not None:
+            self.chunk_start -= offset
+        self._offset = 0
+        if self._pos < 0:
+            self._pos = 0
+
     def feed(self, data: str) -> Generator[list[object], None, None]:
         self.buffer += data
 
         while True:
             if not self.preamble_skipped:
-                if self.buffer.startswith(XSSI_PREFIX):
-                    self.buffer = self.buffer[len(XSSI_PREFIX) :].lstrip()
-                elif XSSI_PREFIX.startswith(self.buffer):
+                rest = self.buffer[self._offset :]
+                if rest.startswith(XSSI_PREFIX):
+                    self._offset += len(XSSI_PREFIX)
+                    # XSSI 前缀后允许任意空白
+                    while (
+                        self._offset < len(self.buffer)
+                        and self.buffer[self._offset] in " \t\r\n"
+                    ):
+                        self._offset += 1
+                    self._pos = max(self._pos, self._offset)
+                elif XSSI_PREFIX.startswith(rest):
                     break
                 self.preamble_skipped = True
 
@@ -216,8 +246,8 @@ class IncrementalJSONStreamParser:
                     if self.depth == 2 and self.chunk_start is not None:
                         chunk_str = self.buffer[self.chunk_start : self._pos + 1]
                         parsed = self._parse_chunk(chunk_str)
-                        self.buffer = self.buffer[self._pos + 1 :]
-                        self._pos = 0
+                        self._offset = self._pos + 1
+                        self._pos = self._offset
                         self.chunk_start = None
                         made_progress = True
                         if isinstance(parsed, list):
@@ -227,6 +257,7 @@ class IncrementalJSONStreamParser:
                 self._pos += 1
 
             if not made_progress:
+                self._compact()
                 break
 
     def finish(self) -> Generator[list[object], None, None]:

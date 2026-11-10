@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import type { ModelProfileItem } from './types.ts'
 import {
   TOOL_SUGGESTIONS,
@@ -7,6 +7,7 @@ import {
   THINKING_LEVEL_OPTIONS,
   MEDIA_RESOLUTION_OPTIONS,
 } from './schema.ts'
+import { useConfirm } from '@/composables/useConfirm.ts'
 import ConfigSwitch from './ConfigSwitch.vue'
 import ConfigSelect from './ConfigSelect.vue'
 import ConfigInput from './ConfigInput.vue'
@@ -25,6 +26,7 @@ import {
 const props = defineProps<{
   profile: ModelProfileItem
   index: number
+  forceExpanded?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -32,10 +34,26 @@ const emit = defineEmits<{
   delete: []
 }>()
 
-const expanded = ref(true)
+const { confirm } = useConfirm()
+const expanded = ref(props.index === 0)
 
-function handleDelete() {
-  if (confirm(`确定要删除规则组 "${props.profile.name || 'unnamed'}" 吗？`)) {
+watch(
+  () => props.forceExpanded,
+  (val) => {
+    if (val !== undefined) {
+      expanded.value = val
+    }
+  },
+)
+
+async function handleDelete() {
+  const ok = await confirm({
+    title: '删除模型规则组',
+    message: `确定要删除规则组「${props.profile.name || 'unnamed'}」吗？`,
+    confirmText: '确认删除',
+    variant: 'danger',
+  })
+  if (ok) {
     emit('delete')
   }
 }
@@ -66,16 +84,16 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
 </script>
 
 <template>
-  <div class="bg-white border border-gray-200/90 rounded-2xl shadow-xs overflow-hidden transition-all">
+  <div class="bg-white border border-slate-200/90 rounded-xl shadow-2xs overflow-hidden transition-all">
     <!-- Header / Toggle -->
     <div
-      class="px-5 py-3.5 bg-gray-50/60 border-b border-gray-100 flex items-center justify-between gap-3 cursor-pointer select-none hover:bg-gray-100/60 transition-colors"
+      class="px-4 py-3 bg-slate-50/70 border-b border-slate-100 flex items-center justify-between gap-3 cursor-pointer select-none hover:bg-slate-100/60 transition-colors"
       @click="expanded = !expanded"
     >
       <div class="flex items-center gap-2.5 min-w-0">
         <button
           type="button"
-          class="text-gray-400 p-0.5 rounded hover:bg-gray-200/60 transition-colors"
+          class="text-slate-400 p-0.5 rounded hover:bg-slate-200/60 transition-colors"
         >
           <ChevronDown
             v-if="expanded"
@@ -87,23 +105,35 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
           />
         </button>
 
-        <div class="w-6 h-6 rounded-lg bg-brand-500 text-white flex items-center justify-center font-bold text-xs shrink-0 shadow-2xs">
+        <div class="w-6 h-6 rounded-md bg-slate-900 text-brand-400 flex items-center justify-center font-mono font-bold text-xs shrink-0 tabular-nums">
           {{ index + 1 }}
         </div>
 
         <div class="truncate">
-          <div class="flex items-center gap-2">
-            <span class="font-bold text-gray-900 text-xs font-mono">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="font-bold text-slate-900 text-xs font-mono">
               {{ profile.name || 'unnamed_profile' }}
             </span>
             <span
               v-if="profile.is_image_model"
-              class="px-2 py-0.2 text-[10px] font-semibold rounded-full bg-purple-100 text-purple-800"
+              class="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-sky-50 text-sky-700 border border-sky-200/70"
             >
-              生图模型规则
+              生图管线
+            </span>
+            <span
+              v-if="profile.disable_safety_settings"
+              class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-emerald-50 text-emerald-700 border border-emerald-200/70"
+            >
+              关闭安全规则
+            </span>
+            <span
+              v-if="profile.drop_unsupported_params"
+              class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-slate-100 text-slate-600 border border-slate-200/70"
+            >
+              过滤未知参数
             </span>
           </div>
-          <div class="text-[11px] text-gray-400 font-mono flex items-center gap-2 mt-0.5 truncate">
+          <div class="text-[11px] text-slate-400 font-mono flex items-center gap-2 mt-0.5 truncate">
             <span v-if="profile.match?.contains?.length">包含: {{ profile.match.contains.join(', ') }}</span>
             <span v-if="profile.match?.prefixes?.length">前缀: {{ profile.match.prefixes.join(', ') }}</span>
             <span v-if="profile.match?.exact?.length">精确: {{ profile.match.exact.join(', ') }}</span>
@@ -117,11 +147,11 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
       >
         <button
           type="button"
-          class="p-1.5 text-gray-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
+          class="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
           title="删除该规则预设"
           @click="handleDelete"
         >
-          <Trash2 class="w-4 h-4" />
+          <Trash2 class="w-3.5 h-3.5" />
         </button>
       </div>
     </div>
@@ -129,7 +159,7 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
     <!-- Body -->
     <div
       v-if="expanded"
-      class="p-5 space-y-5"
+      class="p-4 space-y-4"
     >
       <!-- Profile Name & Image Model Toggle -->
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -162,9 +192,9 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
       </div>
 
       <!-- Match Conditions -->
-      <div class="p-3.5 bg-gray-50/70 border border-gray-200/70 rounded-xl space-y-3">
+      <div class="p-3.5 bg-slate-50/70 border border-slate-200/70 rounded-xl space-y-3">
         <div class="flex items-center justify-between">
-          <div class="flex items-center gap-2 text-xs font-bold text-gray-800">
+          <div class="flex items-center gap-2 text-xs font-bold text-slate-800">
             <Layers class="w-4 h-4 text-brand-600" />
             <span>模型匹配规则</span>
           </div>
@@ -198,9 +228,9 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
       </div>
 
       <!-- Default Tools -->
-      <div class="p-3.5 bg-gray-50/70 border border-gray-200/70 rounded-xl space-y-2">
+      <div class="p-3.5 bg-slate-50/70 border border-slate-200/70 rounded-xl space-y-2">
         <div class="flex items-center justify-between">
-          <div class="flex items-center gap-2 text-xs font-bold text-gray-800">
+          <div class="flex items-center gap-2 text-xs font-bold text-slate-800">
             <Wrench class="w-4 h-4 text-brand-600" />
             <span>默认内置工具</span>
           </div>
@@ -216,9 +246,9 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
       </div>
 
       <!-- Generation Config Defaults -->
-      <div class="p-3.5 bg-gray-50/70 border border-gray-200/70 rounded-xl space-y-3">
+      <div class="p-3.5 bg-slate-50/70 border border-slate-200/70 rounded-xl space-y-3">
         <div class="flex items-center justify-between">
-          <div class="flex items-center gap-2 text-xs font-bold text-gray-800">
+          <div class="flex items-center gap-2 text-xs font-bold text-slate-800">
             <Cpu class="w-4 h-4 text-brand-600" />
             <span>生成参数默认值</span>
           </div>
@@ -320,7 +350,6 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
           />
         </div>
       </div>
-
 
       <!-- Safety Settings (If not completely disabled) -->
       <div v-if="!profile.disable_safety_settings">

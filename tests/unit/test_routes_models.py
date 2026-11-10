@@ -305,3 +305,31 @@ async def test_model_discovery_extended_fields_and_aliases():
     assert resp_model.temperature == 0.7
     assert resp_model.topP == 0.9
     assert resp_model.topK == 40
+
+
+def test_to_gemini_model_limits_are_parsed_and_bad_values_fall_back():
+    """上游 token 上限可能是字符串、脏值或缺失；映射必须稳健。"""
+    from aistudio_api.api.routes_models import _safe_int, _to_gemini_model
+
+    model = _to_gemini_model(
+        {"id": "gemini-x", "inputTokenLimit": "12345", "outputTokenLimit": 678}
+    )
+    assert model.inputTokenLimit == 12345
+    assert model.outputTokenLimit == 678
+
+    # 缺失走默认值
+    fallback = _to_gemini_model({"id": "gemini-y"})
+    assert fallback.inputTokenLimit == 1048576
+    assert fallback.outputTokenLimit == 8192
+
+    # 脏数据不再抛 ValueError/TypeError
+    dirty = _to_gemini_model(
+        {"id": "gemini-z", "inputTokenLimit": "N/A", "outputTokenLimit": {"a": 1}}
+    )
+    assert dirty.inputTokenLimit == 1048576
+    assert dirty.outputTokenLimit == 8192
+
+    # bool 是 int 的子类，但语义上不是合法上限
+    assert _safe_int(True, 7) == 7
+    assert _safe_int(None, 7) == 7
+    assert _safe_int("42", 7) == 42

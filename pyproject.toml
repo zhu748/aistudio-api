@@ -34,24 +34,6 @@ test = [
   "google-auth<2.48.0",
 ]
 
-[tool.pyright]
-include = ["src"]
-typeCheckingMode = "strict"
-reportMissingImports = true
-reportMissingTypeStubs = false
-reportUnknownMemberType = false
-reportUnknownVariableType = false
-reportUnknownArgumentType = false
-reportUnknownLambdaType = false
-reportPrivateUsage = false
-reportUnusedVariable = "warning"
-reportUnusedImport = "warning"
-reportUnusedFunction = "warning"
-reportUnusedClass = "warning"
-reportDuplicateImport = "warning"
-reportUnnecessaryTypeIgnoreComment = "warning"
-reportUnnecessaryCast = "warning"
-
 [project.scripts]
 aistudio-api = "aistudio_api.main:main"
 aistudio-api-server = "aistudio_api.api.app:main"

@@ -115,7 +115,7 @@ class JspbArray(list):
 
     def get_at(self, index: int, default: object = None) -> object:
         """Safely get element at index or return default if out of bounds."""
-        return self[index] if index < len(self) else default
+        return self[index] if 0 <= index < len(self) else default
 
     def compact(self, max_index: int | None = None) -> list[object]:
         """Return a plain list capped at max_index with trailing None values trimmed."""

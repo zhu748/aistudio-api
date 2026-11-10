@@ -18,40 +18,82 @@ if TYPE_CHECKING:
         AccountMeta,
         AccountStore,
     )
-from aistudio_api.infrastructure.gateway.model_defaults import normalize_model_name
+from aistudio_api.infrastructure.gateway.model_defaults import (
+    normalize_model_name,
+    resolve_tier_quota,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("rotator")
 
+# ZoneInfo("America/Los_Angeles") 需要系统 tzdata 或 tzdata 包。缺少时每次
+# 构造都会抛 ZoneInfoNotFoundError（还要试探 import tzdata），实测单次约
+# 108µs，而选路路径会为每个候选账号各调一次——属于纯浪费。
+# 这里只探测一次并缓存结果，缺失时走纯算术回退。
+# 注意：这两个是可变缓存，名字必须小写——pyright 会把全大写模块变量当作
+# 常量并拒绝 `global` 重赋值（reportConstantRedefinition）。
+_tz_probe_done = False
+_pacific_zone_cache: ZoneInfo | None = None
+
+
+def _pacific_zone() -> ZoneInfo | None:
+    global _tz_probe_done, _pacific_zone_cache
+    if not _tz_probe_done:
+        try:
+            _pacific_zone_cache = ZoneInfo("America/Los_Angeles")
+        except Exception:
+            _pacific_zone_cache = None
+        _tz_probe_done = True
+    return _pacific_zone_cache
+
+
+def _pacific_offset_seconds(utc_ts: float) -> int:
+    """无 tzdata 时的太平洋时间偏移（PST -8h / PDT -7h）。
+
+    按美国现行 DST 规则计算：3 月第二个周日 02:00 本地时间开始，
+    11 月第一个周日 02:00 本地时间结束。旧实现硬编码 -28800，
+    在 PDT 期间会偏移 1 小时。
+    """
+    dt = datetime.fromtimestamp(utc_ts, tz=UTC)
+    year = dt.year
+    march_first = datetime(year, 3, 1, tzinfo=UTC)
+    first_sunday_march = march_first + timedelta(days=(6 - march_first.weekday()) % 7)
+    dst_start = (first_sunday_march + timedelta(days=7)).replace(hour=10)  # 02:00 PST
+    nov_first = datetime(year, 11, 1, tzinfo=UTC)
+    first_sunday_nov = nov_first + timedelta(days=(6 - nov_first.weekday()) % 7)
+    dst_end = first_sunday_nov.replace(hour=9)  # 02:00 PDT
+    if dst_start <= dt < dst_end:
+        return -7 * 3600
+    return -8 * 3600
+
+
+def _pacific_datetime(ts: float | None = None) -> datetime:
+    """把 UTC 时间戳转成太平洋时间 datetime（有 tzdata 时用 ZoneInfo）。"""
+    stamp = time.time() if ts is None else ts
+    zone = _pacific_zone()
+    if zone is not None:
+        return datetime.fromtimestamp(stamp, tz=zone)
+    return datetime.fromtimestamp(stamp + _pacific_offset_seconds(stamp), tz=UTC)
+
 
 def get_pacific_date_key(ts: float | None = None) -> str:
     """获取美西太平洋时间（America/Los_Angeles）日期键值 YYYY-MM-DD。"""
-    try:
-        tz = ZoneInfo("America/Los_Angeles")
-        dt = datetime.fromtimestamp(ts or time.time(), tz=tz)
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        dt = datetime.fromtimestamp((ts or time.time()) - 28800, tz=UTC)
-        return dt.strftime("%Y-%m-%d")
+    return _pacific_datetime(ts).strftime("%Y-%m-%d")
 
 
 def get_seconds_until_pacific_midnight() -> float:
     """获取距离下一次美西太平洋时间午夜 00:00 的秒数。"""
-    try:
-        tz = ZoneInfo("America/Los_Angeles")
-        now_dt = datetime.now(tz)
+    zone = _pacific_zone()
+    if zone is not None:
+        now_dt = datetime.now(zone)
         tomorrow_dt = (now_dt + timedelta(days=1)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
         return max(0.0, (tomorrow_dt - now_dt).total_seconds())
-    except Exception:
-        # 保底计算
-        now = time.time()
-        pacific_offset = -28800  # UTC-8
-        now_pacific = now + pacific_offset
-        seconds_in_day = 86400
-        remaining = seconds_in_day - (int(now_pacific) % seconds_in_day)
-        return float(remaining)
+    # 保底计算：按当地时间整点取余（偏移已含 DST 修正）
+    now = time.time()
+    local = now + _pacific_offset_seconds(now)
+    return float(86400 - (local % 86400))
 
 
 def normalize_model_key(model: str | None) -> str | None:
@@ -426,6 +468,39 @@ class AccountStats:
         )
 
 
+@dataclass(frozen=True)
+class _RotatorWeights:
+    """选路打分所需的配置常量（一次解析，供全部候选复用）。"""
+
+    tier_weights: dict[str, float]
+    strategy: str
+    stickiness_bonus: float
+    stickiness_threshold: float
+    drip_penalty: float
+
+
+def _load_rotator_weights() -> _RotatorWeights:
+    """从 config.yaml 读取 rotator 打分权重并归一化为可直接比较的字典。"""
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_configured_rotator_settings,
+    )
+
+    rot_cfg = get_configured_rotator_settings()
+    raw_weights = rot_cfg["tier_weights"]
+    if not isinstance(raw_weights, dict):
+        raise RuntimeError("rotator 配置缺少 tier_weights 配置块")
+    tier_weights = {
+        str(k).strip().lower(): float(str(v)) for k, v in raw_weights.items()
+    }
+    return _RotatorWeights(
+        tier_weights=tier_weights,
+        strategy=str(rot_cfg.get("strategy") or "sticky").strip().lower(),
+        stickiness_bonus=float(str(rot_cfg["stickiness_bonus"])),
+        stickiness_threshold=float(str(rot_cfg["stickiness_threshold"])),
+        drip_penalty=float(str(rot_cfg["drip_penalty"])),
+    )
+
+
 class AccountRotator:
     """账号调度管理器。
 
@@ -672,12 +747,9 @@ class AccountRotator:
         stats: AccountStats,
         model: str | None,
         current_account_id: str | None,
+        rot_weights: _RotatorWeights | None = None,
     ) -> float:
         """评估候选账号权重，综合考虑配额使用率、订阅层级、错误历史与空闲时间，选择成本最低的可用账号。"""
-        from aistudio_api.infrastructure.gateway.model_defaults import (
-            resolve_tier_quota,
-        )
-
         quota = resolve_tier_quota(account.tier, model)
         m_stats = stats.get_model_daily(model)
         req_today = m_stats.requests
@@ -686,40 +758,25 @@ class AccountRotator:
         exhaustion_rate = req_today / max(1, quota)
 
         # 2. 调度配置与加权读取 (严格由 config.yaml 驱动，禁止硬编码与 fallback)
-        from aistudio_api.infrastructure.gateway.model_defaults import (
-            get_configured_rotator_settings,
-        )
-
-        rot_cfg = get_configured_rotator_settings()
-        raw_weights = rot_cfg["tier_weights"]
-        if not isinstance(raw_weights, dict):
-            raise RuntimeError("rotator 配置缺少 tier_weights 配置块")
+        # 权重配置对同一次选路的全部候选相同，由 get_next_account 一次取出后
+        # 传入，避免每个候选都重新解析一次 config.yaml（实测每次约 113µs）。
+        weights = rot_weights if rot_weights is not None else _load_rotator_weights()
         tier_clean = (account.tier or "Free").strip()
-        matched_weight = None
-        for k, v in raw_weights.items():
-            if str(k).lower() == tier_clean.lower():
-                matched_weight = float(str(v))
-                break
-        if matched_weight is None:
-            matched_weight = float(str(raw_weights.get("Free", 0.0)))
-        tier_weight = matched_weight
-
-        strategy = str(rot_cfg.get("strategy") or "sticky").strip().lower()
-        bonus_val = float(str(rot_cfg["stickiness_bonus"]))
-        stick_threshold = float(str(rot_cfg["stickiness_threshold"]))
-        drip_val = float(str(rot_cfg["drip_penalty"]))
+        tier_weight = weights.tier_weights.get(tier_clean.lower())
+        if tier_weight is None:
+            tier_weight = weights.tier_weights.get("free", 0.0)
 
         # 3. 黏性奖励：若启用 sticky 策略且当前账号为活跃账号且未超设定配额阈值，给予减分奖励
         stickiness_bonus = (
-            -bonus_val
+            -weights.stickiness_bonus
             if (
-                strategy == "sticky"
+                weights.strategy == "sticky"
                 and account.id == current_account_id
-                and exhaustion_rate < stick_threshold
+                and exhaustion_rate < weights.stickiness_threshold
             )
             else 0.0
         )
-        drip_penalty = drip_val if m_stats.drip_mode else 0.0
+        drip_penalty = weights.drip_penalty if m_stats.drip_mode else 0.0
 
         # 5. 错误与空闲时间
         now = time.time()
@@ -773,11 +830,13 @@ class AccountRotator:
                             return a
                 return candidates[0][0]
 
-            # 多维软打分选优
+            # 多维软打分选优。权重配置对全部候选相同，这里只解析一次
+            # （每个候选各解析一次 config.yaml 曾占选路耗时的一半以上）。
+            rot_weights = _load_rotator_weights()
             best_account, _ = min(
                 valid_candidates,
                 key=lambda item: self._score_candidate(
-                    item[0], item[1], model, current_account_id
+                    item[0], item[1], model, current_account_id, rot_weights
                 ),
             )
             if current_account_id and best_account.id != current_account_id:
@@ -810,13 +869,15 @@ class AccountRotator:
             self._stats[account_id] = AccountStats(account_id=account_id)
         self._stats[account_id].record_rate_limited(model)
         logger.warning("账号 %s 触发 429 限流: model=%s", account_id, model or "all")
+        # 429 冷却直接决定下一次选路，必须立即落盘（单次约 1-2ms）；
+        # 高放大倍数的 403/错误计数则走防抖，避免单请求阻塞事件循环。
         self.save_state()
 
     def record_error(self, account_id: str, model: str | None = None) -> None:
         if account_id not in self._stats:
             self._stats[account_id] = AccountStats(account_id=account_id)
         self._stats[account_id].record_error(model)
-        self.save_state()
+        self._schedule_debounced_save()
 
     def record_auth_error(
         self,
@@ -830,7 +891,9 @@ class AccountRotator:
             "账号 %s 触发 HTTP 403",
             account_id,
         )
-        self.save_state()
+        # 同一个请求在 403 重试链里可能连续记账 5 次；同步全量落盘会把
+        # 事件循环阻塞数十毫秒，因此与其他高频计数一样走防抖合并写入。
+        self._schedule_debounced_save()
 
     def record_session_expired(
         self,
@@ -841,6 +904,7 @@ class AccountRotator:
             self._stats[account_id] = AccountStats(account_id=account_id)
         self._stats[account_id].record_session_expired(model)
         logger.error("账号 %s 登录态失效，已隔离", account_id)
+        # 登录态失效是重要状态（会隔离账号），立即落盘而非防抖
         self.save_state()
 
     def clear_cooldown(self, account_id: str, model: str | None = None) -> None:
@@ -849,7 +913,11 @@ class AccountRotator:
             self._stats[account_id] = AccountStats(account_id=account_id)
         self._stats[account_id].clear_cooldown(model)
         logger.info("清除账号冷却: account=%s, model=%s", account_id, model)
-        self.save_state()
+        # 清除冷却是「恢复类」动作而不是故障记账：每次成功切号后
+        # account_orchestrator 都会调用它，同步全量落盘会给每次请求
+        # 无条件增加 1.4ms 的写盘开销。跨重启丢掉已清除的冷却只会让
+        # 账号多休息一会儿（下次选路仍会重新判定），不值得同步阻塞。
+        self._schedule_debounced_save()
 
     def clear_all_cooldowns(self) -> None:
         """清除全部账号的所有模型 429 锁定。"""

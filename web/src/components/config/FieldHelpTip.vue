@@ -28,7 +28,7 @@ const displayRecommended = props.recommended !== undefined ? props.recommended :
   >
     <button
       type="button"
-      class="text-gray-400 hover:text-brand-600 transition-colors p-0.5 rounded cursor-pointer"
+      class="text-slate-400 hover:text-brand-600 transition-colors p-0.5 rounded cursor-pointer"
       :title="displayTitle"
       @click.stop="show = !show"
     >
@@ -46,27 +46,27 @@ const displayRecommended = props.recommended !== undefined ? props.recommended :
     >
       <div
         v-if="show"
-        class="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 z-50 w-72 sm:w-80 bg-gray-900 text-gray-100 p-3.5 rounded-xl shadow-2xl border border-gray-700 text-xs space-y-2 pointer-events-auto"
+        class="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 z-50 w-72 sm:w-80 bg-slate-900 text-slate-100 p-3.5 rounded-xl shadow-2xl border border-slate-700 text-xs space-y-2 pointer-events-auto"
       >
-        <div class="flex items-center justify-between border-b border-gray-800 pb-1.5 font-bold text-brand-300">
+        <div class="flex items-center justify-between border-b border-slate-800 pb-1.5 font-bold text-brand-300">
           <span>{{ displayTitle }}</span>
           <span
             v-if="fieldDef?.tags?.length"
-            class="text-[10px] font-normal px-1.5 py-0.2 rounded bg-gray-800 text-gray-400"
+            class="text-[10px] font-normal px-1.5 py-0.5 rounded bg-slate-800 text-slate-400"
           >
             {{ fieldDef.tags.join(' · ') }}
           </span>
         </div>
 
-        <div class="text-gray-300 leading-relaxed text-[11px]">
+        <div class="text-slate-300 leading-relaxed text-[11px]">
           {{ displayContent }}
         </div>
 
         <div
           v-if="displayExplanation"
-          class="text-gray-400 text-[11px] leading-relaxed pt-1 border-t border-gray-800/80"
+          class="text-slate-400 text-[11px] leading-relaxed pt-1 border-t border-slate-800/80"
         >
-          <strong class="text-gray-300">业务原理:</strong> {{ displayExplanation }}
+          <strong class="text-slate-300">业务原理:</strong> {{ displayExplanation }}
         </div>
 
         <div
@@ -78,7 +78,7 @@ const displayRecommended = props.recommended !== undefined ? props.recommended :
         </div>
 
         <!-- Little Arrow -->
-        <div class="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-gray-900" />
+        <div class="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-slate-900" />
       </div>
     </Transition>
   </div>

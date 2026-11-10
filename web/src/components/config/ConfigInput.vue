@@ -33,12 +33,12 @@ function handleInput(e: Event) {
 <template>
   <div class="space-y-1.5">
     <div class="flex items-center justify-between">
-      <label class="block text-xs font-semibold text-gray-700">
+      <label class="block text-xs font-semibold text-slate-700">
         {{ label }}
       </label>
       <span
         v-if="description"
-        class="text-[11px] text-gray-400"
+        class="text-[11px] text-slate-400"
       >
         {{ description }}
       </span>
@@ -49,7 +49,7 @@ function handleInput(e: Event) {
       :value="modelValue ?? ''"
       :placeholder="placeholder"
       :disabled="disabled"
-      class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-mono outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all disabled:opacity-50"
+      class="w-full px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-mono outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all disabled:opacity-50"
       @input="handleInput"
     >
   </div>

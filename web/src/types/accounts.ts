@@ -66,6 +66,8 @@ export interface ImportCookiesRequest {
   account_id?: string
   auth_user?: string
   tier?: string
+  /** 可选：导入时直接绑定出口代理；也可写在 cookies 文本里由后端自动识别 */
+  proxy_url?: string | null
 }
 
 export interface ImportCookiesResponse {
@@ -74,11 +76,14 @@ export interface ImportCookiesResponse {
   cookie_count: number
   auth_user: string
   tier?: string
+  proxy_url?: string | null
 }
 
 export interface ProbeAndImportRequest {
   cookies: string
   name_prefix?: string
+  /** 可选：探测与后续请求共用该代理；留空则从 cookies 文本中自动识别 */
+  proxy_url?: string | null
 }
 
 export interface ProbeAndImportResponse {
@@ -93,6 +98,7 @@ export interface BundleAccountItem {
   cookies: string
   auth_user?: string
   tier?: string
+  proxy_url?: string | null
 }
 
 export interface ImportBundleRequest {

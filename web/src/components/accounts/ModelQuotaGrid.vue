@@ -19,30 +19,30 @@ function getModelDetail(modelKey: string): ModelDailyDetail | null {
 </script>
 
 <template>
-  <div class="mt-3 pt-3 border-t border-gray-100 space-y-2 bg-gray-50/80 p-3.5 rounded-xl">
-    <div class="flex items-center justify-between text-[11px] font-semibold text-gray-700">
+  <div class="mt-2.5 pt-2.5 border-t border-slate-100 space-y-2 bg-slate-50/70 p-3 rounded-lg">
+    <div class="flex items-center justify-between text-[11px] font-semibold text-slate-700">
       <span class="flex items-center gap-1.5">
-        <Flame class="w-3.5 h-3.5 text-amber-500" />
-        <span>各模型今日调用与配额</span>
+        <Flame class="w-3.5 h-3.5 text-brand-600" />
+        <span>模型今日配额消耗矩阵</span>
       </span>
-      <span class="text-gray-400 font-normal font-mono">
-        最后调用: {{ formatDate(account.last_used) }}
+      <span class="text-slate-400 font-normal font-mono tabular-nums">
+        最近活跃: {{ formatDate(account.last_used) }}
       </span>
     </div>
 
     <div
       v-if="account.model_requests && Object.keys(account.model_requests).length"
-      class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5 pt-1"
+      class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 pt-0.5"
     >
       <div
         v-for="(reqCount, modelKey) in account.model_requests"
         :key="String(modelKey)"
-        class="p-3 bg-white rounded-xl border border-gray-200/90 flex flex-col justify-between text-xs shadow-2xs gap-2"
+        class="p-2.5 bg-white rounded-lg border border-slate-200/90 flex flex-col justify-between text-xs shadow-2xs gap-1.5 tabular-nums"
       >
         <div>
           <div class="flex items-center justify-between gap-1 font-mono">
             <span
-              class="font-semibold text-gray-900 truncate text-[11px]"
+              class="font-semibold text-slate-900 truncate text-[11px]"
               :title="String(modelKey)"
             >
               {{ String(modelKey).replace(/^models\//, '') }}
@@ -60,7 +60,7 @@ function getModelDetail(modelKey: string): ModelDailyDetail | null {
               </button>
               <span
                 v-else-if="account.model_drip_mode && account.model_drip_mode[String(modelKey)]"
-                class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-50 text-blue-700 border border-blue-200"
+                class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-sky-50 text-sky-700 border border-sky-200"
               >
                 滴灌
               </span>
@@ -84,11 +84,11 @@ function getModelDetail(modelKey: string): ModelDailyDetail | null {
             v-if="getModelDetail(String(modelKey))"
             class="mt-2 space-y-1 font-mono text-[10px]"
           >
-            <div class="flex justify-between text-gray-500">
-              <span>今日调用: <strong>{{ reqCount }}</strong> / {{ getModelDetail(String(modelKey))!.configured_quota }}</span>
+            <div class="flex justify-between text-slate-500">
+              <span>今日调用 <strong class="text-slate-800">{{ reqCount }}</strong> / {{ getModelDetail(String(modelKey))!.configured_quota }}</span>
               <span>{{ Math.round(getModelDetail(String(modelKey))!.quota_used_percent) }}%</span>
             </div>
-            <div class="w-full bg-gray-100 rounded-full h-1.5 overflow-hidden">
+            <div class="w-full bg-slate-100 rounded-full h-1.5 overflow-hidden">
               <div
                 class="h-1.5 rounded-full transition-all duration-300"
                 :class="[
@@ -104,20 +104,20 @@ function getModelDetail(modelKey: string): ModelDailyDetail | null {
           </div>
           <div
             v-else
-            class="mt-1.5 text-[10px] text-gray-500 font-mono"
+            class="mt-1.5 text-[10px] text-slate-500 font-mono"
           >
-            今日调用: <strong>{{ reqCount }}</strong> 次
+            今日调用: <strong class="text-slate-800">{{ reqCount }}</strong> 次
           </div>
         </div>
 
         <!-- Token breakdown pills if available -->
         <div
           v-if="getModelDetail(String(modelKey)) && (getModelDetail(String(modelKey))!.reasoning_tokens > 0 || getModelDetail(String(modelKey))!.cached_tokens > 0)"
-          class="pt-1.5 border-t border-gray-100 flex items-center gap-1.5 flex-wrap font-mono text-[10px]"
+          class="pt-1.5 border-t border-slate-100 flex items-center gap-1.5 flex-wrap font-mono text-[10px]"
         >
           <span
             v-if="getModelDetail(String(modelKey))!.reasoning_tokens > 0"
-            class="inline-flex items-center gap-0.5 text-purple-700 bg-purple-50 px-1.5 py-0.2 rounded border border-purple-200/50"
+            class="inline-flex items-center gap-0.5 text-brand-700 bg-brand-50 px-1.5 py-0.5 rounded border border-brand-200/50"
             title="思考推理 Token"
           >
             <Brain class="w-2.5 h-2.5" />
@@ -125,7 +125,7 @@ function getModelDetail(modelKey: string): ModelDailyDetail | null {
           </span>
           <span
             v-if="getModelDetail(String(modelKey))!.cached_tokens > 0"
-            class="inline-flex items-center gap-0.5 text-teal-700 bg-teal-50 px-1.5 py-0.2 rounded border border-teal-200/50"
+            class="inline-flex items-center gap-0.5 text-sky-700 bg-sky-50 px-1.5 py-0.5 rounded border border-sky-200/50"
             title="命中缓存 Token"
           >
             <Database class="w-2.5 h-2.5" />
@@ -136,7 +136,7 @@ function getModelDetail(modelKey: string): ModelDailyDetail | null {
     </div>
     <div
       v-else
-      class="text-[11px] text-gray-400 italic py-1"
+      class="text-[11px] text-slate-400 py-1"
     >
       今日暂无模型调用记录
     </div>

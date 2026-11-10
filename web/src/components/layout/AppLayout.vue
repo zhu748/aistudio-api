@@ -18,9 +18,32 @@ const sidebarOpen = ref(false)
 const tokenModalOpen = ref(false)
 const refreshing = ref(false)
 
-const currentTitle = computed(() => {
-  const t = route.meta.title
-  return typeof t === 'string' ? t.replace(' - AI Studio Proxy', '') : 'AI Studio Proxy'
+const routeMetaMap: Record<string, { title: string; subtitle: string }> = {
+  '/': {
+    title: '控制面板',
+    subtitle: '实时监控多账号轮询状态、模型调用吞吐与配额水位',
+  },
+  '/accounts': {
+    title: '账号凭据池',
+    subtitle: '管理 Google AI Studio 会话凭据、订阅等级探测与模型 429 冷却',
+  },
+  '/settings': {
+    title: '系统与协议配置',
+    subtitle: '配置日志转储、抗截断传输、WAA 签名引擎、客户端密钥与模型映射规则',
+  },
+  '/logs': {
+    title: '实时运行日志',
+    subtitle: 'SSE 环形缓冲日志流，支持按级别订阅与全文实时检索',
+  },
+}
+
+const currentHeader = computed(() => {
+  return (
+    routeMetaMap[route.path] || {
+      title: typeof route.meta.title === 'string' ? route.meta.title.replace(' - AI Studio Proxy', '') : 'AI Studio Proxy',
+      subtitle: '',
+    }
+  )
 })
 
 async function handleRefresh() {
@@ -33,7 +56,7 @@ async function handleRefresh() {
       systemStore.fetchRotation(),
       systemStore.checkHealth(),
     ])
-    toast.success('数据已刷新')
+    toast.success('网关状态与统计数据已同步')
   } finally {
     refreshing.value = false
   }
@@ -41,7 +64,7 @@ async function handleRefresh() {
 </script>
 
 <template>
-  <div class="min-h-screen bg-gray-50 flex">
+  <div class="min-h-screen bg-slate-50 flex">
     <ToastContainer />
 
     <!-- Sidebar -->
@@ -52,16 +75,17 @@ async function handleRefresh() {
     />
 
     <!-- Main Content Area -->
-    <div class="flex-1 lg:pl-64 flex flex-col min-w-0">
+    <div class="flex-1 lg:pl-60 flex flex-col min-w-0">
       <Topbar
-        :title="currentTitle"
+        :title="currentHeader.title"
+        :subtitle="currentHeader.subtitle"
         :refreshing="refreshing"
         @toggle-sidebar="sidebarOpen = !sidebarOpen"
         @open-token-modal="tokenModalOpen = true"
         @refresh="handleRefresh"
       />
 
-      <main class="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto">
+      <main class="flex-1 p-4 sm:p-6 max-w-7xl w-full mx-auto">
         <slot />
       </main>
     </div>

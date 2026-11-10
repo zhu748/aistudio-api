@@ -119,6 +119,68 @@ async def test_remote_proof_signer_retry_on_network_error():
 
 
 @pytest.mark.asyncio
+async def test_remote_proof_signer_retries_gateway_unavailable():
+    """502/503/504 属于网关级瞬时不可用：应丢弃旧连接、退避后重试并成功。"""
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(503, text="service unavailable")
+        return httpx.Response(
+            200,
+            json={"ok": True, "proof": "!mock_after_gateway_retry"},
+        )
+
+    signer = RemoteProofSigner(server_url="https://mock.proof.server")
+    orig_client = httpx.AsyncClient
+
+    with patch(
+        "aistudio_api.infrastructure.waa.signer.httpx.AsyncClient",
+        side_effect=lambda **kwargs: orig_client(
+            transport=httpx.MockTransport(handler), **kwargs
+        ),
+    ):
+        proof = await signer.mint_proof(
+            cookies={"SAPISID": "valid_cookie"},
+            prompt="gateway retry",
+        )
+
+    assert attempts == 2
+    assert proof == "!mock_after_gateway_retry"
+    await signer.close()
+
+
+@pytest.mark.asyncio
+async def test_remote_proof_signer_does_not_retry_business_500():
+    """500 携带业务语义（如 Cookie 失效），重试只会重复失败，应一次即抛。"""
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(500, json={"ok": False, "error": "Cookie expired"})
+
+    signer = RemoteProofSigner(server_url="https://mock.proof.server")
+    orig_client = httpx.AsyncClient
+
+    with (
+        patch(
+            "aistudio_api.infrastructure.waa.signer.httpx.AsyncClient",
+            side_effect=lambda **kwargs: orig_client(
+                transport=httpx.MockTransport(handler), **kwargs
+            ),
+        ),
+        pytest.raises(TransportError, match="Cookie expired"),
+    ):
+        await signer.mint_proof(cookies={"SAPISID": "expired"}, prompt="no retry")
+
+    assert attempts == 1
+    await signer.close()
+
+
+@pytest.mark.asyncio
 async def test_waa_signer_facade():
     """Verify WaaSigner delegates generate_snapshot to RemoteProofSigner."""
     signer = WaaSigner(proof_server_url="https://mock.proof.server")

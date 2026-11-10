@@ -210,3 +210,75 @@ model_defaults:
         ).drop_unsupported_params
         is True
     )
+
+
+def test_canonicalize_model_alias_resolves_known_aliases():
+    """别名必须解析到 canonical id，且解析后解析出的默认值与原 id 一致。
+
+    回归点：resolve_model_defaults 旧实现直接用 normalize_model_name，别名
+    （如 nano-banana）拿不到 image 模型 profile，is_image_model 判为 False。
+    """
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        canonicalize_model_alias,
+        normalize_model_name,
+        resolve_model_defaults,
+    )
+
+    pairs = {
+        "nano-banana": "gemini-3.1-flash-lite-image",
+        "nano-banana-pro": "gemini-3-pro-image",
+        "gemini-3.1-flash-image-preview": "gemini-3.1-flash-image",
+    }
+    for alias, canonical in pairs.items():
+        assert canonicalize_model_alias(alias) == canonical
+
+    # 稳定 key 归一化器绝不能改写别名（账号轮换的统计/冷却 key 依赖它）
+    assert normalize_model_name("nano-banana") == "nano-banana"
+
+    # 别名与 canonical 解析出的默认值一致
+    alias_defaults = resolve_model_defaults("nano-banana")
+    canonical_defaults = resolve_model_defaults("gemini-3.1-flash-lite-image")
+    assert alias_defaults == canonical_defaults
+    assert alias_defaults.is_image_model is True
+
+    # 未知名字原样返回
+    assert canonicalize_model_alias("totally-unknown-model") == "totally-unknown-model"
+    assert canonicalize_model_alias("") == ""
+
+
+def test_resolve_tier_quota_is_memoized_and_invalidated_by_mtime(tmp_path):
+    """额度解析被记忆化（/stats 与选路热路径），但配置变更必须立即生效。"""
+    import os
+
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        invalidate_config_cache,
+        resolve_tier_quota,
+    )
+
+    config_path = tmp_path / "config.yaml"
+
+    def _write_limit(limit: int, mtime: int) -> None:
+        config_path.write_text(
+            f"""
+tier_quotas:
+  Pro:
+    default_limit: {limit}
+""",
+            encoding="utf-8",
+        )
+        os.utime(config_path, (mtime, mtime))
+
+    _write_limit(77, 1_700_000_000)
+    assert resolve_tier_quota("Pro", "gemini-3.7-flash", config_path=config_path) == 77
+
+    # 同内容重复调用走缓存
+    assert resolve_tier_quota("Pro", "gemini-3.7-flash", config_path=config_path) == 77
+
+    # mtime 变化即失效
+    _write_limit(123, 1_700_000_100)
+    assert resolve_tier_quota("Pro", "gemini-3.7-flash", config_path=config_path) == 123
+
+    # 显式 invalidate 后仍然读到磁盘上的最新值
+    _write_limit(9, 1_700_000_200)
+    invalidate_config_cache()
+    assert resolve_tier_quota("Pro", "gemini-3.7-flash", config_path=config_path) == 9

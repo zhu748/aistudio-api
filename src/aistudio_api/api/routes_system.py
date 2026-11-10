@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import time
 from collections.abc import Mapping, Sequence
@@ -21,9 +22,12 @@ from aistudio_api.api.response_models import (
 )
 from aistudio_api.infrastructure.gateway.model_defaults import (
     _resolve_config_path,
+    config_file_write_lock,
     invalidate_config_cache,
 )
+from aistudio_api.infrastructure.utils.common import atomic_write_text
 from aistudio_api.infrastructure.utils.logger import get_logger
+from aistudio_api.infrastructure.waa.daemon import is_local_signer_url
 
 logger = get_logger("routes.system")
 
@@ -32,6 +36,11 @@ if TYPE_CHECKING:
 
 public_router = APIRouter()
 protected_router = APIRouter()
+
+# config.yaml 的所有读-改-写路径（整文件保存、API Key 增删改备注）共用一把锁：
+# 这些端点都是「read_text → 改内存 → 整文件覆盖」，并发请求会互相抹掉对方的改动。
+# 锁定义在 model_defaults.config_file_write_lock，与那 5 个配置写函数共用同一把，
+# 否则跨模块并发（面板保存 YAML 同时切换 WAA 节点）仍会互相覆盖。
 
 
 def health_response() -> HealthResponse:
@@ -316,8 +325,10 @@ async def update_config_yaml(req: ConfigYamlUpdateRequest) -> dict[str, object]:
         raise HTTPException(400, detail=f"YAML 语法格式错误: {e}") from e
     config_yaml_path = _resolve_config_path(None)
     try:
-        config_yaml_path.write_text(req.yaml_content, encoding="utf-8")
-        invalidate_config_cache()
+        # 原子替换：直接 write_text 时进程被中断会留下半截 YAML，下次启动即解析失败。
+        with config_file_write_lock():
+            atomic_write_text(config_yaml_path, req.yaml_content)
+            invalidate_config_cache()
 
         if isinstance(parsed, dict) and "logging" in parsed:
             raw_logging = parsed["logging"]
@@ -387,9 +398,7 @@ async def get_signer_servers() -> dict[str, object]:
 
     waa = get_configured_waa_settings()
     # 运行时实际生效节点（含运行时覆盖/环境变量），与 client/session 的取值逻辑对齐
-    active_id = str(
-        get_active_waa_server().get("id") or "local_spidermonkey"
-    ).strip()
+    active_id = str(get_active_waa_server().get("id") or "local_spidermonkey").strip()
     env_override = os.getenv("AISTUDIO_WAA_SERVER", "").strip()
     runtime_override = get_runtime_waa_override()
     raw_servers = waa.get("servers")
@@ -451,7 +460,7 @@ async def switch_signer_server(req: SwitchSignerServerRequest) -> dict[str, obje
     # 切到本地节点：懒启动本地守护进程（缺失时自动回退远程并写回配置）
     active = get_active_waa_server()
     active_url = str(active.get("url") or "")
-    if "127.0.0.1" in active_url or "localhost" in active_url:
+    if is_local_signer_url(active_url):
         from aistudio_api.infrastructure.waa.daemon import ensure_signer_ready
 
         ensure_signer_ready()
@@ -461,7 +470,6 @@ async def switch_signer_server(req: SwitchSignerServerRequest) -> dict[str, obje
         from aistudio_api.infrastructure.waa.daemon import stop_signer_daemon
 
         stop_signer_daemon()
-
     env_override = os.getenv("AISTUDIO_WAA_SERVER", "").strip()
     runtime_override = get_runtime_waa_override()
     note: str | None = None
@@ -516,7 +524,7 @@ async def reset_signer_server() -> dict[str, object]:
     # 覆盖清除后回到默认节点：远端则停掉本地守护，本地则懒启动
     active = get_active_waa_server()
     active_url = str(active.get("url") or "")
-    if "127.0.0.1" in active_url or "localhost" in active_url:
+    if is_local_signer_url(active_url):
         from aistudio_api.infrastructure.waa.daemon import ensure_signer_ready
 
         ensure_signer_ready()
@@ -584,17 +592,44 @@ async def test_signer_server(req: TestSignerServerRequest) -> dict[str, object]:
     """
     import json as _json
     import time
+    from urllib.parse import urlparse
 
     import httpx
 
     from aistudio_api.config import settings
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_configured_waa_settings,
+    )
 
     target_url = req.url.rstrip("/")
-    is_local = "127.0.0.1" in target_url or "localhost" in target_url
+    parsed = urlparse(target_url)
+    host = (parsed.hostname or "").lower()
+
+    # 安全：仅允许探测已在 config.yaml 登记的 WAA 节点，且只放行
+    # http(s) 协议。此前用子串判断 "127.0.0.1"/"localhost" 既挡不住
+    # 127.0.0.1.evil.com 这类绕过，也把任意用户 URL 当成了合法目标（SSRF）。
+    waa_cfg = get_configured_waa_settings()
+    raw_servers = waa_cfg.get("servers")
+    allowed_urls: set[str] = set()
+    for s in raw_servers if isinstance(raw_servers, list) else []:
+        if isinstance(s, dict):
+            allowed_urls.add(str(s.get("url") or "").rstrip("/"))
+    # 兜底：无配置时至少放行内置默认节点
+    allowed_urls.add("http://127.0.0.1:8081")
+    allowed_urls.add("https://waa.spinsnow.fun")
+
+    if parsed.scheme not in ("http", "https") or target_url not in allowed_urls:
+        return {
+            "ok": False,
+            "error": "目标地址未在签名服务器配置中登记，拒绝探测",
+            "elapsed_ms": 0.0,
+        }
+
+    is_local = host in ("127.0.0.1", "localhost", "::1")
     proxy = None if is_local else settings.proxy_url
 
     def _extract_active_cookies() -> str:
-        """从当前活跃账号取核心 Cookie，用于新版协议的深度探活。"""
+        """从当前活跃账号取核心 Cookie，仅用于本机节点的新版协议深度探活。"""
         try:
             from aistudio_api.infrastructure.account.account_store import (
                 AccountStore,
@@ -611,9 +646,7 @@ async def test_signer_server(req: TestSignerServerRequest) -> dict[str, object]:
             auth_path = store.get_auth_path_optional(active.id, require_exists=True)
             if not auth_path:
                 return ""
-            cookies = filter_minimal_cookies(
-                load_cookies_from_auth_file(auth_path)
-            )
+            cookies = filter_minimal_cookies(load_cookies_from_auth_file(auth_path))
             return "; ".join(f"{k}={v}" for k, v in cookies.items() if v)
         except Exception:
             return ""
@@ -637,22 +670,31 @@ async def test_signer_server(req: TestSignerServerRequest) -> dict[str, object]:
                 err_text = str(data.get("error") or body_text).lower()
                 if "cookies" in err_text:
                     is_ok = True
-                    note = (
-                        "服务在线（新版协议要求探活携带 Cookie，"
-                        "携带活跃账号 Cookie 复测中）"
-                    )
-                    # 携带活跃账号 Cookie 复测，获取完整池化状态
-                    cookie_header = _extract_active_cookies()
-                    if cookie_header:
-                        try:
-                            resp2 = await client.get(
-                                f"{target_url}/health",
-                                headers={"X-Google-Cookies": cookie_header},
-                            )
-                            if resp2.status_code == 200:
-                                data = resp2.json()
-                        except Exception:
-                            pass
+                    if is_local:
+                        note = (
+                            "服务在线（新版协议要求探活携带 Cookie，"
+                            "携带活跃账号 Cookie 复测中）"
+                        )
+                        # 仅对本机节点携带活跃账号 Cookie 复测，获取完整池化状态
+                        cookie_header = _extract_active_cookies()
+                        if cookie_header:
+                            try:
+                                resp2 = await client.get(
+                                    f"{target_url}/health",
+                                    headers={"X-Google-Cookies": cookie_header},
+                                )
+                                if resp2.status_code == 200:
+                                    data = resp2.json()
+                            except Exception:
+                                pass
+                    else:
+                        # 安全：绝不向远程节点外发活跃账号的核心 Cookie。
+                        # 配置里登记的节点仍可能被面板/被篡改的配置注入，
+                        # 因此把凭据外发面收敛到本机回环地址。
+                        note = (
+                            "服务在线（新版协议要求探活携带 Cookie；"
+                            "安全策略禁止向远程节点发送账号 Cookie）"
+                        )
                 else:
                     note = str(data.get("error") or body_text)
             elif is_ok:
@@ -741,7 +783,24 @@ async def clear_runtime_logs() -> dict[str, object]:
     removed = clear_recent_logs()
     logger.info("内存日志缓冲已清空: 清除条数=%d", removed)
     stats = get_log_buffer_stats()
-    return {"ok": True, "removed": removed, "total": stats["size"], "capacity": stats["capacity"]}
+    return {
+        "ok": True,
+        "removed": removed,
+        "total": stats["size"],
+        "capacity": stats["capacity"],
+    }
+
+
+@protected_router.post("/api/logs/stream-ticket")
+async def create_log_stream_ticket() -> dict[str, object]:
+    """签发一次性 SSE 票据，供浏览器 EventSource 通过 URL 携带鉴权。
+
+    管理密码不应出现在 URL 中（会残留在浏览器历史、代理访问日志与 Referer 中），
+    因此前端先用请求头完成鉴权，换取短时（30 秒）且仅能使用一次的票据。
+    """
+    from aistudio_api.api.dependencies import issue_stream_ticket
+
+    return {"ok": True, "ticket": issue_stream_ticket()}
 
 
 @protected_router.get("/api/logs/stream")
@@ -755,7 +814,8 @@ async def stream_runtime_logs(
     - ``level``: 最低日志级别过滤（连接期间固定，切换级别由前端重连实现）
     - ``limit``: 初始历史快照条数上限（1~500）
     - 鉴权复用 ``require_web_auth``：浏览器 EventSource 无法携带自定义请求头，
-      因此可通过 ``?key=`` 查询参数传递管理密码（鉴权依赖原生支持该方式）
+      因此前端先用请求头调用 ``POST /api/logs/stream-ticket`` 换取一次性票据，
+      再通过 ``?ticket=`` 携带。管理密码不会出现在 URL 中。
     - 空闲期每 20 秒发送一次 ``ping`` 心跳事件（附带缓冲统计），
       既防止反向代理层超时断连，也作为前端 total/capacity 的低频刷新源
 
@@ -989,9 +1049,7 @@ def _anti_truncation_payload(
         "tool_name": str(settings.get("tool_name") or "router_emit"),
         "variants": {
             "enabled": bool(variants.get("enabled", False)),
-            "models": [
-                str(m) for m in (variants.get("models") or [])
-            ],
+            "models": [str(m) for m in (variants.get("models") or [])],
         },
         "available_models": available,
     }
@@ -1103,35 +1161,38 @@ async def create_api_key(req: CreateApiKeyRequest) -> ApiKeyItemModel:
     name = req.name.strip() if req.name.strip() else "API Key"
 
     config_path = _resolve_config_path(None)
-    content = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    parsed = yaml.safe_load(content) or {}
-    if not isinstance(parsed, dict):
-        parsed = {}
+    with config_file_write_lock():
+        content = (
+            config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        )
+        parsed = yaml.safe_load(content) or {}
+        if not isinstance(parsed, dict):
+            parsed = {}
 
-    raw_keys = parsed.get("api_keys")
-    new_list: list[dict[str, str]] = []
-    if isinstance(raw_keys, list):
-        for item in raw_keys:
-            if isinstance(item, dict):
-                new_list.append(
-                    {
-                        "name": str(item.get("name") or "API Key"),
-                        "key": str(item.get("key") or ""),
-                        "created_at": str(item.get("created_at") or ""),
-                    }
-                )
-            elif isinstance(item, str) and item.strip():
-                new_list.append(
-                    {"name": "API Key", "key": item.strip(), "created_at": ""}
-                )
+        raw_keys = parsed.get("api_keys")
+        new_list: list[dict[str, str]] = []
+        if isinstance(raw_keys, list):
+            for item in raw_keys:
+                if isinstance(item, dict):
+                    new_list.append(
+                        {
+                            "name": str(item.get("name") or "API Key"),
+                            "key": str(item.get("key") or ""),
+                            "created_at": str(item.get("created_at") or ""),
+                        }
+                    )
+                elif isinstance(item, str) and item.strip():
+                    new_list.append(
+                        {"name": "API Key", "key": item.strip(), "created_at": ""}
+                    )
 
-    new_list.append({"name": name, "key": new_key, "created_at": created_at})
-    parsed["api_keys"] = new_list
+        new_list.append({"name": name, "key": new_key, "created_at": created_at})
+        parsed["api_keys"] = new_list
 
-    config_path.write_text(
-        yaml.dump(parsed, allow_unicode=True, sort_keys=False), encoding="utf-8"
-    )
-    invalidate_config_cache()
+        atomic_write_text(
+            config_path, yaml.dump(parsed, allow_unicode=True, sort_keys=False)
+        )
+        invalidate_config_cache()
 
     logger.info("创建 API Key: 备注=%s, 前缀=%s", name, new_key[:8] + "...")
     return ApiKeyItemModel(name=name, key=new_key, created_at=created_at)
@@ -1142,39 +1203,46 @@ async def delete_api_key(key_value: str) -> dict[str, bool]:
     """在 config.yaml 中删除指定 API Key。"""
 
     config_path = _resolve_config_path(None)
-    content = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    parsed = yaml.safe_load(content) or {}
-    if not isinstance(parsed, dict):
-        raise HTTPException(404, detail="未找到 API Key")
+    with config_file_write_lock():
+        content = (
+            config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        )
+        parsed = yaml.safe_load(content) or {}
+        if not isinstance(parsed, dict):
+            raise HTTPException(404, detail="未找到 API Key")
 
-    raw_keys = parsed.get("api_keys")
-    new_list: list[dict[str, str]] = []
-    found = False
-    if isinstance(raw_keys, list):
-        for item in raw_keys:
-            item_key = str(item.get("key") if isinstance(item, dict) else item).strip()
-            if item_key == key_value:
-                found = True
-                continue
-            if isinstance(item, dict):
-                new_list.append(
-                    {
-                        "name": str(item.get("name") or "API Key"),
-                        "key": item_key,
-                        "created_at": str(item.get("created_at") or ""),
-                    }
-                )
-            elif item_key:
-                new_list.append({"name": "API Key", "key": item_key, "created_at": ""})
+        raw_keys = parsed.get("api_keys")
+        new_list: list[dict[str, str]] = []
+        found = False
+        if isinstance(raw_keys, list):
+            for item in raw_keys:
+                item_key = str(
+                    item.get("key") if isinstance(item, dict) else item
+                ).strip()
+                if item_key == key_value:
+                    found = True
+                    continue
+                if isinstance(item, dict):
+                    new_list.append(
+                        {
+                            "name": str(item.get("name") or "API Key"),
+                            "key": item_key,
+                            "created_at": str(item.get("created_at") or ""),
+                        }
+                    )
+                elif item_key:
+                    new_list.append(
+                        {"name": "API Key", "key": item_key, "created_at": ""}
+                    )
 
-    if not found:
-        raise HTTPException(404, detail="未找到该 API Key")
+        if not found:
+            raise HTTPException(404, detail="未找到该 API Key")
 
-    parsed["api_keys"] = new_list
-    config_path.write_text(
-        yaml.dump(parsed, allow_unicode=True, sort_keys=False), encoding="utf-8"
-    )
-    invalidate_config_cache()
+        parsed["api_keys"] = new_list
+        atomic_write_text(
+            config_path, yaml.dump(parsed, allow_unicode=True, sort_keys=False)
+        )
+        invalidate_config_cache()
 
     logger.info("删除 API Key: 前缀=%s", key_value[:8] + "...")
     return {"ok": True}
@@ -1187,43 +1255,48 @@ async def update_api_key_name(
     """在 config.yaml 中更新指定 API Key 的备注名。"""
 
     config_path = _resolve_config_path(None)
-    content = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    parsed = yaml.safe_load(content) or {}
-    if not isinstance(parsed, dict):
-        raise HTTPException(404, detail="未找到 API Key")
+    with config_file_write_lock():
+        content = (
+            config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        )
+        parsed = yaml.safe_load(content) or {}
+        if not isinstance(parsed, dict):
+            raise HTTPException(404, detail="未找到 API Key")
 
-    raw_keys = parsed.get("api_keys")
-    new_list: list[dict[str, str]] = []
-    updated_item: ApiKeyItemModel | None = None
-    new_name = req.name.strip() if req.name.strip() else "API Key"
+        raw_keys = parsed.get("api_keys")
+        new_list: list[dict[str, str]] = []
+        updated_item: ApiKeyItemModel | None = None
+        new_name = req.name.strip() if req.name.strip() else "API Key"
 
-    if isinstance(raw_keys, list):
-        for item in raw_keys:
-            item_key = str(item.get("key") if isinstance(item, dict) else item).strip()
-            created = str(item.get("created_at") if isinstance(item, dict) else "")
-            if item_key == key_value:
-                updated_item = ApiKeyItemModel(
-                    name=new_name, key=item_key, created_at=created or None
-                )
-                new_list.append(
-                    {"name": new_name, "key": item_key, "created_at": created}
-                )
-            else:
-                name_val = str(
-                    item.get("name") if isinstance(item, dict) else "API Key"
-                )
-                new_list.append(
-                    {"name": name_val, "key": item_key, "created_at": created}
-                )
+        if isinstance(raw_keys, list):
+            for item in raw_keys:
+                item_key = str(
+                    item.get("key") if isinstance(item, dict) else item
+                ).strip()
+                created = str(item.get("created_at") if isinstance(item, dict) else "")
+                if item_key == key_value:
+                    updated_item = ApiKeyItemModel(
+                        name=new_name, key=item_key, created_at=created or None
+                    )
+                    new_list.append(
+                        {"name": new_name, "key": item_key, "created_at": created}
+                    )
+                else:
+                    name_val = str(
+                        item.get("name") if isinstance(item, dict) else "API Key"
+                    )
+                    new_list.append(
+                        {"name": name_val, "key": item_key, "created_at": created}
+                    )
 
-    if not updated_item:
-        raise HTTPException(404, detail="未找到该 API Key")
+        if not updated_item:
+            raise HTTPException(404, detail="未找到该 API Key")
 
-    parsed["api_keys"] = new_list
-    config_path.write_text(
-        yaml.dump(parsed, allow_unicode=True, sort_keys=False), encoding="utf-8"
-    )
-    invalidate_config_cache()
+        parsed["api_keys"] = new_list
+        atomic_write_text(
+            config_path, yaml.dump(parsed, allow_unicode=True, sort_keys=False)
+        )
+        invalidate_config_cache()
     logger.info("更新 API Key 备注: 前缀=%s, 备注=%s", key_value[:8] + "...", new_name)
 
     return updated_item

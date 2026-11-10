@@ -8,6 +8,7 @@ without local browser or heavy JavaScript runtime dependencies.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import re
 import time
@@ -26,6 +27,24 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 logger = get_logger("waa.signer")
 
 DEFAULT_PROOF_SERVER_URL = "https://waa.spinsnow.fun"
+
+# Per-task storage: WaaSigner/RemoteProofSigner is shared across concurrent
+# requests. A plain instance attribute lets one request's proof headers be
+# overwritten by another task before generate_snapshot_with_headers reads them,
+# mismatching the proof with the headers and leaking cookies across accounts.
+_LAST_HEADERS: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "aistudio_waa_last_headers", default=None
+)
+
+
+def _retry_delay(attempt: int) -> float:
+    """指数退避：0.5s、1.0s……上限 2s（签名服务抖动通常秒级恢复）。"""
+    return min(2.0, 0.5 * (2 ** (attempt - 1)))
+
+
+# 仅这些网关级状态码代表「上游瞬时不可用」，可安全退避重试。
+# 500 常带业务语义（Cookie 失效等），重试只会重复同一失败。
+_RETRYABLE_GATEWAY_STATUS = frozenset({502, 503, 504})
 
 
 def extract_content_digest(contents: list[AistudioContent]) -> tuple[str, str]:
@@ -65,8 +84,16 @@ class RemoteProofSigner:
         self.server_url = server_url.rstrip("/")
         self.proxy_url = proxy_url
         self.timeout = timeout
-        self.last_headers: dict[str, str] = {}
         self._client: httpx.AsyncClient | None = None
+
+    @property
+    def last_headers(self) -> dict[str, str]:
+        """Return dynamic headers minted by the *current* asyncio task."""
+        return _LAST_HEADERS.get() or {}
+
+    @last_headers.setter
+    def last_headers(self, value: dict[str, str]) -> None:
+        _LAST_HEADERS.set(value)
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or lazily initialize shared HTTP client with connection pooling."""
@@ -140,9 +167,31 @@ class RemoteProofSigner:
                 elapsed_ms = (time.perf_counter() - t0) * 1000
 
                 if resp.status_code != 200:
-                    raise TransportError(
-                        f"Remote proof server returned HTTP {resp.status_code}: {resp.text[:300]}"
+                    detail = (
+                        f"Remote proof server returned HTTP {resp.status_code}: "
+                        f"{resp.text[:300]}"
                     )
+                    if (
+                        resp.status_code in _RETRYABLE_GATEWAY_STATUS
+                        and attempt < max_attempts
+                    ):
+                        # 仅网关级瞬时不可用（502/503/504，通常为重启或过载）值得退避重试；
+                        # 500 多数携带业务语义（如 Cookie 失效），重试只会重复失败，
+                        # 4xx 同理，故直接上抛。
+                        last_error = TransportError(detail)
+                        logger.warning(
+                            "签名服务 %d (%d/%d): server=%s, proxy=%s, detail=%s",
+                            resp.status_code,
+                            attempt,
+                            max_attempts,
+                            self.server_url,
+                            self._masked_proxy(),
+                            resp.text[:300],
+                        )
+                        await self.close()
+                        await asyncio.sleep(_retry_delay(attempt))
+                        continue
+                    raise TransportError(detail)
 
                 data = resp.json()
                 if not data.get("ok") or not data.get("proof"):
@@ -178,7 +227,7 @@ class RemoteProofSigner:
                 # Reset client on connection errors to discard stale connections
                 await self.close()
                 if attempt < max_attempts:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(_retry_delay(attempt))
             except TransportError:
                 raise
             except Exception as e:
@@ -190,8 +239,10 @@ class RemoteProofSigner:
                     self.server_url,
                     e,
                 )
+                # 同一 client 可能已处于坏状态（连接池污染/半关闭），丢掉重建。
+                await self.close()
                 if attempt < max_attempts:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(_retry_delay(attempt))
 
         raise TransportError(
             f"Remote proof minting failed after {max_attempts} attempts "
