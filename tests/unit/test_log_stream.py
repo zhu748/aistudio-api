@@ -257,13 +257,22 @@ async def test_stream_level_filter_blocks_lower_levels():
         test_log.info("不应推送 %s", info_marker)
         test_log.warning("应当推送 %s", warn_marker)
 
+        # 标记日志有两条合法到达通道：ready 之后、生成器恢复执行之前写入
+        # 的日志会同时进入历史快照（snapshot 事件，对象身份去重后不再作为
+        # log 事件重发）与订阅队列，实际走哪条取决于事件循环调度顺序——
+        # Python 3.11 的 wait_for 会把 __anext__ 包成 Task，订阅回调
+        # call_soon_threadsafe 先执行，快照读取时标记已在环形缓冲中；
+        # 3.12+ 则内联 await，快照先读、随后经 queue.get() 以 log 事件
+        # 送达。增量通道本身由
+        # test_stream_protocol_ready_snapshot_live_and_cleanup 单独覆盖。
         for _ in range(20):
             event, payload = await _next_event(agen)
             collected.append(str(payload))
-            if event == "log" and warn_marker in str(payload):
+            if event in ("log", "snapshot") and warn_marker in str(payload):
                 found_warn = True
                 break
         assert found_warn
+        # INFO 级别日志无论走快照还是增量通道都必须被过滤掉
         assert all(info_marker not in c for c in collected)
     finally:
         await agen.aclose()
