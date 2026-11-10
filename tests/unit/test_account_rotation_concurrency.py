@@ -125,7 +125,9 @@ async def test_account_stats_clear_cooldown_resets_counter():
     stats.record_rate_limited(model="gemini-2.5-pro")
     stats.record_rate_limited(model="gemini-2.5-pro")
     assert not stats.is_available("gemini-2.5-pro")
-    assert stats.get_cooldown_remaining("gemini-2.5-pro") > 60.0
+    # 注意边界：冷却被设为恰好 60s，断言用 > 59.0 而非 > 60.0，
+    # 否则时钟走过的几十微秒会让 rem=59.9999x 而偶发失败。
+    assert stats.get_cooldown_remaining("gemini-2.5-pro") > 59.0
 
     # 手动清除冷却
     stats.clear_cooldown(model="gemini-2.5-pro")
@@ -386,7 +388,10 @@ async def test_model_requests_midnight_reset():
 
 @pytest.mark.asyncio
 async def test_ensure_authorization_header_concurrency_and_fallback():
-    """并发请求或异常时，_ensure_authorization_header 绝不丢失已有 Authorization 头部。"""
+    """并发请求或异常时，_ensure_authorization_header 绝不丢失已有 Authorization 头部。
+
+    L4 修复后该函数为纯同步函数（原声明 async 但无任何 await）。
+    """
     from aistudio_api.infrastructure.gateway.transport import (
         _ensure_authorization_header,
     )
@@ -396,7 +401,7 @@ async def test_ensure_authorization_header_concurrency_and_fallback():
         "Authorization": "SAPISIDHASH 1789397237_abcdef0123456789",
     }
 
-    result = await _ensure_authorization_header(headers, auth_user="0")
+    result = _ensure_authorization_header(headers, auth_user="0")
     assert "Authorization" in result
     assert result["Authorization"] == "SAPISIDHASH 1789397237_abcdef0123456789"
     assert result["X-Goog-AuthUser"] == "0"

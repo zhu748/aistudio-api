@@ -544,24 +544,61 @@ class AccountRotator:
         except Exception as e:
             logger.warning("读取账号统计失败 (%s): %s", state_file, e)
 
-    def save_state(self) -> None:
-        """持久化保存账号调度与统计状态。"""
-        if not settings.persist_rotator:
-            return
+    def _snapshot_state(self) -> dict[str, dict[str, object]]:
+        """在调用线程对 _stats 做一致性快照。
+
+        落盘被下放线程池后，直接在工作线程迭代 self._stats 会与事件循环上
+        record_* 的新账号插入发生 "dict changed size during iteration" 竞争；
+        先在事件循环线程快照（to_dict 纯内存无 IO），再让线程只做文件写入。
+        """
+        return {acc_id: stats.to_dict() for acc_id, stats in self._stats.items()}
+
+    def _persist_state(self, payload: dict[str, dict[str, object]]) -> None:
+        """纯文件写入部分（可安全在线程池执行）。"""
         state_file = resolve_rotator_state_file()
         try:
-            payload = {acc_id: stats.to_dict() for acc_id, stats in self._stats.items()}
             atomic_write_json(state_file, payload)
             self._last_saved_time = time.time()
         except Exception as e:
             logger.warning("保存账号统计失败 (%s): %s", state_file, e)
+
+    def save_state(self) -> None:
+        """持久化保存账号调度与统计状态（同步写，供无事件循环的上下文直接调用）。"""
+        if not settings.persist_rotator:
+            return
+        self._persist_state(self._snapshot_state())
+
+    def _save_state_offloaded(self) -> None:
+        """[事件循环线程调用] 先快照再把文件 I/O 下放线程池，不阻塞事件循环。
+
+        复用 _save_task 去重：飞行中的任务执行时会重新快照最新统计，
+        立即重排只会产生并发写竞争；同时保证同一时刻只有一个写者。
+        """
+        if not settings.persist_rotator:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # 无事件循环（同步上下文/测试）：退化为直接写
+            self.save_state()
+            return
+        if self._save_task is not None and not self._save_task.done():
+            return
+
+        async def _offload() -> None:
+            payload = self._snapshot_state()
+            await asyncio.to_thread(self._persist_state, payload)
+
+        self._save_task = loop.create_task(_offload())
 
     def _schedule_debounced_save(self, delay: float = 2.0) -> None:
         if not settings.persist_rotator:
             return
         now = time.time()
         if now - self._last_saved_time >= 5.0:
-            self.save_state()
+            # 距上次落盘已久：立即落盘，但同样下放线程池（原本同步写盘
+            # 会阻塞请求路径上的事件循环）。
+            self._save_state_offloaded()
             return
 
         try:
@@ -575,7 +612,9 @@ class AccountRotator:
 
         async def _delayed():
             await asyncio.sleep(delay)
-            self.save_state()
+            # 快照在事件循环线程做，仅文件写入入线程池（save_state 同理）
+            payload = self._snapshot_state()
+            await asyncio.to_thread(self._persist_state, payload)
 
         self._save_task = loop.create_task(_delayed())
 
@@ -869,9 +908,10 @@ class AccountRotator:
             self._stats[account_id] = AccountStats(account_id=account_id)
         self._stats[account_id].record_rate_limited(model)
         logger.warning("账号 %s 触发 429 限流: model=%s", account_id, model or "all")
-        # 429 冷却直接决定下一次选路，必须立即落盘（单次约 1-2ms）；
-        # 高放大倍数的 403/错误计数则走防抖，避免单请求阻塞事件循环。
-        self.save_state()
+        # 429 冷却直接决定下一次选路，必须立即落盘（内存状态已即时生效，
+        # 落盘下放线程池防抖去重）；高放大倍数的 403/错误计数则走防抖，
+        # 避免单请求阻塞事件循环。
+        self._save_state_offloaded()
 
     def record_error(self, account_id: str, model: str | None = None) -> None:
         if account_id not in self._stats:
@@ -905,7 +945,7 @@ class AccountRotator:
         self._stats[account_id].record_session_expired(model)
         logger.error("账号 %s 登录态失效，已隔离", account_id)
         # 登录态失效是重要状态（会隔离账号），立即落盘而非防抖
-        self.save_state()
+        self._save_state_offloaded()
 
     def clear_cooldown(self, account_id: str, model: str | None = None) -> None:
         """清除指定账号的 429 锁定。"""

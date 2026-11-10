@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -16,8 +17,10 @@ from typing import ClassVar
 from aistudio_api.infrastructure.utils.common import atomic_write_json
 
 
-def _atomic_write_json(path: Path, data: object) -> None:
-    atomic_write_json(path, data, compact=True)
+def _atomic_write_json(path: Path, data: object, *, private: bool = True) -> None:
+    # 账号目录下的 auth.json/meta.json/registry.json 全部含凭据或会话
+    # 指纹，默认收紧为 0600（3.13）。
+    atomic_write_json(path, data, compact=True, private=private)
 
 
 # 默认搜索路径（与 config.py 保持一致）
@@ -67,6 +70,42 @@ def _generate_account_id() -> str:
     import secrets
 
     return f"acc_{secrets.token_hex(4)}"
+
+
+# auth.json Cookie 加载的 mtime 缓存（P9）：save_account 每次保存都会触发
+# 兄弟账号锚点同步，批量导入 M 个账号时要重读全部 N 个 auth.json（O(M×N)
+# 次文件读）。按 (路径, mtime) 缓存加载结果后，只有真正变化的文件需要重读。
+_auth_cookie_cache: dict[Path, tuple[float, dict[str, str], str]] = {}
+_auth_cookie_cache_lock = threading.Lock()
+
+
+def _load_auth_cookies_cached(
+    auth_path: Path,
+) -> tuple[dict[str, str], str] | None:
+    """mtime 缓存的 auth.json 读取，返回 (cookies, session_anchor) 或 None。"""
+    from aistudio_api.infrastructure.account.cookie_parser import (
+        compute_session_anchor,
+        load_cookies_from_auth_file,
+    )
+
+    try:
+        mtime = auth_path.stat().st_mtime
+    except OSError:
+        return None
+    with _auth_cookie_cache_lock:
+        cached = _auth_cookie_cache.get(auth_path)
+        if cached is not None and cached[0] == mtime:
+            return cached[1], cached[2]
+    cdict = load_cookies_from_auth_file(auth_path)
+    if not cdict:
+        return None
+    anchor = compute_session_anchor(cdict)
+    with _auth_cookie_cache_lock:
+        # 简单防膨胀：账号数有限（数百级），超过阈值时整体重建
+        if len(_auth_cookie_cache) > 4096:
+            _auth_cookie_cache.clear()
+        _auth_cookie_cache[auth_path] = (mtime, cdict, anchor)
+    return cdict, anchor
 
 
 @dataclass
@@ -243,7 +282,10 @@ class AccountStore:
         self._presets_path = self._accounts_dir / "presets.json"
         self._registry: Registry | None = None
         self._presets: dict[str, AccountPreset] | None = None
-        self._lock = threading.Lock()
+        # RLock：update_account_cookies 等复合读改写序列需要全程持锁，
+        # 而序列内部还要调用同样加锁的 _load_registry/_save_registry，
+        # 同线程重入必须被允许（3.4）。
+        self._lock = threading.RLock()
         # 一旦检测到损坏的 registry.json 即置位：隔离后文件不再存在，后续
         # _load_registry 若只靠 exists() 判断就会静默返回空注册表，进而把
         # {"accounts": {}} 写回磁盘。该标志让「拒绝静默清空」在所有后续调用
@@ -252,6 +294,22 @@ class AccountStore:
         self._ensure_dirs()
         self._ensure_default_presets()
         self._initialized = True
+        # 清扫上次 SIGKILL/掉电可能残留的原子写临时文件（含完整凭据，3.13）
+        with contextlib.suppress(Exception):
+            from aistudio_api.infrastructure.utils.common import cleanup_stale_tmp_files
+
+            removed = cleanup_stale_tmp_files(
+                self._accounts_dir, pattern="auth.json.tmp.*"
+            ) + cleanup_stale_tmp_files(
+                self._accounts_dir, pattern="registry.json.tmp.*"
+            )
+            for acc_dir in self._accounts_dir.iterdir():
+                if acc_dir.is_dir():
+                    removed += cleanup_stale_tmp_files(acc_dir, pattern="*.tmp.*")
+            if removed:
+                logging.getLogger("account_store").info(
+                    "已清扫 %d 个残留临时凭据文件", removed
+                )
 
     def _ensure_dirs(self) -> None:
         """确保目录存在。"""
@@ -443,7 +501,44 @@ class AccountStore:
         notes: str = "",
         proxy_url: str | None = None,
     ) -> AccountMeta:
-        """保存新账号。"""
+        """保存新账号。
+
+        多文件读-改-写序列（auth.json/meta.json/registry/兄弟账号同步）全程
+        持锁：与 update_account_cookies 的线程安全契约对齐，否则一旦出现
+        线程池调用方（类本身声明线程安全）就会并发回写互相覆盖丢 Cookie。
+        self._lock 为 RLock，内部 _load/_save_registry/_sync_sibling_cookies_locked
+        可重入不受影响。
+        """
+        with self._lock:
+            return self._save_account_locked(
+                name=name,
+                email=email,
+                storage_state=storage_state,
+                account_id=account_id,
+                auth_user=auth_user,
+                cookie_id=cookie_id,
+                tier=tier,
+                enabled=enabled,
+                group=group,
+                notes=notes,
+                proxy_url=proxy_url,
+            )
+
+    def _save_account_locked(
+        self,
+        name: str,
+        email: str | None,
+        storage_state: dict[str, object],
+        account_id: str | None = None,
+        auth_user: str = "0",
+        cookie_id: str | None = None,
+        tier: str = "Free",
+        enabled: bool = True,
+        group: str = "default",
+        notes: str = "",
+        proxy_url: str | None = None,
+    ) -> AccountMeta:
+        """save_account 的持锁实现（调用方必须已持有 self._lock）。"""
         registry = self._load_registry()
         now = datetime.now(UTC).isoformat()
         created_at = now
@@ -622,8 +717,6 @@ class AccountStore:
         """同步共享同一浏览器会话 (SAPISID / SID) 的多登兄弟账号 (u/0..u/N) 的滚动 Cookie。"""
         from aistudio_api.infrastructure.account.cookie_parser import (
             ROTATING_SESSION_COOKIE_NAMES,
-            compute_session_anchor,
-            load_cookies_from_auth_file,
         )
 
         groups: dict[str, list[tuple[AccountMeta, Path, dict[str, str]]]] = {}
@@ -634,11 +727,13 @@ class AccountStore:
                 continue
             if not auth_path.is_file():
                 continue
-            cdict = load_cookies_from_auth_file(auth_path)
-            if not cdict:
+            # mtime 缓存加载（P9）：批量导入时 save_account 逐个触发同步，
+            # 若每次都全量重读所有 auth.json 就是 O(M×N) 次文件读。
+            cached_load = _load_auth_cookies_cached(auth_path)
+            if cached_load is None:
                 continue
-            anchor = compute_session_anchor(cdict)
-            if not anchor:
+            cdict, anchor = cached_load
+            if not cdict or not anchor:
                 continue
             groups.setdefault(anchor, []).append((acc, auth_path, cdict))
 
@@ -700,14 +795,34 @@ class AccountStore:
         new_cookies: dict[str, str],
         rotated_at: float | None = None,
     ) -> list[str]:
-        """将更新后的 Cookie 写回目标账号及其同源多登兄弟账号 (u/0..u/N) 的 auth.json。"""
+        """将更新后的 Cookie 写回目标账号及其同源多登兄弟账号 (u/0..u/N) 的 auth.json。
+
+        全程持锁（3.4）：同锚点兄弟账号的读盘-合并-写回序列若不互斥，
+        并发回写会互相覆盖导致轮换 Cookie 丢失、后续请求 403。
+        """
+        if not new_cookies:
+            return []
+
+        with self._lock:
+            return self._update_account_cookies_locked(
+                account_id,
+                auth_file=auth_file,
+                new_cookies=new_cookies,
+                rotated_at=rotated_at,
+            )
+
+    def _update_account_cookies_locked(
+        self,
+        account_id: str | None,
+        *,
+        auth_file: str | Path | None,
+        new_cookies: dict[str, str],
+        rotated_at: float | None,
+    ) -> list[str]:
         from aistudio_api.infrastructure.account.cookie_parser import (
             compute_session_anchor,
             load_cookies_from_auth_file,
         )
-
-        if not new_cookies:
-            return []
 
         registry = self._load_registry()
         target_id = account_id
@@ -753,8 +868,10 @@ class AccountStore:
                 continue
             if not apath.is_file():
                 continue
-            cur_cookies = load_cookies_from_auth_file(apath)
-            cur_anchor = compute_session_anchor(cur_cookies)
+            cached_load = _load_auth_cookies_cached(apath)
+            if cached_load is None:
+                continue
+            cur_cookies, cur_anchor = cached_load
 
             is_target = bool(target_id and acc_id == target_id)
             is_same_cid = bool(target_cid and acc.cookie_id == target_cid)

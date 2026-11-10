@@ -28,14 +28,36 @@ export const useAccountsStore = defineStore('accounts', () => {
   const applyingPresetId = ref<string | null>(null)
   const activeId = computed(() => activeAccount.value?.id || '')
 
+  // 按 id 复用行对象引用（P8）：轮询每 8s 全量替换数组时，若账号数据与其
+  // 调度统计均未变化，复用上一次的对象引用，避免几百账号 × 每账号模型
+  // 配额网格的整棵组件树全量重渲染。字段值均为原始类型，浅比较即可。
+  const rowCache = new Map<string, AccountWithStats>()
+
+  function sameFields(fresh: Record<string, unknown>, prev: Record<string, unknown>): boolean {
+    for (const k of Object.keys(fresh)) {
+      if (fresh[k] !== prev[k]) return false
+    }
+    return true
+  }
+
   const accountRows = computed<AccountWithStats[]>(() => {
-    return accounts.value.map((a) => {
+    const nextCache = new Map<string, AccountWithStats>()
+    const rows = accounts.value.map((a) => {
       const rot = rotationAccounts.value[a.id] || {}
-      return {
-        ...a,
-        ...rot,
+      const rotFields = rot as unknown as Record<string, unknown>
+      const prev = rowCache.get(a.id)
+      const prevFields = prev as unknown as Record<string, unknown>
+      if (prev && sameFields(a as unknown as Record<string, unknown>, prevFields) && sameFields(rotFields, prevFields)) {
+        nextCache.set(a.id, prev)
+        return prev
       }
+      const row = { ...a, ...rot } as AccountWithStats
+      nextCache.set(a.id, row)
+      return row
     })
+    rowCache.clear()
+    for (const [k, v] of nextCache) rowCache.set(k, v)
+    return rows
   })
 
   // 请求代次：轮询与操作后的 fetchAll 可能乱序返回，只让最新一次写状态。

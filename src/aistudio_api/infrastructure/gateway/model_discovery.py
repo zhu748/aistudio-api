@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
@@ -715,7 +716,20 @@ class ModelDiscoveryService:
         self._cache_ttl = cache_ttl_seconds
         self._cached_models: list[dict[str, object]] = []
         self._last_fetched_at: float = 0.0
-        self._lock = asyncio.Lock()
+        # 锁按事件循环惰性创建：模块级单例在 import 时创建 asyncio.Lock，
+        # 若被多个事件循环先后使用（测试、内嵌场景），第二个 loop 上 acquire
+        # 会永久挂起或抛 "bound to a different event loop"。与 transport 层
+        # 的 _get_client_lock 同方案。
+        self._lock: asyncio.Lock | None = None
+        self._lock_loop: asyncio.AbstractEventLoop | None = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """返回与当前事件循环绑定的拉取互斥锁。"""
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._lock_loop is not loop:
+            self._lock = asyncio.Lock()
+            self._lock_loop = loop
+        return self._lock
 
     async def get_models(
         self,
@@ -734,7 +748,7 @@ class ModelDiscoveryService:
         ):
             return self._cached_models
 
-        async with self._lock:
+        async with self._get_lock():
             # 双重检查
             if (
                 not force_refresh
@@ -793,13 +807,24 @@ class ModelDiscoveryService:
                         logger.info("已更新上游模型列表: count=%d", len(merged))
                         return merged
                 except Exception as e:
-                    logger.debug("拉取模型列表失败: %s", e)
+                    logger.warning(
+                        "拉取上游模型列表失败，将使用本地缓存/内置列表: %s", e
+                    )
+                    # 有旧缓存但拉取失败时也写短 TTL 负缓存：否则 _last_fetched_at
+                    # 不更新，后续每次 get_models 都会重新拿锁、对已挂掉的上游
+                    # 发 10s 超时请求并在锁上串行堆积，拖慢所有 /models 请求。
+                    if self._cached_models:
+                        self._last_fetched_at = (
+                            time.time() - self._cache_ttl + 60.0
+                        )
             # 3. 保底返回本地默认模型列表（含本地补充模型）
             if not self._cached_models:
                 self._cached_models = _merge_extra_models(
                     [dict(m) for m in _FALLBACK_MODELS]
                 )
-                self._last_fetched_at = time.time()
+                # 上游拉取失败且无缓存时只给短 TTL，避免启动时一次瞬时网络故障
+                # 导致 10 分钟内不再尝试上游（L1）。
+                self._last_fetched_at = time.time() - self._cache_ttl + 60.0
 
             return self._cached_models
 
@@ -808,18 +833,24 @@ class ModelDiscoveryService:
     ) -> Mapping[str, object] | None:
         """根据 model_id 或模型别名获取单个模型元数据（含保底匹配）。"""
         discovered = await self.get_models(session=session)
-        clean_target = model_id.removeprefix("models/")
+        # 与 get_cached_model_info 一致地大小写不敏感，避免同一别名仅因大小写
+        # 不同在两个入口一个命中一个 404。
+        clean_target = model_id.removeprefix("models/").lower()
         for model_info in discovered:
             model_raw_id = str(model_info.get("id") or model_info.get("name") or "")
-            model_clean_id = model_raw_id.removeprefix("models/")
+            model_clean_id = model_raw_id.removeprefix("models/").lower()
             if model_clean_id == clean_target:
                 return model_info
             raw_aliases = model_info.get("aliases")
-            if isinstance(raw_aliases, list) and clean_target in raw_aliases:
+            if (
+                isinstance(raw_aliases, list)
+                and clean_target
+                in [str(a).lower() for a in raw_aliases]
+            ):
                 return model_info
         for model_info in (*_FALLBACK_MODELS, *_EXTRA_GUARANTEED_MODELS):
             model_raw_id = str(model_info.get("id") or model_info.get("name") or "")
-            model_clean_id = model_raw_id.removeprefix("models/")
+            model_clean_id = model_raw_id.removeprefix("models/").lower()
             if model_clean_id == clean_target:
                 return model_info
         return None
@@ -993,10 +1024,34 @@ class ModelDiscoveryService:
         from aistudio_api.config import settings
 
         url = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ListModels"
-        async with httpx.AsyncClient(timeout=10.0, proxy=settings.proxy_url) as client:
+        # 复用 transport 层的共享 SSLContext 与 h2 探测：裸建 AsyncClient 会
+        # 每次重新枚举系统证书库（Windows 上单次 0.7~1.4s）且丢失 HTTP/2。
+        from aistudio_api.infrastructure.gateway.transport import (
+            _http2_enabled,
+            _shared_ssl_context,
+        )
+
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            proxy=settings.proxy_url,
+            http2=_http2_enabled(),
+            verify=_shared_ssl_context(),
+        ) as client:
             resp = await client.post(url, headers=headers, content="[]")
             if resp.status_code == 200:
-                return self._parse_raw_models(resp.json())
+                # batchexecute 系端点响应携带 XSSI 防护前缀 )]}}'，
+                # 必须先剥离再解析（与 GenerateContent/GetAiStudioBenefitTier 同法）。
+                text = resp.text.strip()
+                if text.startswith(")]}'"):
+                    text = text[4:].lstrip()
+                try:
+                    raw_data = json.loads(text)
+                except json.JSONDecodeError as e:
+                    logger.warning(
+                        "ListModels 响应 JSON 解析失败（已剥离 XSSI 前缀）: %s", e
+                    )
+                    return []
+                return self._parse_raw_models(raw_data)
         return []
 
     def _parse_raw_models(self, raw_data: object) -> list[dict[str, object]]:

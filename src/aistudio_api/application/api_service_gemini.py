@@ -26,6 +26,7 @@ from aistudio_api.application.account_orchestrator import (
     try_switch_account,
 )
 from aistudio_api.application.anti_truncation import (
+    _close_stream_quietly,
     prepare_anti_truncation,
     resolve_model_variant,
     restore_anti_truncation_output,
@@ -69,6 +70,9 @@ class Auth403RetryManager:
         self.count: int = 0
         self.max_retries: int = max_retries
         self.current_prepared: PreparedRequest | None = None
+        # 本次请求实际服务的账号（3.9 记账串号修复）：由请求循环在每次
+        # 尝试发送前刷新，403 记账用它而非收尾时的全局活跃账号。
+        self.serving_account_id: str | None = None
 
     async def handle_403(
         self,
@@ -87,7 +91,9 @@ class Auth403RetryManager:
         # 每次 403 重试都记账会让单个请求放大成 5 次惩罚（auth_errors*200 权重），
         # 同一请求首个 403 已足以让账号降权，后续重试只做恢复动作、不重复记罚。
         if self.count == 1:
-            record_rotator_event("auth_error", model=model)
+            record_rotator_event(
+                "auth_error", model=model, account_id=self.serving_account_id
+            )
 
         # 1. 前 2 次 403: 重放已签名请求
         if self.count <= 2:
@@ -104,15 +110,24 @@ class Auth403RetryManager:
             self.current_prepared = None
             if self.count == 3:
                 account_svc = runtime_state.account_service
-                active_acc = account_svc.get_active_account() if account_svc else None
+                # 用本管理器记录的“本次请求实际服务账号”而非全局活跃账号：
+                # 并发请求下全局活跃账号可能已被其他请求切走，轮换错误的
+                # 账号既救不了当前请求还会污染无关账号的 Cookie。
+                target_acc = None
+                if self.serving_account_id and account_svc and hasattr(
+                    account_svc, "get_account"
+                ):
+                    target_acc = account_svc.get_account(self.serving_account_id)
+                if target_acc is None and account_svc:
+                    target_acc = account_svc.get_active_account()
                 if (
                     account_svc is not None
-                    and active_acc is not None
+                    and target_acc is not None
                     and hasattr(account_svc, "rotate_account_cookies")
                 ):
                     try:
                         session = getattr(client, "session", None)
-                        await account_svc.rotate_account_cookies(active_acc.id, session)
+                        await account_svc.rotate_account_cookies(target_acc.id, session)
                     except Exception:
                         pass
             logger.warning(
@@ -126,8 +141,17 @@ class Auth403RetryManager:
         if self.count == 5:
             self.current_prepared = None
             account_svc = runtime_state.account_service
-            active_acc = account_svc.get_active_account() if account_svc else None
-            failed_id = active_acc.id if active_acc else None
+            # 同上：failed_id 优先取本请求实际服务的账号，避免把无关账号
+            # 从候选池里排除（串号修复的 403 路径残留）。
+            failed_id = None
+            if self.serving_account_id and account_svc and hasattr(
+                account_svc, "get_account"
+            ):
+                failed_acc = account_svc.get_account(self.serving_account_id)
+                failed_id = failed_acc.id if failed_acc else self.serving_account_id
+            if failed_id is None and account_svc:
+                active_acc = account_svc.get_active_account()
+                failed_id = active_acc.id if active_acc else None
             if await try_switch_account(model=model, failed_account_id=failed_id):
                 logger.warning(
                     "HTTP 403 切换备用账号重试: model=%s",
@@ -258,7 +282,10 @@ def classify_gemini_error_payload(exc: Exception) -> tuple[int, str, str]:
         return 502, str(exc), "UNAVAILABLE"
     if isinstance(exc, AistudioError):
         return 500, str(exc), "INTERNAL"
-    return 500, str(exc), "INTERNAL"
+    # 未分类异常（KeyError 等）：str(exc) 可能泄漏内部路径与账号标识，
+    # 对外只给固定文案，原始异常进日志（3.15）。
+    logger.error("未分类异常转为 500（对外脱敏）: %s: %s", type(exc).__name__, exc)
+    return 500, "Internal server error", "INTERNAL"
 
 
 async def handle_attempt_exception(
@@ -268,15 +295,28 @@ async def handle_attempt_exception(
     model_path: str,
     normalized_model: str | None,
     has_yielded_data: bool = False,
+    serving_account_id: str | None = None,
 ) -> bool:
     """Handle per-attempt error classification and account switching.
+
+    serving_account_id 为本次尝试实际服务的账号（3.9 记账串号修复）。
 
     Returns True if the operation should be retried, or raises HTTPException / re-raises.
     """
     target_model = normalized_model or model_path
     account_svc = runtime_state.account_service
-    active_acc = account_svc.get_active_account() if account_svc else None
-    failed_id = active_acc.id if active_acc else None
+    # 统一解析「本次尝试实际服务的账号」：serving_account_id 存在时用它
+    # （避免并发下全局活跃账号串号），否则回退全局活跃账号。
+    # 修复：原实现只在 else 分支赋值 active_acc，serving_account_id 非空的
+    # 正常路径下 SessionExpiredError 分支引用 active_acc 会 UnboundLocalError，
+    # 导致「登录态失效→探活轮换→切号」链路整体失效。
+    serving_acc = None
+    if serving_account_id and account_svc and hasattr(account_svc, "get_account"):
+        serving_acc = account_svc.get_account(serving_account_id)
+        failed_id = serving_acc.id if serving_acc else serving_account_id
+    else:
+        serving_acc = account_svc.get_active_account() if account_svc else None
+        failed_id = serving_acc.id if serving_acc else None
 
     if isinstance(exc, ValueError):
         raise HTTPException(
@@ -284,7 +324,7 @@ async def handle_attempt_exception(
         ) from exc
 
     if isinstance(exc, SessionExpiredError):
-        if not has_yielded_data and account_svc is not None and active_acc is not None:
+        if not has_yielded_data and account_svc is not None and serving_acc is not None:
             # 遇到 401 时先探活会话并尝试轮换滚动 Cookie，若拿到新 PSIDTS 则原地重试
             try:
                 from aistudio_api.infrastructure.account.cookie_parser import (
@@ -292,7 +332,7 @@ async def handle_attempt_exception(
                     probe_aistudio_session,
                 )
 
-                auth_path = account_svc.get_account_auth_path(active_acc.id)
+                auth_path = account_svc.get_account_auth_path(serving_acc.id)
                 cdict = load_cookies_from_auth_file(auth_path) if auth_path else {}
                 before_ts = cdict.get("__Secure-1PSIDTS", "")
                 if cdict:
@@ -304,7 +344,7 @@ async def handle_attempt_exception(
                             else None
                         )
                         rot_res = await account_svc.rotate_account_cookies(
-                            active_acc.id, session
+                            serving_acc.id, session
                         )
                         new_cookies = rot_res.get("cookies")
                         after_ts = (
@@ -315,7 +355,7 @@ async def handle_attempt_exception(
                         if rot_res.get("ok") and after_ts and after_ts != before_ts:
                             logger.info(
                                 "账号 %s 触发 401 后完成 Cookie 轮换，原地重试",
-                                active_acc.id,
+                                serving_acc.id,
                             )
                             return True
             except Exception as rot_err:
@@ -339,7 +379,9 @@ async def handle_attempt_exception(
 
     if isinstance(exc, AuthError):
         logger.warning("账号权限被拒绝 (HTTP 403): %s", exc)
-        record_rotator_event("auth_error", model=target_model)
+        record_rotator_event(
+            "auth_error", model=target_model, account_id=serving_account_id
+        )
 
         raise HTTPException(
             403, detail={"message": str(exc), "type": "auth_error"}
@@ -347,7 +389,9 @@ async def handle_attempt_exception(
 
     if isinstance(exc, UsageLimitExceeded):
         runtime_state.record(target_model, "rate_limited")
-        record_rotator_event("rate_limited", model=target_model)
+        record_rotator_event(
+            "rate_limited", model=target_model, account_id=serving_account_id
+        )
         if not has_yielded_data and await try_switch_account(
             model=target_model, failed_account_id=failed_id
         ):
@@ -404,7 +448,9 @@ async def handle_attempt_exception(
             return True
         if is_transport_error(exc):
             runtime_state.record(target_model, "errors")
-            record_rotator_event("error", model=target_model)
+            record_rotator_event(
+                "error", model=target_model, account_id=serving_account_id
+            )
             logger.warning("上游传输中断 (502): %s", exc)
             raise HTTPException(
                 502, detail={"message": str(exc), "type": "upstream_error"}
@@ -428,14 +474,14 @@ async def handle_attempt_exception(
 
     if isinstance(exc, AistudioError):
         runtime_state.record(target_model, "errors")
-        record_rotator_event("error", model=target_model)
+        record_rotator_event("error", model=target_model, account_id=serving_account_id)
         logger.warning("服务端处理异常: %s", exc)
         raise HTTPException(
             500, detail={"message": str(exc), "type": "server_error"}
         ) from exc
 
     runtime_state.record(target_model, "errors")
-    record_rotator_event("error", model=target_model)
+    record_rotator_event("error", model=target_model, account_id=serving_account_id)
     logger.error("请求处理发生未捕获异常: %s", exc)
     logger.debug("异常堆栈详情:", exc_info=True)
     raise HTTPException(
@@ -509,9 +555,16 @@ async def handle_gemini_generate_content(
     last_error: Exception | None = None
     auth_manager = Auth403RetryManager()
     total_attempts = MAX_RETRIES + AUTH_403_MAX_RETRIES
+    # 本次请求实际服务的账号（3.9）：在每次尝试发送前刷新，收尾记账用它，
+    # 避免并发请求切号后把结果记到无关账号头上。
+    serving_account_id: str | None = None
 
     for attempt in range(total_attempts):
         await ensure_active_account(attempt, model=model_path)
+        _svc = runtime_state.account_service
+        _acc = _svc.get_active_account() if _svc else None
+        serving_account_id = _acc.id if _acc else None
+        auth_manager.serving_account_id = serving_account_id
         normalized = None
         try:
             normalized = normalize_gemini_request(req, model_path)
@@ -564,7 +617,10 @@ async def handle_gemini_generate_content(
             # 记 success 会让账号健康度虚高、掩盖被软封的账号。
             rotator_event = "success" if has_any_output else "error"
             record_rotator_event(
-                rotator_event, model=normalized.model, usage=output.usage
+                rotator_event,
+                model=normalized.model,
+                usage=output.usage,
+                account_id=serving_account_id,
             )
             runtime_state.record(
                 normalized.model,
@@ -605,10 +661,20 @@ async def handle_gemini_generate_content(
                 attempt=attempt,
                 model_path=model_path,
                 normalized_model=normalized.model if normalized else None,
+                serving_account_id=serving_account_id,
             ):
                 continue
             raise
 
+    # 重试耗尽：最后一跳的异常才是真实失败原因。原实现固定报 429
+    # “配额耗尽”，但循环退出的原因也可能是传输中断/上游 5xx，统一报
+    # 429 会误导客户端与运维排障，这里按真实异常分类返回。
+    if last_error is not None and not isinstance(last_error, UsageLimitExceeded):
+        status, msg, status_str = classify_gemini_error_payload(last_error)
+        raise HTTPException(
+            status,
+            detail={"message": msg, "status": status_str, "type": "upstream_error"},
+        ) from last_error
     raise HTTPException(
         429,
         detail={
@@ -776,6 +842,8 @@ def _build_gemini_streaming_response(
             has_yielded_data = False
             auth_manager = Auth403RetryManager()
             total_attempts = MAX_RETRIES + AUTH_403_MAX_RETRIES
+            # 本次请求实际服务的账号（3.9）：同非流式路径
+            serving_account_id: str | None = None
             for stream_attempt in range(total_attempts):
                 has_yielded_data = False
                 last_stream_error = None
@@ -784,6 +852,10 @@ def _build_gemini_streaming_response(
                 latest_response_id = None
                 buffered_thought_sig = None
                 await ensure_active_account(stream_attempt, model=model_path)
+                _svc = runtime_state.account_service
+                _acc = _svc.get_active_account() if _svc else None
+                serving_account_id = _acc.id if _acc else None
+                auth_manager.serving_account_id = serving_account_id
                 normalized = normalize_gemini_request(req, model_path)
                 at_ctx = prepare_anti_truncation(normalized, override=anti_truncation)
                 try:
@@ -818,8 +890,37 @@ def _build_gemini_streaming_response(
                         buffered_resp = _build_gemini_response_from_output(
                             output, normalized.model
                         )
-                        has_yielded_data = True
+                        # 与非流式路径（空回防护）对齐（3.8）：-at 缓冲变体
+                        # 仅在真正产出内容时才算 has_yielded_data，否则上游
+                        # 200 但零内容的空回会被记为 success 且跳过诊断注入，
+                        # 被风控软封的账号健康度虚高。
+                        buffered_has_output = bool(
+                            output.text
+                            or output.function_calls
+                            or output.function_responses
+                            or output.images
+                            or output.reasoning_images
+                        )
+                        has_yielded_data = buffered_has_output
                         has_yielded_any = True
+                        # 空回防护（3.8）：缓冲变体零内容时同样注入可见诊断文本
+                        if not buffered_has_output:
+                            logger.warning(
+                                "抗截断缓冲变体返回 200 但内容为空（可能是风控拦截）: "
+                                "model=%s, finish=%s",
+                                normalized.model,
+                                final_finish_reason,
+                            )
+                            if buffered_resp.candidates:
+                                buffered_resp.candidates[0].content.parts.append(
+                                    GeminiPartResponse(
+                                        text=(
+                                            "[aistudio-api 空回诊断] 上游返回 200 但内容为空 "
+                                            f"(finish={final_finish_reason})。"
+                                            "可能为账号风控拦截或安全策略，请在面板“运行日志”页查看详情。"
+                                        )
+                                    )
+                                )
                         yield (
                             "data: "
                             + json.dumps(
@@ -846,47 +947,57 @@ def _build_gemini_streaming_response(
                         generation_config_overrides=normalized.generation_config_overrides,
                         prepared=auth_manager.current_prepared,
                     )
-                    async for event_type, text in restore_anti_truncation_stream(
+                    # 重试 continue / 客户端断连时，async for 不会自动关闭被迭代
+                    # 的异步生成器，只能等 GC 的 asyncgen finalizer 释放上游连接；
+                    # 高断连/重试率下会积压未释放连接。这里持引用并用
+                    # try/finally 确定性关闭（与 compat 适配器同标准）。
+                    anti_stream = restore_anti_truncation_stream(
                         upstream_events, at_ctx
-                    ):
-                        if event_type == "usage":
-                            final_usage = text if isinstance(text, dict) else None
-                        elif event_type == "finish_reason":
-                            if text not in _IGNORED_WIRE_FINISH_REASONS:
-                                final_finish_reason = (
-                                    to_gemini_finish_reason(text)
-                                    if isinstance(text, int)
-                                    else str(text)
-                                )
-                        elif event_type == "response_id":
-                            latest_response_id = str(text)
-                        elif event_type == "thought_signature":
-                            buffered_thought_sig = str(text)
-                        else:
-                            chunk = format_sse_event(
-                                event_type,
-                                text,
-                                model_version=normalized.model,
-                                response_id=latest_response_id,
-                                thought_signature=buffered_thought_sig,
-                            )
-                            buffered_thought_sig = None
-                            if chunk:
-                                if not has_yielded_data:
-                                    ttft_ms = (
-                                        time.perf_counter() - stream_start_time
-                                    ) * 1000
-                                    logger.info(
-                                        "流式首包到达: model=%s, ttft=%.1fms",
-                                        normalized.model,
-                                        ttft_ms,
+                    )
+                    try:
+                        async for event_type, text in anti_stream:
+                            if event_type == "usage":
+                                final_usage = text if isinstance(text, dict) else None
+                            elif event_type == "finish_reason":
+                                if text not in _IGNORED_WIRE_FINISH_REASONS:
+                                    final_finish_reason = (
+                                        to_gemini_finish_reason(text)
+                                        if isinstance(text, int)
+                                        else str(text)
                                     )
-                                has_yielded_data = True
-                                has_yielded_any = True
-                                yield chunk
-                    auth_manager.current_prepared = None
-                    stream_completed = True
-                    break
+                            elif event_type == "response_id":
+                                latest_response_id = str(text)
+                            elif event_type == "thought_signature":
+                                buffered_thought_sig = str(text)
+                            else:
+                                chunk = format_sse_event(
+                                    event_type,
+                                    text,
+                                    model_version=normalized.model,
+                                    response_id=latest_response_id,
+                                    thought_signature=buffered_thought_sig,
+                                )
+                                buffered_thought_sig = None
+                                if chunk:
+                                    if not has_yielded_data:
+                                        ttft_ms = (
+                                            time.perf_counter() - stream_start_time
+                                        ) * 1000
+                                        logger.info(
+                                            "流式首包到达: model=%s, ttft=%.1fms",
+                                            normalized.model,
+                                            ttft_ms,
+                                        )
+                                    has_yielded_data = True
+                                    has_yielded_any = True
+                                    yield chunk
+                        auth_manager.current_prepared = None
+                        stream_completed = True
+                        break
+                    finally:
+                        # 正常完成 / 异常重试 / 客户端断连部走这里，
+                        # 确定性释放上游连接（关闭包装器会连带关闭内层流）。
+                        await _close_stream_quietly(anti_stream)
                 except Exception as exc:
                     last_stream_error = exc
                     if (
@@ -909,6 +1020,7 @@ def _build_gemini_streaming_response(
                         model_path=model_path,
                         normalized_model=normalized.model if normalized else None,
                         has_yielded_data=has_yielded_data,
+                        serving_account_id=serving_account_id,
                     ):
                         continue
                     raise
@@ -936,7 +1048,12 @@ def _build_gemini_streaming_response(
                     yield diagnostic_chunk
             # 与空回防护一致：零内容不能记为 success（见上方流式空回诊断）
             stream_event = "success" if has_yielded_data else "error"
-            record_rotator_event(stream_event, model=target_model, usage=final_usage)
+            record_rotator_event(
+                stream_event,
+                model=target_model,
+                usage=final_usage,
+                account_id=serving_account_id,
+            )
             if normalized is not None:
                 runtime_state.record(
                     normalized.model,

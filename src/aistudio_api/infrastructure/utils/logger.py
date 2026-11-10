@@ -59,6 +59,11 @@ class RingBufferHandler(logging.Handler):
                 exc_text = self._format_exc_tail(record)
                 if exc_text:
                     message = f"{message}\n{exc_text}"
+            # 进环形缓冲前截断（L7）：开启 dump 时单条转储约 8KB，日志环
+            # 容量固定且逐条 SSE 广播，超长消息会成倍放大内存占用与广播
+            # 流量；截断到 2KB 保留头部足以定位问题。
+            if len(message) > 2048:
+                message = message[:2048] + f"\n...[已截断，原长 {len(message)} 字符]"
             entry: dict[str, object] = {
                 "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "ts_ms": int(record.created * 1000),

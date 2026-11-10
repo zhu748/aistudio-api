@@ -556,6 +556,12 @@ def invalidate_config_cache() -> None:
     _compat_cache.clear()
 
 
+# 说明（P4 评估结论）：曾评估过对 mtime 探测做 1 秒粒度节流，但它会削弱
+# “手工编辑 config.yaml 后立即生效”这一设计保证（mtime 变化即失效），
+# 而 stat() 在现代系统上是亚微秒级操作，高频调用的真实开销在下游的
+# 集合并集与重编码上（由 P5 的 _merge_key_sets 缓存解决），故不节流。
+
+
 # resolve_tier_quota 的结果只依赖 (tier, model, 配置文件内容)。它被
 # /api/stats（模型数 × 账号数 次）与账号打分（每候选账号 × 2 次）反复调用，
 # 单次约 120µs，50 账号 × 10 模型时单次 /api/stats 就要 70ms+ 同步阻塞
@@ -787,7 +793,15 @@ def _load_yaml_config(config_path: Path) -> dict[str, object]:
 
 
 @lru_cache(maxsize=8)
-def _compiled_profiles(config_path: str) -> tuple[ModelProfile, ...]:
+def _compiled_profiles(config_path: str, _mtime: float) -> tuple[ModelProfile, ...]:
+    """编译模型 profiles。
+
+    缓存键必须含 mtime（2.4）：旧实现仅按路径缓存，手工编辑 config.yaml
+    （mtime 缓存明确支持的用法）后 profiles 永远卡在旧值直到进程重启；
+    而 resolve_model_defaults 内全局配置来自带 mtime 的 _CONFIG_CACHE
+    却是新鲜的，两层缓存键不一致导致同一请求里新旧行为互相矛盾。
+    （形参名加下划线：仅作缓存键使用，函数体内不读取。）
+    """
     config = _load_yaml_config(Path(config_path))
     raw_md = config.get("model_defaults")
     model_defaults = raw_md if isinstance(raw_md, dict) else {}
@@ -799,7 +813,10 @@ def _compiled_profiles(config_path: str) -> tuple[ModelProfile, ...]:
 
 
 @lru_cache(maxsize=8)
-def _compiled_model_overrides(config_path: str) -> dict[str, ModelDefaults]:
+def _compiled_model_overrides(
+    config_path: str, _mtime: float
+) -> dict[str, ModelDefaults]:
+    """编译模型级覆盖（缓存键含 mtime，理由同 _compiled_profiles）。"""
     config = _load_yaml_config(Path(config_path))
     raw_md = config.get("model_defaults")
     model_defaults = raw_md if isinstance(raw_md, dict) else {}
@@ -832,12 +849,16 @@ def resolve_model_defaults(
     # model-specific override still wins over the canonical-derived one.
     canonical = canonicalize_model_alias(model)
     candidates = (normalized,) if canonical == normalized else (normalized, canonical)
-    profiles = _compiled_profiles(resolved_path)
+    try:
+        config_mtime = Path(resolved_path).stat().st_mtime
+    except OSError:
+        config_mtime = 0.0
+    profiles = _compiled_profiles(resolved_path, config_mtime)
     resolved = ModelDefaults(drop_unsupported_params=global_drop)
     for profile in profiles:
         if any(profile.matches(c) for c in candidates):
             resolved = resolved.merged(profile.defaults)
-    overrides = _compiled_model_overrides(resolved_path)
+    overrides = _compiled_model_overrides(resolved_path, config_mtime)
     override = next((overrides.get(c) for c in candidates if c in overrides), None)
     if override is not None:
         resolved = resolved.overridden(override)
@@ -1008,11 +1029,16 @@ def resolve_tier_quota(
     )
     cached_quota = _TIER_QUOTA_CACHE.get(cache_key)
     if cached_quota is not None:
+        # 命中即移到末尾：dict 保持插入序，溢出时丢队首即近似 LRU
+        _TIER_QUOTA_CACHE[cache_key] = _TIER_QUOTA_CACHE.pop(cache_key)
         return cached_quota
 
     quota = _resolve_tier_quota_uncached(tier, normalized_model, resolved_path)
     if len(_TIER_QUOTA_CACHE) >= _TIER_QUOTA_CACHE_MAX:
-        _TIER_QUOTA_CACHE.clear()
+        # LRU 淘汰（L5）：满额整体 clear 会造成周期性惊群（全部调用方同帧重算），
+        # 改为丢最旧的一半，保留近期热点。
+        for _ in range(_TIER_QUOTA_CACHE_MAX // 2):
+            _TIER_QUOTA_CACHE.pop(next(iter(_TIER_QUOTA_CACHE)), None)
     _TIER_QUOTA_CACHE[cache_key] = quota
     return quota
 

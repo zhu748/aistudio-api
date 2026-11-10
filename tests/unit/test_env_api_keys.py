@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from aistudio_api.config import _load_api_keys
@@ -124,7 +126,10 @@ async def test_no_env_keys_stays_open(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_list_api_keys_merges_env_injected(monkeypatch):
-    """面板 API Key 列表应合并展示环境变量注入的 Key（标注来源）。"""
+    """面板 API Key 列表应合并展示环境变量注入的 Key（标注来源）。
+
+    未配置管理密码时（API Key 回退鉴权场景），Key 明文应脱敏展示（2.1）。
+    """
     from aistudio_api.api import routes_system
     from aistudio_api.config import settings
 
@@ -136,11 +141,17 @@ async def test_list_api_keys_merges_env_injected(monkeypatch):
     )
     monkeypatch.setattr(settings, "api_keys", frozenset({"sk-env-a", "sk-env-b"}))
 
-    items = await routes_system.list_api_keys()
+    class _StubRequest:
+        headers: ClassVar[dict[str, str]] = {"authorization": "Bearer sk-env-a"}
+
+    items = await routes_system.list_api_keys(_StubRequest())
     by_key = {i.key: i for i in items}
 
-    assert "sk-from-config" in by_key
-    assert by_key["sk-from-config"].name == "面板创建"
-    assert "sk-env-a" in by_key and "sk-env-b" in by_key
-    assert "环境变量注入" in by_key["sk-env-a"].name
-    assert by_key["sk-env-a"].created_at is None
+    # 无管理密码：脱敏展示，但保留首尾可辨识字符
+    assert "sk-fro***nfig" in by_key
+    assert by_key["sk-fro***nfig"].name == "面板创建"
+    assert "sk***-a" in by_key and "sk***-b" in by_key
+    assert "环境变量注入" in by_key["sk***-a"].name
+    assert by_key["sk***-a"].created_at is None
+    # 明文不应出现在返回中
+    assert all(i.key != "sk-from-config" and i.key != "sk-env-a" for i in items)
