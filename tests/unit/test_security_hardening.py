@@ -1,6 +1,7 @@
 """安全加固与并发修复的配套回归测试（对应审查报告 2.1/2.2/2.3/3.1/3.9/3.11）。"""
 
 import time as _time
+from typing import cast
 
 import pytest
 
@@ -43,7 +44,8 @@ async def test_list_models_strips_xssi_prefix(monkeypatch):
 
     assert models, "XSSI 前缀未剥离导致解析结果为空（2.2 回归）"
     assert models[0]["id"] == "gemini-3.9-flash"
-    assert "generateContent" in models[0]["supportedGenerationMethods"]
+    methods = cast("list[str]", models[0]["supportedGenerationMethods"])
+    assert "generateContent" in methods
 
 
 @pytest.mark.asyncio
@@ -224,7 +226,7 @@ def test_require_web_auth_blocks_anonymous_when_api_keys_configured(monkeypatch)
     assert deps.web_auth_required() is True
 
     with pytest.raises(HTTPException) as ei:
-        deps.require_web_auth(_StubRequest())
+        deps.require_web_auth(_StubRequest())  # type: ignore[arg-type]
     assert ei.value.status_code == 401
 
 
@@ -240,7 +242,7 @@ def test_require_web_auth_accepts_api_key_fallback(monkeypatch):
     )
 
     req = _StubRequest(headers={"authorization": "Bearer sk-real-key"})
-    deps.require_web_auth(req)  # 不应抛出
+    deps.require_web_auth(req)  # type: ignore[arg-type]  # 不应抛出
 
 
 def test_require_web_auth_rejects_api_key_when_admin_password_set(monkeypatch):
@@ -255,12 +257,12 @@ def test_require_web_auth_rejects_api_key_when_admin_password_set(monkeypatch):
 
     req = _StubRequest(headers={"authorization": "Bearer sk-real-key"})
     with pytest.raises(HTTPException) as ei:
-        deps.require_web_auth(req)
+        deps.require_web_auth(req)  # type: ignore[arg-type]
     assert ei.value.status_code == 401
 
     # 管理密码本体可以通过
     ok_req = _StubRequest(headers={"authorization": "Bearer admin-pass-123"})
-    deps.require_web_auth(ok_req)
+    deps.require_web_auth(ok_req)  # type: ignore[arg-type]
 
 
 def test_require_web_auth_rejects_query_param_token(monkeypatch):
@@ -279,7 +281,7 @@ def test_require_web_auth_rejects_query_param_token(monkeypatch):
             return {"key": "admin-pass-123"}
 
     with pytest.raises(HTTPException) as ei:
-        deps.require_web_auth(_QueryReq())
+        deps.require_web_auth(_QueryReq())  # type: ignore[arg-type]
     assert ei.value.status_code == 401
 
 
@@ -297,7 +299,7 @@ def test_management_auth_rate_limit(monkeypatch):
     statuses = []
     for _ in range(12):
         try:
-            deps.require_web_auth(req)
+            deps.require_web_auth(req)  # type: ignore[arg-type]
             statuses.append(200)
         except HTTPException as e:
             statuses.append(e.status_code)

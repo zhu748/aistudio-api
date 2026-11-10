@@ -814,9 +814,7 @@ class ModelDiscoveryService:
                     # 不更新，后续每次 get_models 都会重新拿锁、对已挂掉的上游
                     # 发 10s 超时请求并在锁上串行堆积，拖慢所有 /models 请求。
                     if self._cached_models:
-                        self._last_fetched_at = (
-                            time.time() - self._cache_ttl + 60.0
-                        )
+                        self._last_fetched_at = time.time() - self._cache_ttl + 60.0
             # 3. 保底返回本地默认模型列表（含本地补充模型）
             if not self._cached_models:
                 self._cached_models = _merge_extra_models(
@@ -842,11 +840,9 @@ class ModelDiscoveryService:
             if model_clean_id == clean_target:
                 return model_info
             raw_aliases = model_info.get("aliases")
-            if (
-                isinstance(raw_aliases, list)
-                and clean_target
-                in [str(a).lower() for a in raw_aliases]
-            ):
+            if isinstance(raw_aliases, list) and clean_target in [
+                str(a).lower() for a in raw_aliases
+            ]:
                 return model_info
         for model_info in (*_FALLBACK_MODELS, *_EXTRA_GUARANTEED_MODELS):
             model_raw_id = str(model_info.get("id") or model_info.get("name") or "")

@@ -43,6 +43,33 @@ jobs:
         run: |
           echo "GHCR_REPO=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
 
+      # Docker Hub 凭证是可选的：未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
+      # secrets 时（fork、或仅用 GHCR 的部署）优雅降级为只推 GHCR，
+      # 而不是在登录一步硬性失败导致连 GHCR 镜像也发不出去。
+      - name: Detect Docker Hub credentials
+        id: dh
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Docker Hub skipped::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets 未配置，本次只发布到 GHCR。"
+          fi
+
+      - name: Compute image list
+        run: |
+          {
+            echo "IMAGES<<EOF"
+            echo "${GHCR_REPO}"
+            if [ "${{ steps.dh.outputs.available }}" = "true" ]; then
+              echo "${DOCKERHUB_REPO}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -53,9 +80,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: |
-            ${{ env.GHCR_REPO }}
-            ${{ env.DOCKERHUB_REPO }}
+          images: ${{ env.IMAGES }}
           tags: |
             type=ref,event=branch
             type=ref,event=tag
@@ -73,7 +98,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.dh.outputs.available == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}

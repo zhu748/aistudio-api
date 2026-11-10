@@ -114,8 +114,10 @@ class Auth403RetryManager:
                 # 并发请求下全局活跃账号可能已被其他请求切走，轮换错误的
                 # 账号既救不了当前请求还会污染无关账号的 Cookie。
                 target_acc = None
-                if self.serving_account_id and account_svc and hasattr(
-                    account_svc, "get_account"
+                if (
+                    self.serving_account_id
+                    and account_svc
+                    and hasattr(account_svc, "get_account")
                 ):
                     target_acc = account_svc.get_account(self.serving_account_id)
                 if target_acc is None and account_svc:
@@ -144,8 +146,10 @@ class Auth403RetryManager:
             # 同上：failed_id 优先取本请求实际服务的账号，避免把无关账号
             # 从候选池里排除（串号修复的 403 路径残留）。
             failed_id = None
-            if self.serving_account_id and account_svc and hasattr(
-                account_svc, "get_account"
+            if (
+                self.serving_account_id
+                and account_svc
+                and hasattr(account_svc, "get_account")
             ):
                 failed_acc = account_svc.get_account(self.serving_account_id)
                 failed_id = failed_acc.id if failed_acc else self.serving_account_id
