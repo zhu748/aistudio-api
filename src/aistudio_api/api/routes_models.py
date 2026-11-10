@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from aistudio_api.api.dependencies import get_runtime_state
 from aistudio_api.api.response_models import (
@@ -145,14 +145,31 @@ def _expand_anti_truncation_variants(
 
 @router.get("/v1beta/models", response_model=GeminiModelListResponse)
 async def list_models(
+    request: Request,
     runtime_state: RuntimeState = Depends(get_runtime_state),
     force_refresh: bool = False,
 ) -> GeminiModelListResponse:
     """列出可用模型。
 
-    查询参数 force_refresh=true 时跳过缓存向上游强制拉取（管理面板
-    「刷新模型列表」用）；常规调用仍走 10 分钟缓存。
+    查询参数 force_refresh=true 时跳过缓存向上游强制拉取。
+    该参数会穿透 10 分钟 TTL 直打上游（消耗账号配额、辅助风控指纹），
+    因此仅限持有管理级凭据的调用方使用（3.14）；普通 API Key 调用返回 403。
     """
+    if force_refresh:
+        from aistudio_api.api.dependencies import is_management_session
+
+        if not is_management_session(request):
+            logger.warning(
+                "拒绝非管理会话的 force_refresh 请求: 客户端=%s",
+                request.client.host if request.client else "unknown",
+            )
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "message": "force_refresh 仅限管理端调用；普通请求请使用默认的 10 分钟缓存",
+                    "type": "permission_denied",
+                },
+            )
     session = runtime_state.client.session if runtime_state.client else None
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 

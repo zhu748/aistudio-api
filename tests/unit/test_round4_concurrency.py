@@ -35,7 +35,8 @@ def _prep(tag: str) -> PreparedRequest:
     return PreparedRequest(url="https://upstream", headers={}, body=tag, model=tag)
 
 
-def test_last_prepared_request_is_task_local():
+@pytest.mark.asyncio
+async def test_last_prepared_request_is_task_local():
     """Two concurrent tasks must not observe each other's signed request."""
     client = AIStudioClient()
     observed: dict[str, str | None] = {}
@@ -47,10 +48,7 @@ def test_last_prepared_request_is_task_local():
         got = client.last_prepared_request
         observed[tag] = got.body if got is not None else None
 
-    async def run() -> None:
-        await asyncio.gather(worker("A"), worker("B"))
-
-    asyncio.run(run())
+    await asyncio.gather(worker("A"), worker("B"))
     assert observed == {"A": "A", "B": "B"}
 
 
@@ -87,29 +85,27 @@ async def test_signers_last_headers_are_task_local():
     await signer.close()
 
 
-def test_contextvar_default_is_independent_of_instance():
+@pytest.mark.asyncio
+async def test_contextvar_default_is_independent_of_instance():
     """A fresh task must not inherit a value from a sibling task."""
     client = AIStudioClient()
 
-    async def run() -> None:
-        client.last_prepared_request = _prep("outer")
+    client.last_prepared_request = _prep("outer")
 
-        async def inner() -> PreparedRequest | None:
-            return client.last_prepared_request
+    async def inner() -> PreparedRequest | None:
+        return client.last_prepared_request
 
-        # Clear the var in this task before spawning the child so the child
-        # starts from the default, proving no stale cross-request leakage.
-        from aistudio_api.infrastructure.gateway import client as client_mod
+    # Clear the var in this task before spawning the child so the child
+    # starts from the default, proving no stale cross-request leakage.
+    from aistudio_api.infrastructure.gateway import client as client_mod
 
-        reset = client_mod._LAST_PREPARED_REQUEST.set(None)
-        try:
-            child = asyncio.create_task(inner())
-            got = await child
-        finally:
-            client_mod._LAST_PREPARED_REQUEST.reset(reset)
-        assert got is None
-
-    asyncio.run(run())
+    reset = client_mod._LAST_PREPARED_REQUEST.set(None)
+    try:
+        child = asyncio.create_task(inner())
+        got = await child
+    finally:
+        client_mod._LAST_PREPARED_REQUEST.reset(reset)
+    assert got is None
 
 
 @pytest.mark.asyncio

@@ -185,11 +185,17 @@ class AIStudioClient:
             max_tokens=max_tokens,
             generation_config_overrides=generation_config_overrides,
         )
-        async for event in self._streaming_gateway.stream_chat(
+        # aclosing：上层重试丢弃本生成器时确定性关闭流式网关生成器，
+        # 逐层触发 aclose 链（session → transport → resp.aclose）。
+        gateway_stream = self._streaming_gateway.stream_chat(
             request=effective_prep,
             model=model,
-        ):
-            yield event
+        )
+        try:
+            async for event in gateway_stream:
+                yield event
+        finally:
+            await gateway_stream.aclose()
 
     async def generate_content(
         self,

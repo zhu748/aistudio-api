@@ -302,8 +302,9 @@ Open `http://localhost:8080` in your browser to access the Web Console.
 | Variable | Type | Default | Description |
 |---|---|---|---|
 | `AISTUDIO_PORT` | int | `8080` | HTTP service listening port |
-| `AISTUDIO_WEB_PASSWORD` | string | `""` | Web Console access password (also checks `AISTUDIO_ADMIN_PASSWORD`) |
+| `AISTUDIO_WEB_PASSWORD` | string | `""` | Web Console access password (also checks `AISTUDIO_ADMIN_PASSWORD`). When only API keys are configured (no password), the console falls back to accepting any valid API key with masked key display; when neither is configured, a random admin password is auto-generated and printed to the log on startup |
 | `AISTUDIO_API_KEYS` | string | `""` | API auth keys, comma/newline separated or a JSON array (e.g. `sk-aaa,sk-bbb`); singular `AISTUDIO_API_KEY` also accepted. Merged with keys from config.yaml, survives diskless redeploys |
+| `AISTUDIO_ALLOW_NO_AUTH` | bool | `false` | Explicitly opt in to fully-open mode on trusted LANs. Without any credentials the service auto-generates a random console password; set this to `1` only if you deliberately want no authentication |
 | `AISTUDIO_PROXY` | string | `""` | Outbound proxy URL (`http://`, `https://`, or `socks5://`) |
 | `AISTUDIO_COOKIES` | string | `""` | Account cookies injected at startup; one entry per line, each entry supports `proxy+cookies` / `cookies` / `cookies+proxy` formats |
 | `AISTUDIO_COOKIES_<N>` | string | `""` | Numbered injection variables (`AISTUDIO_COOKIES_1`, `AISTUDIO_COOKIES_2`, ...) for platforms that cannot pass multi-line env vars |

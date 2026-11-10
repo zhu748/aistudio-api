@@ -151,15 +151,17 @@ def test_threaded_create_api_keys_keeps_all_entries(
     assert sorted(keys) == sorted(f"sk-thread-{index:02d}" for index in range(8))
 
 
-def test_threaded_delete_and_create_do_not_clobber(
+@pytest.mark.asyncio
+async def test_threaded_delete_and_create_do_not_clobber(
     _isolated_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """删除与创建并发时不应互抹：最终应包含所有创建结果且不含被删项。"""
+    # 注意：不要在主线程用 asyncio.run() 跑 setup——它会清掉当前线程的
+    # event loop，导致 pytest-asyncio 保存的 loop 成为孤儿（GC 时报
+    # "unclosed event loop"）。auto 模式下直接 await 即可。
     for index in range(4):
-        asyncio.run(
-            routes_system.create_api_key(
-                routes_system.CreateApiKeyRequest(key=f"sk-old-{index}", name="old")
-            )
+        await routes_system.create_api_key(
+            routes_system.CreateApiKeyRequest(key=f"sk-old-{index}", name="old")
         )
 
     _patch_slow_write(monkeypatch)

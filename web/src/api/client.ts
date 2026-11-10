@@ -12,19 +12,56 @@ export class ApiError extends Error {
 
 const TOKEN_KEY = 'asp_api_token'
 
+// 令牌存储（3.17）：localStorage 使管理密码在浏览器中永久留存（任何 XSS
+// 都可直接窃取、无过期机制、shared device 上换用户也残留）。改为
+// sessionStorage + 进程内缓存：令牌随标签页会话结束自动消失，浏览器
+// 重启后需重新登录；首次读取时顺带把历史 localStorage 令牌迁移清理。
+let cachedToken: string | null = null
+
 export function getToken(): string {
-  return localStorage.getItem(TOKEN_KEY) || ''
+  if (cachedToken !== null) return cachedToken
+  // 历史版本把令牌落在 localStorage：迁移到 sessionStorage 并清除原值
+  const legacy = localStorage.getItem(TOKEN_KEY)
+  if (legacy) {
+    localStorage.removeItem(TOKEN_KEY)
+    try {
+      sessionStorage.setItem(TOKEN_KEY, legacy)
+    } catch {
+      /* sessionStorage 不可用（隐私模式等）时退化为仅内存缓存 */
+    }
+    cachedToken = legacy
+    return legacy
+  }
+  try {
+    cachedToken = sessionStorage.getItem(TOKEN_KEY) || ''
+  } catch {
+    cachedToken = ''
+  }
+  return cachedToken
 }
 
 export function setToken(token: string): void {
-  if (token.trim()) {
-    localStorage.setItem(TOKEN_KEY, token.trim())
-  } else {
-    localStorage.removeItem(TOKEN_KEY)
+  const trimmed = token.trim()
+  cachedToken = trimmed
+  try {
+    if (trimmed) {
+      sessionStorage.setItem(TOKEN_KEY, trimmed)
+    } else {
+      sessionStorage.removeItem(TOKEN_KEY)
+    }
+  } catch {
+    /* 存储不可用时仅保留内存缓存 */
   }
+  localStorage.removeItem(TOKEN_KEY)
 }
 
 export function clearToken(): void {
+  cachedToken = ''
+  try {
+    sessionStorage.removeItem(TOKEN_KEY)
+  } catch {
+    /* ignore */
+  }
   localStorage.removeItem(TOKEN_KEY)
 }
 

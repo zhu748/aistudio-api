@@ -12,11 +12,12 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import re
 import secrets
 import time
-from collections.abc import AsyncGenerator, AsyncIterable
+from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
 
 import httpx
 from fastapi import Request
@@ -493,6 +494,20 @@ async def openai_to_gemini_request(
     contents: list[GeminiContent] = []
     system_texts: list[str] = []
     tool_name_by_id: dict[str, str] = {}
+
+    # 第一遍：先扫全部 assistant 消息建 tool_call_id → 函数名映射。
+    # 与 Claude 侧一致的两遍扫描：容忍客户端把 tool 结果放在对应
+    # assistant 消息之前（裁剪/乱序历史），避免函数名回退 "unknown"
+    # 透传给上游 functionResponse 导致上游报错。
+    for message in req.messages:
+        if message.role.strip().lower() != "assistant":
+            continue
+        for tool_call in message.tool_calls or []:
+            function = _as_dict(tool_call.get("function"))
+            call_id = _as_str(tool_call.get("id"))
+            name = _as_str(function.get("name"))
+            if call_id and name:
+                tool_name_by_id.setdefault(call_id, name)
 
     for message in req.messages:
         role = message.role.strip().lower()
@@ -1274,113 +1289,125 @@ async def openai_stream_adapter(
     has_tool_calls = False
     saw_error = False
 
+    # 确定性关闭内层 SSE 生成器（3.6）：适配器自身异常或客户端断连时，
+    # 不再依赖事件循环的异步生成器终结器延迟释放上游连接。
+    source_aclose: Callable[[], Awaitable[None]] | None = getattr(
+        source, "aclose", None
+    )
     try:
-        async for frame in _iter_gemini_sse_frames(source):
-            error_obj = frame.get("error")
-            if isinstance(error_obj, dict):
-                saw_error = True
-                code = _as_int(error_obj.get("code")) or 500
-                message = _as_str(error_obj.get("message")) or "Upstream error"
-                yield _sse(
-                    _error_chunk(
-                        message, _OPENAI_ERROR_TYPE.get(code, "api_error"), code
-                    )
-                )
-                break
-            candidate = _frame_candidate(frame)
-            finish = _as_str(candidate.get("finishReason"))
-            if finish:
-                finish_reason_raw = finish
-            usage_metadata = frame.get("usageMetadata")
-            if isinstance(usage_metadata, dict):
-                usage_frame = usage_metadata
-            for part in _frame_parts(candidate):
-                function_call = _as_dict(part.get("functionCall"))
-                if function_call:
-                    has_tool_calls = True
-                    call_id = _as_str(function_call.get("id")) or (
-                        f"call_{secrets.token_hex(12)}"
-                    )
-                    name = _as_str(function_call.get("name")) or "unknown"
-                    args = function_call.get("args")
-                    if args is None:
-                        args = {}
+        try:
+            async for frame in _iter_gemini_sse_frames(source):
+                error_obj = frame.get("error")
+                if isinstance(error_obj, dict):
+                    saw_error = True
+                    code = _as_int(error_obj.get("code")) or 500
+                    message = _as_str(error_obj.get("message")) or "Upstream error"
                     yield _sse(
-                        _chunk(
-                            {
-                                "tool_calls": [
-                                    {
-                                        "index": tool_index,
-                                        "id": call_id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": name,
-                                            "arguments": json.dumps(
-                                                args, ensure_ascii=False
-                                            ),
-                                        },
-                                    }
-                                ]
-                            },
-                            None,
+                        _error_chunk(
+                            message, _OPENAI_ERROR_TYPE.get(code, "api_error"), code
                         )
                     )
-                    tool_index += 1
-                    continue
-                inline = _as_dict(part.get("inlineData"))
-                if inline:
-                    mime = _as_str(inline.get("mimeType")) or "image/png"
-                    data = _as_str(inline.get("data"))
-                    if data:
+                    break
+                candidate = _frame_candidate(frame)
+                finish = _as_str(candidate.get("finishReason"))
+                if finish:
+                    finish_reason_raw = finish
+                usage_metadata = frame.get("usageMetadata")
+                if isinstance(usage_metadata, dict):
+                    usage_frame = usage_metadata
+                for part in _frame_parts(candidate):
+                    function_call = _as_dict(part.get("functionCall"))
+                    if function_call:
+                        has_tool_calls = True
+                        call_id = _as_str(function_call.get("id")) or (
+                            f"call_{secrets.token_hex(12)}"
+                        )
+                        name = _as_str(function_call.get("name")) or "unknown"
+                        args = function_call.get("args")
+                        if args is None:
+                            args = {}
                         yield _sse(
                             _chunk(
                                 {
-                                    "content": (
-                                        f"\n\n![image](data:{mime};base64,{data})"
-                                    )
+                                    "tool_calls": [
+                                        {
+                                            "index": tool_index,
+                                            "id": call_id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": name,
+                                                "arguments": json.dumps(
+                                                    args, ensure_ascii=False
+                                                ),
+                                            },
+                                        }
+                                    ]
                                 },
                                 None,
                             )
                         )
-                    continue
-                text = part.get("text")
-                if isinstance(text, str) and text:
-                    if part.get("thought") is True:
-                        yield _sse(_chunk({"reasoning_content": text}, None))
-                    else:
-                        yield _sse(_chunk({"content": text}, None))
-    except Exception as exc:
-        saw_error = True
-        logger.warning("OpenAI 流式转换异常: %s", exc)
-        yield _sse(_error_chunk(f"{type(exc).__name__}: {exc}", "internal_error", 500))
+                        tool_index += 1
+                        continue
+                    inline = _as_dict(part.get("inlineData"))
+                    if inline:
+                        mime = _as_str(inline.get("mimeType")) or "image/png"
+                        data = _as_str(inline.get("data"))
+                        if data:
+                            yield _sse(
+                                _chunk(
+                                    {
+                                        "content": (
+                                            f"\n\n![image](data:{mime};base64,{data})"
+                                        )
+                                    },
+                                    None,
+                                )
+                            )
+                        continue
+                    text = part.get("text")
+                    if isinstance(text, str) and text:
+                        if part.get("thought") is True:
+                            yield _sse(_chunk({"reasoning_content": text}, None))
+                        else:
+                            yield _sse(_chunk({"content": text}, None))
+        except Exception as exc:
+            saw_error = True
+            logger.warning("OpenAI 流式转换异常: %s", exc)
+            yield _sse(
+                _error_chunk(f"{type(exc).__name__}: {exc}", "internal_error", 500)
+            )
 
-    if saw_error:
-        yield "data: [DONE]\n\n"
-        return
+        if saw_error:
+            yield "data: [DONE]\n\n"
+            return
 
-    finish_reason = _openai_finish_reason(
-        finish_reason_raw, has_tool_calls=has_tool_calls
-    )
-    usage_payload = (
-        _openai_usage_from_frame(usage_frame) if usage_frame is not None else None
-    )
-    final_chunk = _chunk({}, finish_reason)
-    # OpenAI 语义：仅 include_usage=True 时发送 usage（且以 choices 为空的
-    # 独立尾块形式）。False 时任何 chunk 都不得携带 usage 字段，否则 SDK
-    # 会把带 finish_reason 的终结块解析成混合块（协议不允许）。
-    yield _sse(final_chunk)
-    if include_usage and usage_payload is not None:
-        yield _sse(
-            {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": requested_model,
-                "choices": [],
-                "usage": usage_payload,
-            }
+        finish_reason = _openai_finish_reason(
+            finish_reason_raw, has_tool_calls=has_tool_calls
         )
-    yield "data: [DONE]\n\n"
+        usage_payload = (
+            _openai_usage_from_frame(usage_frame) if usage_frame is not None else None
+        )
+        final_chunk = _chunk({}, finish_reason)
+        # OpenAI 语义：仅 include_usage=True 时发送 usage（且以 choices 为空的
+        # 独立尾块形式）。False 时任何 chunk 都不得携带 usage 字段，否则 SDK
+        # 会把带 finish_reason 的终结块解析成混合块（协议不允许）。
+        yield _sse(final_chunk)
+        if include_usage and usage_payload is not None:
+            yield _sse(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": requested_model,
+                    "choices": [],
+                    "usage": usage_payload,
+                }
+            )
+        yield "data: [DONE]\n\n"
+    finally:
+        if callable(source_aclose):
+            with contextlib.suppress(Exception):
+                await source_aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -1635,6 +1662,10 @@ async def claude_stream_adapter(
     emitter = _ClaudeStreamEmitter(f"msg_{secrets.token_hex(12)}", requested_model)
     yield emitter.message_start()
     yield emitter.ping()
+    # 确定性关闭内层 SSE 生成器（3.6）：自身异常或客户端断连时立即释放上游连接
+    source_aclose: Callable[[], Awaitable[None]] | None = getattr(
+        source, "aclose", None
+    )
     try:
         async for frame in _iter_gemini_sse_frames(source):
             error_obj = frame.get("error")
@@ -1683,8 +1714,13 @@ async def claude_stream_adapter(
         for event in emitter.error(500, f"{type(exc).__name__}: {exc}"):
             yield event
         return
-    for event in emitter.finish(stop_sequences):
-        yield event
+    else:
+        for event in emitter.finish(stop_sequences):
+            yield event
+    finally:
+        if callable(source_aclose):
+            with contextlib.suppress(Exception):
+                await source_aclose()
 
 
 # ---------------------------------------------------------------------------

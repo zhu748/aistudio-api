@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from fastapi import APIRouter, Depends, Request
 
 from aistudio_api.api.response_models import GeminiGenerateContentResponse
@@ -17,6 +19,13 @@ router = APIRouter()
 
 _TRUTHY = frozenset({"1", "true", "yes", "on", "y", "t"})
 _FALSY = frozenset({"0", "false", "no", "off", "n", "f"})
+# 日志注入防护（L6）：model_path 来自 URL，未过滤时控制字符可注入伪造日志行
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _sanitize_model_path(model_path: str) -> str:
+    """清洗路径参数中的控制字符，避免日志伪造（CRLF 注入）。"""
+    return _CONTROL_CHARS_RE.sub("", model_path)
 
 
 def _parse_anti_truncation_header(request: Request) -> bool | None:
@@ -43,9 +52,10 @@ async def generate_content(
     http_request: Request,
     client: AIStudioClient = Depends(get_client),
 ):
-    logger.debug("收到 generateContent 请求: model=%s", model_path)
+    clean_model = _sanitize_model_path(model_path)
+    logger.debug("收到 generateContent 请求: model=%s", clean_model)
     return await handle_gemini_generate_content(
-        model_path,
+        clean_model,
         req,
         client,
         stream=False,
@@ -60,9 +70,10 @@ async def stream_generate_content(
     http_request: Request,
     client: AIStudioClient = Depends(get_client),
 ):
-    logger.debug("收到 streamGenerateContent 请求: model=%s", model_path)
+    clean_model = _sanitize_model_path(model_path)
+    logger.debug("收到 streamGenerateContent 请求: model=%s", clean_model)
     return await handle_gemini_generate_content(
-        model_path,
+        clean_model,
         req,
         client,
         stream=True,

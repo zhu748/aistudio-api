@@ -422,6 +422,11 @@ func (runtime *Runtime) snapshotWith(ctx context.Context, digest mozjs.Value) (s
 			}{value, err}
 		})
 	}
+	// registeredID 由 VM 事件循环线程写入/读取（两个 post 任务严格按序执行，
+	// 经 loop 队列信道建立 happens-before）。0 表示尚未注册。
+	// 超时/取消后据此清理 results 条目，避免 VM 启动成功但永不回调时
+	// 映射条目永久残留（L15）。
+	registeredID := float64(0)
 	if !runtime.loop.post(func() {
 		if err := ctx.Err(); err != nil {
 			finish("", err)
@@ -430,6 +435,7 @@ func (runtime *Runtime) snapshotWith(ctx context.Context, digest mozjs.Value) (s
 		state := runtime.agent
 		runtime.nextResult++
 		id := runtime.nextResult
+		registeredID = id
 		runtime.results[id] = func(value string) { finish(value, nil) }
 		callback, err := handleOf(state.invoke(runtime.bind, 0, mozjs.Object(runtime.deliver), mozjs.Number(id)))
 		if err != nil {
@@ -460,6 +466,14 @@ func (runtime *Runtime) snapshotWith(ctx context.Context, digest mozjs.Value) (s
 	case output := <-result:
 		return output.value, output.err
 	case <-ctx.Done():
+		// 经事件循环清理已注册的 results 条目：两个闭包都在 loop 线程
+		// 按序执行——若本清理先于快照任务运行，快照任务会因上方 ctx
+		// 检查提前返回（不会注册）；若在其后运行则删除已注册条目。
+		runtime.loop.post(func() {
+			if registeredID != 0 {
+				delete(runtime.results, registeredID)
+			}
+		})
 		return "", ctx.Err()
 	}
 }

@@ -33,15 +33,13 @@ const snapshotName = ref('')
 const snapshotDesc = ref('')
 const selectedGroup = ref<string>('ALL')
 
-async function loadData() {
-  await Promise.all([
-    accountsStore.fetchAll(),
-    accountsStore.fetchPresets(),
-    accountsStore.fetchGroups(),
-  ])
-}
-
-usePolling(loadData, 8000)
+// 轮询降频拆分（P8）：账号列表/活跃账号/调度统计是离频变化数据，8s 轮询；
+// 预设方案与分组只在用户操作后变化（各 mutation 已自行刷新），降到 60s
+// 即可，把周期请求数从 5 个/8s 降到 3 个/8s + 2 个/60s。
+usePolling(accountsStore.fetchAll, 8000)
+usePolling(async () => {
+  await Promise.all([accountsStore.fetchPresets(), accountsStore.fetchGroups()])
+}, 60000)
 
 const allGroups = computed(() => {
   const set = new Set<string>()

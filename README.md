@@ -337,8 +337,9 @@ environment:
 | 变量名 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `AISTUDIO_PORT` | int | `8080` | API 服务监听端口 |
-| `AISTUDIO_WEB_PASSWORD` | string | `""` | Web 控制台访问密码（亦可设置 `AISTUDIO_ADMIN_PASSWORD`） |
+| `AISTUDIO_WEB_PASSWORD` | string | `""` | Web 控制台访问密码（亦可设置 `AISTUDIO_ADMIN_PASSWORD`）。仅配置 API Key 未设密码时，面板改由任意有效 API Key 登录且 Key 明文脱敏展示；两者均未配置时启动会自动生成随机管理密码并打印到日志 |
 | `AISTUDIO_API_KEYS` | string | `""` | API 调用鉴权 Key，多个用逗号/换行分隔或 JSON 数组（如 `sk-aaa,sk-bbb`）；亦可单数 `AISTUDIO_API_KEY` 注入单个。与 config.yaml 中配置的 Key 合并生效，无磁盘部署重启后自动恢复 |
+| `AISTUDIO_ALLOW_NO_AUTH` | bool | `false` | 显式声明在可信内网完全开放（免鉴权）。未配置任何凭据时默认自动生成随机管理密码保护面板；确需裸奔模式必须显式设置此变量（1=开启） |
 | `AISTUDIO_PROXY` | string | `""` | 出口代理地址，支持 `http://`、`https://` 或 `socks5://` |
 | `AISTUDIO_COOKIES` | string | `""` | 启动时注入的账号 Cookie，多条用换行分隔，单条支持 `代理+Cookie` / `Cookie` / `Cookie+代理` 三种格式（详见下方[环境变量注入账号](#环境变量注入账号无磁盘部署)） |
 | `AISTUDIO_COOKIES_<N>` | string | `""` | 编号变量注入（`AISTUDIO_COOKIES_1`、`AISTUDIO_COOKIES_2` ...），适合无法传入多行环境变量的平台，与 `AISTUDIO_COOKIES` 可同时使用 |
@@ -357,6 +358,17 @@ environment:
 | `AISTUDIO_DUMP_REQUESTS` | bool | `false` | 是否在终端转储每次 API 交互报文详情（支持 `DEBUG=1` 触发） |
 | `AISTUDIO_DUMP_FILE` | bool | `false` | 是否将请求与响应报文详情落盘保存 |
 | `AISTUDIO_DUMP_DIR` | string | `dumps/` | 报文转储保存目录 |
+
+#### 本地 WAA 签名器（waa-signer）环境变量
+
+| 变量名 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `SIGNER_SHARED_SECRET` | string | `""` | 签名器 `/v1/*` 端点的 Bearer 共享密钥（常量时间比较）。跨网络部署签名器时**必须**设置；检测到 `PORT` 注入（绑定 0.0.0.0）而未设置时签名器将拒绝启动 |
+| `LISTEN_ADDR` | string | `127.0.0.1:8081` | 签名器监听地址；未设置且容器平台注入 `PORT` 时会绑定 `0.0.0.0`（此时强制要求 `SIGNER_SHARED_SECRET`） |
+| `WAA_MAX_WORKERS` | int | `32` | 签名器同时保活的最大 Worker 数（每个 Worker 持有一个 SpiderMonkey VM 与连接池）；满额时优先回收空闲 Worker，全部忙碌则拒绝新请求 |
+| `WAA_IDLE_TTL_MINUTES` | int | `30` | Worker 空闲回收阈值（分钟），后台每分钟扫描一次，超时 Worker 被关闭释放内存 |
+
+> 安全说明：`/v1/rpc/send` 的目标 URL 已限制为 Google 域白名单（`*.google.com` / `*.googleapis.com`），防止签名器被用作 SSRF 中继；`/health` 保持免鉴权（仅暴露 Worker 计数）供探活。
 ---
 
 ### 抗截断传输 (Anti-Truncation Transport)

@@ -74,24 +74,45 @@ def _shared_ssl_context() -> ssl.SSLContext:
     return _ssl_context
 
 
+# 空 Cookie 的短 TTL 负缓存：账号 Cookie 加载失败/为空时，避免每个请求
+# 都在事件循环里同步读一遍 auth.json + 查询 AccountStore（读盘虽小，
+# 但在“账号损坏”这个持续状态下是每请求一次的纯浪费）。5 秒足够短，
+# 面板修复账号后几乎立即恢复。
+_empty_cookie_cache: dict[str, tuple[float, bool]] = {}
+_EMPTY_COOKIE_TTL = 5.0
+
+
 def _get_auth_cookies(auth_file: str | None = None) -> dict[str, str] | None:
     """Read credentials from the bound auth_file or active account."""
     if auth_file:
         cookies = load_cookies_from_auth_file(auth_file)
         if cookies:
             return cookies
+    cache_key = auth_file or ""
+    now = time.monotonic()
+    cached = _empty_cookie_cache.get(cache_key)
+    if cached is not None and now - cached[0] < _EMPTY_COOKIE_TTL:
+        if cached[1]:
+            return None  # 负缓存命中：已知无可用 Cookie
+    else:
+        cached = None
     with contextlib.suppress(Exception):
         from aistudio_api.infrastructure.account.account_store import AccountStore
 
         store = AccountStore()
         active = store.get_active_account()
         if not active:
+            if cached is None:
+                _empty_cookie_cache[cache_key] = (now, True)
             return None
         auth_path = store.get_auth_path_optional(active.id, require_exists=True)
         if auth_path:
             cookies = load_cookies_from_auth_file(auth_path)
             if cookies:
+                _empty_cookie_cache.pop(cache_key, None)
                 return cookies
+    if cached is None:
+        _empty_cookie_cache[cache_key] = (now, True)
     return None
 
 
@@ -107,23 +128,35 @@ def _get_active_account_tier() -> str:
     return "Free"
 
 
-def _sync_response_cookies(
-    resp: httpx.Response,
+def _persist_set_cookies(
+    set_cookies: list[str],
     auth_file: str | None = None,
     cookies: dict[str, str] | None = None,
 ) -> None:
-    """捕获上游响应中的 Set-Cookie 并同步回内存与 AccountStore。"""
-    set_cookies = resp.headers.get_list("set-cookie")
-    if not set_cookies:
-        return
-    target_map = (
-        cookies if cookies is not None else (_get_auth_cookies(auth_file) or {})
-    )
+    """[仅限线程池调用] 将上游 Set-Cookie 合并回内存 Cookie 与 AccountStore。
+
+    内部含逐账号读盘、合并、原子写回等同步 I/O，账号越多阻塞越重；
+    必须经由 asyncio.to_thread 调用，禁止在事件循环线程内直接执行（3.4）。
+
+    线程安全：``cookies`` 可能是事件循环线程正在迭代的共享 SessionContext
+    字典（filter_minimal_cookies / calculate_sapisid_hash 等）。禁止在工作
+    线程逐键就地变更（并发插入会触发 "dictionary changed size during
+    iteration"，殃及无辜并发请求）；先在快照上合并，再一次性原子写回
+    （单次 dict.update 为 C 级调用，读侧也先做快照，两者叠加后无撕裂窗口）。
+    """
+    if cookies is not None:
+        snapshot = dict(cookies)
+        target_map = snapshot
+    else:
+        target_map = _get_auth_cookies(auth_file) or {}
     if not target_map:
         return
     updated = apply_set_cookies(target_map, set_cookies)
     if not updated:
         return
+    if cookies is not None:
+        # 单次原子写回共享 dict：其他线程要么看到旧值要么看到完整新值
+        cookies.update({name: target_map[name] for name in updated})
     logger.debug("捕获上游 Set-Cookie 更新: %s", updated)
     try:
         from aistudio_api.infrastructure.account.account_store import AccountStore
@@ -143,14 +176,18 @@ def _mask_proxy_url(proxy_url: str | None) -> str:
     return re.sub(r"//[^@/]+@", "//***@", str(proxy_url))
 
 
-async def _ensure_authorization_header(
+def _ensure_authorization_header(
     headers: dict[str, str],
     auth_user: str = "0",
     tier: str | None = None,
     auth_file: str | None = None,
     cookies: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    """Ensure SAPISIDHASH Authorization, X-Goog-AuthUser, and X-AIStudio-G1-Tier are set."""
+    """Ensure SAPISIDHASH Authorization, X-Goog-AuthUser, and X-AIStudio-G1-Tier are set.
+
+    纯同步函数（L4）：无任何 await，声明为 async 只会让每个请求多一次
+    协程创建与调度的纯开销。
+    """
     incoming_auth = ""
     for k, v in headers.items():
         if k.lower() == "authorization" and v:
@@ -214,10 +251,14 @@ class HTTPStreamTransport:
         return self._client_lock
 
     async def close(self) -> None:
-        for client in self._clients.values():
-            if not client.is_closed:
-                await client.aclose()
-        self._clients.clear()
+        # 与 _get_client 的建池分支互斥：否则并发建池插入 self._clients
+        # 会让这里的迭代抛 "dictionary changed size during iteration"，
+        # 且 close 之后新建的客户端将永远不会被关闭（连接泄漏）。
+        async with self._get_client_lock():
+            for client in self._clients.values():
+                if not client.is_closed:
+                    await client.aclose()
+            self._clients.clear()
 
     async def _get_client(self, proxy_url: str | None = None) -> httpx.AsyncClient:
         """获取（或创建）绑定指定出口代理的客户端；proxy_url=None 时使用全局默认代理。"""
@@ -254,7 +295,7 @@ class HTTPStreamTransport:
     ) -> tuple[int, bytes]:
         """Execute non-streaming HTTP request directly."""
         t0 = time.perf_counter()
-        clean_headers = await _ensure_authorization_header(
+        clean_headers = _ensure_authorization_header(
             headers,
             auth_user=auth_user,
             tier=tier,
@@ -273,7 +314,13 @@ class HTTPStreamTransport:
             resp = await client.post(
                 url, headers=clean_headers, content=body.encode("utf-8")
             )
-            _sync_response_cookies(resp, auth_file=auth_file, cookies=cookies)
+            # Set-Cookie 回写下放线程池（3.4）：逐账号读盘/写盘的同步 I/O
+            # 若留在事件循环内会拖慢所有并发请求的首字延迟。
+            set_cookies = resp.headers.get_list("set-cookie")
+            if set_cookies:
+                await asyncio.to_thread(
+                    _persist_set_cookies, set_cookies, auth_file, cookies
+                )
             elapsed_ms = (time.perf_counter() - t0) * 1000
             logger.debug(
                 "请求完成: status=%d, 耗时=%.1fms, 响应长度=%d",
@@ -307,7 +354,7 @@ class HTTPStreamTransport:
         proxy_url: str | None = None,
     ) -> AsyncGenerator[tuple[str, object], None]:
         """Stream HTTP response chunks directly."""
-        clean_headers = await _ensure_authorization_header(
+        clean_headers = _ensure_authorization_header(
             headers,
             auth_user=auth_user,
             tier=tier,
@@ -324,7 +371,11 @@ class HTTPStreamTransport:
                 "POST", url, headers=clean_headers, content=body.encode("utf-8")
             )
             resp = await client.send(req, stream=True)
-            _sync_response_cookies(resp, auth_file=auth_file, cookies=cookies)
+            set_cookies = resp.headers.get_list("set-cookie")
+            if set_cookies:
+                await asyncio.to_thread(
+                    _persist_set_cookies, set_cookies, auth_file, cookies
+                )
             yield ("status", resp.status_code)
 
             if resp.status_code != 200:

@@ -21,7 +21,6 @@ from aistudio_api.application.compat_service import build_compat_error_response
 from aistudio_api.config import settings
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.model_defaults import (
-    get_configured_api_keys,
     get_configured_logging_settings,
 )
 from aistudio_api.infrastructure.utils.logger import (
@@ -57,8 +56,9 @@ async def lifespan(_app: FastAPI):
         stop_signer_daemon,
     )
 
-    # 启动时自动检查并拉起本地 WAA 签名服务（若配置为本地节点）
-    ensure_signer_ready()
+    # 启动时自动检查并拉起本地 WAA 签名服务（若配置为本地节点）。
+    # 内含阻塞 I/O，下放线程池避免卡住启动期事件循环。
+    await asyncio.to_thread(ensure_signer_ready)
 
     from aistudio_api.application.account_rotator import init_rotator
     from aistudio_api.application.account_service import AccountService
@@ -326,7 +326,7 @@ async def lifespan(_app: FastAPI):
             await client.close()
         except Exception as e:
             logger.debug("关闭客户端异常: %s", e)
-    stop_signer_daemon()
+    await asyncio.to_thread(stop_signer_daemon)
     # 统计与调度状态都改成了防抖写入（record 后 2s 才落盘）；若进程在最后一次
     # 记账后 2s 内退出，最后一次增量会丢失。关闭时显式刷新一次内存态。
     try:
@@ -528,9 +528,9 @@ if static_dir.is_dir():
 @app.get("/auth/check")
 async def auth_check():
     """检查认证状态，用于前端判断是否需要登录。"""
-    from aistudio_api.config import settings
+    from aistudio_api.api.dependencies import web_auth_required
 
-    return {"auth_enabled": settings.auth_enabled}
+    return {"auth_enabled": web_auth_required()}
 
 
 @app.middleware("http")
@@ -668,11 +668,47 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", type=int, default=settings.port)
     args = parser.parse_args(argv)
 
+    import secrets as _secrets
+
+    from aistudio_api.api.dependencies import _all_configured_api_keys
+
     web_password_set = bool((settings.web_password or "").strip())
-    if not settings.api_keys and not web_password_set and not get_configured_api_keys():
+    configured_keys = settings.api_keys or _all_configured_api_keys()
+    allow_no_auth = (os.getenv("AISTUDIO_ALLOW_NO_AUTH") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+    if not web_password_set and not configured_keys:
+        if allow_no_auth:
+            logger.warning(
+                "未配置任何鉴权（AISTUDIO_API_KEYS / AISTUDIO_WEB_PASSWORD / "
+                "config.yaml api_keys）且已显式设置 AISTUDIO_ALLOW_NO_AUTH=1："
+                "服务将以完全开放模式运行，请仅在可信内网使用"
+            )
+        else:
+            # 安全默认（2.8）：首次启动到运维手动配置之间的窗口期内，
+            # 管理面板不再裸奔——自动生成一次性随机管理密码并打印到日志。
+            generated = _secrets.token_urlsafe(12)
+            settings.web_password = generated
+            logger.warning("=" * 64)
+            logger.warning(
+                "未检测到任何凭据，已自动生成随机管理密码保护管理面板（每次重启都会重新生成）："
+            )
+            logger.warning("  管理密码: %s", generated)
+            logger.warning(
+                "  如需固定密码请设置环境变量 AISTUDIO_WEB_PASSWORD；"
+                "如需在可信内网完全开放请设置 AISTUDIO_ALLOW_NO_AUTH=1"
+            )
+            logger.warning("=" * 64)
+    elif configured_keys and not web_password_set:
+        # 扩展告警（2.1）：覆盖“配置了 API Key 但未配置管理密码”的常见场景
         logger.warning(
-            "未配置任何鉴权（AISTUDIO_API_KEYS / AISTUDIO_WEB_PASSWORD / "
-            "config.yaml api_keys）：服务将对网络开放，请仅在可信内网使用"
+            "已配置 API Key 但未设置管理密码（AISTUDIO_WEB_PASSWORD）："
+            "管理控制台将允许任意有效 API Key 登录，且 Key 明文在 /api-keys、"
+            "/config 中脱敏展示。建议设置独立管理密码以隔离面板与 API 权限。"
         )
 
     import uvicorn

@@ -70,7 +70,12 @@ class StreamingGateway:
         latest_finish_reason: int | None = None
         latest_response_id: str | None = None
         raw_parts: list[str] = []
+        raw_parts_total = 0  # 累计长度计数器：避免每个 chunk 都 sum() 全量重算（O(n²)）
+        # 头部样本窗口与 is_login_redirect_payload 的扫描窗口（2000）对齐：
+        # 若只保留 512 字符，落在 512~2000 区间的 "servicelogin" 特征会漏检，
+        # 登录重定向被误判为普通 TransportError 而不触发账号轮换。
         head_sample: str = ""
+        HEAD_SAMPLE_LIMIT = 2000
         emitted_any_chunk = False
         has_received_chunks = False
         status_code = 0
@@ -111,45 +116,66 @@ class StreamingGateway:
                 events.append(("thought_signature", candidate.thought_signature))
             return events
 
-        async for event_type, payload in self._session.send_streaming_request(
+        # aclosing：客户端断连/上层重试丢弃本生成器时，async for 不会自动
+        # 关闭被迭代的异步生成器，上游 httpx 连接只能等 GC 释放；显式关闭
+        # 触发 transport 层 finally 的 resp.aclose()，确定性归还连接。
+        upstream = self._session.send_streaming_request(
             body=request_body,
             url=request.url,
             headers=request.headers,
             ctx=request.ctx,
-        ):
-            if event_type == "error":
-                err_msg = (
-                    str(payload).strip()
-                    if payload
-                    else "unknown streaming transport error"
-                )
-                raise TransportError(f"Streaming request failed: {err_msg}")
-            if event_type == "status" and payload and not status_code:
-                status_code = int(str(payload))
-            elif event_type == "chunk" and payload:
-                has_received_chunks = True
-                if isinstance(payload, bytes):
-                    text_payload = utf8_decoder.decode(payload, final=False)
-                else:
-                    text_payload = str(payload)
-                if not text_payload:
-                    continue
-                if status_code != 200:
-                    raw_parts.append(text_payload)
-                elif len(head_sample) < 512:
-                    head_sample += text_payload[: 512 - len(head_sample)]
-                for parsed_chunk in parser.feed(text_payload):
+        )
+        try:
+            async for event_type, payload in upstream:
+                if event_type == "error":
+                    err_msg = (
+                        str(payload).strip()
+                        if payload
+                        else "unknown streaming transport error"
+                    )
+                    raise TransportError(f"Streaming request failed: {err_msg}")
+                if event_type == "status" and payload and not status_code:
+                    status_code = int(str(payload))
+                elif event_type == "chunk" and payload:
+                    has_received_chunks = True
+                    if isinstance(payload, bytes):
+                        text_payload = utf8_decoder.decode(payload, final=False)
+                    else:
+                        text_payload = str(payload)
+                    if not text_payload:
+                        continue
+                    if status_code != 200:
+                        # 错误响应体可能巨大（整页 HTML），截断累积上限避免内存被
+                        # 单个异常响应打爆（诊断只需头部样本）。
+                        if raw_parts_total < 65536:
+                            raw_parts.append(text_payload)
+                            raw_parts_total += len(text_payload)
+                    elif len(head_sample) < HEAD_SAMPLE_LIMIT:
+                        head_sample += text_payload[
+                            : HEAD_SAMPLE_LIMIT - len(head_sample)
+                        ]
+                    if status_code == 200:
+                        # 非 200 的错误体无需逐块解析（解析器只为正常流服务，
+                        # 白扫 64KB 错误页纯浪费 CPU，且理论上可能把凑巧结构
+                        # 下发为事件）；错误分类走末尾的 raw_response 路径。
+                        for parsed_chunk in parser.feed(text_payload):
+                            for event in emit_parsed_chunk(parsed_chunk):
+                                emitted_any_chunk = True
+                                yield event
+        finally:
+            # 正常结束 / 异常 / 客户端断连（GeneratorExit）都走这里：
+            # 确定性关闭 transport 生成器，触发其 finally 的 resp.aclose()。
+            await upstream.aclose()
+        trailing_text = utf8_decoder.decode(b"", final=True)
+        if trailing_text:
+            if status_code != 200 and raw_parts_total < 65536:
+                raw_parts.append(trailing_text)
+                raw_parts_total += len(trailing_text)
+            if status_code == 200:
+                for parsed_chunk in parser.feed(trailing_text):
                     for event in emit_parsed_chunk(parsed_chunk):
                         emitted_any_chunk = True
                         yield event
-        trailing_text = utf8_decoder.decode(b"", final=True)
-        if trailing_text:
-            if status_code != 200:
-                raw_parts.append(trailing_text)
-            for parsed_chunk in parser.feed(trailing_text):
-                for event in emit_parsed_chunk(parsed_chunk):
-                    emitted_any_chunk = True
-                    yield event
 
         for parsed_chunk in parser.finish():
             for event in emit_parsed_chunk(parsed_chunk):
@@ -184,7 +210,23 @@ class StreamingGateway:
                 raise TransportError("upstream returned HTML error page on HTTP 200")
         if latest_finish_reason is not None:
             yield ("finish_reason", latest_finish_reason)
+        elif emitted_any_chunk:
+            # 流正常结束但从未收到上游 finish_reason：典型场景是连接在
+            # 最后一个数据块之前被截断。若仍伪装成 STOP，下游会把被截断的
+            # 回答当成完整回答（静默丢字）。此处下发 OTHER（wire 5）让
+            # Gemini 协议客户端可感知异常，并记录 WARNING 供告警统计。
+            logger.warning(
+                "流式响应结束但未收到上游 finish_reason（疑似截断）: "
+                "model=%s, 已输出内容=%s, 响应头样本=%r",
+                model,
+                emitted_any_chunk,
+                head_sample[:120],
+            )
+            yield ("finish_reason", 5)
         else:
+            logger.warning(
+                "流式响应结束但未收到上游 finish_reason（无内容输出）: model=%s", model
+            )
             yield ("finish_reason", 1)
         yield ("usage", latest_usage)
         yield ("done", None)

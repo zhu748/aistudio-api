@@ -154,7 +154,12 @@ type browserResponseBody struct {
 // newBrowserRoundTripper 创建与当前 Camoufox 网络形状一致的传输：经代理时只用 HTTP/2，直连时按 Alt-Svc 改用 HTTP/3
 func newBrowserRoundTripper(proxyURL string) (stdhttp.RoundTripper, error) {
 	proxyURL = strings.TrimSpace(proxyURL)
-	var proxyDialer proxy.ContextDialer = &net.Dialer{}
+	// 直连拨号器必须带超时（3.16）：裸 &net.Dialer{} 拨号无截止时间，
+	// 黑洞地址要等操作系统默认约 2 分钟；对齐 Firefox 的 30s 拨号超时。
+	var proxyDialer proxy.ContextDialer = &net.Dialer{
+		Timeout:   firefoxTLSHandshakeTimeout,
+		KeepAlive: 30 * time.Second,
+	}
 	if proxyURL != "" {
 		parsed, err := url.Parse(proxyURL)
 		if err != nil || parsed.Hostname() == "" {
@@ -397,7 +402,11 @@ func (pool *firefoxConnPool) shutdown() {
 
 // dialBrowserTLS 以 Firefox ClientHello 建立 TLS 连接并要求协商 HTTP/2
 func dialBrowserTLS(dialer proxy.ContextDialer, hello tls.ClientHelloID, address string) (net.Conn, error) {
-	raw, err := dialer.DialContext(context.Background(), "tcp", address)
+	// TCP 拨号同样受 30s 截止（3.16）：context.Background() 无截止时
+	// 黑洞地址要等操作系统默认约 2 分钟。
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), firefoxTLSHandshakeTimeout)
+	defer dialCancel()
+	raw, err := dialer.DialContext(dialCtx, "tcp", address)
 	if err != nil {
 		return nil, err
 	}

@@ -146,7 +146,9 @@ async def healthz():
 
 @protected_router.get("/stats", response_model=StatsResponse)
 async def stats():
-    return stats_response()
+    # O(模型数 × 账号数) 的同步聚合（P3）：50 账号 × 10 模型时达数十毫秒，
+    # 下放线程池避免阻塞事件循环拖慢并发流式请求。
+    return await asyncio.to_thread(stats_response)
 
 
 # ========== 调度与配额管理 API ==========
@@ -276,9 +278,47 @@ class ConfigYamlUpdateRequest(BaseModel):
     yaml_content: str
 
 
+def _mask_yaml_api_keys(yaml_content: str) -> str:
+    """对 YAML 文本中 api_keys 块的 key 字段值脱敏（仅展示用）。
+
+    按缩进识别顶层 ``api_keys:`` 块的边界，只替换其中 ``key: <value>``
+    行的值，不影响其余内容与注释，保证面板编辑器中的往返安全。
+    """
+    import re
+
+    lines = yaml_content.splitlines(keepends=True)
+    out: list[str] = []
+    in_api_keys_block = False
+    for line in lines:
+        stripped = line.rstrip("\n")
+        if not stripped.startswith((" ", "\t", "#")) and stripped.strip():
+            # 顶层键：进入/退出 api_keys 块
+            in_api_keys_block = stripped.rstrip().endswith(":") and (
+                stripped.split(":", 1)[0].strip() == "api_keys"
+            )
+        elif in_api_keys_block and stripped.strip().startswith("key:"):
+            m = re.match(r"^(\s*key:\s*).+$", stripped)
+            if m:
+                from aistudio_api.api.dependencies import mask_api_key
+
+                raw_value = stripped[m.end(1) :].strip().strip("'\"")
+                if raw_value:
+                    line = m.group(1) + mask_api_key(raw_value) + "\n"
+        out.append(line)
+    return "".join(out)
+
+
 @protected_router.get("/config")
-async def get_system_config() -> dict[str, object]:
-    """获取系统运行配置与 config.yaml 内容。"""
+async def get_system_config(request: Request) -> dict[str, object]:
+    """获取系统运行配置与 config.yaml 内容。
+
+    脱敏（2.1）：未配置管理密码时 yaml_content 中的 API Key 明文会被
+    掩码，避免任意 Key 持有者读到全部 Key。
+    """
+    from aistudio_api.api.dependencies import (
+        is_admin_password_session,
+        web_auth_required,
+    )
     from aistudio_api.config import settings
     from aistudio_api.infrastructure.utils.logger import (
         get_dump_dir,
@@ -293,6 +333,8 @@ async def get_system_config() -> dict[str, object]:
     if config_yaml_path.exists():
         with contextlib.suppress(Exception):
             yaml_content = config_yaml_path.read_text(encoding="utf-8")
+    if not is_admin_password_session(request):
+        yaml_content = _mask_yaml_api_keys(yaml_content)
     from aistudio_api.infrastructure.gateway.model_defaults import (
         get_active_waa_server,
     )
@@ -303,7 +345,7 @@ async def get_system_config() -> dict[str, object]:
         "proof_server_url": str(active_waa.get("url") or settings.proof_server_url),
         "active_signer_server": active_waa.get("id"),
         "proxy_configured": bool(settings.proxy_url),
-        "auth_enabled": settings.auth_enabled,
+        "auth_enabled": web_auth_required(),
         "yaml_content": yaml_content,
         "log_level": get_log_level(),
         "dump_requests": is_dump_requests_enabled(),
@@ -457,19 +499,21 @@ async def switch_signer_server(req: SwitchSignerServerRequest) -> dict[str, obje
 
     switch_active_waa_server(target_id)
 
-    # 切到本地节点：懒启动本地守护进程（缺失时自动回退远程并写回配置）
+    # 切到本地节点：懒启动本地守护进程（缺失时自动回退远程并写回配置）。
+    # ensure_signer_ready 内含阻塞 urlopen/端口探测/子进程等待（最长约 12 秒），
+    # 必须下放线程池，否则会卡住整个事件循环、冻结所有并发流式请求。
     active = get_active_waa_server()
     active_url = str(active.get("url") or "")
     if is_local_signer_url(active_url):
         from aistudio_api.infrastructure.waa.daemon import ensure_signer_ready
 
-        ensure_signer_ready()
+        await asyncio.to_thread(ensure_signer_ready)
         # 兼容二进制缺失自动回退远程的情况，重新读取实际生效节点
         active = get_active_waa_server()
     else:
         from aistudio_api.infrastructure.waa.daemon import stop_signer_daemon
 
-        stop_signer_daemon()
+        await asyncio.to_thread(stop_signer_daemon)
     env_override = os.getenv("AISTUDIO_WAA_SERVER", "").strip()
     runtime_override = get_runtime_waa_override()
     note: str | None = None
@@ -521,18 +565,19 @@ async def reset_signer_server() -> dict[str, object]:
             "changed": False,
         }
 
-    # 覆盖清除后回到默认节点：远端则停掉本地守护，本地则懒启动
+    # 覆盖清除后回到默认节点：远端则停掉本地守护，本地则懒启动。
+    # 同 switch 接口：阻塞操作下放线程池，避免卡住事件循环。
     active = get_active_waa_server()
     active_url = str(active.get("url") or "")
     if is_local_signer_url(active_url):
         from aistudio_api.infrastructure.waa.daemon import ensure_signer_ready
 
-        ensure_signer_ready()
+        await asyncio.to_thread(ensure_signer_ready)
         active = get_active_waa_server()
     else:
         from aistudio_api.infrastructure.waa.daemon import stop_signer_daemon
 
-        stop_signer_daemon()
+        await asyncio.to_thread(stop_signer_daemon)
 
     env_override = os.getenv("AISTUDIO_WAA_SERVER", "").strip()
     logger.info(
@@ -1112,17 +1157,26 @@ class UpdateApiKeyRequest(BaseModel):
 
 
 @protected_router.get("/api-keys", response_model=list[ApiKeyItemModel])
-async def list_api_keys() -> list[ApiKeyItemModel]:
-    """获取已配置的 API Keys 列表（config.yaml + 环境变量注入合并展示）。"""
+async def list_api_keys(request: Request) -> list[ApiKeyItemModel]:
+    """获取已配置的 API Keys 列表（config.yaml + 环境变量注入合并展示）。
+
+    脱敏（2.1）：未配置管理密码时，管理端以 API Key 回退鉴权，任意 Key
+    持有者不应看到其他 Key 的明文，返回脱敏形式；配置了管理密码时
+    （即真正的管理员会话）才返回明文。
+    """
+    from aistudio_api.api.dependencies import is_admin_password_session, mask_api_key
     from aistudio_api.infrastructure.gateway.model_defaults import (
         get_configured_api_key_items,
     )
 
+    show_plaintext = is_admin_password_session(request)
     items = get_configured_api_key_items()
     result = [
         ApiKeyItemModel(
             name=item.get("name") or "API Key",
-            key=item.get("key") or "",
+            key=(item.get("key") or "")
+            if show_plaintext
+            else mask_api_key(str(item.get("key") or "")),
             created_at=item.get("created_at") or None,
         )
         for item in items
@@ -1139,7 +1193,7 @@ async def list_api_keys() -> list[ApiKeyItemModel]:
         result.append(
             ApiKeyItemModel(
                 name="环境变量注入 (ENV)",
-                key=key,
+                key=key if show_plaintext else mask_api_key(key),
                 created_at=None,
             )
         )

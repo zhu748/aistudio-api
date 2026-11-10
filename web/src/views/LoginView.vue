@@ -84,6 +84,16 @@ async function handleLogin() {
         </p>
       </div>
 
+      <!-- 服务不可达提示（L16）：被重定向到登录页但真实原因是后端探测失败时，
+           必须明确告知“服务不可达”而非让用户误以为密码错误 -->
+      <div
+        v-if="authStore.checkFailed"
+        class="mb-5 p-3 bg-amber-50 border border-amber-200/80 rounded-xl text-xs font-medium text-amber-900 flex items-start gap-2"
+      >
+        <AlertCircle class="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+        <span>后端服务暂时不可达，无法确认是否需要登录。请确认网关服务已启动，刷新页面重试——这不是密码错误。</span>
+      </div>
+
       <!-- Error Alert -->
       <div
         v-if="errorMsg"
