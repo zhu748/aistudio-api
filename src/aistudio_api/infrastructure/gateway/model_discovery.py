@@ -761,6 +761,9 @@ class ModelDiscoveryService:
             effective_cookies = cookies
             effective_auth_user = auth_user
             effective_tier = "Free"
+            effective_proxy = None
+            if session and session.active_context:
+                effective_proxy = session.active_context.proxy_url
             if not effective_cookies:
                 auth_file = (
                     getattr(session, "_auth_file", None)
@@ -781,6 +784,7 @@ class ModelDiscoveryService:
                             )
                             auth_file = str(auth_path) if auth_path else None
                             effective_auth_user = active.auth_user or "0"
+                            effective_proxy = active.proxy_url
                             effective_tier = getattr(active, "tier", "Free") or "Free"
                     except Exception:
                         pass
@@ -799,6 +803,7 @@ class ModelDiscoveryService:
                         effective_cookies,
                         effective_auth_user,
                         tier=effective_tier,
+                        proxy_url=effective_proxy,
                     )
                     if models:
                         merged = _merge_extra_models(models)
@@ -1007,6 +1012,7 @@ class ModelDiscoveryService:
         auth_user: str,
         *,
         tier: str = "Free",
+        proxy_url: str | None = None,
     ) -> list[dict[str, object]]:
         """通过 HTTP 客户端携带 SAPISIDHASH 拉取。"""
         import httpx
@@ -1029,7 +1035,8 @@ class ModelDiscoveryService:
 
         async with httpx.AsyncClient(
             timeout=10.0,
-            proxy=settings.proxy_url,
+            proxy=proxy_url or settings.proxy_url,
+            trust_env=False,
             http2=_http2_enabled(),
             verify=_shared_ssl_context(),
         ) as client:

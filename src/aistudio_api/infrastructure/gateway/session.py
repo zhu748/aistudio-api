@@ -7,6 +7,7 @@ import itertools
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from aistudio_api.config import settings
 from aistudio_api.infrastructure.account.cookie_parser import (
@@ -22,7 +23,12 @@ from aistudio_api.infrastructure.account.cookie_parser import (
 )
 from aistudio_api.infrastructure.gateway.transport import HTTPStreamTransport
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
+from aistudio_api.infrastructure.request_context import (
+    current_request,
+    upstream_attempt,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
+from aistudio_api.infrastructure.utils.redaction import redact_text
 from aistudio_api.infrastructure.waa.signer import WaaSigner
 
 log = get_logger("session")
@@ -115,6 +121,10 @@ class GatewaySession:
         """Atomic account switch."""
         await self.transition_to_account(auth_file, force_refresh=True)
 
+    async def set_default_proxy(self, proxy: str | None) -> None:
+        self._transport.proxy_url = proxy
+        await self._signer.reconfigure(proxy_url=proxy or "")
+
     async def transition_to_account(
         self, auth_file: str | None, force_refresh: bool = False
     ) -> SessionContext:
@@ -187,12 +197,25 @@ class GatewaySession:
         auth_user = active_ctx.auth_user or "0"
         tier = active_ctx.tier or "Free"
 
+        observation = current_request.get()
+        if observation is not None:
+            observation.model = model
+            observation.account_id = (
+                Path(active_ctx.auth_file).parent.name if active_ctx.auth_file else ""
+            )
+            observation.auth_user = auth_user
+            observation.proxy = redact_text(
+                active_ctx.proxy_url or settings.proxy_url or ""
+            )
+            observation.signer = redact_text(target_url)
+
         proof = await self._signer.generate_snapshot(
             contents=contents,
             cookies=cookies,
             auth_user=auth_user,
             tier=tier,
             model=model,
+            upstream_proxy=active_ctx.proxy_url or settings.proxy_url,
         )
         self._sync_signer_cookies(active_ctx)
         return proof
@@ -257,16 +280,23 @@ class GatewaySession:
         req_headers["X-Goog-AuthUser"] = active_ctx.auth_user
         if headers:
             req_headers.update(headers)
-        return await self._transport.send_request(
-            url=target_url,
-            headers=req_headers,
-            body=body,
-            auth_user=active_ctx.auth_user,
-            tier=active_ctx.tier,
-            auth_file=active_ctx.auth_file,
-            cookies=active_ctx.cookies,
-            proxy_url=active_ctx.proxy_url,
-        )
+        with upstream_attempt(
+            active_ctx.auth_file,
+            active_ctx.auth_user,
+            active_ctx.proxy_url or settings.proxy_url or "",
+        ) as attempt:
+            result = await self._transport.send_request(
+                url=target_url,
+                headers=req_headers,
+                body=body,
+                auth_user=active_ctx.auth_user,
+                tier=active_ctx.tier,
+                auth_file=active_ctx.auth_file,
+                cookies=active_ctx.cookies,
+                proxy_url=active_ctx.proxy_url,
+            )
+            attempt["status_code"] = result[0]
+            return result
 
     async def send_streaming_request(
         self,
@@ -296,11 +326,20 @@ class GatewaySession:
             cookies=active_ctx.cookies,
             proxy_url=active_ctx.proxy_url,
         )
-        try:
-            async for event in upstream:
-                yield event
-        finally:
-            await upstream.aclose()
+        with upstream_attempt(
+            active_ctx.auth_file,
+            active_ctx.auth_user,
+            active_ctx.proxy_url or settings.proxy_url or "",
+        ) as attempt:
+            try:
+                async for event in upstream:
+                    if event[0] == "status":
+                        attempt["status_code"] = event[1]
+                    elif event[0] == "error":
+                        attempt["error"] = redact_text(str(event[1]))[:500]
+                    yield event
+            finally:
+                await upstream.aclose()
 
     async def close(self) -> None:
         """Close transport, signer, and reset active context."""

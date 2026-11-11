@@ -20,8 +20,8 @@ from aistudio_api.api.responses import to_gemini_parts, to_gemini_usage_metadata
 from aistudio_api.api.schemas import GeminiGenerateContentRequest
 from aistudio_api.api.state import runtime_state
 from aistudio_api.application.account_orchestrator import (
-    MAX_RETRIES,
     ensure_active_account,
+    get_max_retries,
     record_rotator_event,
     try_switch_account,
 )
@@ -54,6 +54,7 @@ from aistudio_api.infrastructure.gateway.client import (
 from aistudio_api.infrastructure.gateway.wire_spec import (
     WIRE_FINISH_REASON_CONTINUING,
 )
+from aistudio_api.infrastructure.request_context import current_request, record_result
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("api.gemini")
@@ -340,7 +341,9 @@ async def handle_attempt_exception(
                 cdict = load_cookies_from_auth_file(auth_path) if auth_path else {}
                 before_ts = cdict.get("__Secure-1PSIDTS", "")
                 if cdict:
-                    alive, _ = await probe_aistudio_session(cdict)
+                    alive, _ = await probe_aistudio_session(
+                        cdict, proxy_url=serving_acc.proxy_url
+                    )
                     if alive and hasattr(account_svc, "rotate_account_cookies"):
                         session = (
                             runtime_state.client.session
@@ -371,7 +374,7 @@ async def handle_attempt_exception(
             failed_account_id=failed_id,
             is_session_expired=True,
         ):
-            logger.info("已切换账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
+            logger.info("已切换账号重试 (%d/%d)", attempt + 1, get_max_retries())
             return True
         raise HTTPException(
             401,
@@ -402,7 +405,7 @@ async def handle_attempt_exception(
             logger.warning(
                 "触发 429 限流，切换账号重试 (%d/%d): model=%s",
                 attempt + 1,
-                MAX_RETRIES,
+                get_max_retries(),
                 target_model,
             )
             return True
@@ -429,12 +432,12 @@ async def handle_attempt_exception(
     if (
         is_transient_rpc_error(exc)
         and not has_yielded_data
-        and attempt < MAX_RETRIES - 1
+        and attempt < get_max_retries() - 1
     ):
         logger.warning(
             "上游 404 路由抖动，立即重试 (%d/%d): %s",
             attempt + 1,
-            MAX_RETRIES,
+            get_max_retries(),
             clean_upstream_error_message(str(exc)),
         )
         return True
@@ -442,13 +445,13 @@ async def handle_attempt_exception(
         logger.warning(
             "传输或签名异常，切换账号重试 (%d/%d): %s",
             attempt + 1,
-            MAX_RETRIES,
+            get_max_retries(),
             exc,
         )
         if not has_yielded_data and await try_switch_account(
             model=target_model, failed_account_id=failed_id
         ):
-            logger.info("已切换账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
+            logger.info("已切换账号重试 (%d/%d)", attempt + 1, get_max_retries())
             return True
         if is_transport_error(exc):
             runtime_state.record(target_model, "errors")
@@ -531,6 +534,9 @@ async def handle_gemini_generate_content(
     stream: bool,
     anti_truncation: bool | None = None,
 ):
+    observation = current_request.get()
+    if observation is not None:
+        observation.model = model_path
     # 抗截断模型变体：带后缀的模型强制开启抗截断；请求头 X-Anti-Truncation
     # 显式传值时以请求头为准。非流式变体额外强制缓冲（非流式）上游传输。
     force_buffer = False
@@ -558,7 +564,7 @@ async def handle_gemini_generate_content(
 
     last_error: Exception | None = None
     auth_manager = Auth403RetryManager()
-    total_attempts = MAX_RETRIES + AUTH_403_MAX_RETRIES
+    total_attempts = get_max_retries() + AUTH_403_MAX_RETRIES
     # 本次请求实际服务的账号（3.9）：在每次尝试发送前刷新，收尾记账用它，
     # 避免并发请求切号后把结果记到无关账号头上。
     serving_account_id: str | None = None
@@ -619,6 +625,9 @@ async def handle_gemini_generate_content(
                 )
             # 空回不能记为成功：上游 200 但零内容通常意味着风控/安全拦截，
             # 记 success 会让账号健康度虚高、掩盖被软封的账号。
+            observation = current_request.get()
+            if observation and observation.account_id:
+                serving_account_id = observation.account_id
             rotator_event = "success" if has_any_output else "error"
             record_rotator_event(
                 rotator_event,
@@ -655,6 +664,10 @@ async def handle_gemini_generate_content(
             return response_obj
         except Exception as exc:
             last_error = exc
+            observation = current_request.get()
+            if observation and observation.account_id:
+                serving_account_id = observation.account_id
+                auth_manager.serving_account_id = serving_account_id
             if isinstance(exc, AuthError) and not isinstance(exc, SessionExpiredError):
                 target_m = normalized.model if normalized else model_path
                 if await auth_manager.handle_403(exc, model=target_m, client=client):
@@ -845,7 +858,7 @@ def _build_gemini_streaming_response(
             # 预先初始化，避免循环零次执行时下方引用被判 possibly-unbound
             has_yielded_data = False
             auth_manager = Auth403RetryManager()
-            total_attempts = MAX_RETRIES + AUTH_403_MAX_RETRIES
+            total_attempts = get_max_retries() + AUTH_403_MAX_RETRIES
             # 本次请求实际服务的账号（3.9）：同非流式路径
             serving_account_id: str | None = None
             for stream_attempt in range(total_attempts):
@@ -1004,6 +1017,10 @@ def _build_gemini_streaming_response(
                         await _close_stream_quietly(anti_stream)
                 except Exception as exc:
                     last_stream_error = exc
+                    observation = current_request.get()
+                    if observation and observation.account_id:
+                        serving_account_id = observation.account_id
+                        auth_manager.serving_account_id = serving_account_id
                     if (
                         isinstance(exc, AuthError)
                         and not isinstance(exc, SessionExpiredError)
@@ -1051,6 +1068,9 @@ def _build_gemini_streaming_response(
                     has_yielded_any = True
                     yield diagnostic_chunk
             # 与空回防护一致：零内容不能记为 success（见上方流式空回诊断）
+            observation = current_request.get()
+            if observation and observation.account_id:
+                serving_account_id = observation.account_id
             stream_event = "success" if has_yielded_data else "error"
             record_rotator_event(
                 stream_event,
@@ -1085,6 +1105,7 @@ def _build_gemini_streaming_response(
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - stream_start_time) * 1000
             code, msg, status_str = classify_gemini_error_payload(exc)
+            record_result("rate_limited" if code == 429 else "error", error=msg)
             logger.warning(
                 "流式生成失败: model=%s, 耗时=%.1fms, code=%d(%s), "
                 "已输出内容=%s, 异常类型=%s, 原因=%s",

@@ -52,6 +52,7 @@
 | **动态模型发现** | 自动向上游同步可用模型列表，支持 `gemini-3.7-flash`、`gemini-3.8-flash` 等最新模型 |
 | **多账号自动轮换** | 支持多账号管理与故障自动切换，按模型独立记录 429 配额，每日美西午夜自动重置 |
 | **运行状态持久化** | 模型调用量、Token 消耗统计 (`stats.json`) 以及账号 429 限额与冷却状态 (`rotator_state.json`) 自动落盘，容器/服务重启不丢失状态 |
+| **请求审计与运行日志** | 可检索请求历史、账号/代理尝试与 Token 元数据；结构化日志轮转落盘并按请求 ID 关联。默认不保存请求或响应正文 |
 | **下游参数容错与丢弃** | 支持配置 `drop_unsupported_params` 自动过滤下游传入的非标准安全分类（如 `HARM_CATEGORY_CIVIC_INTEGRITY`）与不兼容工具，避免 400 阻断 |
 | **批量子账号探活** | 导入单个包含多个 Google 身份的 Cookie 后，自动探测子账号（`u/0`, `u/1`...）并分别建档 |
 | **内置搜索与工具** | 支持 Google Search 联网搜索、Google Maps、代码执行沙箱等官方扩展能力 |
@@ -351,13 +352,23 @@ environment:
 | `AISTUDIO_CONFIG_FILE` | string | `config.yaml` | 模型规则与默认工具配置文件路径 |
 | `AISTUDIO_PERSIST_STATS` | bool | `true` | 是否持久化模型调用与 Token 统计（1=开启，0=关闭） |
 | `AISTUDIO_PERSIST_ROTATOR` | bool | `true` | 是否持久化账号 429 冷却与调度状态（1=开启，0=关闭） |
-| `AISTUDIO_PROOF_SERVER_URL` | string | `http://127.0.0.1:8081` | 签名服务器地址覆盖项；推荐在 `config.yaml` 的 `waa.servers` 中统一配置各节点及其特征 User-Agent 并手动切换 |
+| `AISTUDIO_PROOF_SERVER_URL` | string | `https://waa.spinsnow.fun` | 签名服务器地址覆盖项；推荐在 `config.yaml` 的 `waa.servers` 中统一配置各节点及其特征 User-Agent 并手动切换 |
 | `AISTUDIO_DEFAULT_TEXT_MODEL` | string | `gemini-3.7-flash` | 默认文本模型 |
 | `AISTUDIO_TIMEZONE` | string | 自动探测 | Wire 协议交互时区（默认 `America/Los_Angeles`） |
 | `AISTUDIO_ANTI_TRUNCATION` | bool | `false` | 强制覆盖 `config.yaml` 中 `anti_truncation.enabled` 全局开关（1=开启，0=关闭，留空跟随配置文件） |
 | `AISTUDIO_DUMP_REQUESTS` | bool | `false` | 是否在终端转储每次 API 交互报文详情（支持 `DEBUG=1` 触发） |
 | `AISTUDIO_DUMP_FILE` | bool | `false` | 是否将请求与响应报文详情落盘保存 |
-| `AISTUDIO_DUMP_DIR` | string | `dumps/` | 报文转储保存目录 |
+| `AISTUDIO_DUMP_DIR` | string | `data/dumps/` | 报文转储保存目录 |
+| `AISTUDIO_REQUEST_HISTORY` | bool | `true` | 是否持久化请求元数据（不保存正文） |
+| `AISTUDIO_HISTORY_DAYS` / `AISTUDIO_HISTORY_MAX_ROWS` | int | `14` / `100000` | 请求历史保留天数和最大记录数 |
+| `AISTUDIO_MAX_REQUEST_BYTES` | int | `33554432` | 单个模型请求正文上限（字节） |
+| `AISTUDIO_MAX_CONCURRENT_REQUESTS` | int | `50` | 同时处理的模型请求上限，超出时返回 HTTP 429 |
+| `AISTUDIO_REQUEST_TIMEOUT` | int | `600` | 模型请求总超时（秒）；流式响应从请求开始计时 |
+| `AISTUDIO_DUMP_MAX_BYTES` | int | `1048576` | 详细转储时单个请求体或响应体的采集上限（字节） |
+| `AISTUDIO_DUMP_MAX_FILES` | int | `1000` | 详细转储文件最多保留数量 |
+| `AISTUDIO_DUMP_MAX_AGE_DAYS` | int | `7` | 详细转储文件最多保留天数 |
+| `AISTUDIO_DUMP_MAX_TOTAL_BYTES` | int | `268435456` | 详细转储目录最大总容量（默认 256 MiB） |
+| `AISTUDIO_SIGNER_SECRET` / `AISTUDIO_SIGNER_SECRET_URL` | string | `""` | 为对应签名节点配置 Bearer 共享密钥；仅发给匹配 URL 的节点 |
 
 #### 本地 WAA 签名器（waa-signer）环境变量
 
@@ -606,8 +617,12 @@ if response.function_calls:
 - **仪表盘 (Dashboard)**：实时展示服务健康状况、各模型请求量、成功率及 429 冷却指标。
 - **账号管理 (Accounts)**：支持 Cookie 单条与凭据包批量导入、自动探测多账号、手动切换当前活跃账号或重置冷却状态。
 - **运行日志 (Logs)**：内存环形缓冲最近 2000 条日志，SSE 实时推送（`GET /api/logs/stream`，新日志毫秒级直达面板，空闲期 20 秒心跳保活），支持级别过滤（信息/警告+/错误+）与关键字检索，可一键清空。
+- **请求历史 (Requests)**：完整请求结束后写入元数据，支持模型、账号、Key 标识、结果、时间与关键字筛选；详情关联上游尝试、Token 用量和同一请求的持久化日志，可导出 JSON 或清理历史。
+- **代理诊断 (Proxies)**：显示全局/账号级代理生效来源，可测试当前或草稿代理到 Google、AI Studio 与出口 IP；可在线更新全局代理。请求历史只显示脱敏代理地址。
+- **历史日志**：JSONL 后台线程轮转写入 `data/logs/`，最多约 30 MiB，按请求 ID、级别和关键字查询，并保留实时日志页面。
+- **服务保护**：请求正文默认限制 32 MiB、最大并发 50、总超时 600 秒。阈值均可通过环境变量调整。
 - **系统设置 (Settings)**：在线编辑 `config.yaml`（支持配置 profiles 与 models 默认规则），保存后服务端即时热重载。
-- **访问鉴权**：设置环境变量 `AISTUDIO_WEB_PASSWORD` 后自动开启登录鉴权守卫。
+- **访问鉴权**：管理 API 与控制台受管理密码或有效 API Key 保护。未配置凭据时服务会生成随机管理密码；如仅在可信内网开放，可显式设置 `AISTUDIO_ALLOW_NO_AUTH=1`。
 
 ### 失败排查：请求失败 / 空回看哪里
 

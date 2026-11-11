@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { LayoutDashboard, Users, Sliders, Key, LogOut, ScrollText, Terminal } from 'lucide-vue-next'
+import { LayoutDashboard, Users, Sliders, Key, LogOut, ScrollText, Terminal, Network, ListChecks } from 'lucide-vue-next'
 import { useAuthStore } from '@/stores/auth.ts'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useRouter, useRoute } from 'vue-router'
@@ -29,6 +29,8 @@ const accountCountBadge = computed(() => {
 })
 
 const navItems = computed(() => [
+  { name: '请求记录', path: '/requests', icon: ListChecks, badge: '' },
+  { name: '代理与出口', path: '/proxies', icon: Network, badge: '' },
   {
     name: '控制面板',
     path: '/',
