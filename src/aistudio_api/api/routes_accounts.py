@@ -493,10 +493,19 @@ async def update_account_proxy(
     account = account_service.get_account(account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
+    from aistudio_api.api.state import runtime_state
+    from aistudio_api.infrastructure.utils.redaction import redact_text
+
+    client = runtime_state.client
+    if client and client.session.active_context:
+        active_file = client.session.active_context.auth_file
+        target_file = account_service.get_account_auth_path(account_id)
+        if target_file and active_file == str(target_file):
+            await client.session.transition_to_account(active_file, force_refresh=True)
     log.info(
         "更新账号代理: id=%s, proxy=%s",
         account_id,
-        account.proxy_url or "(全局)",
+        redact_text(account.proxy_url or "(全局)"),
     )
     return to_account_response(account)
 

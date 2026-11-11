@@ -10,8 +10,10 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import hashlib
+import os
 import re
 import time
+from contextlib import suppress
 from typing import Any
 
 import httpx
@@ -27,6 +29,31 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 logger = get_logger("waa.signer")
 
 DEFAULT_PROOF_SERVER_URL = "https://waa.spinsnow.fun"
+
+
+def signer_authorization(server_url: str) -> dict[str, str]:
+    """Bind credentials to a node, preventing fallback from disclosing its secret."""
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_configured_waa_settings,
+    )
+    from aistudio_api.infrastructure.waa.daemon import is_local_signer_url
+
+    url = server_url.rstrip("/")
+    secret = ""
+    servers = get_configured_waa_settings().get("servers")
+    if isinstance(servers, list):
+        for server in servers:
+            if (
+                isinstance(server, dict)
+                and str(server.get("url") or "").rstrip("/") == url
+            ):
+                secret = os.getenv(str(server.get("auth_token_env") or ""), "")
+                break
+    if not secret and (is_local_signer_url(url) or url == settings.signer_secret_url):
+        secret = settings.signer_secret
+    return {"Authorization": f"Bearer {secret}"} if secret else {}
+
 
 # Per-task storage: WaaSigner/RemoteProofSigner is shared across concurrent
 # requests. A plain instance attribute lets one request's proof headers be
@@ -82,7 +109,7 @@ class RemoteProofSigner:
         timeout: float = 30.0,
     ) -> None:
         self.server_url = server_url.rstrip("/")
-        self.proxy_url = proxy_url
+        self.proxy_url = proxy_url or None
         self.timeout = timeout
         self._client: httpx.AsyncClient | None = None
 
@@ -98,15 +125,14 @@ class RemoteProofSigner:
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or lazily initialize shared HTTP client with connection pooling."""
         if self._client is None or self._client.is_closed:
-            is_local = (
-                "127.0.0.1" in self.server_url
-                or "localhost" in self.server_url
-                or "::1" in self.server_url
-            )
+            from aistudio_api.infrastructure.waa.daemon import is_local_signer_url
+
+            is_local = is_local_signer_url(self.server_url)
             effective_proxy = None if is_local else self.proxy_url
             self._client = httpx.AsyncClient(
                 timeout=self.timeout,
                 proxy=effective_proxy,
+                trust_env=False,
                 limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
             )
         return self._client
@@ -132,6 +158,7 @@ class RemoteProofSigner:
         model: str = "models/gemini-3.7-flash",
         prompt: str = "",
         wire_contents: list[Any] | None = None,
+        upstream_proxy: str | None = None,
     ) -> str:
         """Request proof from remote proof server with automatic retry on transient failure."""
         min_cookies = filter_minimal_cookies(cookies)
@@ -151,6 +178,12 @@ class RemoteProofSigner:
         }
         if wire_contents is not None:
             payload["wireContents"] = wire_contents
+        if upstream_proxy:
+            payload["proxy"] = upstream_proxy
+        request_headers = {
+            "Content-Type": "application/json",
+            **signer_authorization(self.server_url),
+        }
 
         max_attempts = 2
         last_error: Exception | None = None
@@ -162,7 +195,7 @@ class RemoteProofSigner:
                 resp = await client.post(
                     f"{self.server_url}/v1/proof/mint",
                     json=payload,
-                    headers={"Content-Type": "application/json"},
+                    headers=request_headers,
                 )
                 elapsed_ms = (time.perf_counter() - t0) * 1000
 
@@ -188,7 +221,6 @@ class RemoteProofSigner:
                             self._masked_proxy(),
                             resp.text[:300],
                         )
-                        await self.close()
                         await asyncio.sleep(_retry_delay(attempt))
                         continue
                     raise TransportError(detail)
@@ -224,8 +256,8 @@ class RemoteProofSigner:
                     self._masked_proxy(),
                     e,
                 )
-                # Reset client on connection errors to discard stale connections
-                await self.close()
+                # HTTPX discards failed connections from its pool. Keep the shared
+                # client alive so one request cannot close connections used by peers.
                 if attempt < max_attempts:
                     await asyncio.sleep(_retry_delay(attempt))
             except TransportError:
@@ -239,8 +271,8 @@ class RemoteProofSigner:
                     self.server_url,
                     e,
                 )
-                # 同一 client 可能已处于坏状态（连接池污染/半关闭），丢掉重建。
-                await self.close()
+                # Client is shared across concurrent requests; a single malformed
+                # response must not close connections currently used by other tasks.
                 if attempt < max_attempts:
                     await asyncio.sleep(_retry_delay(attempt))
 
@@ -262,6 +294,7 @@ class WaaSigner:
         self._remote_signer = RemoteProofSigner(server_url=url, proxy_url=proxy_url)
         self._reconfigure_lock: asyncio.Lock | None = None
         self._delayed_close_tasks: set[asyncio.Task[None]] = set()
+        self._retired_signers: set[RemoteProofSigner] = set()
 
     def _get_reconfigure_lock(self) -> asyncio.Lock:
         """惰性创建切换锁（避免 import 时无事件循环可用）。"""
@@ -284,7 +317,9 @@ class WaaSigner:
         lock = self._get_reconfigure_lock()
         current = self._remote_signer
         target_url = (server_url or current.server_url).rstrip("/")
-        target_proxy = proxy_url if proxy_url is not None else current.proxy_url
+        target_proxy = (
+            (proxy_url or None) if proxy_url is not None else current.proxy_url
+        )
         if current.server_url == target_url and current.proxy_url == target_proxy:
             return  # 快路径：目标未变，不进入切换序列
 
@@ -297,6 +332,7 @@ class WaaSigner:
             )
             # 原子替换：后续新请求立即使用新实例，在途请求仍持有旧实例引用
             self._remote_signer = new_signer
+            self._retired_signers.add(current)
             logger.info(
                 "签名节点已切换: %s -> %s",
                 current.server_url,
@@ -305,11 +341,14 @@ class WaaSigner:
 
         # 旧实例延迟关闭：给在途请求一个宽限期（其超时上限为 30s）
         async def _delayed_close() -> None:
-            try:
+            with suppress(asyncio.CancelledError):
                 await asyncio.sleep(35.0)
+            try:
                 await current.close()
             except Exception as e:
                 logger.debug("延迟关闭旧签名器失败: %s", e)
+            finally:
+                self._retired_signers.discard(current)
 
         try:
             task = asyncio.create_task(_delayed_close())
@@ -321,9 +360,15 @@ class WaaSigner:
 
     async def close(self) -> None:
         """Close underlying remote signer resources."""
-        for task in list(self._delayed_close_tasks):
+        tasks = list(self._delayed_close_tasks)
+        for task in tasks:
             task.cancel()
         self._delayed_close_tasks.clear()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for retired in tuple(self._retired_signers):
+            await retired.close()
+        self._retired_signers.clear()
         await self._remote_signer.close()
 
     @property
@@ -343,6 +388,7 @@ class WaaSigner:
         auth_user: str = "0",
         tier: str = "Free",
         model: str = "models/gemini-3.7-flash",
+        upstream_proxy: str | None = None,
     ) -> tuple[str, dict[str, str]]:
         """Generate fresh WAA proof token along with dynamic session headers."""
         proof = await self.generate_snapshot(
@@ -351,6 +397,7 @@ class WaaSigner:
             auth_user=auth_user,
             tier=tier,
             model=model,
+            upstream_proxy=upstream_proxy,
         )
         return proof, dict(self._remote_signer.last_headers)
 
@@ -361,6 +408,7 @@ class WaaSigner:
         auth_user: str = "0",
         tier: str = "Free",
         model: str = "models/gemini-3.7-flash",
+        upstream_proxy: str | None = None,
     ) -> str:
         """Compute content hash and generate fresh WAA proof token."""
         prompt, content_hash = extract_content_digest(contents)
@@ -379,4 +427,5 @@ class WaaSigner:
             model=model,
             prompt=prompt,
             wire_contents=wire_contents,
+            upstream_proxy=upstream_proxy,
         )

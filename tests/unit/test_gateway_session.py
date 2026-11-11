@@ -41,6 +41,27 @@ async def test_gateway_session_generate_snapshot():
 
 
 @pytest.mark.asyncio
+async def test_account_proxy_is_passed_to_proof_signer():
+    session = GatewaySession()
+    context = SessionContext(
+        auth_user="0",
+        auth_file="/data/accounts/account-1/auth.json",
+        cookies={"SAPISID": "test_sapisid"},
+        proxy_url="socks5h://user:pass@proxy:1080",
+    )
+    mock_signer = MagicMock()
+    mock_signer.generate_snapshot = AsyncMock(return_value="!proof")
+    session._signer = mock_signer
+
+    contents = [AistudioContent(role="user", parts=[AistudioPart(text="hello")])]
+    await session.generate_snapshot(contents, ctx=context)
+
+    assert mock_signer.generate_snapshot.await_args.kwargs["upstream_proxy"] == (
+        "socks5h://user:pass@proxy:1080"
+    )
+
+
+@pytest.mark.asyncio
 async def test_gateway_session_send_request():
     session = GatewaySession()
     session.set_ready_context(

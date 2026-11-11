@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { RefreshCw, Trash2, Search, ArrowDownToLine, Radio, Pause } from 'lucide-vue-next'
+import HistoricalLogsPanel from '@/components/HistoricalLogsPanel.vue'
 import { systemApi } from '@/api/system.ts'
 import { useAuthStore } from '@/stores/auth.ts'
 import { useToastStore } from '@/stores/toast.ts'
 import type { LogEntry } from '@/types'
 
+const historical = ref(false)
 const entries = ref<LogEntry[]>([])
 const total = ref(0)
 const capacity = ref(0)
@@ -246,6 +248,10 @@ function handleRefresh() {
   void connectStream()
 }
 
+watch(historical, (value) => {
+  if (value) { closeStream(); connState.value = 'idle' }
+  else void connectStream()
+})
 watch(level, () => void connectStream())
 watch(live, (enabled) => {
   if (enabled) void connectStream()
@@ -276,197 +282,217 @@ onUnmounted(() => {
 
 <template>
   <div class="flex flex-col gap-3.5">
-    <!-- Consolidated Log Control Bar -->
-    <div class="bg-white border border-slate-200/90 rounded-xl p-3.5 shadow-2xs space-y-3">
-      <div class="flex flex-wrap items-center justify-between gap-3">
-        <!-- Connection Status & Buffer Telemetry -->
-        <div class="flex items-center gap-2.5 min-w-0">
-          <span
-            class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-xs font-semibold"
-            :class="
-              connState === 'open'
-                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                : connState === 'retrying'
-                  ? 'bg-rose-50 text-rose-700 border-rose-200'
-                  : 'bg-slate-100 text-slate-600 border-slate-200'
-            "
-          >
+    <div class="flex gap-2 text-xs">
+      <button
+        type="button"
+        class="px-3 py-2 rounded-lg border"
+        :class="!historical ? 'bg-slate-900 text-white' : 'bg-white'"
+        @click="historical = false"
+      >
+        实时日志
+      </button><button
+        type="button"
+        class="px-3 py-2 rounded-lg border"
+        :class="historical ? 'bg-slate-900 text-white' : 'bg-white'"
+        @click="historical = true"
+      >
+        历史归档
+      </button>
+    </div>
+    <HistoricalLogsPanel v-if="historical" />
+    <template v-else>
+      <!-- Consolidated Log Control Bar -->
+      <div class="bg-white border border-slate-200/90 rounded-xl p-3.5 shadow-2xs space-y-3">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <!-- Connection Status & Buffer Telemetry -->
+          <div class="flex items-center gap-2.5 min-w-0">
             <span
-              class="w-2 h-2 rounded-full"
-              :class="connDotClass[connState]"
-            />
-            <span>{{ connLabel[connState] }}</span>
-          </span>
+              class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-xs font-semibold"
+              :class="
+                connState === 'open'
+                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                  : connState === 'retrying'
+                    ? 'bg-rose-50 text-rose-700 border-rose-200'
+                    : 'bg-slate-100 text-slate-600 border-slate-200'
+              "
+            >
+              <span
+                class="w-2 h-2 rounded-full"
+                :class="connDotClass[connState]"
+              />
+              <span>{{ connLabel[connState] }}</span>
+            </span>
 
-          <span class="text-xs text-slate-500 font-mono tabular-nums truncate">
-            缓冲 <strong class="text-slate-800">{{ total }}</strong> / {{ capacity }} · 视图 <strong class="text-slate-800">{{ visibleLogs.length }}</strong> 条
-          </span>
+            <span class="text-xs text-slate-500 font-mono tabular-nums truncate">
+              缓冲 <strong class="text-slate-800">{{ total }}</strong> / {{ capacity }} · 视图 <strong class="text-slate-800">{{ visibleLogs.length }}</strong> 条
+            </span>
+          </div>
+
+          <!-- Level Segmented Selector & Stream Actions -->
+          <div class="flex items-center gap-2 flex-wrap">
+            <!-- Level Pills -->
+            <div class="flex items-center bg-slate-100 p-0.5 rounded-lg text-xs font-mono font-medium">
+              <button
+                v-for="opt in levelOptions"
+                :key="opt.value"
+                type="button"
+                class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
+                :class="
+                  level === opt.value
+                    ? 'bg-white text-slate-900 font-bold shadow-2xs'
+                    : 'text-slate-500 hover:text-slate-900'
+                "
+                @click="level = opt.value"
+              >
+                {{ opt.label }}
+              </button>
+            </div>
+
+            <!-- Live Toggle Button -->
+            <button
+              type="button"
+              class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors cursor-pointer"
+              :class="
+                live
+                  ? 'bg-brand-50 text-brand-700 border-brand-200'
+                  : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+              "
+              @click="live = !live"
+            >
+              <Radio
+                v-if="live"
+                class="w-3.5 h-3.5"
+              />
+              <Pause
+                v-else
+                class="w-3.5 h-3.5"
+              />
+              <span>{{ live ? '实时订阅中' : '已暂停' }}</span>
+            </button>
+
+            <button
+              type="button"
+              class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium text-slate-600 bg-white border border-slate-200 hover:bg-slate-50 transition-colors cursor-pointer"
+              :class="{ 'opacity-60 pointer-events-none': connState === 'connecting' }"
+              @click="handleRefresh"
+            >
+              <RefreshCw
+                class="w-3.5 h-3.5"
+                :class="{ 'animate-spin': connState === 'connecting' }"
+              />
+              <span>重连</span>
+            </button>
+
+            <button
+              type="button"
+              class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
+              @click="handleClear"
+            >
+              <Trash2 class="w-3.5 h-3.5" />
+              <span>清空</span>
+            </button>
+          </div>
         </div>
 
-        <!-- Level Segmented Selector & Stream Actions -->
-        <div class="flex items-center gap-2 flex-wrap">
-          <!-- Level Pills -->
-          <div class="flex items-center bg-slate-100 p-0.5 rounded-lg text-xs font-mono font-medium">
+        <!-- Second Row: Search Input & Sort Direction -->
+        <div class="flex flex-wrap items-center gap-2.5 pt-2.5 border-t border-slate-100">
+          <div class="relative flex-1 min-w-[200px]">
+            <Search class="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input
+              v-model="searchInput"
+              type="text"
+              placeholder="过滤日志内容、模块名称或级别…"
+              class="w-full bg-slate-50 border border-slate-200 rounded-lg pl-8 pr-3 py-1.5 text-xs font-mono text-slate-700 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
+            >
+          </div>
+
+          <div class="inline-flex rounded-lg bg-slate-100 p-0.5 text-xs font-medium">
             <button
-              v-for="opt in levelOptions"
-              :key="opt.value"
               type="button"
               class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-              :class="
-                level === opt.value
-                  ? 'bg-white text-slate-900 font-bold shadow-2xs'
-                  : 'text-slate-500 hover:text-slate-900'
-              "
-              @click="level = opt.value"
+              :class="order === 'desc' ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-500 hover:text-slate-900'"
+              @click="order = 'desc'"
             >
-              {{ opt.label }}
+              最新在前
+            </button>
+            <button
+              type="button"
+              class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
+              :class="order === 'asc' ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-500 hover:text-slate-900'"
+              @click="order = 'asc'"
+            >
+              时间正序
             </button>
           </div>
 
-          <!-- Live Toggle Button -->
-          <button
-            type="button"
-            class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors cursor-pointer"
-            :class="
-              live
-                ? 'bg-brand-50 text-brand-700 border-brand-200'
-                : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
-            "
-            @click="live = !live"
+          <label
+            v-if="order === 'asc'"
+            class="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer select-none px-2 py-1 rounded-lg hover:bg-slate-50"
           >
-            <Radio
-              v-if="live"
-              class="w-3.5 h-3.5"
-            />
-            <Pause
-              v-else
-              class="w-3.5 h-3.5"
-            />
-            <span>{{ live ? '实时订阅中' : '已暂停' }}</span>
-          </button>
-
-          <button
-            type="button"
-            class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium text-slate-600 bg-white border border-slate-200 hover:bg-slate-50 transition-colors cursor-pointer"
-            :class="{ 'opacity-60 pointer-events-none': connState === 'connecting' }"
-            @click="handleRefresh"
-          >
-            <RefreshCw
-              class="w-3.5 h-3.5"
-              :class="{ 'animate-spin': connState === 'connecting' }"
-            />
-            <span>重连</span>
-          </button>
-
-          <button
-            type="button"
-            class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
-            @click="handleClear"
-          >
-            <Trash2 class="w-3.5 h-3.5" />
-            <span>清空</span>
-          </button>
+            <ArrowDownToLine class="w-3.5 h-3.5 text-slate-400" />
+            <input
+              v-model="autoScroll"
+              type="checkbox"
+              class="accent-brand-600 w-3.5 h-3.5 cursor-pointer"
+            >
+            <span>跟随底部</span>
+          </label>
         </div>
       </div>
 
-      <!-- Second Row: Search Input & Sort Direction -->
-      <div class="flex flex-wrap items-center gap-2.5 pt-2.5 border-t border-slate-100">
-        <div class="relative flex-1 min-w-[200px]">
-          <Search class="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-          <input
-            v-model="searchInput"
-            type="text"
-            placeholder="过滤日志内容、模块名称或级别…"
-            class="w-full bg-slate-50 border border-slate-200 rounded-lg pl-8 pr-3 py-1.5 text-xs font-mono text-slate-700 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
-          >
-        </div>
-
-        <div class="inline-flex rounded-lg bg-slate-100 p-0.5 text-xs font-medium">
-          <button
-            type="button"
-            class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-            :class="order === 'desc' ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-500 hover:text-slate-900'"
-            @click="order = 'desc'"
-          >
-            最新在前
-          </button>
-          <button
-            type="button"
-            class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-            :class="order === 'asc' ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-500 hover:text-slate-900'"
-            @click="order = 'asc'"
-          >
-            时间正序
-          </button>
-        </div>
-
-        <label
-          v-if="order === 'asc'"
-          class="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer select-none px-2 py-1 rounded-lg hover:bg-slate-50"
-        >
-          <ArrowDownToLine class="w-3.5 h-3.5 text-slate-400" />
-          <input
-            v-model="autoScroll"
-            type="checkbox"
-            class="accent-brand-600 w-3.5 h-3.5 cursor-pointer"
-          >
-          <span>跟随底部</span>
-        </label>
-      </div>
-    </div>
-
-    <!-- Connection Error Banner -->
-    <div
-      v-if="loadError"
-      class="bg-rose-50 border border-rose-200 rounded-xl px-4 py-3 text-xs text-rose-800"
-    >
-      日志流连接失败：{{ loadError }}（请确认控制台登录状态与后端网关服务在线）
-    </div>
-
-    <!-- Terminal Log Stream Viewport -->
-    <div
-      ref="logContainer"
-      class="bg-slate-950 rounded-xl border border-slate-800 p-3.5 font-mono text-xs leading-relaxed overflow-y-auto shadow-inner"
-      style="max-height: calc(100vh - 280px); min-height: 360px"
-    >
+      <!-- Connection Error Banner -->
       <div
-        v-if="visibleLogs.length === 0"
-        class="h-full flex flex-col items-center justify-center gap-2 text-slate-500 py-16 font-sans"
+        v-if="loadError"
+        class="bg-rose-50 border border-rose-200 rounded-xl px-4 py-3 text-xs text-rose-800"
       >
-        <span class="text-sm font-medium text-slate-400">
-          {{ connState === 'connecting' ? '正在接入实时日志流…' : '当前过滤条件下暂无日志' }}
-        </span>
-        <span
-          v-if="connState !== 'connecting'"
-          class="text-xs text-slate-600"
-        >
-          可切换上方级别至「DEBUG+」，或在「系统与协议配置 → 日志与调试」中调整输出级别
-        </span>
+        日志流连接失败：{{ loadError }}（请确认控制台登录状态与后端网关服务在线）
       </div>
 
+      <!-- Terminal Log Stream Viewport -->
       <div
-        v-for="entry in visibleLogs"
-        :key="keyOf(entry)"
-        class="py-1.5 px-2.5 rounded hover:bg-white/[0.04] transition-colors"
-        :class="rowAccentClass[entry.level]"
+        ref="logContainer"
+        class="bg-slate-950 rounded-xl border border-slate-800 p-3.5 font-mono text-xs leading-relaxed overflow-y-auto shadow-inner"
+        style="max-height: calc(100vh - 280px); min-height: 360px"
       >
-        <div class="flex items-baseline gap-2 flex-wrap">
-          <span class="text-slate-500 shrink-0 tabular-nums text-[11px]">{{ entry.ts }}</span>
-          <span
-            class="shrink-0 inline-flex items-center px-1.5 py-px rounded border text-[10px] font-semibold"
-            :class="levelBadgeClass[entry.level] || levelBadgeClass.DEBUG"
-          >
-            {{ entry.level }}
+        <div
+          v-if="visibleLogs.length === 0"
+          class="h-full flex flex-col items-center justify-center gap-2 text-slate-500 py-16 font-sans"
+        >
+          <span class="text-sm font-medium text-slate-400">
+            {{ connState === 'connecting' ? '正在接入实时日志流…' : '当前过滤条件下暂无日志' }}
           </span>
           <span
-            class="text-brand-400/90 shrink-0 max-w-[240px] truncate text-[11px]"
-            :title="entry.name"
-          >{{ entry.name }}</span>
-          <span class="text-slate-200 whitespace-pre-wrap break-all flex-1 min-w-[260px]">
-            {{ entry.message }}
+            v-if="connState !== 'connecting'"
+            class="text-xs text-slate-600"
+          >
+            可切换上方级别至「DEBUG+」，或在「系统与协议配置 → 日志与调试」中调整输出级别
           </span>
         </div>
+
+        <div
+          v-for="entry in visibleLogs"
+          :key="keyOf(entry)"
+          class="py-1.5 px-2.5 rounded hover:bg-white/[0.04] transition-colors"
+          :class="rowAccentClass[entry.level]"
+        >
+          <div class="flex items-baseline gap-2 flex-wrap">
+            <span class="text-slate-500 shrink-0 tabular-nums text-[11px]">{{ entry.ts }}</span>
+            <span
+              class="shrink-0 inline-flex items-center px-1.5 py-px rounded border text-[10px] font-semibold"
+              :class="levelBadgeClass[entry.level] || levelBadgeClass.DEBUG"
+            >
+              {{ entry.level }}
+            </span>
+            <span
+              class="text-brand-400/90 shrink-0 max-w-[240px] truncate text-[11px]"
+              :title="entry.name"
+            >{{ entry.name }}</span>
+            <span class="text-slate-200 whitespace-pre-wrap break-all flex-1 min-w-[260px]">
+              {{ entry.message }}
+            </span>
+          </div>
+        </div>
       </div>
-    </div>
+    </template>
   </div>
 </template>

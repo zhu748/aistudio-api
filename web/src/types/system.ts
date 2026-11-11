@@ -44,6 +44,7 @@ export interface UpdateApiKeyRequest {
 }
 
 export interface SignerServerItem {
+  auth_token_env?: string
   id: string
   name: string
   description?: string
@@ -95,6 +96,7 @@ export interface AvailableModelItem {
 }
 
 export interface LogEntry {
+  request_id?: string
   ts: string
   ts_ms: number
   level: string

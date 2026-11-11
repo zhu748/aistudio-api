@@ -455,7 +455,6 @@ def parse_cookie_string(
 _PROXY_SCHEMES: tuple[str, ...] = (
     "http://",
     "https://",
-    "socks4://",
     "socks5://",
     "socks5h://",
 )
@@ -480,16 +479,32 @@ def normalize_proxy_url(candidate: str | None) -> str | None:
     text = candidate.strip().rstrip("/")
     if not text:
         return None
-    if text.lower().startswith(_PROXY_SCHEMES):
-        return text
-    if _USERINFO_HOST_PORT_RE.fullmatch(text):
-        return f"http://{text}"
-    if _HOST_PORT_RE.fullmatch(text):
-        return f"http://{text}"
-    if _HOST_PORT_USERINFO_RE.fullmatch(text):
+    if "://" not in text and _HOST_PORT_USERINFO_RE.fullmatch(text):
         host, port, user, password = text.split(":", 3)
-        return f"http://{user}:{password}@{host}:{port}"
-    return None
+        text = f"http://{user}:{password}@{host}:{port}"
+    elif "://" not in text and (
+        _USERINFO_HOST_PORT_RE.fullmatch(text) or _HOST_PORT_RE.fullmatch(text)
+    ):
+        text = f"http://{text}"
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit(text)
+        if (
+            parsed.scheme.lower() not in ("http", "https", "socks5", "socks5h")
+            or not parsed.hostname
+            or parsed.path not in ("", "/")
+            or parsed.query
+            or parsed.fragment
+            or re.search(r"[\s\x00-\x1f]", text)
+            or parsed.port == 0
+        ):
+            return None
+        if parsed.scheme.startswith("socks") and parsed.port is None:
+            return None
+    except ValueError:
+        return None
+    return text
 
 
 def _looks_like_proxy(candidate: str) -> bool:

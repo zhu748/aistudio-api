@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-import secrets
 import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -24,17 +23,17 @@ from aistudio_api.infrastructure.gateway.model_defaults import (
     get_configured_logging_settings,
 )
 from aistudio_api.infrastructure.utils.logger import (
-    dump_request_exchange,
     get_logger,
-    is_dump_requests_enabled,
     setup_logging,
 )
 
 from .dependencies import require_api_key, require_web_auth
+from .request_middleware import RequestMiddleware
 from .routes_accounts import router as accounts_router
 from .routes_compat import router as compat_router
 from .routes_gemini import router as gemini_router
 from .routes_models import router as models_router
+from .routes_operations import router as operations_router
 from .routes_system import (
     protected_router as system_protected_router,
     public_router as system_public_router,
@@ -56,6 +55,13 @@ async def lifespan(_app: FastAPI):
         stop_signer_daemon,
     )
 
+    ensure_auth_configured()
+    from aistudio_api.infrastructure.utils.log_files import (
+        start_file_logging,
+        stop_file_logging,
+    )
+
+    start_file_logging()
     # 启动时自动检查并拉起本地 WAA 签名服务（若配置为本地节点）。
     # 内含阻塞 I/O，下放线程池避免卡住启动期事件循环。
     await asyncio.to_thread(ensure_signer_ready)
@@ -330,12 +336,15 @@ async def lifespan(_app: FastAPI):
     # 统计与调度状态都改成了防抖写入（record 后 2s 才落盘）；若进程在最后一次
     # 记账后 2s 内退出，最后一次增量会丢失。关闭时显式刷新一次内存态。
     try:
-        runtime_state.save_stats()
+        if runtime_state._save_task is not None:
+            await runtime_state._save_task
+        await asyncio.to_thread(runtime_state.save_stats)
         pending_rotator = runtime_state.rotator
         if pending_rotator is not None:
-            pending_rotator.save_state()
+            await asyncio.to_thread(pending_rotator.save_state)
     except Exception as e:
         logger.debug("关闭时刷新统计/调度状态失败: %s", e)
+    await asyncio.to_thread(stop_file_logging)
     runtime_state.client = None
     runtime_state.account_service = None
     runtime_state.rotator = None
@@ -351,6 +360,7 @@ app.include_router(accounts_router, dependencies=[Depends(require_web_auth)])
 app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
 app.include_router(models_router, dependencies=[Depends(require_api_key)])
 app.include_router(compat_router, dependencies=[Depends(require_api_key)])
+app.include_router(operations_router, dependencies=[Depends(require_web_auth)])
 
 
 def _log_http_exception(request: Request, code: int, msg: str) -> None:
@@ -366,6 +376,9 @@ def _log_http_exception(request: Request, code: int, msg: str) -> None:
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
     code, msg, status_str = classify_gemini_error_payload(exc)
+    from aistudio_api.infrastructure.request_context import record_result
+
+    record_result("rate_limited" if code == 429 else "error", error=msg)
     _log_http_exception(_request, code, msg)
     # OpenAI / Claude 兼容路径按各自协议格式下发错误体
     compat_response = build_compat_error_response(_request, exc)
@@ -388,6 +401,9 @@ async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONR
 async def validation_exception_handler(
     _request: Request, exc: RequestValidationError
 ) -> JSONResponse:
+    from aistudio_api.infrastructure.request_context import record_result
+
+    record_result("error", error="Invalid request parameters")
     # OpenAI / Claude 兼容路径按各自协议格式下发校验错误体
     compat_response = build_compat_error_response(_request, exc)
     if compat_response is not None:
@@ -405,113 +421,6 @@ async def validation_exception_handler(
             }
         },
     )
-
-
-@app.middleware("http")
-async def logging_and_dump_middleware(request, call_next):
-    """统一请求生命周期日志与请求转储 (DEBUG) 中间件。"""
-
-    start_time = time.perf_counter()
-    path = request.url.path
-
-    is_static = path.startswith(("/static", "/assets")) or path in ("/favicon.ico",)
-    dump_enabled = is_dump_requests_enabled() and not is_static
-
-    req_id = ""
-    body_text = None
-    client_str = ""
-    headers_dict = None
-    query_dict = None
-
-    if dump_enabled:
-        req_id = f"req_{secrets.token_hex(4)}"
-        client_str = (
-            f"{request.client.host}:{request.client.port}"
-            if request.client
-            else "unknown"
-        )
-        headers_dict = dict(request.headers)
-        query_dict = dict(request.query_params)
-        try:
-            body_bytes = await request.body()
-            body_text = body_bytes.decode("utf-8", errors="replace")
-        except Exception:
-            body_text = "(failed to read request body)"
-
-    try:
-        response = await call_next(request)
-    except Exception as exc:
-        elapsed_ms = (time.perf_counter() - start_time) * 1000
-        if dump_enabled:
-            dump_request_exchange(
-                req_id=req_id,
-                method=request.method,
-                url=str(request.url),
-                client=client_str,
-                headers=headers_dict or {},
-                query_params=query_dict or {},
-                body_text=body_text,
-                status_code=500,
-                elapsed_ms=elapsed_ms,
-                response_text=f"Internal Server Error (Exception: {exc})",
-            )
-        else:
-            logger.error(
-                "HTTP %s %s -> 500 (%.1fms, %s)",
-                request.method,
-                path,
-                elapsed_ms,
-                exc,
-            )
-        raise exc
-
-    elapsed_ms = (time.perf_counter() - start_time) * 1000
-    content_type = response.headers.get("content-type", "")
-    is_event_stream = "text/event-stream" in content_type
-
-    if dump_enabled:
-        resp_text = None
-        if is_event_stream:
-            resp_text = "(streaming response in progress)"
-        else:
-            try:
-                # 读取非流式响应体并重构 iterator 以便正常返回给客户端
-                chunks = [chunk async for chunk in response.body_iterator]
-                resp_bytes = b"".join(chunks)
-                resp_text = resp_bytes.decode("utf-8", errors="replace")
-
-                async def _replay_iterator():
-                    for c in chunks:
-                        yield c
-
-                response.body_iterator = _replay_iterator()
-            except Exception:
-                resp_text = "(failed to read response body)"
-
-        dump_request_exchange(
-            req_id=req_id,
-            method=request.method,
-            url=str(request.url),
-            client=client_str,
-            headers=headers_dict or {},
-            query_params=query_dict or {},
-            body_text=body_text,
-            status_code=response.status_code,
-            elapsed_ms=elapsed_ms,
-            response_headers=dict(response.headers),
-            response_text=resp_text,
-            is_stream=is_event_stream,
-        )
-    elif not is_static:
-        logger.info(
-            "HTTP %s %s -> %d (%.1fms)",
-            request.method,
-            path,
-            response.status_code,
-            elapsed_ms,
-        )
-
-    return response
 
 
 # 挂载前端静态资源与 SPA 路由支持
@@ -663,23 +572,17 @@ async def compat_cors_middleware(request: Request, call_next):
     return response
 
 
-def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="AI Studio API Server")
-    parser.add_argument("--port", type=int, default=settings.port)
-    args = parser.parse_args(argv)
+app.add_middleware(RequestMiddleware)
 
+
+def ensure_auth_configured() -> None:
     import secrets as _secrets
 
     from aistudio_api.api.dependencies import _all_configured_api_keys
 
     web_password_set = bool((settings.web_password or "").strip())
     configured_keys = settings.api_keys or _all_configured_api_keys()
-    allow_no_auth = (os.getenv("AISTUDIO_ALLOW_NO_AUTH") or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    allow_no_auth = settings.allow_no_auth
 
     if not web_password_set and not configured_keys:
         if allow_no_auth:
@@ -711,7 +614,13 @@ def main(argv: list[str] | None = None) -> None:
             "/config 中脱敏展示。建议设置独立管理密码以隔离面板与 API 权限。"
         )
 
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="AI Studio API Server")
+    parser.add_argument("--port", type=int, default=settings.port)
+    args = parser.parse_args(argv)
+    ensure_auth_configured()
     import uvicorn
 
     logger.info("启动服务: 监听端口=%d", args.port)
-    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=args.port, log_config=None)

@@ -5,8 +5,12 @@ const DashboardView = () => import('@/views/DashboardView.vue')
 const AccountsView = () => import('@/views/AccountsView.vue')
 const SettingsView = () => import('@/views/SettingsView.vue')
 const LogsView = () => import('@/views/LogsView.vue')
+const RequestsView = () => import('@/views/RequestsView.vue')
+const ProxiesView = () => import('@/views/ProxiesView.vue')
 
 const routes: RouteRecordRaw[] = [
+  { path: '/requests', name: 'requests', component: RequestsView, meta: { title: '请求记录' } },
+  { path: '/proxies', name: 'proxies', component: ProxiesView, meta: { title: '代理与出口' } },
   {
     path: '/login',
     name: 'login',

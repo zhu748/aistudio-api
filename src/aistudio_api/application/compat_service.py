@@ -222,14 +222,27 @@ async def _fetch_remote_media(url: str) -> tuple[str, str]:
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError(f"Unsupported media URL: {url[:128]}")
     try:
-        async with httpx.AsyncClient(
-            timeout=15.0,
-            follow_redirects=True,
-            proxy=settings.proxy_url,
-        ) as http:
-            response = await http.get(url)
+        from aistudio_api.infrastructure.safe_media import PublicMediaTransport
+
+        async with (
+            httpx.AsyncClient(
+                timeout=15.0,
+                follow_redirects=True,
+                max_redirects=5,
+                transport=PublicMediaTransport(proxy=settings.proxy_url),
+                trust_env=False,
+            ) as http,
+            http.stream("GET", url) as response,
+        ):
             response.raise_for_status()
-            raw = response.content
+            chunks: list[bytes] = []
+            size = 0
+            async for chunk in response.aiter_bytes():
+                size += len(chunk)
+                if size > _MAX_MEDIA_BYTES:
+                    raise ValueError("Remote media exceeds configured size limit")
+                chunks.append(chunk)
+            raw = b"".join(chunks)
             mime = (response.headers.get("content-type") or "").split(";")[0].strip()
     except httpx.HTTPError as exc:
         raise ValueError(f"Failed to download media from {url[:128]}: {exc}") from exc

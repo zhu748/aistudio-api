@@ -27,7 +27,9 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
+from aistudio_api.infrastructure.request_context import current_request
 from aistudio_api.infrastructure.utils.common import atomic_write_json
+from aistudio_api.infrastructure.utils.redaction import redact_text
 
 # ---------------------------------------------------------------------------
 # 内存日志环形缓冲（供 Web 面板 /api/logs 查询运行日志与报错）
@@ -54,11 +56,12 @@ class RingBufferHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            message = record.getMessage()
+            message = redact_text(record.getMessage())
             if record.exc_info:
                 exc_text = self._format_exc_tail(record)
                 if exc_text:
                     message = f"{message}\n{exc_text}"
+            message = redact_text(message)
             # 进环形缓冲前截断（L7）：开启 dump 时单条转储约 8KB，日志环
             # 容量固定且逐条 SSE 广播，超长消息会成倍放大内存占用与广播
             # 流量；截断到 2KB 保留头部足以定位问题。
@@ -70,6 +73,7 @@ class RingBufferHandler(logging.Handler):
                 "level": record.levelname,
                 "name": record.name,
                 "message": message,
+                "request_id": getattr(record, "request_id", ""),
             }
             with _log_ring_lock:
                 _log_ring.append(entry)
@@ -222,6 +226,12 @@ class UnifiedFormatter(logging.Formatter):
         self.use_color = use_color
 
     def format(self, record: logging.LogRecord) -> str:
+        record.msg = redact_text(record.getMessage())
+        record.args = ()
+        context = current_request.get()
+        record.request_id = getattr(record, "request_id", "") or (
+            context.request_id if context else ""
+        )
         orig_levelname = record.levelname
         if self.use_color and record.levelname in _COLORS:
             color = _COLORS[record.levelname]
@@ -230,7 +240,7 @@ class UnifiedFormatter(logging.Formatter):
             record.levelname = record.levelname
 
         try:
-            return super().format(record)
+            return redact_text(super().format(record))
         finally:
             record.levelname = orig_levelname
 
@@ -250,7 +260,7 @@ def is_dump_to_file_enabled() -> bool:
     1. 运行时动态配置 (_dump_to_file_override)
     2. 环境变量 AISTUDIO_DUMP_FILE / AISTUDIO_DUMP_TO_FILE
     3. config.yaml 中 logging.dump_to_file
-    4. 当 dump_requests 开启时，若 dump_to_file 未显式禁用则默认开启
+    控制台与文件转储独立配置。
     """
     global _dump_to_file_override
     if _dump_to_file_override is not None:
@@ -272,12 +282,7 @@ def is_dump_to_file_enabled() -> bool:
         )
 
         cfg = get_configured_logging_settings()
-        # get_configured_logging_settings() 恒返回 dump_to_file 键，故旧的
-        # `if "dump_to_file" in cfg` 分支永远命中、其后的 dump_requests 联动是死代码。
-        # 这里改为：显式开启则 True；否则按优先级 4 随 dump_requests 联动。
-        if cfg.get("dump_to_file"):
-            return True
-        return bool(cfg.get("dump_requests", False))
+        return bool(cfg.get("dump_to_file", False))
     except Exception:
         return False
 
@@ -295,16 +300,22 @@ def set_dump_to_file(enabled: bool | None) -> None:
 def get_dump_dir() -> Path:
     """获取或创建请求转储文件存放目录。"""
     global _dump_dir_override
+
+    def resolve_directory(value: str | Path) -> Path:
+        path = Path(value)
+        if not path.is_absolute():
+            from aistudio_api.config import resolve_data_dir
+
+            path = resolve_data_dir() / path
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     if _dump_dir_override:
-        p = Path(_dump_dir_override)
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        return resolve_directory(_dump_dir_override)
 
     val = os.getenv("AISTUDIO_DUMP_DIR")
     if val and val.strip():
-        p = Path(val.strip())
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        return resolve_directory(val.strip())
 
     try:
         from aistudio_api.infrastructure.gateway.model_defaults import (
@@ -314,7 +325,11 @@ def get_dump_dir() -> Path:
         cfg = get_configured_logging_settings()
         custom_dir = str(cfg.get("dump_dir") or "").strip()
         if custom_dir:
+            from aistudio_api.config import resolve_data_dir
+
             p = Path(custom_dir)
+            if not p.is_absolute():
+                p = resolve_data_dir() / p
             p.mkdir(parents=True, exist_ok=True)
             return p
     except Exception:
@@ -324,11 +339,11 @@ def get_dump_dir() -> Path:
 
     cfg_dir = getattr(settings, "dump_dir", None)
     if cfg_dir and str(cfg_dir).strip():
-        p = Path(str(cfg_dir).strip())
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        return resolve_directory(str(cfg_dir).strip())
 
-    default_dir = Path(__file__).resolve().parents[3] / "dumps"
+    from aistudio_api.config import resolve_data_dir
+
+    default_dir = resolve_data_dir() / "dumps"
     default_dir.mkdir(parents=True, exist_ok=True)
     return default_dir
 
@@ -569,13 +584,16 @@ def _mask_sensitive_value(key: str, val: str) -> str:
     """对敏感字段值做固定掩码，绝不保留任何原始前缀。"""
     if not val:
         return "***"
-    if _is_sensitive_key(key):
+    from urllib.parse import unquote
+
+    if _is_sensitive_key(unquote(key)):
         return "***"
     return val
 
 
 def _mask_url(url: str) -> str:
     """脱敏 URL 查询串中的敏感参数（如 ?key=<管理密码>）。"""
+    url = redact_text(url)
     if "?" not in url:
         return url
     base, _, query = url.partition("?")
@@ -606,11 +624,17 @@ def _mask_json_value(value: object) -> object:
     """
     if isinstance(value, dict):
         return {
-            str(k): ("***" if _is_sensitive_key(str(k)) else _mask_json_value(v))
+            str(k): (
+                "***"
+                if _is_sensitive_key(str(k)) or str(k).lower() == "yaml_content"
+                else _mask_json_value(v)
+            )
             for k, v in value.items()
         }
     if isinstance(value, list):
         return [_mask_json_value(item) for item in value]
+    if isinstance(value, str):
+        return redact_text(value)
     return value
 
 
@@ -634,6 +658,10 @@ def dump_request_exchange(
     token_usage: dict[str, object] | None = None,
     finish_reason: str | None = None,
     error_detail: str | None = None,
+    stream_complete: bool = False,
+    console: bool = True,
+    request_body_truncated: bool = False,
+    response_body_truncated: bool = False,
 ) -> None:
     """转储单次完整请求与响应详细信息。"""
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -652,11 +680,15 @@ def dump_request_exchange(
         except Exception:
             return "(non-JSON payload omitted)"
 
-    parsed_body = _parse_and_mask(body_text)
-    parsed_resp = None if is_stream else _parse_and_mask(response_text)
+    parsed_body = None if request_body_truncated else _parse_and_mask(body_text)
+    parsed_resp = (
+        None if is_stream or response_body_truncated else _parse_and_mask(response_text)
+    )
 
     # 格式化请求体（基于脱敏后的结构）
-    if parsed_body is not None:
+    if request_body_truncated:
+        pretty_body = "(请求体超过转储上限，已省略)"
+    elif parsed_body is not None:
         pretty_body = json.dumps(parsed_body, ensure_ascii=False, indent=2)
         if len(pretty_body) > 4000:
             pretty_body = (
@@ -667,7 +699,9 @@ def dump_request_exchange(
         pretty_body = "(空请求体)"
     # 格式化响应体（基于脱敏后的结构）
     if is_stream:
-        pretty_resp = f"(流式传输中，已开始分发，截至首包耗时 {elapsed_ms:.1f}ms)"
+        pretty_resp = f"(流式响应{'已结束' if stream_complete else '已开始'}，耗时 {elapsed_ms:.1f}ms；正文不转储)"
+    elif response_body_truncated:
+        pretty_resp = "(响应体超过转储上限，已省略)"
     elif parsed_resp is not None:
         pretty_resp = json.dumps(parsed_resp, ensure_ascii=False, indent=2)
         if len(pretty_resp) > 4000:
@@ -720,21 +754,25 @@ def dump_request_exchange(
                 "safe_query_params": safe_query_params,
                 "body": parsed_body,
                 "raw_body": safe_body_text,
+                "request_body_truncated": request_body_truncated,
                 "status_code": status_code,
                 "elapsed_ms": elapsed_ms,
                 "is_stream": is_stream,
+                "stream_complete": stream_complete,
                 "response_headers": safe_resp_headers,
                 "safe_response_headers": safe_resp_headers,
                 "response_body": parsed_resp,
                 "raw_response_body": safe_resp_text,
+                "response_body_truncated": response_body_truncated,
                 "token_usage": token_usage,
                 "finish_reason": finish_reason,
-                "error_detail": error_detail,
+                "error_detail": redact_text(error_detail or ""),
             }
-            atomic_write_json(dump_file_path, record_data)
+            atomic_write_json(dump_file_path, record_data, private=True)
 
             latest_file = dump_folder / "latest_request.json"
-            atomic_write_json(latest_file, record_data)
+            atomic_write_json(latest_file, record_data, private=True)
+            _prune_dumps(dump_folder)
         except Exception as e:
             dump_logger.warning("请求文件转储失败: %s", e)
 
@@ -772,4 +810,56 @@ def dump_request_exchange(
         f"==================== [转储结束: {req_id}] ===================="
     )
 
-    dump_logger.info(dump_msg)
+    if console:
+        dump_logger.info(dump_msg)
+
+
+_last_dump_cleanup = 0.0
+_dump_cleanup_lock = threading.Lock()
+
+
+def _prune_dumps(folder: Path) -> None:
+    """Bound debug payload retention by age, file count, and total disk use."""
+    global _last_dump_cleanup
+    with _dump_cleanup_lock:
+        now = time.time()
+        if now - _last_dump_cleanup < 60:
+            return
+        _last_dump_cleanup = now
+        from aistudio_api.config import settings
+
+        def modified(path: Path) -> float:
+            try:
+                return path.stat().st_mtime
+            except OSError:
+                return 0
+
+        files = sorted(folder.glob("req_*.json"), key=modified, reverse=True)
+        latest = folder / "latest_request.json"
+        all_files = [*files, *([latest] if latest.is_file() else [])]
+        for path in all_files:
+            try:
+                if now - path.stat().st_mtime > settings.dump_max_age_days * 86400:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                continue
+
+        kept: list[Path] = []
+        for path in files:
+            if not path.is_file():
+                continue
+            kept.append(path)
+            if len(kept) > settings.dump_max_files:
+                path.unlink(missing_ok=True)
+
+        remaining = [*kept, *([latest] if latest.is_file() else [])]
+        total = 0
+        for path in sorted(remaining, key=modified, reverse=True):
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if total + size > settings.dump_max_total_bytes:
+                path.unlink(missing_ok=True)
+            else:
+                total += size

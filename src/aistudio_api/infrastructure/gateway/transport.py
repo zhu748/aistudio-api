@@ -274,6 +274,7 @@ class HTTPStreamTransport:
             client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.timeout, connect=15.0),
                 proxy=effective,
+                trust_env=False,
                 http2=_http2_enabled(),
                 verify=_shared_ssl_context(),
                 limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
@@ -309,7 +310,8 @@ class HTTPStreamTransport:
             auth_user,
         )
 
-        client = await self._get_client(proxy_url)
+        effective_proxy = self.proxy_url if proxy_url is None else proxy_url
+        client = await self._get_client(effective_proxy)
         try:
             resp = await client.post(
                 url, headers=clean_headers, content=body.encode("utf-8")
@@ -336,7 +338,7 @@ class HTTPStreamTransport:
             logger.error(
                 "HTTP 请求失败: url=%s, proxy=%s, error=%s",
                 url,
-                _mask_proxy_url(proxy_url),
+                _mask_proxy_url(effective_proxy),
                 err_detail,
             )
             raise TransportError(f"HTTP request failed: {err_detail}") from exc
@@ -363,7 +365,8 @@ class HTTPStreamTransport:
         )
         logger.debug("建立流式请求: url=%s, u/%s", url, auth_user)
 
-        client = await self._get_client(proxy_url)
+        effective_proxy = self.proxy_url if proxy_url is None else proxy_url
+        client = await self._get_client(effective_proxy)
 
         resp = None
         try:
@@ -394,7 +397,7 @@ class HTTPStreamTransport:
             logger.warning(
                 "流式传输异常: url=%s, proxy=%s, error=%s",
                 url,
-                _mask_proxy_url(proxy_url),
+                _mask_proxy_url(effective_proxy),
                 err_detail,
             )
             yield ("error", err_detail)

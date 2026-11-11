@@ -409,6 +409,7 @@ class UpsertSignerServerRequest(BaseModel):
     description: str = ""
     url: str
     user_agent: str = ""
+    auth_token_env: str = ""
     headers: dict[str, str] = {}
 
 

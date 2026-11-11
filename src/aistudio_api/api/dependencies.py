@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 import threading
 import time
@@ -11,6 +12,7 @@ from fastapi import HTTPException, Request
 
 from aistudio_api.config import settings
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
+from aistudio_api.infrastructure.request_context import current_request
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 from .state import runtime_state
@@ -73,9 +75,7 @@ def web_auth_required() -> bool:
     环境变量），管理端就必须鉴权——旧逻辑仅看管理密码，导致“只配置了
     API Key”这一最常见部署形态下管理面板完全开放。
     """
-    if (settings.web_password or "").strip():
-        return True
-    return bool(_all_configured_api_keys())
+    return bool((settings.web_password or "").strip() or _all_configured_api_keys())
 
 
 @lru_cache(maxsize=32)
@@ -179,8 +179,8 @@ def require_web_auth(request: Request) -> None:
     """保护管理控制台路由。
 
     鉴权层级（2.1 对称化）：
-    1. 未配置任何凭据（管理密码与全部 API Key 均为空）：保持开放，
-       启动时会输出显著告警；
+    1. 未配置任何凭据：仅当显式启用 AISTUDIO_ALLOW_NO_AUTH 时开放，
+       否则拒绝访问；
     2. 已配置管理密码：仅接受管理密码（API Key 持有者不可越权进入管理端）；
     3. 仅配置了 API Key：接受任意有效 API Key 登录管理端（封堵匿名访问洞，
        同时不把未设管理密码的运维锁在面板外）；此时 /api-keys 与
@@ -191,7 +191,9 @@ def require_web_auth(request: Request) -> None:
     """
     web_password = (settings.web_password or "").strip()
     if not web_password and not _all_configured_api_keys():
-        return
+        if settings.allow_no_auth:
+            return
+        raise HTTPException(503, "Authentication is not configured")
 
     client_ip = request.client.host if request.client else "unknown"
 
@@ -286,9 +288,11 @@ def require_api_key(request: Request) -> None:
     """保护对外 Gemini API 路由 (通过 config.yaml 中的 api_keys 配置)。"""
     all_valid_keys = _all_configured_api_keys()
 
-    # 如果 config.yaml 与环境变量均未配置任何 Key，则 API 免密开放
-    if not all_valid_keys:
+    web_password = (settings.web_password or "").strip()
+    if not all_valid_keys and not web_password and settings.allow_no_auth:
         return
+    if not all_valid_keys and not web_password:
+        raise HTTPException(503, "Authentication is not configured")
 
     token = _extract_request_token(request)
     if not token:
@@ -310,6 +314,9 @@ def require_api_key(request: Request) -> None:
         secrets.compare_digest(token_bytes, candidate)
         for candidate in _encoded_keys(all_valid_keys)
     ):
+        context = current_request.get()
+        if context is not None:
+            context.key_id = hashlib.sha256(token_bytes).hexdigest()[:12]
         return
 
     # 匹配管理密码（管理员具备超级 API 访问权限），同样用 bytes 常量时间比较
@@ -319,6 +326,9 @@ def require_api_key(request: Request) -> None:
         and web_password.strip()
         and secrets.compare_digest(token_bytes, _encode_secret(web_password))
     ):
+        context = current_request.get()
+        if context is not None:
+            context.key_id = "admin"
         return
     client_ip = request.client.host if request.client else "unknown"
     logger.warning("API 鉴权失败: 客户端=%s, API Key 无效", client_ip)

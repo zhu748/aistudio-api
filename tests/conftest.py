@@ -155,6 +155,9 @@ def _shared_test_env(tmp_path_factory):
 @pytest.fixture(autouse=True)
 def isolate_test_config(monkeypatch, _shared_test_env):
     """Isolate all test runs from repository-level config.yaml modifications and runtime state files."""
+    from aistudio_api.config import settings
+
+    monkeypatch.setattr(settings, "allow_no_auth", True)
     config_file, data_dir = _shared_test_env
     stats_file = data_dir / "stats.json"
     rotator_file = data_dir / "rotator_state.json"

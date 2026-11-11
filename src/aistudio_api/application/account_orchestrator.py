@@ -10,7 +10,19 @@ from aistudio_api.infrastructure.account.account_store import AccountMeta
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("orchestrator")
-MAX_RETRIES = 5
+
+
+def get_max_retries() -> int:
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_configured_rotator_settings,
+    )
+
+    value = get_configured_rotator_settings().get("max_retries", 5)
+    try:
+        return max(1, min(20, int(str(value))))
+    except ValueError:
+        return 5
+
 
 _switch_lock: asyncio.Lock | None = None
 _switch_lock_loop: asyncio.AbstractEventLoop | None = None
@@ -285,8 +297,8 @@ def record_rotator_event(
 
 
 __all__ = [
-    "MAX_RETRIES",
     "ensure_active_account",
+    "get_max_retries",
     "record_rotator_event",
     "try_switch_account",
 ]
