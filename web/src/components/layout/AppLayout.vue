@@ -19,6 +19,8 @@ const tokenModalOpen = ref(false)
 const refreshing = ref(false)
 
 const routeMetaMap: Record<string, { title: string; subtitle: string }> = {
+  '/requests': { title: '请求记录', subtitle: '查询最终结果、重试链路、耗时和关联日志' },
+  '/proxies': { title: '代理与出口', subtitle: '管理全局代理与账号出口，检查连通性和出口 IP' },
   '/': {
     title: '控制面板',
     subtitle: '实时监控多账号轮询状态、模型调用吞吐与配额水位',

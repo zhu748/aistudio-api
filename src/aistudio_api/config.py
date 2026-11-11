@@ -10,6 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml
 from dotenv import load_dotenv
 
 # 加载 .env 文件（如果存在）
@@ -198,6 +199,13 @@ def discover_proxy_url() -> str | None:
     )
     if env_proxy:
         return env_proxy
+    try:
+        config = yaml.safe_load(resolve_config_file().read_text(encoding="utf-8"))
+        network = config.get("network", {}) if isinstance(config, dict) else {}
+        if isinstance(network, dict) and "proxy_url" in network:
+            return str(network["proxy_url"] or "").strip() or None
+    except (OSError, ValueError, yaml.YAMLError):
+        pass
     # 尝试自动探测本地代理（如 Termux 下的 Clash / v2ray）
     import socket
 
@@ -251,8 +259,34 @@ class Settings:
     persist_rotator: bool = _load_bool_env("AISTUDIO_PERSIST_ROTATOR", default=True)
     dump_requests: bool = _load_dump_requests_env()
     dump_to_file: bool = _load_dump_to_file_env()
-    dump_dir: str = os.getenv("AISTUDIO_DUMP_DIR", str(_PROJECT_ROOT / "dumps"))
+    dump_dir: str = os.getenv("AISTUDIO_DUMP_DIR", "")
     log_level: str = "INFO"
+    allow_no_auth: bool = _load_bool_env("AISTUDIO_ALLOW_NO_AUTH", default=False)
+    signer_secret: str = os.getenv("AISTUDIO_SIGNER_SECRET", "")
+    signer_secret_url: str = os.getenv("AISTUDIO_SIGNER_SECRET_URL", "").rstrip("/")
+    request_history: bool = _load_bool_env("AISTUDIO_REQUEST_HISTORY", default=True)
+    history_days: int = max(1, int(os.getenv("AISTUDIO_HISTORY_DAYS", "14")))
+    history_max_rows: int = max(
+        1, int(os.getenv("AISTUDIO_HISTORY_MAX_ROWS", "100000"))
+    )
+    dump_max_bytes: int = max(
+        1024, int(os.getenv("AISTUDIO_DUMP_MAX_BYTES", "1048576"))
+    )
+    dump_max_files: int = max(1, int(os.getenv("AISTUDIO_DUMP_MAX_FILES", "1000")))
+    dump_max_age_days: int = max(1, int(os.getenv("AISTUDIO_DUMP_MAX_AGE_DAYS", "7")))
+    dump_max_total_bytes: int = max(
+        1024 * 1024,
+        int(os.getenv("AISTUDIO_DUMP_MAX_TOTAL_BYTES", str(256 * 1024 * 1024))),
+    )
+    max_request_bytes: int = max(
+        1024, int(os.getenv("AISTUDIO_MAX_REQUEST_BYTES", "33554432"))
+    )
+    max_concurrent_requests: int = max(
+        1, int(os.getenv("AISTUDIO_MAX_CONCURRENT_REQUESTS", "50"))
+    )
+    request_timeout: float = max(
+        1.0, float(os.getenv("AISTUDIO_REQUEST_TIMEOUT", "600"))
+    )
 
     @property
     def auth_enabled(self) -> bool:

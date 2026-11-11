@@ -192,6 +192,7 @@ async function handleSaveServer() {
       description: form.value.description?.trim() || '',
       url: form.value.url.trim(),
       user_agent: form.value.user_agent?.trim() || '',
+      auth_token_env: form.value.auth_token_env?.trim() || '',
       headers: parsedHeaders,
     }
     await systemApi.upsertSignerServer(payload)
@@ -520,6 +521,17 @@ onMounted(() => {
             placeholder="选填，关于该签名节点的补充说明"
             class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-brand-500"
           >
+        </div>
+        <div class="space-y-1.5">
+          <label class="block font-semibold text-slate-700">鉴权环境变量名</label>
+          <input
+            v-model="form.auth_token_env"
+            placeholder="例如 MY_SIGNER_TOKEN（填写变量名）"
+            class="w-full px-3 py-2 border border-slate-200 rounded-lg font-mono"
+          >
+          <p class="text-slate-400">
+            节点需要共享密钥时，先在服务端设置环境变量，再填写变量名。凭据只发送到此节点。
+          </p>
         </div>
       </div>
 

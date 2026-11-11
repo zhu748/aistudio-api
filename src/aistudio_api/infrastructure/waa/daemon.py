@@ -15,6 +15,7 @@ import atexit
 import contextlib
 import ctypes
 import functools
+import io
 import os
 import signal
 import socket
@@ -36,6 +37,25 @@ logger = get_logger("waa.daemon")
 _daemon_proc: subprocess.Popen[bytes] | None = None
 _daemon_lock = threading.Lock()
 _PR_SET_PDEATHSIG = 1
+
+
+def _relay_signer_logs(proc: subprocess.Popen[bytes]) -> None:
+    stream = getattr(proc, "stdout", None)
+    if not isinstance(stream, io.BufferedIOBase):
+        return
+    try:
+        for line in iter(lambda: stream.readline(8192), b""):
+            text = line.decode("utf-8", errors="replace").strip()[:8192]
+            level = (
+                "error"
+                if "level=ERROR" in text
+                else "warning"
+                if "level=WARN" in text
+                else "info"
+            )
+            getattr(get_logger("waa.process"), level)("%s", text)
+    finally:
+        stream.close()
 
 
 def _set_parent_death_signal(expected_parent_pid: int) -> None:
@@ -195,10 +215,17 @@ def ensure_signer_ready() -> None:
             logger.info("启动本地 WAA 签名服务: %s", bin_path)
             try:
                 popen_kwargs: dict[str, object] = {
-                    "stdout": subprocess.DEVNULL,
-                    "stderr": subprocess.DEVNULL,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.STDOUT,
                     "cwd": str(bin_path.parent.parent),
                 }
+                from aistudio_api.config import settings
+
+                if settings.signer_secret:
+                    popen_kwargs["env"] = {
+                        **os.environ,
+                        "SIGNER_SHARED_SECRET": settings.signer_secret,
+                    }
                 if sys.platform == "win32":
                     popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
                 else:
@@ -207,6 +234,12 @@ def ensure_signer_ready() -> None:
                     )
 
                 proc = subprocess.Popen(cmd, **popen_kwargs)  # type: ignore[call-overload]
+                threading.Thread(
+                    target=_relay_signer_logs,
+                    args=(proc,),
+                    daemon=True,
+                    name="signer-logs",
+                ).start()
                 _daemon_proc = proc
                 # 等待检查就绪（最多 2 秒）
                 for _ in range(20):

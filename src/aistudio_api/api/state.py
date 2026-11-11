@@ -6,12 +6,14 @@ import asyncio
 import json
 import time
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, tzinfo
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aistudio_api.config import resolve_stats_file, settings
+from aistudio_api.infrastructure.request_context import record_result
 from aistudio_api.infrastructure.utils.common import atomic_write_json
 
 if TYPE_CHECKING:
@@ -109,11 +111,15 @@ class RuntimeState:
 
     def save_stats(self) -> None:
         """将模型调用与 Token 统计持久化到文件。"""
+        self._persist_stats(
+            {model: asdict(item) for model, item in self.model_stats.items()}
+        )
+
+    def _persist_stats(self, payload: Mapping[str, object]) -> None:
         if not settings.persist_stats:
             return
         stats_path = resolve_stats_file()
         try:
-            payload = {model: asdict(item) for model, item in self.model_stats.items()}
             atomic_write_json(stats_path, payload)
             self._last_saved_time = time.time()
         except Exception as e:
@@ -137,8 +143,19 @@ class RuntimeState:
         async def _flush() -> None:
             if time.time() - self._last_saved_time < 5.0:
                 await asyncio.sleep(delay)
-            # 落盘是阻塞 I/O，放到线程池执行，避免阻塞事件循环
-            await asyncio.to_thread(self.save_stats)
+            while True:
+                # 落盘是阻塞 I/O，放到线程池执行，避免阻塞事件循环。
+                payload = {
+                    model: asdict(item) for model, item in self.model_stats.items()
+                }
+                await asyncio.to_thread(self._persist_stats, payload)
+                current = {
+                    model: asdict(item) for model, item in self.model_stats.items()
+                }
+                if payload == current:
+                    return
+                # 新请求在文件写入期间发生时，合并到下一轮快照中。
+                await asyncio.sleep(delay)
 
         self._save_task = loop.create_task(_flush())
 
@@ -157,8 +174,14 @@ class RuntimeState:
             stats.success += 1
         elif result == "rate_limited":
             stats.rate_limited += 1
-        elif result == "errors":
+        elif result in ("error", "errors"):
             stats.errors += 1
+
+        record_result(
+            "error" if result == "errors" else result,
+            usage=usage,
+            finish_reason=finish_reason or "",
+        )
 
         if finish_reason:
             clean_fr = str(finish_reason).strip().upper()
