@@ -682,11 +682,11 @@ def _default_config() -> dict[str, object]:
         },
         "paid_model_rules": {
             "ultra_required": {
-                "contains": ["veo", "ultra"],
+                "contains": ["veo", "ultra", "antigravity", "carbon"],
                 "required_tiers": ["Ultra", "Ultra_20X"],
             },
             "pro_required": {
-                "contains": ["argon", "gemini-4", "image", "imagen"],
+                "contains": ["argon", "image", "imagen"],
                 "required_tiers": ["Pro", "Ultra", "Ultra_20X"],
             },
         },
@@ -703,7 +703,7 @@ def _default_config() -> dict[str, object]:
             },
             "Pro": {
                 "argon_models": {
-                    "match": {"contains": ["argon", "gemini-4"]},
+                    "match": {"contains": ["argon", "carbon"]},
                     "daily_limit": 50,
                 },
                 "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 150},
@@ -716,7 +716,7 @@ def _default_config() -> dict[str, object]:
             },
             "Ultra": {
                 "argon_models": {
-                    "match": {"contains": ["argon", "gemini-4"]},
+                    "match": {"contains": ["argon", "carbon"]},
                     "daily_limit": 250,
                 },
                 "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 1500},
@@ -730,7 +730,7 @@ def _default_config() -> dict[str, object]:
             },
             "Ultra_20X": {
                 "argon_models": {
-                    "match": {"contains": ["argon", "gemini-4"]},
+                    "match": {"contains": ["argon", "carbon"]},
                     "daily_limit": 1000,
                 },
                 "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 5000},
