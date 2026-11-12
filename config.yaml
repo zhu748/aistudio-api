@@ -54,19 +54,25 @@ rotator:
     rate_limited_short: 60
     rate_limited_drip: 300
     rate_limited_drip_extended: 600
+# 付费模型门控：上游 ListModels 目录（accessModes[82]/paid[77]）为第一权威，
+# 此处名称规则仅作目录缺失/未命中时的兜底。gemini-4 系列按 2026-11-12 线上
+# 目录实测逐个归类（禁止按 "gemini-4" 前缀一刀切，误伤免费新模型 hydrogen）：
+#   hydrogen: paid[77]=None / modes[82]=None -> 免费模型，不作任何拦截；
+#   argon:   paid=2 / modes=[1,3] -> Pro+（含 3 不含 4）；
+#   carbon:  paid=2 / modes=[1,4] -> Ultra-only（含 4 不含 3）。
 paid_model_rules:
   ultra_required:
     contains:
     - veo
     - ultra
     - antigravity
+    - carbon
     required_tiers:
     - Ultra
     - Ultra_20X
   pro_required:
     contains:
     - argon
-    - gemini-4
     - image
     - imagen
     - omni
@@ -187,7 +193,7 @@ tier_quotas:
       match:
         contains:
         - argon
-        - gemini-4
+        - carbon
       daily_limit: 50
     flash_models:
       match:
@@ -221,7 +227,7 @@ tier_quotas:
       match:
         contains:
         - argon
-        - gemini-4
+        - carbon
       daily_limit: 250
     flash_models:
       match:
@@ -260,7 +266,7 @@ tier_quotas:
       match:
         contains:
         - argon
-        - gemini-4
+        - carbon
       daily_limit: 1000
     flash_models:
       match:
