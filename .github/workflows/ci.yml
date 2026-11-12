@@ -103,6 +103,8 @@ jobs:
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
 
       - name: Install web dependencies
         run: bun install --frozen-lockfile
@@ -113,11 +115,13 @@ jobs:
       - name: Run ESLint
         run: bun run lint
 
+      - name: Preserve Committed Static Assets
+        working-directory: .
+        run: cp -a src/aistudio_api/static "$RUNNER_TEMP/aistudio-api-committed-static"
+
       - name: Verify Web Production Build
         run: bun run build
 
-      - name: Verify Committed Static Assets Are Up To Date
+      - name: Verify Committed Static Assets Match Build Content
         working-directory: .
-        run: |
-          git add -A src/aistudio_api/static
-          git diff --cached --exit-code
+        run: bun scripts/verify_static_assets.mjs src/aistudio_api/static "$RUNNER_TEMP/aistudio-api-committed-static"
