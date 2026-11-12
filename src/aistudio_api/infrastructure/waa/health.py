@@ -38,6 +38,7 @@ from __future__ import annotations
 import os
 import time
 from collections import deque
+from typing import Any
 
 from aistudio_api.infrastructure.utils.logger import get_logger
 
@@ -102,10 +103,16 @@ class SignerHealthTracker:
         """熔断冷却剩余秒数（未降级为 0）。"""
         return max(0.0, self._degraded_until - time.monotonic())
 
-    def state_summary(self) -> dict[str, object]:
-        """供管理端点 / 日志输出的状态快照。"""
+    def state_summary(self) -> dict[str, Any]:
+        """供管理端点 / 日志输出的状态快照。
+
+        返回值形状为运行时诊断快照（嵌套结构用于 JSON 序列化），
+        声明为 dict[str, Any] 以便调用方直接索引嵌套字段。
+        """
         now = time.monotonic()
-        recent = [(ts, acc) for ts, acc in self._rejects if now - ts <= self.window_seconds]
+        recent = [
+            (ts, acc) for ts, acc in self._rejects if now - ts <= self.window_seconds
+        ]
         accounts = {acc for _, acc in recent if acc}
         return {
             "degraded": self.is_degraded(),
