@@ -4,6 +4,7 @@ import { Network, RefreshCw, Save } from 'lucide-vue-next'
 import { operationsApi, type ProxyStatus, type ProxyCheck } from '@/api/operations.ts'
 import { useToastStore } from '@/stores/toast.ts'
 import Button from '@/components/ui/Button.vue'
+import { usePageRefresh } from '@/composables/usePageRefresh.ts'
 
 const toast = useToastStore()
 const status = ref<ProxyStatus>({ global_proxy: '', signer: '', accounts: [] })
@@ -17,9 +18,16 @@ const error = ref('')
 
 async function load() {
   loading.value = true
-  try { status.value = await operationsApi.proxies(); error.value = '' }
-  catch (err) { error.value = err instanceof Error ? err.message : '加载失败' }
-  finally { loading.value = false }
+  try {
+    status.value = await operationsApi.proxies()
+    error.value = ''
+    return true
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : '加载失败'
+    return false
+  } finally {
+    loading.value = false
+  }
 }
 
 async function save() {
@@ -29,21 +37,30 @@ async function save() {
     toast.success(result.note)
     proxy.value = ''
     await load()
-  } catch (err) { toast.error(err instanceof Error ? err.message : '保存失败') }
-  finally { saving.value = false }
+  } catch (err) {
+    toast.error(err instanceof Error ? err.message : '保存失败')
+  } finally {
+    saving.value = false
+  }
 }
 
 async function test(accountId = '', draft = false) {
   testing.value = draft ? 'draft' : accountId || 'global'
   checks.value = []
   try {
-    const result = await operationsApi.testProxy(accountId ? { account_id: accountId } : draft ? { proxy_url: proxy.value.trim() } : {})
+    const result = await operationsApi.testProxy(
+      accountId ? { account_id: accountId } : draft ? { proxy_url: proxy.value.trim() } : {},
+    )
     checks.value = result.checks
     checkedProxy.value = result.proxy || '直连'
-  } catch (err) { toast.error(err instanceof Error ? err.message : '诊断失败') }
-  finally { testing.value = '' }
+  } catch (err) {
+    toast.error(err instanceof Error ? err.message : '诊断失败')
+  } finally {
+    testing.value = ''
+  }
 }
 onMounted(load)
+usePageRefresh(load)
 </script>
 
 <template>
@@ -53,10 +70,12 @@ onMounted(load)
         <div>
           <h2 class="font-semibold flex gap-2 items-center">
             <Network class="w-4 h-4 text-brand-600" />全局代理
-          </h2><p class="text-xs text-slate-500 mt-1">
+          </h2>
+          <p class="text-xs text-slate-500 mt-1">
             当前出口：<code>{{ status.global_proxy || '直连' }}</code>
           </p>
-        </div><Button
+        </div>
+        <Button
           :loading="loading"
           @click="load"
         >
@@ -128,12 +147,17 @@ onMounted(load)
         >
           <p class="font-semibold">
             {{ check.name }} · {{ check.ok ? '通过' : '失败' }}
-          </p><p>{{ check.elapsed_ms }}ms <span v-if="check.status_code">· HTTP {{ check.status_code }}</span></p><p
+          </p>
+          <p>
+            {{ check.elapsed_ms }}ms <span v-if="check.status_code">· HTTP {{ check.status_code }}</span>
+          </p>
+          <p
             v-if="check.ip"
             class="font-mono"
           >
             {{ check.ip }}
-          </p><p
+          </p>
+          <p
             v-if="check.error"
             class="break-all text-rose-700"
           >
@@ -157,28 +181,42 @@ onMounted(load)
             <tr>
               <th class="p-3">
                 账号
-              </th><th class="p-3">
+              </th>
+              <th class="p-3">
                 来源
-              </th><th class="p-3">
+              </th>
+              <th class="p-3">
                 有效出口
-              </th><th class="p-3">
+              </th>
+              <th class="p-3">
                 诊断
               </th>
             </tr>
-          </thead><tbody class="divide-y divide-slate-100">
+          </thead>
+          <tbody class="divide-y divide-slate-100">
             <tr
               v-for="account in status.accounts"
               :key="account.account_id"
             >
               <td class="p-3">
-                {{ account.name }}<div class="text-slate-400 mt-1 font-mono">
+                {{ account.name }}
+                <div class="text-slate-400 mt-1 font-mono">
                   {{ account.account_id }} · {{ account.enabled ? '启用' : '停用' }}
                 </div>
-              </td><td class="p-3">
-                {{ account.source === 'account' ? '账号独立' : account.source === 'global' ? '继承全局' : '直连' }}
-              </td><td class="p-3 font-mono break-all">
+              </td>
+              <td class="p-3">
+                {{
+                  account.source === 'account'
+                    ? '账号独立'
+                    : account.source === 'global'
+                      ? '继承全局'
+                      : '直连'
+                }}
+              </td>
+              <td class="p-3 font-mono break-all">
                 {{ account.proxy || '直连' }}
-              </td><td class="p-3">
+              </td>
+              <td class="p-3">
                 <Button
                   size="xs"
                   :loading="testing === account.account_id"
@@ -188,7 +226,8 @@ onMounted(load)
                   测试出口
                 </Button>
               </td>
-            </tr><tr v-if="!status.accounts.length">
+            </tr>
+            <tr v-if="!status.accounts.length">
               <td
                 colspan="4"
                 class="text-center text-slate-400 p-10"

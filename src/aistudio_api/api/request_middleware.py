@@ -5,14 +5,20 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from dataclasses import asdict
 from uuid import uuid4
 
 from fastapi import HTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from aistudio_api.config import settings
-from aistudio_api.infrastructure.request_context import RequestContext, current_request
+from aistudio_api.infrastructure.request_context import (
+    RequestContext,
+    current_request,
+    register_request,
+    request_event,
+    request_snapshot,
+    unregister_request,
+)
 from aistudio_api.infrastructure.request_history import request_history
 from aistudio_api.infrastructure.utils.logger import (
     _mask_json_value,
@@ -44,13 +50,29 @@ class RequestMiddleware:
         dump_enabled = model_call and (
             is_dump_requests_enabled() or is_dump_to_file_enabled()
         )
-        context = RequestContext(request_id="req_" + uuid4().hex)
+        context = RequestContext(
+            request_id="req_" + uuid4().hex,
+            category="model" if model_call else "system",
+            protocol="gemini"
+            if path.startswith("/v1beta/")
+            else "claude"
+            if path == "/v1/messages"
+            else "openai"
+            if model_call
+            else "",
+            method=scope["method"],
+            path=redact_text(path),
+        )
+        if model_call and path.startswith("/v1beta/"):
+            context.requested_model = path.removeprefix("/v1beta/").split(":", 1)[0]
+            context.model = context.requested_model
         token = current_request.set(context)
         started_at, started = time.time(), time.perf_counter()
         status, response_started, completed = 500, False, False
         is_stream = False
         first_byte_ms: float | None = None
         received_bytes = 0
+        metadata_body = bytearray()
         request_body = bytearray()
         response_body = bytearray()
         request_body_truncated = False
@@ -85,6 +107,24 @@ class RequestMiddleware:
             elif message["type"] == "http.request":
                 body = message.get("body", b"")
                 received_bytes += len(body)
+                if (
+                    model_call
+                    and not context.requested_model
+                    and received_bytes <= 65536
+                ):
+                    metadata_body.extend(body)
+                    if not message.get("more_body", False):
+                        try:
+                            metadata = json.loads(metadata_body)
+                            if isinstance(metadata, dict) and isinstance(
+                                metadata.get("model"), str
+                            ):
+                                context.requested_model = redact_text(
+                                    metadata["model"]
+                                )[:256]
+                                context.model = context.requested_model
+                        except (ValueError, UnicodeDecodeError):
+                            pass
                 if model_call and received_bytes > settings.max_request_bytes:
                     raise HTTPException(413, "Request body exceeds configured limit")
                 if dump_enabled and not request_body_truncated:
@@ -107,6 +147,7 @@ class RequestMiddleware:
             if message["type"] == "http.response.start":
                 response_started = True
                 status = message["status"]
+                context.status_code = status
                 raw_headers = list(message.get("headers", []))
                 raw_headers = [
                     (k, v) for k, v in raw_headers if k.lower() != b"x-request-id"
@@ -119,10 +160,17 @@ class RequestMiddleware:
                 is_stream = "text/event-stream" in response_headers.get(
                     "content-type", ""
                 )
+                context.is_stream = is_stream
             elif message["type"] == "http.response.body":
                 body = message.get("body", b"")
                 if body and first_byte_ms is None:
                     first_byte_ms = (time.perf_counter() - started) * 1000
+                    context.first_byte_ms = first_byte_ms
+                    if model_call:
+                        request_event(
+                            "streaming" if is_stream else "response",
+                            "首个响应数据已发送",
+                        )
                 if dump_enabled and not is_stream and not response_body_truncated:
                     if len(response_body) + len(body) <= settings.dump_max_bytes:
                         response_body.extend(body)
@@ -134,6 +182,22 @@ class RequestMiddleware:
             await send(message)
 
         try:
+            if model_call:
+                register_request(context)
+                request_event("received", "收到模型调用")
+                logger.info(
+                    "模型请求开始: protocol=%s model=%s",
+                    context.protocol,
+                    context.model or "待解析",
+                )
+                if settings.request_history:
+                    try:
+                        await asyncio.to_thread(
+                            request_history().insert,
+                            request_snapshot(context, running=True),
+                        )
+                    except Exception:
+                        logger.exception("Failed to persist request start")
             if model_call and self.active >= settings.max_concurrent_requests:
                 context.error = "Concurrent request limit reached"
                 await reply(429, context.error)
@@ -201,14 +265,35 @@ class RequestMiddleware:
             if not completed and context.result == "success":
                 context.result = "cancelled"
             if model_call:
+                from aistudio_api.api.state import runtime_state
+
+                service = runtime_state.account_service
+                account = (
+                    service.get_account(context.account_id)
+                    if service and context.account_id
+                    else None
+                )
+                if account:
+                    context.account_name = account.email or account.name or account.id
+                request_event(
+                    "finished",
+                    f"调用结束 · {context.result}"
+                    + (f" · {context.error}" if context.error else ""),
+                )
                 record = {
-                    **asdict(context),
+                    **request_snapshot(context),
                     "started_at": started_at,
                     "method": scope["method"],
                     "path": redact_text(path),
                     "status_code": status,
                     "is_stream": is_stream,
                     "elapsed_ms": round(elapsed_ms, 2),
+                    "finished_at": time.time(),
+                    "generation_ms": round(
+                        max(0, elapsed_ms - context.first_content_ms), 2
+                    )
+                    if context.first_content_ms is not None
+                    else None,
                     "first_byte_ms": first_byte_ms,
                 }
                 # Cancellation must not interrupt final bookkeeping after a client disconnect.
@@ -234,6 +319,8 @@ class RequestMiddleware:
                     await asyncio.shield(task)
                 except asyncio.CancelledError:
                     await task
+                finally:
+                    unregister_request(context.request_id)
             current_request.reset(token)
 
     @staticmethod
@@ -290,11 +377,27 @@ class RequestMiddleware:
             except Exception:
                 logger.exception("Failed to persist request dump")
         logger.info(
-            "%s %s -> %d result=%s duration=%.1fms request_id=%s",
+            "%s %s -> %d model=%s account=%s result=%s duration=%.1fms attempts=%d request_id=%s",
             record["method"],
             path,
             status,
+            context.model,
+            context.account_name or context.account_id,
             context.result,
             elapsed_ms,
+            len(context.attempts),
             context.request_id,
+        )
+        details = context.usage.get("completion_tokens_details")
+        logger.info(
+            "调用计量: 首包=%sms 首段回复=%sms 总耗时=%.1fms Token(输入/输出/思考/缓存)=%s/%s/%s/%s",
+            record.get("first_byte_ms"),
+            context.first_content_ms,
+            elapsed_ms,
+            context.usage.get("prompt_tokens", "未提供"),
+            context.usage.get("completion_tokens", "未提供"),
+            details.get("reasoning_tokens", "未提供")
+            if isinstance(details, dict)
+            else "未提供",
+            context.usage.get("cached_tokens", "未提供"),
         )

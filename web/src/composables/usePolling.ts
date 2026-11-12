@@ -19,7 +19,7 @@ export interface PollingHandle {
 }
 
 interface ActiveTask {
-  fn: () => void | Promise<void>
+  fn: () => unknown | Promise<unknown>
   intervalMs: number
   maxBackoffMs: number
   timer?: number
@@ -58,8 +58,8 @@ async function runTask(task: ActiveTask) {
   if (task.running || (typeof document !== 'undefined' && document.hidden)) return
   task.running = true
   try {
-    await task.fn()
-    task.failureCount = 0
+    const result = await task.fn()
+    task.failureCount = result === false ? task.failureCount + 1 : 0
   } catch (err) {
     task.failureCount++
     console.debug('[usePolling] task execution error (consecutive failures: %d):', task.failureCount, err)
@@ -96,9 +96,9 @@ function stopTaskTimer(task: ActiveTask) {
  * 支持页面隐藏自动冻结、失败指数退避与销毁自动释放。
  */
 export function usePolling(
-  fn: () => void | Promise<void>,
+  fn: () => unknown | Promise<unknown>,
   intervalMs: number,
-  options: PollingOptions = {}
+  options: PollingOptions = {},
 ): PollingHandle {
   setupGlobalVisibilityListener()
 

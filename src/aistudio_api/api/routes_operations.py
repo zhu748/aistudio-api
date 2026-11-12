@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import re
 import time
 
 import httpx
@@ -13,8 +16,10 @@ from pydantic import BaseModel
 from aistudio_api.api.state import runtime_state
 from aistudio_api.config import settings
 from aistudio_api.infrastructure.gateway.model_defaults import get_active_waa_server
+from aistudio_api.infrastructure.request_context import active_requests
 from aistudio_api.infrastructure.request_history import request_history
 from aistudio_api.infrastructure.utils.log_files import read_log_history
+from aistudio_api.infrastructure.utils.logger import _mask_json_value, get_dump_dir
 from aistudio_api.infrastructure.utils.redaction import redact_text
 
 router = APIRouter(prefix="/api")
@@ -31,6 +36,9 @@ async def list_requests(
     search: str = Query("", max_length=256),
     since: float = Query(0, ge=0),
     until: float = Query(0, ge=0),
+    protocol: str = "",
+    retried: bool = False,
+    min_elapsed_ms: float = Query(0, ge=0),
 ) -> dict[str, object]:
     return await asyncio.to_thread(
         request_history().query,
@@ -43,6 +51,9 @@ async def list_requests(
         search=search,
         since=since,
         until=until,
+        protocol=protocol,
+        retried=retried,
+        min_elapsed_ms=min_elapsed_ms,
     )
 
 
@@ -55,6 +66,9 @@ async def export_requests(
     account_id: str = "",
     key_id: str = "",
     search: str = Query("", max_length=256),
+    protocol: str = "",
+    retried: bool = False,
+    min_elapsed_ms: float = Query(0, ge=0),
 ) -> dict[str, object]:
     return await asyncio.to_thread(
         request_history().query,
@@ -66,11 +80,109 @@ async def export_requests(
         account_id=account_id,
         key_id=key_id,
         search=search,
+        protocol=protocol,
+        retried=retried,
+        min_elapsed_ms=min_elapsed_ms,
     )
+
+
+@router.get("/requests/active")
+async def list_active_requests() -> dict[str, object]:
+    records = _mask_json_value(active_requests())
+    return {"items": records, "total": len(records) if isinstance(records, list) else 0}
+
+
+@router.get("/requests/stats")
+async def request_statistics(
+    since: float = Query(0, ge=0),
+    until: float = Query(0, ge=0),
+    model: str = "",
+    account_id: str = "",
+) -> dict[str, object]:
+    now = time.time()
+    start = max(since or now - 86400, now - settings.history_days * 86400)
+    end = min(until or now, now)
+    if start > end:
+        raise HTTPException(400, "开始时间不能晚于结束时间")
+    result = await asyncio.to_thread(
+        request_history().metrics,
+        since=start,
+        until=end,
+        model=model,
+        account_id=account_id,
+    )
+    result.update(
+        history_days=settings.history_days,
+        history_enabled=settings.request_history,
+        active=len(active_requests()),
+    )
+    return result
+
+
+@router.get("/requests/options")
+async def request_options() -> dict[str, object]:
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_configured_api_key_items,
+    )
+
+    result = await asyncio.to_thread(request_history().options)
+    service = runtime_state.account_service
+    result["accounts"] = (
+        [
+            {"id": account.id, "name": account.email or account.name or account.id}
+            for account in service.list_accounts()
+        ]
+        if service
+        else []
+    )
+    result["key_names"] = {
+        hashlib.sha256(str(item.get("key") or "").encode()).hexdigest()[:12]: str(
+            item.get("name") or "API Key"
+        )
+        for item in get_configured_api_key_items()
+    } | {"admin": "管理员"}
+    return result
+
+
+@router.get("/requests/{request_id}/payload")
+async def request_payload(request_id: str) -> dict[str, object]:
+    if not re.fullmatch(r"req_[A-Za-z0-9_-]{1,100}", request_id):
+        raise HTTPException(400, "请求 ID 格式无效")
+    record = await asyncio.to_thread(request_history().get, request_id)
+    if record is None:
+        raise HTTPException(404, "请求记录不存在或已过保留期")
+
+    def read() -> dict[str, object]:
+        target = get_dump_dir() / f"{request_id}.json"
+        if not target.is_file():
+            return {
+                "available": False,
+                "note": "此请求未采集正文，或转储已过保留期。可在日志与调试中为后续请求开启文件转储。",
+            }
+        if target.stat().st_size > settings.dump_max_bytes * 4 + 65536:
+            return {
+                "available": False,
+                "note": "转储超过当前读取上限，请在服务器端查看。",
+            }
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"available": False, "note": "转储文件暂时不可读取。"}
+        return {
+            "available": True,
+            "payload": _mask_json_value(payload),
+            "note": "正文已脱敏；流式响应仅保留元数据与执行过程。",
+        }
+
+    return await asyncio.to_thread(read)
 
 
 @router.get("/requests/{request_id}")
 async def get_request(request_id: str) -> dict[str, object]:
+    for record in active_requests():
+        if record["request_id"] == request_id:
+            safe = _mask_json_value(record)
+            return safe if isinstance(safe, dict) else {}
     record = await asyncio.to_thread(request_history().get, request_id)
     if record is None:
         raise HTTPException(404, "请求记录不存在或已过保留期")
@@ -89,6 +201,10 @@ async def historical_logs(
     request_id: str = "",
     page: int = Query(1, ge=1),
     page_size: int = Query(100, ge=1, le=500),
+    category: str = "model",
+    model: str = "",
+    account_id: str = "",
+    order: str = "desc",
 ) -> dict[str, object]:
     return await asyncio.to_thread(
         read_log_history,
@@ -97,6 +213,10 @@ async def historical_logs(
         request_id=request_id,
         page=page,
         page_size=page_size,
+        category=category,
+        model=model,
+        account_id=account_id,
+        order=order,
     )
 
 

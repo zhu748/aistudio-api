@@ -87,8 +87,11 @@ class RequestHistory:
         search: str = "",
         since: float = 0,
         until: float = 0,
+        protocol: str = "",
+        retried: bool = False,
+        min_elapsed_ms: float = 0,
     ) -> dict[str, object]:
-        clauses: list[str] = []
+        clauses: list[str] = ["result != 'running'"]
         params: list[object] = []
         for column, value in (
             ("model", model),
@@ -97,15 +100,39 @@ class RequestHistory:
             ("result", result),
         ):
             if value:
-                clauses.append(f"{column} = ?")
-                params.append(value)
+                empty_filters = {
+                    "model": "__unknown__",
+                    "account_id": "__unassigned__",
+                    "key_id": "__anonymous__",
+                }
+                if value == empty_filters.get(column):
+                    clauses.append(f"{column} = ''")
+                elif column == "result" and value == "failed":
+                    clauses.append("result != 'success'")
+                elif column == "model":
+                    clauses.append("(model = ? OR model = ?)")
+                    clean = value.removeprefix("models/")
+                    params.extend([clean, "models/" + clean])
+                else:
+                    clauses.append(f"{column} = ?")
+                    params.append(value)
         for operator, value in ((">=", since), ("<=", until)):
             if value:
                 clauses.append(f"started_at {operator} ?")
                 params.append(value)
         if search:
-            clauses.append("(request_id LIKE ? OR model LIKE ? OR account_id LIKE ?)")
-            params.extend([f"%{search}%"] * 3)
+            clauses.append(
+                "(request_id LIKE ? OR model LIKE ? OR account_id LIKE ? OR json_extract(payload, '$.account_name') LIKE ? OR key_id LIKE ?)"
+            )
+            params.extend([f"%{search}%"] * 5)
+        if protocol:
+            clauses.append("json_extract(payload, '$.protocol') = ?")
+            params.append(protocol)
+        if retried:
+            clauses.append("json_array_length(payload, '$.attempts') > 1")
+        if min_elapsed_ms:
+            clauses.append("json_extract(payload, '$.elapsed_ms') >= ?")
+            params.append(min_elapsed_ms)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self._lock, self._connect() as connection:
             total = connection.execute(
@@ -133,9 +160,92 @@ class RequestHistory:
 
     def clear(self) -> int:
         with self._lock, self._connect() as connection:
-            count = connection.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
-            connection.execute("DELETE FROM requests")
+            count = connection.execute(
+                "SELECT COUNT(*) FROM requests WHERE result != 'running'"
+            ).fetchone()[0]
+            connection.execute("DELETE FROM requests WHERE result != 'running'")
         return count
+
+    def recover_interrupted(self) -> int:
+        """Called once at server startup, before accepting new requests."""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT request_id, payload FROM requests WHERE result = 'running'"
+            ).fetchall()
+            for request_id, payload in rows:
+                record = json.loads(payload)
+                record.update(
+                    result="interrupted",
+                    stage="finished",
+                    error="服务重启前调用未完成",
+                    status_code=0,
+                    elapsed_ms=None,
+                    first_byte_ms=None,
+                )
+                connection.execute(
+                    "UPDATE requests SET result = 'interrupted', payload = ? WHERE request_id = ?",
+                    (json.dumps(record, ensure_ascii=False), request_id),
+                )
+        return len(rows)
+
+    def metrics(
+        self, *, since: float, until: float, model: str = "", account_id: str = ""
+    ) -> dict[str, object]:
+        from aistudio_api.infrastructure.request_metrics import summarize
+
+        fields = {
+            "elapsed_ms": "$.elapsed_ms",
+            "first_byte_ms": "$.first_byte_ms",
+            "account_name": "$.account_name",
+            "prompt_tokens": "$.usage.prompt_tokens",
+            "completion_tokens": "$.usage.completion_tokens",
+            "total_tokens": "$.usage.total_tokens",
+            "reasoning_tokens": "$.usage.completion_tokens_details.reasoning_tokens",
+            "cached_tokens": "$.usage.cached_tokens",
+            "finish_reason": "$.finish_reason",
+        }
+        columns = ", ".join(
+            f"json_extract(payload, '{value}') AS {key}"
+            for key, value in fields.items()
+        )
+        clauses = ["started_at >= ?", "started_at <= ?", "result != 'running'"]
+        params: list[object] = [since, until]
+        if model:
+            clauses.append("(model = ? OR model = ?)")
+            clean = model.removeprefix("models/")
+            params.extend([clean, "models/" + clean])
+        if account_id:
+            clauses.append("account_id = ?")
+            params.append(account_id)
+        with self._lock, self._connect() as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                "SELECT model, account_id, key_id, result, started_at, "
+                + columns
+                + ", json_array_length(payload, '$.attempts') AS attempts FROM requests WHERE "
+                + " AND ".join(clauses),
+                params,
+            ).fetchall()
+        return summarize([dict(row) for row in rows], since=since, until=until)
+
+    def options(self) -> dict[str, object]:
+        with self._lock, self._connect() as connection:
+            return {
+                "models": [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT DISTINCT model FROM requests WHERE model != '' ORDER BY model"
+                    )
+                ],
+                "keys": [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT DISTINCT key_id FROM requests WHERE key_id != '' ORDER BY key_id"
+                    )
+                ],
+                "history_days": settings.history_days,
+                "enabled": settings.request_history,
+            }
 
 
 @lru_cache(maxsize=8)

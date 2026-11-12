@@ -47,7 +47,11 @@ export const useAccountsStore = defineStore('accounts', () => {
       const rotFields = rot as unknown as Record<string, unknown>
       const prev = rowCache.get(a.id)
       const prevFields = prev as unknown as Record<string, unknown>
-      if (prev && sameFields(a as unknown as Record<string, unknown>, prevFields) && sameFields(rotFields, prevFields)) {
+      if (
+        prev &&
+        sameFields(a as unknown as Record<string, unknown>, prevFields) &&
+        sameFields(rotFields, prevFields)
+      ) {
         nextCache.set(a.id, prev)
         return prev
       }
@@ -67,7 +71,7 @@ export const useAccountsStore = defineStore('accounts', () => {
     const seq = ++fetchSeq
     loading.value = true
     try {
-      const [accsRes, activeRes] = await Promise.allSettled([
+      const [accsRes, activeRes, rotationRes] = await Promise.allSettled([
         accountsApi.list(),
         accountsApi.getActive(),
         systemStore.fetchRotation(),
@@ -88,6 +92,12 @@ export const useAccountsStore = defineStore('accounts', () => {
         // 瞬时失败不代表没有激活账号：保留旧值，避免面板谎报「无激活账号」
         console.warn('获取激活账号失败，保留当前展示数据:', activeRes.reason)
       }
+      return (
+        accsRes.status === 'fulfilled' &&
+        activeRes.status === 'fulfilled' &&
+        rotationRes.status === 'fulfilled' &&
+        rotationRes.value
+      )
     } finally {
       if (seq === fetchSeq) loading.value = false
     }
@@ -230,9 +240,11 @@ export const useAccountsStore = defineStore('accounts', () => {
       await accountsApi.update(id, name)
       toast.success('账号名称已更新')
       await fetchAll()
+      return true
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : '更新失败'
       toast.error(msg)
+      return false
     }
   }
 
@@ -242,9 +254,22 @@ export const useAccountsStore = defineStore('accounts', () => {
       await accountsApi.updateProxy(id, proxyUrl)
       toast.success(proxyUrl ? `账号代理已更新: ${proxyUrl}` : '已恢复使用全局代理')
       await fetchAll()
+      return true
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : '代理更新失败'
       toast.error(msg)
+      return false
+    }
+  }
+
+  async function updateAccountNotes(id: string, notes: string) {
+    try {
+      await accountsApi.updateNotes(id, notes)
+      await fetchAll()
+      return true
+    } catch (err) {
+      useToastStore().error(err instanceof Error ? err.message : '备注更新失败')
+      return false
     }
   }
 
@@ -347,6 +372,7 @@ export const useAccountsStore = defineStore('accounts', () => {
     deleteCookieGroup,
     updateAccountName,
     updateAccountProxy,
+    updateAccountNotes,
     importCookies,
     probeAndImport,
     importBundle,

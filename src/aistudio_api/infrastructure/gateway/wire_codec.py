@@ -6,18 +6,21 @@ import copy
 import json
 
 from aistudio_api.config import DEFAULT_TEXT_MODEL, settings
+from aistudio_api.infrastructure.request_context import current_request, request_event
+from aistudio_api.infrastructure.utils.logger import get_logger
 
 from .model_defaults import resolve_model_defaults
 from .wire_parser import (
     WIRE_PART_FILE_DATA_INDEX,
     parse_response_part,
 )
-from .wire_spec import TopLevelIndex
+from .wire_spec import ThinkingConfigIndex, TopLevelIndex
 from .wire_types import (
     AistudioContent,
     AistudioGenerationConfig,
     AistudioPart,
     AistudioRequest,
+    ThinkingLevel,
 )
 
 TOOLS_TEMPLATES: dict[str, list[object]] = {
@@ -349,6 +352,43 @@ class AistudioWireCodec:
                     else:
                         filtered_tools.append(t)
                 effective_tools = filtered_tools or None
+
+        observation = current_request.get()
+        if observation is not None:
+            effective: dict[str, object] = {
+                "temperature": gc.temperature,
+                "top_p": gc.top_p,
+                "top_k": gc.top_k,
+                "max_tokens": gc.max_tokens,
+                "thinking_level": None,
+                "thinking_budget": None,
+                "thinking_mode": None,
+            }
+            thinking = gc.thinking_config
+            if isinstance(thinking, list):
+                if len(thinking) > ThinkingConfigIndex.MODE:
+                    effective["thinking_mode"] = thinking[ThinkingConfigIndex.MODE]
+                if len(thinking) > ThinkingConfigIndex.BUDGET:
+                    effective["thinking_budget"] = thinking[ThinkingConfigIndex.BUDGET]
+                if len(thinking) > ThinkingConfigIndex.LEVEL:
+                    raw_level = thinking[ThinkingConfigIndex.LEVEL]
+                    if (
+                        isinstance(raw_level, int)
+                        and raw_level in ThinkingLevel._value2member_map_
+                    ):
+                        effective["thinking_level"] = ThinkingLevel(
+                            raw_level
+                        ).name.lower()
+            observation.effective_parameters = effective
+            request_event("configured", "生成参数已解析")
+            get_logger("requests.parameters").info(
+                "生成参数: model=%s thinking=%s budget=%s temperature=%s max_tokens=%s",
+                model,
+                effective["thinking_level"] or "未指定档位",
+                effective["thinking_budget"],
+                gc.temperature,
+                gc.max_tokens,
+            )
 
         return AistudioRequest(
             model=model,

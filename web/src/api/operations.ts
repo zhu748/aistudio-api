@@ -1,7 +1,9 @@
 import { request } from './client.ts'
 import type { LogEntry } from '@/types'
+import type { RequestMetricsResponse } from '@/types/stats.ts'
 
 export interface Attempt {
+  error_code?: number
   account_id?: string
   proxy?: string
   status_code: number
@@ -10,6 +12,17 @@ export interface Attempt {
 }
 
 export interface RequestRecord {
+  request_parameters?: Record<string, unknown>
+  effective_parameters?: Record<string, unknown>
+  first_content_ms?: number | null
+  first_thought_ms?: number | null
+  generation_ms?: number | null
+  finished_at?: number
+  protocol?: string
+  requested_model?: string
+  account_name?: string
+  stage?: string
+  events?: { stage: string; message: string; elapsed_ms: number; account_id?: string }[]
   request_id: string
   started_at: number
   method: string
@@ -24,7 +37,7 @@ export interface RequestRecord {
   finish_reason: string
   status_code: number
   is_stream: boolean
-  elapsed_ms: number
+  elapsed_ms: number | null
   first_byte_ms: number | null
   usage: Record<string, unknown>
   attempts: Attempt[]
@@ -61,6 +74,30 @@ export interface ProxyCheck {
 }
 
 export const operationsApi = {
+  metrics(params: URLSearchParams) {
+    return request<RequestMetricsResponse>(`/api/requests/stats?${params}`)
+  },
+  active() {
+    return request<{ items: RequestRecord[]; total: number }>('/api/requests/active')
+  },
+  options() {
+    return request<{
+      models: string[]
+      keys: string[]
+      key_names: Record<string, string>
+      accounts: { id: string; name: string }[]
+      history_days: number
+      enabled: boolean
+    }>('/api/requests/options')
+  },
+  detail(id: string) {
+    return request<RequestRecord>(`/api/requests/${encodeURIComponent(id)}`)
+  },
+  payload(id: string) {
+    return request<{ available: boolean; note: string; payload?: Record<string, unknown> }>(
+      `/api/requests/${encodeURIComponent(id)}/payload`,
+    )
+  },
   requests(params: URLSearchParams) {
     return request<Page<RequestRecord>>(`/api/requests?${params}`)
   },
@@ -77,9 +114,15 @@ export const operationsApi = {
     return request<ProxyStatus>('/api/proxies')
   },
   saveProxy(proxy_url: string) {
-    return request<{ note: string }>('/api/proxies/global', { method: 'PUT', body: JSON.stringify({ proxy_url }) })
+    return request<{ note: string }>('/api/proxies/global', {
+      method: 'PUT',
+      body: JSON.stringify({ proxy_url }),
+    })
   },
   testProxy(options: { account_id?: string; proxy_url?: string } = {}) {
-    return request<{ proxy: string; checks: ProxyCheck[] }>('/api/proxies/test', { method: 'POST', body: JSON.stringify(options) })
+    return request<{ proxy: string; checks: ProxyCheck[] }>('/api/proxies/test', {
+      method: 'POST',
+      body: JSON.stringify(options),
+    })
   },
 }

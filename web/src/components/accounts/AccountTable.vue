@@ -1,5 +1,12 @@
 <script setup lang="ts">
-import { ref, computed, toRef, onMounted } from 'vue'
+import { ref, computed, toRef, onMounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { usePolling } from '@/composables/usePolling.ts'
+import { accountsApi } from '@/api/accounts.ts'
+import { operationsApi, type RequestRecord } from '@/api/operations.ts'
+import Modal from '@/components/ui/Modal.vue'
+import ModelQuotaGrid from './ModelQuotaGrid.vue'
+import { duration, resultLabels } from '@/utils/requests.ts'
 import type { AccountWithStats } from '@/types/accounts.ts'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useSystemStore } from '@/stores/system.ts'
@@ -10,15 +17,7 @@ import { useCookieGroups, type CookieGroup } from './useCookieGroups.ts'
 import CookieGroupBlock from './CookieGroupBlock.vue'
 import AccountRow from './AccountRow.vue'
 import Button from '@/components/ui/Button.vue'
-import {
-  Cookie,
-  Search,
-  Layers,
-  Clock,
-  Trash2,
-  Plus,
-  ChevronsUpDown,
-} from 'lucide-vue-next'
+import { Cookie, Search, Layers, Clock, Trash2, Plus, ChevronsUpDown } from 'lucide-vue-next'
 
 const props = defineProps<{
   accounts: AccountWithStats[]
@@ -34,19 +33,122 @@ const accountsStore = useAccountsStore()
 const systemStore = useSystemStore()
 const toast = useToastStore()
 const { confirm } = useConfirm()
+const route = useRoute()
+const router = useRouter()
+const clock = ref(Date.now())
+usePolling(() => {
+  clock.value = Date.now()
+}, 30000)
+function closeDetails() {
+  detailsId.value = ''
+  if (route.query.account_id) {
+    const query = { ...route.query }
+    delete query.account_id
+    void router.replace({ query })
+  }
+}
 
 // Search & status filter
 const searchKeyword = ref('')
-const statusFilter = ref<'all' | 'ready' | 'limited' | 'expired'>('all')
+const statusFilter = ref<'all' | 'ready' | 'limited' | 'expired' | 'disabled'>('all')
+const selectedIds = ref<Set<string>>(new Set())
+const batchMode = ref(false)
+const batching = ref(false)
+const detailsId = ref(String(route.query.account_id || ''))
+const detailAccount = computed(() => props.accounts.find((account) => account.id === detailsId.value) || null)
+const recentRequests = ref<RequestRecord[]>([])
+const recentError = ref('')
+watch(
+  () => route.query.account_id,
+  (id) => {
+    detailsId.value = String(id || '')
+  },
+)
+watch(
+  detailsId,
+  async (id) => {
+    recentRequests.value = []
+    recentError.value = ''
+    if (!id) return
+    try {
+      const response = await operationsApi.requests(new URLSearchParams({ account_id: id, page_size: '5' }))
+      if (detailsId.value === id) recentRequests.value = response.items
+    } catch {
+      if (detailsId.value === id) recentError.value = '最近调用加载失败，可前往请求记录查询。'
+    }
+  },
+  { immediate: true },
+)
+function toggleSelected(id: string) {
+  const next = new Set(selectedIds.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  selectedIds.value = next
+}
+function toggleBatchMode() {
+  batchMode.value = !batchMode.value
+  selectedIds.value = new Set()
+}
+function editDetails() {
+  if (!detailAccount.value) return
+  emit('editName', detailAccount.value)
+  closeDetails()
+}
+function selectVisible() {
+  const ids = filteredAccounts.value.map((account) => account.id)
+  const allSelected = ids.length > 0 && ids.every((id) => selectedIds.value.has(id))
+  const next = new Set(selectedIds.value)
+  for (const id of ids) {
+    if (allSelected) next.delete(id)
+    else next.add(id)
+  }
+  selectedIds.value = next
+}
+watch(
+  () => props.accounts,
+  (accounts) => {
+    const valid = new Set(accounts.map((account) => account.id))
+    selectedIds.value = new Set([...selectedIds.value].filter((id) => valid.has(id)))
+  },
+)
+async function batch(action: 'enable' | 'disable' | 'probe') {
+  const ids = [...selectedIds.value]
+  if (!ids.length) return
+  batching.value = true
+  let failed = 0
+  try {
+    for (let index = 0; index < ids.length; index += 4) {
+      const outcomes = await Promise.allSettled(
+        ids
+          .slice(index, index + 4)
+          .map((id) =>
+            action === 'probe' ? accountsApi.detectEmail(id) : accountsApi.toggle(id, action === 'enable'),
+          ),
+      )
+      failed += outcomes.filter((item) => item.status === 'rejected').length
+    }
+    await accountsStore.fetchAll()
+    if (failed) toast.error(`已完成 ${ids.length - failed} 个，${failed} 个失败，请重试`)
+    else
+      toast.success(
+        `已${action === 'probe' ? '探测' : action === 'enable' ? '启用' : '停用'} ${ids.length} 个账号`,
+      )
+  } finally {
+    batching.value = false
+  }
+}
 
 const statusCounts = computed(() => {
   let ready = 0
   let limited = 0
   let expired = 0
+  let disabled = 0
   for (const acc of props.accounts) {
-    if (acc.session_expired) {
+    if (acc.enabled === false) {
+      disabled += 1
+    } else if (acc.session_expired) {
       expired += 1
-    } else if (acc.is_available === false) {
+    } else if (acc.availability === 'partial' || acc.is_available === false) {
       limited += 1
     } else {
       ready += 1
@@ -57,18 +159,32 @@ const statusCounts = computed(() => {
     ready,
     limited,
     expired,
+    disabled,
   }
 })
 
 const filteredAccounts = computed<AccountWithStats[]>(() => {
   const kw = searchKeyword.value.trim().toLowerCase()
   return props.accounts.filter((acc) => {
-    if (statusFilter.value === 'expired') {
-      if (!acc.session_expired) return false
+    if (statusFilter.value === 'disabled') {
+      if (acc.enabled !== false) return false
+    } else if (statusFilter.value === 'expired') {
+      if (acc.enabled === false || !acc.session_expired) return false
     } else if (statusFilter.value === 'limited') {
-      if (acc.session_expired || acc.is_available !== false) return false
+      if (
+        acc.enabled === false ||
+        acc.session_expired ||
+        (acc.availability !== 'partial' && acc.is_available !== false)
+      )
+        return false
     } else if (statusFilter.value === 'ready') {
-      if (acc.session_expired || acc.is_available === false) return false
+      if (
+        acc.enabled === false ||
+        acc.session_expired ||
+        acc.availability === 'partial' ||
+        acc.is_available === false
+      )
+        return false
     }
 
     if (!kw) return true
@@ -147,7 +263,7 @@ function toggleAllModels() {
 
 // PST midnight countdown
 const hoursUntilPacificMidnight = computed(() => {
-  const now = new Date()
+  const now = new Date(clock.value)
   try {
     const parts = new Intl.DateTimeFormat('en-US', {
       timeZone: 'America/Los_Angeles',
@@ -229,11 +345,15 @@ async function handleClearModelCooldown(accountId: string, model: string) {
 <template>
   <div class="bg-white border border-slate-200/90 rounded-xl shadow-2xs overflow-hidden">
     <!-- Consolidated Filter & View Toolbar -->
-    <div class="px-4 py-3 border-b border-slate-100 bg-slate-50/50 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+    <div
+      class="px-4 py-3 border-b border-slate-100 bg-slate-50/50 flex flex-col lg:flex-row lg:items-center justify-between gap-3"
+    >
       <!-- Left: Search Input & Status Segmented Filter -->
       <div class="flex items-center gap-2.5 flex-wrap flex-1 min-w-0">
         <div class="relative w-full sm:w-60">
-          <Search class="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+          <Search
+            class="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
+          />
           <input
             v-model="searchKeyword"
             type="text"
@@ -247,7 +367,11 @@ async function handleClearModelCooldown(accountId: string, model: string) {
           <button
             type="button"
             class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-            :class="statusFilter === 'all' ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-600 hover:text-slate-900'"
+            :class="
+              statusFilter === 'all'
+                ? 'bg-white text-slate-900 font-semibold shadow-2xs'
+                : 'text-slate-600 hover:text-slate-900'
+            "
             @click="statusFilter = 'all'"
           >
             全部 ({{ statusCounts.all }})
@@ -255,7 +379,11 @@ async function handleClearModelCooldown(accountId: string, model: string) {
           <button
             type="button"
             class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-            :class="statusFilter === 'ready' ? 'bg-white text-emerald-700 font-semibold shadow-2xs' : 'text-slate-600 hover:text-slate-900'"
+            :class="
+              statusFilter === 'ready'
+                ? 'bg-white text-emerald-700 font-semibold shadow-2xs'
+                : 'text-slate-600 hover:text-slate-900'
+            "
             @click="statusFilter = 'ready'"
           >
             就绪 ({{ statusCounts.ready }})
@@ -263,7 +391,11 @@ async function handleClearModelCooldown(accountId: string, model: string) {
           <button
             type="button"
             class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-            :class="statusFilter === 'limited' ? 'bg-white text-amber-700 font-semibold shadow-2xs' : 'text-slate-600 hover:text-slate-900'"
+            :class="
+              statusFilter === 'limited'
+                ? 'bg-white text-amber-700 font-semibold shadow-2xs'
+                : 'text-slate-600 hover:text-slate-900'
+            "
             @click="statusFilter = 'limited'"
           >
             受限 ({{ statusCounts.limited }})
@@ -271,16 +403,37 @@ async function handleClearModelCooldown(accountId: string, model: string) {
           <button
             type="button"
             class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-            :class="statusFilter === 'expired' ? 'bg-white text-rose-700 font-semibold shadow-2xs' : 'text-slate-600 hover:text-slate-900'"
+            :class="
+              statusFilter === 'expired'
+                ? 'bg-white text-rose-700 font-semibold shadow-2xs'
+                : 'text-slate-600 hover:text-slate-900'
+            "
             @click="statusFilter = 'expired'"
           >
             失效 ({{ statusCounts.expired }})
+          </button>
+          <button
+            type="button"
+            class="px-2.5 py-1 rounded-md cursor-pointer"
+            :class="statusFilter === 'disabled' ? 'bg-white text-slate-800 shadow-2xs' : 'text-slate-500'"
+            @click="statusFilter = 'disabled'"
+          >
+            停用 ({{ statusCounts.disabled }})
           </button>
         </div>
       </div>
 
       <!-- Right: Quota Reset Timer & View Toggles -->
       <div class="flex items-center gap-2 flex-wrap shrink-0">
+        <button
+          type="button"
+          class="px-2.5 py-1 text-xs border border-slate-200 rounded-lg bg-white cursor-pointer"
+          :class="batchMode ? 'text-brand-700 border-brand-300' : 'text-slate-600'"
+          :disabled="batching"
+          @click="toggleBatchMode"
+        >
+          {{ batchMode ? '结束批量管理' : '批量管理' }}
+        </button>
         <div
           class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-white border border-slate-200/80 text-[11px] text-slate-500 font-mono tabular-nums"
           title="美西时间 00:00 (PST/PDT) 自动重置每日模型配额计数"
@@ -327,6 +480,37 @@ async function handleClearModelCooldown(accountId: string, model: string) {
     </div>
 
     <!-- Tree Body -->
+    <div
+      v-if="batchMode"
+      class="p-3 flex flex-wrap items-center gap-3 bg-brand-50/50 border-b border-brand-100 text-xs"
+    >
+      <button
+        class="text-brand-700 cursor-pointer"
+        :disabled="batching"
+        @click="selectVisible"
+      >
+        选择/取消当前筛选结果
+      </button><span class="text-slate-500">已选 {{ selectedIds.size }} 个</span><Button
+        size="xs"
+        :disabled="!selectedIds.size || batching"
+        @click="batch('enable')"
+      >
+        启用
+      </Button><Button
+        size="xs"
+        :disabled="!selectedIds.size || batching"
+        @click="batch('disable')"
+      >
+        停用
+      </Button><Button
+        size="xs"
+        :loading="batching"
+        :disabled="!selectedIds.size"
+        @click="batch('probe')"
+      >
+        探测邮箱与等级
+      </Button>
+    </div>
     <div class="divide-y divide-slate-100">
       <CookieGroupBlock
         v-for="group in cookieGroups"
@@ -343,10 +527,16 @@ async function handleClearModelCooldown(accountId: string, model: string) {
           :active="acc.id === activeId"
           :activating="accountsStore.activatingId === acc.id"
           :force-expanded="forceExpandAllModels"
+          :selectable="batchMode"
+          :selected="selectedIds.has(acc.id)"
+          @select="toggleSelected(acc.id)"
+          @details="detailsId = acc.id"
           @activate="accountsStore.activateAccount(acc.id)"
           @delete="handleDeleteAccount(acc)"
           @edit-name="emit('editName', acc)"
-          @clear-cooldown="acc.session_expired ? handleReverifyAccount(acc) : handleClearAccountCooldown(acc.id)"
+          @clear-cooldown="
+            acc.session_expired ? handleReverifyAccount(acc) : handleClearAccountCooldown(acc.id)
+          "
           @clear-model="handleClearModelCooldown(acc.id, $event)"
         />
       </CookieGroupBlock>
@@ -356,7 +546,9 @@ async function handleClearModelCooldown(accountId: string, model: string) {
         v-if="!filteredAccounts.length"
         class="py-14 text-center space-y-3"
       >
-        <div class="w-10 h-10 rounded-xl bg-slate-100 text-slate-400 flex items-center justify-center mx-auto">
+        <div
+          class="w-10 h-10 rounded-xl bg-slate-100 text-slate-400 flex items-center justify-center mx-auto"
+        >
           <Cookie class="w-5 h-5" />
         </div>
         <div class="space-y-1">
@@ -364,7 +556,11 @@ async function handleClearModelCooldown(accountId: string, model: string) {
             {{ searchKeyword || statusFilter !== 'all' ? '未找到匹配的账号节点' : '凭据池为空' }}
           </div>
           <p class="text-xs text-slate-400 max-w-sm mx-auto">
-            {{ searchKeyword || statusFilter !== 'all' ? '请尝试清空搜索词或切换上方状态筛选条件。' : '导入 Google AI Studio Cookie 凭据即可开始多账号粘性轮询。' }}
+            {{
+              searchKeyword || statusFilter !== 'all'
+                ? '请尝试清空搜索词或切换上方状态筛选条件。'
+                : '导入 Google AI Studio Cookie 凭据即可开始多账号粘性轮询。'
+            }}
           </p>
         </div>
         <div v-if="!searchKeyword && statusFilter === 'all'">
@@ -379,5 +575,126 @@ async function handleClearModelCooldown(accountId: string, model: string) {
         </div>
       </div>
     </div>
+    <Modal
+      :model-value="!!detailAccount"
+      title="账号详情"
+      :subtitle="detailAccount?.id"
+      max-width="4xl"
+      @update:model-value="closeDetails"
+    >
+      <div
+        v-if="detailAccount"
+        class="space-y-5"
+      >
+        <div class="flex flex-wrap justify-between gap-3">
+          <div>
+            <h3 class="font-semibold break-all">
+              {{ detailAccount.email || detailAccount.name || detailAccount.id }}
+            </h3>
+            <p class="text-xs text-slate-500 mt-1">
+              {{ detailAccount.tier || 'Free' }} · u/{{ detailAccount.auth_user }} ·
+              {{ detailAccount.group || 'default' }}
+            </p>
+          </div>
+          <Button
+            size="sm"
+            @click="editDetails"
+          >
+            编辑资料
+          </Button>
+        </div>
+        <p
+          v-if="detailAccount.notes"
+          class="p-3 rounded-lg bg-slate-50 text-sm text-slate-600 whitespace-pre-wrap"
+        >
+          {{ detailAccount.notes }}
+        </p>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
+          <div class="bg-slate-50 p-3 rounded-lg">
+            <p class="text-xs text-slate-500">
+              账号状态
+            </p>
+            <p class="mt-1">
+              {{
+                detailAccount.enabled === false
+                  ? '已停用'
+                  : detailAccount.session_expired
+                    ? '凭据失效'
+                    : detailAccount.availability === 'partial'
+                      ? '部分模型冷却'
+                      : '就绪'
+              }}
+            </p>
+          </div>
+          <div class="bg-slate-50 p-3 rounded-lg">
+            <p class="text-xs text-slate-500">
+              今日调度调用
+            </p>
+            <p class="mt-1 tabular-nums">
+              {{ detailAccount.today_total_requests || 0 }}
+            </p>
+          </div>
+          <div class="bg-slate-50 p-3 rounded-lg">
+            <p class="text-xs text-slate-500">
+              今日 Token
+            </p>
+            <p class="mt-1 tabular-nums">
+              {{ (detailAccount.today_total_tokens || 0).toLocaleString() }}
+            </p>
+          </div>
+          <div class="bg-slate-50 p-3 rounded-lg">
+            <p class="text-xs text-slate-500">
+              累计 429
+            </p>
+            <p class="mt-1 tabular-nums">
+              {{ detailAccount.rate_limited || 0 }}
+            </p>
+          </div>
+        </div>
+        <p class="text-xs text-slate-500">
+          账号配额按美西日期统计，含调度重试事件；客户端调用的最终结果可在请求记录中查看。
+        </p>
+        <ModelQuotaGrid
+          :account="detailAccount"
+          @clear-model="handleClearModelCooldown(detailAccount.id, $event)"
+        />
+        <div class="flex justify-between items-center">
+          <h3 class="text-sm font-semibold">
+            最近调用
+          </h3>
+          <router-link
+            :to="{ path: '/requests', query: { account_id: detailAccount.id } }"
+            class="text-xs text-brand-700 hover:underline"
+          >
+            查看全部请求 ↗
+          </router-link>
+        </div>
+        <p
+          v-if="recentError"
+          class="text-sm text-rose-600"
+        >
+          {{ recentError }}
+        </p>
+        <div class="divide-y divide-slate-100">
+          <router-link
+            v-for="request in recentRequests"
+            :key="request.request_id"
+            :to="{ path: '/requests', query: { request_id: request.request_id } }"
+            class="flex flex-wrap justify-between gap-2 py-3 text-xs hover:text-brand-700"
+          >
+            <span class="font-mono break-all">{{ request.model || '未解析模型' }}</span><span
+              class="text-slate-500"
+            >{{ resultLabels[request.result] }} · {{ duration(request.elapsed_ms) }} ·
+              {{ new Date(request.started_at * 1000).toLocaleString() }}</span>
+          </router-link>
+          <p
+            v-if="!recentRequests.length && !recentError"
+            class="py-6 text-center text-sm text-slate-400"
+          >
+            暂无保留期内的请求
+          </p>
+        </div>
+      </div>
+    </Modal>
   </div>
 </template>
