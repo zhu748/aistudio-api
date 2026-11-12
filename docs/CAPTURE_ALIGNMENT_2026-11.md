@@ -172,3 +172,101 @@ Auth403RetryManager 注释中记录该语义；proof 复用缓存默认关闭（
   `POST /v1beta/:countTokens` 200（`{"totalTokens":2}`）、
   `:generateContent` 与 OpenAI 兼容端点 403 —— 账号级生成限流仍在
   窗口内（§8.3），请求形态已由 spy 独立验证，非实现问题。
+
+---
+
+## 9. 2026-11-12 第三轮深挖（新抓包换新 cookie）：403 第四种语义与签名器熔断
+
+用户以手机浏览器重新验证账号可用（新 HAR：`最新抓包.txt`，6 条 MakerSuite RPC 全 200，
+含 GenerateContent ×2），推翻「账号被限流」的单一解释。以该新鲜 Cookie + 同 SOCKS5
+代理重做对照矩阵，锁定真正的根因。
+
+### 9.1 新鲜 Cookie 对照矩阵（同代理同 UA 同 visit-id，逐字节重放）
+
+| 实验 | 结果 | 结论 |
+|---|---|---|
+| CountTokens（合并轮换 cookie） | 200 | 会话/鉴权/代理链路健康 |
+| GenerateContent · 抓包 body 逐字节重放（原版浏览器 proof + 原版 cookie） | **200** | 账号健康，昨日 403 窗口已过期 |
+| GenerateContent · 同 body 换合并轮换 cookie | **200** | cookie 轮换（SIDCC/PSIDCC set-cookie）不影响 |
+| GenerateContent · spinsnow 新铸 proof #1（浏览器 5 槽形态） | **403** | mint 质量问题浮出 |
+| GenerateContent · 新铸 proof #2 / #3（含不带 proxy 参数变体） | **403 / 403** | 3/3 全拒 —— 非概率抖动 |
+| 同分钟原版 proof 对照重放 | **200** | 决定性：账号与请求形态无辜，**被拒的只有 mint proof** |
+
+### 9.2 项目构造路径端到端验证（「这个是不是对的」的最终答案）
+
+以项目自身调用链 `normalize_gemini_request → AIStudioClient.prepare_request`
+构造请求体（快照注入抓包原版浏览器 proof），与抓包 body 逐槽比对后经代理发送：
+**200**（差异槽仅为浏览器会话续接 token 等可选字段，语义无关）。项目构造的
+请求形态正确性自此与 proof 质量解耦验证完毕。
+
+### 9.3 spinsnow 服务级挑战过期（TLV 解码铁证）
+
+按 §7.1 规范解码 `!proof` 外层 TLV 信封对比（浏览器 3 枚 / mint 5 枚）：
+
+| 字段 | 浏览器 proof（200） | spinsnow mint proof（403） |
+|---|---|---|
+| challenge_version（Tag66） | `3153048796` | `3109903533`（**过期挑战构建**） |
+| challenge_build_ts（Tag66） | `3705056239` | `2404368952` |
+| 加密环境载荷（Tag153） | 1352~1436 B | **1015 B**（薄 ~340B，缺交互/DOM 信号） |
+| 冷启动耗时（Tag2） | 62 ms | 282 ms |
+| 版本 / 魔数 / baseEnd | v3 / 0xA5 / 100 | 一致（协议层未变） |
+
+5 次 mint（跨 3.5-lite / 3.8-flash / 4-carbon 三模型、随机 prompt）全部携带
+**完全相同**的 `challenge_version=3109903533 / build_ts=2404368952` ——
+spinsnow 全节点共用同一过期挑战，属服务级降级而非节点抖动。浏览器当日挑战
+（3 枚 proof 一致为 3153048796）与旧抓包（上一轮会话时重放 200）完全一致，
+证明 Google 正常轮换挑战而 spinsnow 的 VM 池未跟进。
+
+### 9.4 403 第四种语义：签名器 attestation 质量降级
+
+**「The caller does not have permission」在会话与账号完全健康、请求形态逐字节
+正确的前提下，可因签名器产出的 proof 质量不足（过期挑战 / 薄环境声明）被系统性
+拒绝。** 该语义与 §8.3 账号级限流在单请求内表现完全相同（403 + 轻量端点 200，
+CountTokens 无法区分二者）；唯一可观测差异在跨账号维度：
+
+- §8.3 账号级限流：仅受影响账号 403，切号即恢复；
+- 本语义：**所有账号**的新铸 proof 全 403（签名器是公共依赖），切号只会
+  无差别烧穿账号池并给无辜账号记 auth_error 惩罚。
+
+### 9.5 落地：SignerHealthTracker 熔断（`infrastructure/waa/health.py`）
+
+- **判据**：滑动窗口（默认 300s）内 ≥3 次「403 记账」且涉及 ≥2 个不同账号
+  → 判签名器降级，进入冷却（默认 60s）。单账号信号永不触发（无法与 §8.3
+  区分，保守放行完整阶梯）。阈值支持 `AISTUDIO_SIGNER_CB_*` 环境变量调节。
+- **降级期间**：403 阶梯在 count≥3（重签/切号阶段）直接短路，返回
+  `type=signer_degraded` 的可定位错误；首个 403 不再对账号记 auth_error
+  （账号无辜）；前两跳免费重放保留（覆盖可自愈语义 1/2）。
+- **半开语义**：任何一次成功生成（proof 被上游接受，含流式已产出数据后
+  途断的 403）立即解除熔断并清窗。
+- **可观测**：新增 `GET /config/signer-health` 管理端点（窗口计数、涉及
+  账号数、冷却剩余、最近一次触发详情）。
+- 回归测试：`tests/unit/test_signer_health.py`（9 项：判据、清窗、剪枝、
+  快照字段、阶梯完整性保持、短路行为、端到端风暴聚合）。
+
+### 9.6 当日第三轮实测矩阵汇总
+
+| 实验 | 结果 |
+|---|---|
+| CountTokens · 新鲜合并 cookie | 200 |
+| GenerateContent · 原版 proof 逐字节重放（×2 变体） | 200 / 200 |
+| GenerateContent · 新铸 proof（×3，含无 proxy 变体） | 403 ×3 |
+| GenerateContent · 项目构造路径 + 原版 proof | **200** |
+| mint ×5（3 模型 / 随机 prompt）TLV 解码 | 全部同一过期挑战（3109903533） |
+
+### 9.7 优化后服务 E2E（完整 FastAPI + 抓包账号 + SOCKS5 代理 + 劣化 spinsnow）
+
+| 端点 | 结果 | 备注 |
+|---|---|---|
+| `GET /health` | 200 | |
+| `POST /v1beta/:countTokens` | **200** `{"totalTokens":2}` | attempts=1，1.5s |
+| `POST /v1beta/:generateContent`（E2E-R4 prompt） | **200** 返回 `E2E-R4` | **attempts=3，4.5s**：第 1 次发送（新铸 proof）403 → 阶梯重放第 2 次 403 → **第 3 次重放 200** |
+| `GET /config/signer-health` | 200 | 成功后窗口清零（半开语义生效），未误触发熔断 |
+
+两条由 E2E 修正的既有结论：
+
+1. **「mint proof 单次使用」非绝对教条**：同枚 proof 第 3 次发送即 200 ——
+   上游对 VM 级 proof 的拒绝存在概率性（与 §3.2 观测的「新 mint 偶发 403」
+   同源）。403 阶梯保留的前两跳免费重放在劣化场景下具有真实恢复价值
+   （本次实战恢复），熔断将 count≥3 才短路的设计与之自洽。
+2. **SignerHealthTracker 的半开语义实战验证**：阶梯恢复成功即调用
+   record_proof_accepted 清窗，避免一次抖动触发熔断误杀后续请求。

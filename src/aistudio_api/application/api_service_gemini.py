@@ -66,6 +66,7 @@ from aistudio_api.infrastructure.request_context import (
     record_result,
 )
 from aistudio_api.infrastructure.utils.logger import get_logger
+from aistudio_api.infrastructure.waa.health import get_signer_health
 
 logger = get_logger("api.gemini")
 
@@ -86,14 +87,19 @@ AUTH_403_MAX_RETRIES = (
 class Auth403RetryManager:
     """403 阶梯重试管理器：前 2 次重放，后 2 次重新签名，最后 1 次切号。
 
-    403「The caller does not have permission」的三种已知语义
-    （2026-11 抓包 + SOCKS5 代理实测，详见 docs/CAPTURE_ALIGNMENT_2026-11.md §8.3）：
+    403「The caller does not have permission」的四种已知语义
+    （2026-11 抓包 + SOCKS5 代理实测，详见 docs/CAPTURE_ALIGNMENT_2026-11.md
+    §8.3 与 §9）：
     1. proof 失效/摘要失配 —— 重签有效（阶梯第 3-4 跳）；
     2. 远程签名服务单次使用/质量抖动 —— 重签有效；
     3. 账号级生成限流/风控拦截 —— 会话与鉴权健康（CountTokens/
        CheckUserStatus 同期 200），但原版有效 proof 重放也 403；此时
        重签无效，阶梯最终切号是唯一出路。中间两次重签对该场景是
        无效消耗，维持现阶梯是为覆盖 1/2 两类可自愈场景。
+    4. 签名器 attestation 质量降级（spinsnow 服务级挑战过期实测）——
+       mint 成功但 proof 被上游系统性拒绝，且跨账号全量发生（签名器
+       是公共依赖）。此时重签与切号均无效且无消耗账号池价值，由
+       SignerHealthTracker 熔断短路（见 waa/health.py 判据与证据链）。
     """
 
     def __init__(self, max_retries: int = AUTH_403_MAX_RETRIES) -> None:
@@ -113,18 +119,53 @@ class Auth403RetryManager:
         has_yielded_data: bool = False,
     ) -> bool:
         record_attempt_error(403, str(exc))
+        signer_health = get_signer_health()
         if has_yielded_data:
+            # 已产出数据后途断的 403：能产出即证明当次 proof 通过了
+            # attestation，记入「接受」信号参与签名器健康判定。
+            signer_health.record_proof_accepted(self.serving_account_id)
             raise HTTPException(
                 403, detail={"message": str(exc), "type": "auth_error"}
             ) from exc
 
         self.count += 1
+        # 记「签名器产出的 proof 被拒」事件；跨账号关联达阈值时触发熔断
+        # （单账号永不触发，语义 1/2/3 照旧走完整阶梯）。
+        signer_health.record_proof_rejected(self.serving_account_id)
+
         # 每次 403 重试都记账会让单个请求放大成 5 次惩罚（auth_errors*200 权重），
         # 同一请求首个 403 已足以让账号降权，后续重试只做恢复动作、不重复记罚。
-        if self.count == 1:
+        # 语义 4（签名器降级）例外：账号无辜，降级期间不记罚色。
+        if self.count == 1 and not signer_health.is_degraded():
             record_rotator_event(
                 "auth_error", model=model, account_id=self.serving_account_id
             )
+
+        # 语义 4 熔断短路：重签（3-4 跳）与切号（第 5 跳）对签名器级拒绝
+        # 均无效 —— 远程 VM 产出的新 proof 同样会被拒，切号只会无差别
+        # 烧穿账号池。保留前两跳免费重放（万一为可自愈语义），代价最高
+        # 的中后段直接终止并给出可定位的错误类型。
+        if signer_health.is_degraded() and self.count >= 3:
+            logger.error(
+                "HTTP 403 签名器熔断短路 (count=%d): model=%s, 冷却剩余 %.0fs",
+                self.count,
+                model,
+                signer_health.cooldown_remaining(),
+            )
+            raise HTTPException(
+                403,
+                detail={
+                    "message": (
+                        "上游拒绝生成请求（403 permission denied），且近期"
+                        f"新铸 proof 被拒已跨账号关联（签名器熔断中，剩余冷却 "
+                        f"{signer_health.cooldown_remaining():.0f}s）。账号与会话"
+                        "可能完全健康，根因大概率在 WAA 签名服务（如远程 VM "
+                        "挑战过期）。请稍后重试、更换签名节点或改用本地 "
+                        "waa-signer（浏览器级 attestation）。"
+                    ),
+                    "type": "signer_degraded",
+                },
+            ) from exc
 
         # 1. 前 2 次 403: 重放已签名请求
         if self.count <= 2:
@@ -700,6 +741,10 @@ async def handle_gemini_generate_content(
                 usage=output.usage,
                 account_id=serving_account_id,
             )
+            # 签名器健康信号：能产出即当次 proof 通过了上游 attestation，
+            # 解除熔断（半开探测语义，见 waa/health.py）。
+            if has_any_output:
+                get_signer_health().record_proof_accepted(serving_account_id)
             runtime_state.record(
                 normalized.model,
                 rotator_event,
@@ -1147,6 +1192,10 @@ def _build_gemini_streaming_response(
                 usage=final_usage,
                 account_id=serving_account_id,
             )
+            # 签名器健康信号：已产出数据即当次 proof 通过了上游
+            # attestation，解除熔断（半开探测语义，见 waa/health.py）。
+            if has_yielded_data:
+                get_signer_health().record_proof_accepted(serving_account_id)
             if normalized is not None:
                 runtime_state.record(
                     normalized.model,
