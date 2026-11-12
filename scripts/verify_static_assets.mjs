@@ -60,6 +60,10 @@ async function normalizedTree(root) {
       for (const [name, normalized] of replacements) {
         content = content.replaceAll(name, normalized)
       }
+      if (path.extname(entry.path).toLowerCase() === '.js') {
+        // Bun's minifier may emit either equivalent form for Vite's preload helper.
+        content = content.replaceAll('new Error(', 'Error(')
+      }
       bytes = Buffer.from(content)
     }
     files.set(normalizedPath, bytes)
