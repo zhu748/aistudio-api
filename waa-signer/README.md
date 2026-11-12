@@ -18,7 +18,7 @@
 ## 跨平台一键编译
 
 ### 前置要求
-- Go 1.22+ (`go version`)
+- Go 1.27+ (`go version`，与 `go.mod` 一致)
 - C/C++ 编译器：强烈推荐 `zig`（免配置支持静态交叉链接），亦可使用 `clang` 或 `gcc` / `MinGW-w64`
 
 ### 编译命令
@@ -59,6 +59,14 @@ build.bat
 | `-state-dir` | `WAA_STATE_DIR` | 系统临时目录下的 `aistudio_waa_workers` | Worker 指纹与解释器缓存目录 |
 | `-locale` | `WAA_LOCALE` | `en-US` | 浏览器环境语言 |
 | `-timezone` | `AISTUDIO_TIMEZONE` | `America/Los_Angeles` | 浏览器环境时区 |
+| `-shared-secret` | `SIGNER_SHARED_SECRET` | 空 | `/v1/*` 接口的 Bearer 共享密钥；对外监听时必填 |
+
+监听地址优先级为 `-listen` > `LISTEN_ADDR` > `PORT` > `127.0.0.1:8081`。
+主服务自动拉起的签名器始终监听本机 `127.0.0.1:8081`，不受 Render 等平台为主服务注入的 `PORT` 影响。
+
+面板“测试连通”会先尝试启动内置本地签名器，再访问 `/health`，不会切换当前激活节点。
+切换本地节点失败时会明确显示二进制缺失、执行权限、退出码或探活超时，并显示实际回退的节点。
+`/health` 仅验证服务在线；账号 Cookie 和上游网络是否可用需通过实际请求确认。
 
 ### 后台守护启动示例
 ```bash

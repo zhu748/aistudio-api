@@ -68,6 +68,7 @@ export interface SignerServersResponse {
 
 export interface SwitchSignerServerResponse {
   ok: boolean
+  error?: string | null
   active_server: SignerServerItem
   runtime_override?: string | null
   /** 信息提示：环境变量默认与切换目标不一致时说明重启后的回退行为 */
@@ -76,6 +77,7 @@ export interface SwitchSignerServerResponse {
 
 export interface ResetSignerServerResponse {
   ok: boolean
+  error?: string | null
   active_server: SignerServerItem
   runtime_override?: string | null
   /** 是否真正清除了运行时覆盖（原本未设置时为 false） */

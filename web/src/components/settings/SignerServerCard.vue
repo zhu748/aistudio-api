@@ -30,6 +30,8 @@ const { confirm } = useConfirm()
 const loading = ref(false)
 const switching = ref<string | null>(null)
 const testingId = ref<string | null>(null)
+const resetting = ref(false)
+const busy = computed(() => switching.value !== null || resetting.value || testingId.value !== null)
 const testResults = ref<Record<string, { ok: boolean; ms?: number; err?: string }>>({})
 
 const activeServerId = ref('local_spidermonkey')
@@ -44,8 +46,6 @@ const showResetButton = computed(() => {
     ?? activeServerId.value
   return runtimeOverride.value !== defaultId
 })
-
-const resetting = ref(false)
 
 const showModal = ref(false)
 const isEditing = ref(false)
@@ -82,21 +82,24 @@ async function handleSwitch(serverId: string) {
   switching.value = serverId
   try {
     const res = await systemApi.switchSignerServer(serverId)
-    if (res.ok) {
-      const activeId = res.active_server.id
-      activeServerId.value = activeId
-      runtimeOverride.value = res.runtime_override ?? activeId
-      servers.value = servers.value.map((s) => ({
-        ...s,
-        is_active: s.id === activeId,
-      }))
+    const activeId = res.active_server.id
+    activeServerId.value = activeId
+    runtimeOverride.value = res.runtime_override ?? null
+    servers.value = servers.value.map((s) => ({
+      ...s,
+      is_active: s.id === activeId,
+    }))
+    delete testResults.value[serverId]
+    if (res.ok && activeId === serverId) {
       if (res.note) {
         toast.info(res.note, 8000)
       } else {
         toast.success(`已切换至签名节点: ${res.active_server.name}`)
       }
-      emit('switched')
+    } else {
+      toast.error(res.error || `切换未成功，当前激活节点: ${res.active_server.name}`)
     }
+    emit('switched')
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : '切换签名服务器失败'
     toast.error(msg)
@@ -109,15 +112,17 @@ async function handleReset() {
   resetting.value = true
   try {
     const res = await systemApi.resetSignerServer()
+    await fetchServers()
     if (res.ok) {
-      await fetchServers()
       if (res.changed) {
         toast.success(`已恢复默认签名节点: ${res.active_server.name}`)
       } else {
         toast.info('当前未设置运行时覆盖，节点保持默认')
       }
-      emit('switched')
+    } else {
+      toast.error(res.error || `恢复默认节点失败，当前激活节点: ${res.active_server.name}`)
     }
+    emit('switched')
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : '恢复默认节点失败'
     toast.error(msg)
@@ -281,7 +286,7 @@ onMounted(() => {
           v-if="showResetButton"
           type="button"
           class="inline-flex items-center gap-1 ml-2 px-2 py-0.5 text-[11px] font-semibold text-sky-700 bg-white hover:bg-sky-50 rounded border border-sky-200 transition-colors cursor-pointer disabled:opacity-50"
-          :disabled="resetting"
+          :disabled="busy"
           @click="handleReset"
         >
           <RotateCcw
@@ -306,7 +311,7 @@ onMounted(() => {
         <button
           type="button"
           class="inline-flex items-center gap-1 ml-2 px-2 py-0.5 text-[11px] font-semibold text-sky-700 bg-white hover:bg-sky-50 rounded border border-sky-200 transition-colors cursor-pointer disabled:opacity-50"
-          :disabled="resetting"
+          :disabled="busy"
           @click="handleReset"
         >
           <RotateCcw
@@ -407,6 +412,7 @@ onMounted(() => {
               variant="secondary"
               size="xs"
               :loading="testingId === server.id"
+              :disabled="busy"
               @click="handleTest(server)"
             >
               <Activity
@@ -421,6 +427,7 @@ onMounted(() => {
               variant="primary"
               size="xs"
               :loading="switching === server.id"
+              :disabled="busy"
               @click="handleSwitch(server.id)"
             >
               <span>切换至此节点</span>

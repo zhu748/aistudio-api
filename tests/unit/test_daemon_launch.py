@@ -3,7 +3,7 @@
 覆盖此前完全没有测试的两条高风险路径：
 1. ``is_local_signer_url`` 必须按主机名精确判定，不能用子串匹配
    （``http://127.0.0.1:8081.evil.com`` 曾被误判为本机）。
-2. 拉起后 2 秒探活失败必须**先回收子进程**再回退远程节点，
+2. 拉起后探活失败必须**先回收子进程**再回退远程节点，
    否则会留下僵尸进程并长期占用 8081 端口，导致后续启动无法绑定。
 """
 
@@ -14,7 +14,16 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from aistudio_api.infrastructure.gateway import model_defaults
 from aistudio_api.infrastructure.waa import daemon
+
+
+@pytest.fixture(autouse=True)
+def isolate_runtime_override():
+    previous = model_defaults.get_runtime_waa_override()
+    model_defaults.set_runtime_waa_override(None)
+    yield
+    model_defaults.set_runtime_waa_override(previous)
 
 
 @pytest.mark.parametrize(
@@ -60,6 +69,7 @@ def test_ensure_signer_ready_reaps_child_before_remote_fallback(
     fake_proc.pid = 4242
     # wait() 正常返回，避免走 TimeoutExpired 分支
     fake_proc.wait.return_value = 0
+    fake_proc.poll.return_value = 1
 
     # 不往仓库里写假二进制：直接让产物探测命中
     monkeypatch.setattr(
@@ -141,3 +151,73 @@ def test_ensure_signer_ready_noop_for_remote_server(
     daemon.ensure_signer_ready()
 
     assert calls == []
+
+
+def test_explicit_local_test_failure_does_not_switch_active_server(monkeypatch):
+    monkeypatch.setattr(Path, "is_file", lambda self: False)
+    monkeypatch.setattr(daemon, "is_service_healthy", lambda url: False)
+    monkeypatch.setattr(daemon, "is_port_open", lambda host, port: False)
+    switch = MagicMock()
+    monkeypatch.setattr(daemon, "switch_active_waa_server", switch)
+
+    error = daemon.ensure_signer_ready(server_url="http://127.0.0.1:8081")
+
+    assert error is not None and "未检测到" in error
+    switch.assert_not_called()
+    assert model_defaults.get_runtime_waa_override() is None
+
+
+def test_remote_fallback_survives_readonly_config(monkeypatch):
+    monkeypatch.setattr(Path, "is_file", lambda self: False)
+    monkeypatch.setattr(daemon, "is_service_healthy", lambda url: False)
+    monkeypatch.setattr(daemon, "is_port_open", lambda host, port: False)
+    monkeypatch.setattr(
+        daemon, "get_active_waa_server", lambda: {"url": "http://127.0.0.1:8081"}
+    )
+    monkeypatch.setattr(
+        daemon, "switch_active_waa_server", MagicMock(side_effect=OSError("readonly"))
+    )
+
+    assert daemon.ensure_signer_ready() is not None
+    assert model_defaults.get_runtime_waa_override() == "remote_spinsnow"
+
+
+def test_local_launch_overrides_platform_listen_env(monkeypatch):
+    """PORT/LISTEN_ADDR 属于主服务，不能使本机子进程退出或占用公网端口。"""
+    monkeypatch.setenv("PORT", "10000")
+    monkeypatch.setenv("LISTEN_ADDR", "0.0.0.0:10000")
+    monkeypatch.setattr(Path, "is_file", lambda self: True)
+    monkeypatch.setattr(daemon.os, "access", lambda *_a, **_kw: True)
+    monkeypatch.setattr(daemon, "is_port_open", lambda host, port: False)
+    health = iter([False, True])
+    monkeypatch.setattr(daemon, "is_service_healthy", lambda url: next(health))
+    proc = MagicMock()
+    proc.poll.return_value = None
+    popen = MagicMock(return_value=proc)
+    monkeypatch.setattr(daemon.subprocess, "Popen", popen)
+    monkeypatch.setattr(daemon, "_daemon_proc", None)
+
+    assert daemon.ensure_signer_ready(server_url="http://127.0.0.1:8081") is None
+    child_env = popen.call_args.kwargs["env"]
+    assert child_env["LISTEN_ADDR"] == "127.0.0.1:8081"
+    assert popen.call_args.args[0][1:3] == ["-listen", "127.0.0.1:8081"]
+
+
+def test_local_launch_allows_slow_cold_start(monkeypatch):
+    monkeypatch.setattr(Path, "is_file", lambda self: True)
+    monkeypatch.setattr(daemon.os, "access", lambda *_a, **_kw: True)
+    monkeypatch.setattr(daemon, "is_port_open", lambda host, port: False)
+    clock = [0.0]
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        daemon.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+    monkeypatch.setattr(daemon, "is_service_healthy", lambda url: clock[0] >= 3.0)
+    proc = MagicMock()
+    proc.poll.return_value = None
+    monkeypatch.setattr(daemon.subprocess, "Popen", MagicMock(return_value=proc))
+    monkeypatch.setattr(daemon, "_daemon_proc", None)
+
+    assert daemon.ensure_signer_ready(server_url="http://127.0.0.1:8081") is None
+    assert clock[0] >= 3.0
+    proc.terminate.assert_not_called()

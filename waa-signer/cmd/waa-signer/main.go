@@ -538,14 +538,6 @@ func main() {
 	defaultListen := os.Getenv("LISTEN_ADDR")
 	if defaultListen == "" {
 		if port := os.Getenv("PORT"); port != "" {
-			// 显式安全声明（2.5）：PORT 由容器平台注入时意味着对外暴露，
-			// 此时必须同时配置 SIGNER_SHARED_SECRET，否则拒绝启动。
-			if os.Getenv("SIGNER_SHARED_SECRET") == "" {
-				slog.Error("检测到 PORT 环境变量（将绑定 0.0.0.0 对外监听）但未设置 SIGNER_SHARED_SECRET；" +
-					"签名器可携任意 Cookie 铸造 WAA 证明并作为 SSRF 中继，禁止裸奔对外。" +
-					"请设置 SIGNER_SHARED_SECRET 或改用 LISTEN_ADDR=127.0.0.1:8081")
-				os.Exit(1)
-			}
 			defaultListen = "0.0.0.0:" + port
 		} else {
 			defaultListen = "127.0.0.1:8081"
@@ -573,6 +565,12 @@ func main() {
 	timezone := flag.String("timezone", defaultTZ, "Browser profile IANA timezone")
 	sharedSecret := flag.String("shared-secret", os.Getenv("SIGNER_SHARED_SECRET"), "Bearer token required for /v1/* endpoints (empty = auth disabled, loopback-only recommended)")
 	flag.Parse()
+	// 必须在解析 -listen 后检查实际监听地址。PaaS 注入的 PORT 属于 Python
+	// 网关，不能让它覆盖守护进程显式指定的本机监听并提前拒绝启动。
+	if err := validateListenAddress(*listenAddr, *sharedSecret); err != nil {
+		slog.Error("签名器监听配置无效", "error", err)
+		os.Exit(1)
+	}
 
 	pool := NewWorkerPool(*stateDir, *proxyURL, *locale, *timezone, maxWorkers, time.Duration(idleTTLMinutes)*time.Minute)
 	defer pool.CloseAll()

@@ -117,8 +117,10 @@ class _FakeSignerResponse:
 class _FakeSignerClient:
     responses: ClassVar[list] = []
 
-    def __init__(self, timeout: float = 8.0, proxy: str | None = None):
-        pass
+    def __init__(
+        self, timeout: float = 8.0, proxy: str | None = None, *, trust_env: bool = True
+    ):
+        assert trust_env is False
 
     async def __aenter__(self):
         return self
@@ -233,7 +235,13 @@ async def test_signer_server_test_network_error(monkeypatch):
     """网络不可达时返回 ok=False 与错误信息。"""
 
     class _BrokenClient:
-        def __init__(self, timeout: float = 8.0, proxy: str | None = None):
+        def __init__(
+            self,
+            timeout: float = 8.0,
+            proxy: str | None = None,
+            *,
+            trust_env: bool = True,
+        ):
             pass
 
         async def __aenter__(self):
@@ -271,7 +279,13 @@ async def test_signer_server_test_rejects_unregistered_url(monkeypatch, url):
     """SSRF 防护：未登记/非 http(s) 的目标必须在发出任何请求前被拒绝。"""
 
     class _NoCallClient:
-        def __init__(self, timeout: float = 8.0, proxy: str | None = None):
+        def __init__(
+            self,
+            timeout: float = 8.0,
+            proxy: str | None = None,
+            *,
+            trust_env: bool = True,
+        ):
             raise AssertionError("未登记的地址不应创建网络客户端")
 
     async with _client() as client:
@@ -291,7 +305,13 @@ async def test_signer_server_test_no_cookie_exfiltration_to_remote(monkeypatch):
     class _RecordingClient:
         responses: ClassVar[list] = []
 
-        def __init__(self, timeout: float = 8.0, proxy: str | None = None):
+        def __init__(
+            self,
+            timeout: float = 8.0,
+            proxy: str | None = None,
+            *,
+            trust_env: bool = True,
+        ):
             pass
 
         async def __aenter__(self):

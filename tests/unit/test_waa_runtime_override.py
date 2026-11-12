@@ -247,3 +247,103 @@ async def test_delete_active_server_clears_stale_override(waa_config, monkeypatc
     saved = yaml.safe_load(waa_config.read_text(encoding="utf-8"))
     assert saved["waa"]["active_server"] == "local_spidermonkey"
     assert get_runtime_waa_override() is None
+
+
+@pytest.mark.asyncio
+async def test_failed_local_switch_reports_actual_remote_node(waa_config, monkeypatch):
+    """重现截图：缺本地二进制时回退远程，不能提示本地切换成功。"""
+    from aistudio_api.infrastructure.waa import daemon
+
+    monkeypatch.setenv("AISTUDIO_WAA_SERVER", "remote_spinsnow")
+    monkeypatch.setattr(daemon.Path, "is_file", lambda self: False)
+    monkeypatch.setattr(daemon, "is_service_healthy", lambda url: False)
+    monkeypatch.setattr(daemon, "is_port_open", lambda host, port: False)
+
+    async with _client() as client:
+        resp = await client.post(
+            "/config/signer-servers/switch", json={"server_id": "local_spidermonkey"}
+        )
+        current = (await client.get("/config/signer-servers")).json()
+
+    data = resp.json()
+    assert data["ok"] is False
+    assert data["note"] is None
+    assert "未检测到" in data["error"]
+    assert data["active_server"]["id"] == current["active_server"] == "remote_spinsnow"
+    assert data["runtime_override"] == current["runtime_override"] == "remote_spinsnow"
+
+
+@pytest.mark.asyncio
+async def test_local_health_test_starts_inactive_daemon_without_switching(
+    waa_config, monkeypatch
+):
+    from aistudio_api.infrastructure.waa import daemon
+
+    monkeypatch.setenv("AISTUDIO_WAA_SERVER", "remote_spinsnow")
+    prepared: list[str | None] = []
+
+    def prepare(*, server_url=None):
+        prepared.append(server_url)
+
+    monkeypatch.setattr(daemon, "ensure_signer_ready", prepare)
+    # 只替换签名器探活 HTTP transport，面板的 ASGI 客户端保持真实。
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={"ok": True}))
+    original_client = httpx.AsyncClient
+    kwargs_seen: list[dict] = []
+
+    def signer_client(**kwargs):
+        kwargs_seen.append(kwargs)
+        return original_client(transport=transport, **kwargs)
+
+    async with _client() as client:
+        monkeypatch.setattr(httpx, "AsyncClient", signer_client)
+        resp = await client.post(
+            "/config/signer-servers/test", json={"url": "http://127.0.0.1:8081"}
+        )
+
+    assert resp.json()["ok"] is True
+    assert prepared == ["http://127.0.0.1:8081"]
+    assert kwargs_seen[0]["trust_env"] is False
+    assert kwargs_seen[0]["proxy"] is None
+    assert get_active_waa_server()["id"] == "remote_spinsnow"
+    assert get_runtime_waa_override() is None
+
+
+@pytest.mark.asyncio
+async def test_local_health_test_returns_startup_diagnostic(waa_config, monkeypatch):
+    from aistudio_api.infrastructure.waa import daemon
+
+    monkeypatch.setenv("AISTUDIO_WAA_SERVER", "remote_spinsnow")
+    monkeypatch.setattr(daemon.Path, "is_file", lambda self: False)
+    monkeypatch.setattr(daemon, "is_service_healthy", lambda url: False)
+    monkeypatch.setattr(daemon, "is_port_open", lambda host, port: False)
+
+    async with _client() as client:
+        resp = await client.post(
+            "/config/signer-servers/test", json={"url": "http://127.0.0.1:8081"}
+        )
+
+    assert resp.json()["ok"] is False
+    assert "未检测到" in resp.json()["error"]
+    assert get_active_waa_server()["id"] == "remote_spinsnow"
+    assert get_runtime_waa_override() is None
+
+
+@pytest.mark.asyncio
+async def test_failed_reset_reports_fallback_runtime_override(waa_config, monkeypatch):
+    from aistudio_api.infrastructure.waa import daemon
+
+    monkeypatch.setenv("AISTUDIO_WAA_SERVER", "local_spidermonkey")
+    set_runtime_waa_override("remote_spinsnow")
+    monkeypatch.setattr(daemon.Path, "is_file", lambda self: False)
+    monkeypatch.setattr(daemon, "is_service_healthy", lambda url: False)
+    monkeypatch.setattr(daemon, "is_port_open", lambda host, port: False)
+
+    async with _client() as client:
+        resp = await client.post("/config/signer-servers/reset")
+
+    data = resp.json()
+    assert data["ok"] is False
+    assert "未检测到" in data["error"]
+    assert data["active_server"]["id"] == "remote_spinsnow"
+    assert data["runtime_override"] == get_runtime_waa_override() == "remote_spinsnow"

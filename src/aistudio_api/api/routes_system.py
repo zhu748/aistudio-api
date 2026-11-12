@@ -505,10 +505,11 @@ async def switch_signer_server(req: SwitchSignerServerRequest) -> dict[str, obje
     # 必须下放线程池，否则会卡住整个事件循环、冻结所有并发流式请求。
     active = get_active_waa_server()
     active_url = str(active.get("url") or "")
+    startup_error: str | None = None
     if is_local_signer_url(active_url):
         from aistudio_api.infrastructure.waa.daemon import ensure_signer_ready
 
-        await asyncio.to_thread(ensure_signer_ready)
+        startup_error = await asyncio.to_thread(ensure_signer_ready)
         # 兼容二进制缺失自动回退远程的情况，重新读取实际生效节点
         active = get_active_waa_server()
     else:
@@ -517,8 +518,15 @@ async def switch_signer_server(req: SwitchSignerServerRequest) -> dict[str, obje
         await asyncio.to_thread(stop_signer_daemon)
     env_override = os.getenv("AISTUDIO_WAA_SERVER", "").strip()
     runtime_override = get_runtime_waa_override()
+    switched = active.get("id") == target_id and startup_error is None
+    error = None
+    if not switched:
+        error = (
+            f"切换至 [{target_id}] 失败：{startup_error or '目标节点未生效'}。"
+            f"当前实际激活节点为 [{active.get('id')}]。"
+        )
     note: str | None = None
-    if env_override and env_override != target_id:
+    if switched and env_override and env_override != target_id:
         note = (
             f"已切换至 [{target_id}] 并对当前进程立即生效；"
             f"重启后将恢复环境变量 AISTUDIO_WAA_SERVER={env_override} 指定的默认节点。"
@@ -533,10 +541,11 @@ async def switch_signer_server(req: SwitchSignerServerRequest) -> dict[str, obje
         else "",
     )
     return {
-        "ok": True,
+        "ok": switched,
         "active_server": active,
         "runtime_override": runtime_override or None,
         "note": note,
+        "error": error,
     }
 
 
@@ -555,6 +564,7 @@ async def reset_signer_server() -> dict[str, object]:
     from aistudio_api.infrastructure.gateway.model_defaults import (
         clear_runtime_waa_override,
         get_active_waa_server,
+        get_runtime_waa_override,
     )
 
     previous = clear_runtime_waa_override()
@@ -570,10 +580,11 @@ async def reset_signer_server() -> dict[str, object]:
     # 同 switch 接口：阻塞操作下放线程池，避免卡住事件循环。
     active = get_active_waa_server()
     active_url = str(active.get("url") or "")
+    startup_error: str | None = None
     if is_local_signer_url(active_url):
         from aistudio_api.infrastructure.waa.daemon import ensure_signer_ready
 
-        await asyncio.to_thread(ensure_signer_ready)
+        startup_error = await asyncio.to_thread(ensure_signer_ready)
         active = get_active_waa_server()
     else:
         from aistudio_api.infrastructure.waa.daemon import stop_signer_daemon
@@ -587,10 +598,11 @@ async def reset_signer_server() -> dict[str, object]:
         f"（环境变量默认 {env_override}）" if env_override else "（配置文件默认）",
     )
     return {
-        "ok": True,
+        "ok": startup_error is None,
         "active_server": active,
-        "runtime_override": None,
+        "runtime_override": get_runtime_waa_override(),
         "changed": True,
+        "error": startup_error,
     }
 
 
@@ -699,7 +711,21 @@ async def test_signer_server(req: TestSignerServerRequest) -> dict[str, object]:
 
     t0 = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=8.0, proxy=proxy) as client:
+        if is_local_signer_url(target_url, port=8081):
+            from aistudio_api.infrastructure.waa.daemon import ensure_signer_ready
+
+            startup_error = await asyncio.to_thread(
+                ensure_signer_ready, server_url=target_url
+            )
+            if startup_error:
+                return {
+                    "ok": False,
+                    "error": startup_error,
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+                }
+        async with httpx.AsyncClient(
+            timeout=8.0, proxy=proxy, trust_env=False
+        ) as client:
             resp = await client.get(f"{target_url}/health")
             elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
             is_ok = resp.status_code == 200
