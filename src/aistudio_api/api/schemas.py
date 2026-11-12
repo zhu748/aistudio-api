@@ -204,3 +204,22 @@ class GeminiGenerateContentRequest(BaseModel):
         default=None,
         validation_alias=AliasChoices("reasoningEffort", "reasoning_effort"),
     )
+
+
+class GeminiCountTokensRequest(BaseModel):
+    """Gemini v1beta ``models.countTokens`` 请求体。
+
+    官方协议允许三种形态：顶层 ``contents``、顶层 ``model``，或嵌套的
+    ``generateContentRequest``（把 generateContent 请求整个塞进来）。
+    上游 MakerSuiteService/CountTokens 只消费 contents（2026-11 HAR 实测），
+    这里三种来源统一展开成 contents 列表。
+    """
+
+    contents: list[GeminiContent] | None = None
+    model: str | None = None
+    generateContentRequest: GeminiGenerateContentRequest | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "generateContentRequest", "generate_content_request"
+        ),
+    )

@@ -15,6 +15,7 @@ from aistudio_api.infrastructure.account.cookie_parser import (
     build_makersuite_headers,
     get_auth_user_from_meta,
     get_tier_from_meta,
+    get_visit_id,
     load_account_meta,
     load_cookies_from_auth_file,
     normalize_benefit_tier,
@@ -53,7 +54,27 @@ class SessionContext:
 
 GENERATE_CONTENT_URL = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GenerateContent"
 
+# CountTokens 上游端点（2026-11 HAR 实测 + 逆向验证）：
+# - 请求体为 ["models/x", contents_wire]；
+# - 响应为 [total_tokens, [], [[[prompt_tokens], 1]], null, null, [[1, total]]]；
+# - 无需 WAA snapshot（GenerateContent 必须带 snapshot 否则 403，但
+#   CountTokens 实测无 snapshot 直接 200），鉴权链同 GenerateContent。
+COUNT_TOKENS_URL = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/CountTokens"
+
 DEFAULT_UPSTREAM_HEADERS: dict[str, str] = build_makersuite_headers()
+
+
+def _ensure_visit_id(req_headers: dict[str, str], active_ctx: SessionContext) -> None:
+    """为 RPC 请求补齐 X-AIStudio-Visit-Id（2026-11 抓包对齐）。
+
+    真实浏览器对同账号的**所有** MakerSuite RPC（GenerateContent /
+    CountTokens / GenerateTitle / …）都携带 visit-id 且会话内恒定；
+    调用方已显式设置时（如 client.prepare_request 的账号作用域值）不覆盖。
+    """
+    if "X-AIStudio-Visit-Id" not in req_headers:
+        req_headers["X-AIStudio-Visit-Id"] = get_visit_id(
+            f"account:{active_ctx.auth_file or 'default'}"
+        )
 
 
 class GatewaySession:
@@ -267,6 +288,10 @@ class GatewaySession:
         )
         return proof, dict(self.last_signer_headers)
 
+    def invalidate_proof_cache(self) -> int:
+        """失效 WAA proof 复用缓存（403 重签路径钩子），返回清除条数。"""
+        return self._signer.invalidate_proof_cache()
+
     async def send_request(
         self,
         *,
@@ -283,6 +308,7 @@ class GatewaySession:
         req_headers["X-Goog-AuthUser"] = active_ctx.auth_user
         if headers:
             req_headers.update(headers)
+        _ensure_visit_id(req_headers, active_ctx)
         with upstream_attempt(
             active_ctx.auth_file,
             active_ctx.auth_user,
@@ -317,6 +343,7 @@ class GatewaySession:
         req_headers["X-Goog-AuthUser"] = active_ctx.auth_user
         if headers:
             req_headers.update(headers)
+        _ensure_visit_id(req_headers, active_ctx)
         # aclosing：上层丢弃本生成器时确定性关闭 transport 生成器，
         # 释放上游 httpx 连接（async for 不保证关闭被迭代对象）。
         upstream = self._transport.send_streaming_request(
@@ -352,6 +379,7 @@ class GatewaySession:
 
 
 __all__ = [
+    "COUNT_TOKENS_URL",
     "DEFAULT_UPSTREAM_HEADERS",
     "GENERATE_CONTENT_URL",
     "GatewaySession",
