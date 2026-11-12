@@ -466,6 +466,20 @@ async def get_signer_servers() -> dict[str, object]:
     }
 
 
+@protected_router.get("/config/signer-health")
+async def get_signer_health_state() -> dict[str, object]:
+    """WAA 签名器健康熔断状态（语义与判据见 waa/health.py）。
+
+    面板/运维排障用途：当 GenerateContent 集中 403 而 CountTokens 等
+    轻量端点正常时，优先查看本端点 —— ``degraded=true`` 意味着
+    「新铸 proof 被上游拒绝」已跨账号关联，根因大概率在签名服务
+    （如远程 VM 挑战过期，2026-11-12 spinsnow 实测案例），而非账号。
+    """
+    from aistudio_api.infrastructure.waa.health import get_signer_health
+
+    return get_signer_health().state_summary()
+
+
 @protected_router.post("/config/signer-servers/switch")
 async def switch_signer_server(req: SwitchSignerServerRequest) -> dict[str, object]:
     """纯手动切换当前激活的 WAA 签名服务器（即时生效并持久化）。

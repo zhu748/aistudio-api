@@ -290,10 +290,15 @@ class WaaSigner:
     #   - 浏览器级 attestation（真机抓包 proof）重放 3 天后仍 200，且与
     #     contents 的 SHA-256 摘要严格绑定（同 token 换 prompt 立即 403）；
     #   - 但远程签名服务（spinsnow / NodeVM 类）mint 的 proof 观测到
-    #     “单次使用”现象：同 proof 第二次请求即 403，且 mint 质量存在
-    #     概率性抖动（新 mint 也偶发 403，重试后恢复）；
+    #     「单次使用」倾向（同 proof 二次请求常 403）；不过 2026-11-12
+    #     服务 E2E 实测同一 proof 第 3 次发送恢复 200 —— 上游拒绝
+    #     存在概率性，403 阶梯前两跳免费重放具有真实恢复价值；
     #   - X-AIStudio-Visit-Id / UA 与 proof 无确定性绑定关系（3×3 交叉
     #     实验证实 403 为概率性而非头缺失导致）。
+    #   - 2026-11-12 第三轮实测补充：spinsnow 出现服务级挑战过期
+    #     （全部节点 mint 携带同一过期 challenge_version，加密环境
+    #     载荷薄 ~340B），mint ok:true 但 proof 被上游 100% 拒绝 ——
+    #     由 SignerHealthTracker 跨账号熔断兜底（waa/health.py）。
     # 因此缓存默认关闭（TTL=0）：仅在使用本地 SpiderMonkey 签名器等
     # “浏览器级 attestation”场景下可按需开启（建议先小 TTL 实测重放性）。
     # 403 重签路径会主动失效缓存，作为兜底防护。
