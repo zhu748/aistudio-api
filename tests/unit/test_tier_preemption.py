@@ -139,7 +139,13 @@ async def test_plus_account_requesting_pro_model_preempts_to_pro_account():
 
 @pytest.mark.asyncio
 async def test_pro_account_requesting_ultra_model_preempts_to_ultra_account():
-    """当当前账号为 Pro 等级但收到 Veo (Ultra 独占) 模型时，主动抢切 Ultra 账号。"""
+    """当当前账号为 Pro 等级但收到 Ultra 独占模型（如 gemini-4-carbon，
+    上游目录实测 accessModes=[1,4]）时，主动抢切 Ultra 账号。
+
+    注意：旧用例以 veo-2.0-generate-001 代表 Ultra 独占；2026-11 实测
+    该 ID 已是 gemini-omni-1.1-flash（Pro 级 [1,3]）的别名，Pro 号直用即可，
+    不再满足 Ultra 抢切场景，故改用数据驱动的 carbon。
+    """
     mock_rotator = MagicMock(spec=AccountRotator)
     mock_service = MagicMock(spec=AccountService)
     mock_client = MagicMock()
@@ -170,7 +176,7 @@ async def test_pro_account_requesting_ultra_model_preempts_to_ultra_account():
         patch.object(runtime_state, "account_service", mock_service),
         patch.object(runtime_state, "client", mock_client),
     ):
-        await ensure_active_account(attempt=0, model="veo-2.0-generate-001")
+        await ensure_active_account(attempt=0, model="gemini-4-carbon")
 
         mock_rotator.get_next_account.assert_awaited_once()
         kwargs = mock_rotator.get_next_account.call_args[1]

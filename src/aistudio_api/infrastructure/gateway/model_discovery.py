@@ -83,8 +83,11 @@ def _extract_model_aliases(raw: object) -> list[str]:
 
 # 本地补充模型：无论上游 ListModels 是否返回，都确保出现在模型列表中
 # （README 宣传的模型 / config.yaml 已配置对应付费规则与层级配额）
-# 注意：gemini-4-hydrogen 为免费模型（2026-11-12 线上目录实测 paid[77]=None /
+# 注意：gemini-4-hydrogen 为免费模型（线上目录实测 paid[77]=None /
 # accessModes[82]=None），与 argon/carbon 的付费定位不同，不得挂付费规则。
+# 付费/等级判定优先用上游目录数据（paid[77]/accessModes[82,87]），
+# 随模型列表同一次 ListModels 拉取缓存并 600s 周期刷新；config.yaml
+# 规则仅在模型不在目录或上游未标等级时兜底。
 _EXTRA_GUARANTEED_MODELS = [
     {
         "id": "gemini-4-hydrogen",
@@ -126,8 +129,9 @@ def _merge_extra_models(
 
 
 # 本地保底默认模型列表（当网络未就绪或未配置账号时使用）。
-# 数据来源: 2026-11-12 上游 ListModels 实测快照（含思考等级与别名映射；
-# 2026-11-12 补录 gemini-4-carbon 与目录 [83] 开关映射）。
+# 数据来源: 上游 ListModels 实测快照（含思考等级与别名映射；
+# 补录 gemini-4-carbon 与目录 [83] 开关映射；付费条目含实测 accessModes，
+# 冷启动时等级判定与线上一致：[1,3]=Pro+，[1,4]=仅 Ultra 系）。
 # 覆盖旗舰/Flash/图像(Omni)/音乐(Lyria)/TTS/转写/Live/智能体/机器人/开源 Gemma 全类别。
 _FALLBACK_MODELS = [
     {
@@ -142,6 +146,7 @@ _FALLBACK_MODELS = [
         "thinkingLevels": [],
         "aliases": ["featured-agent", "antigravity-preview-05-2026"],
         "paid": True,
+        "accessModes": [1],
         "is_image_model": False,
         "is_video_model": False,
         "is_audio_model": False,
@@ -158,6 +163,7 @@ _FALLBACK_MODELS = [
         "thinkingLevels": [],
         "aliases": ["deep-research-pro-preview-12-2025"],
         "paid": True,
+        "accessModes": [1, 3],
         "is_image_model": False,
         "is_video_model": False,
         "is_audio_model": False,
@@ -173,6 +179,7 @@ _FALLBACK_MODELS = [
         "defaultThinkingLevel": None,
         "thinkingLevels": [],
         "paid": True,
+        "accessModes": [1, 3],
         "is_image_model": False,
         "is_video_model": False,
         "is_audio_model": False,
@@ -188,6 +195,7 @@ _FALLBACK_MODELS = [
         "defaultThinkingLevel": 2,
         "thinkingLevels": [1, 2, 3],
         "paid": True,
+        "accessModes": [1, 3],
         "is_image_model": False,
         "is_video_model": False,
         "is_audio_model": False,
@@ -203,6 +211,7 @@ _FALLBACK_MODELS = [
         "defaultThinkingLevel": 2,
         "thinkingLevels": [1, 2, 3],
         "paid": True,
+        "accessModes": [1, 4],
         "supportedGenerationMethods": [
             "generateContent",
             "countTokens",
@@ -338,6 +347,7 @@ _FALLBACK_MODELS = [
         "thinkingLevels": [4, 1, 2, 3],
         "aliases": ["gemini-3.5-flash"],
         "paid": True,
+        "accessModes": [1, 3],
         "is_image_model": False,
         "is_video_model": False,
         "is_audio_model": False,
@@ -383,6 +393,7 @@ _FALLBACK_MODELS = [
         "thinkingLevels": [4, 1, 2, 3],
         "aliases": ["gemini-2.0-flash", "gemini-2.0-flash-001"],
         "paid": True,
+        "accessModes": [1, 3],
         "is_image_model": False,
         "is_video_model": False,
         "is_audio_model": False,
@@ -398,6 +409,7 @@ _FALLBACK_MODELS = [
         "defaultThinkingLevel": 2,
         "thinkingLevels": [4, 2, 3],
         "paid": True,
+        "accessModes": [1, 3],
         "is_image_model": True,
         "is_video_model": False,
         "is_audio_model": False,
@@ -435,6 +447,7 @@ _FALLBACK_MODELS = [
         "thinkingLevels": [4, 3],
         "aliases": ["gemini-3.1-flash-image-preview"],
         "paid": True,
+        "accessModes": [1, 3],
         "is_image_model": True,
         "is_video_model": False,
         "is_audio_model": False,
@@ -451,6 +464,7 @@ _FALLBACK_MODELS = [
         "thinkingLevels": [],
         "aliases": ["gemini-3-pro-image-preview", "nano-banana-pro"],
         "paid": True,
+        "accessModes": [1, 3],
         "is_image_model": True,
         "is_video_model": False,
         "is_audio_model": False,
@@ -481,6 +495,7 @@ _FALLBACK_MODELS = [
         "thinkingLevels": [],
         "aliases": ["gemini-2.5-flash-image-preview", "gemini-2.5-flash-preview-image"],
         "paid": True,
+        "accessModes": [1, 3],
         "is_image_model": True,
         "is_video_model": False,
         "is_audio_model": False,
@@ -654,6 +669,7 @@ _FALLBACK_MODELS = [
         "defaultThinkingLevel": None,
         "thinkingLevels": [],
         "paid": True,
+        "accessModes": [1, 3],
         "is_image_model": False,
         "is_video_model": False,
         "is_audio_model": True,
@@ -668,6 +684,7 @@ _FALLBACK_MODELS = [
         "defaultThinkingLevel": None,
         "thinkingLevels": [],
         "paid": True,
+        "accessModes": [1, 3],
         "is_image_model": False,
         "is_video_model": False,
         "is_audio_model": True,
@@ -682,6 +699,7 @@ _FALLBACK_MODELS = [
         "defaultThinkingLevel": None,
         "thinkingLevels": [],
         "paid": True,
+        "accessModes": [1, 3],
         "is_image_model": False,
         "is_video_model": False,
         "is_audio_model": True,
@@ -728,6 +746,7 @@ _FALLBACK_MODELS = [
         "thinkingLevels": [],
         "aliases": ["omni-featured"],
         "paid": True,
+        "accessModes": [1, 3],
         "is_image_model": False,
         "is_video_model": True,
         "is_audio_model": False,
@@ -750,6 +769,7 @@ _FALLBACK_MODELS = [
             "gemini-omni-flash-preview",
         ],
         "paid": True,
+        "accessModes": [1, 3],
         "is_image_model": False,
         "is_video_model": True,
         "is_audio_model": False,
@@ -984,12 +1004,37 @@ class ModelDiscoveryService:
         return all(m not in (3, 4) for m in raw_modes)
 
     def is_paid_model(self, model_id: str) -> bool:
-        """判定目标模型是否为付费模型（由 config.yaml 的 paid_model_rules 严格驱动，结合 upstream accessModes）。"""
+        """判定目标模型是否为付费模型（上游 ListModels 目录数据优先，config.yaml 仅兜底）。
+
+        优先级（2026-11-12 上游实测交叉验证，随模型列表同一次拉取 600s 刷新）：
+        1. 目录明确结论：paid=True（ListModels 槽位 [77]==2）、accessModes 含
+           3/4（订阅门槛）或能力码 20（视频路由）→ 付费；paid=False 且无
+           门槛 → 免费。上游结论直接生效，config.yaml 关键词规则不再覆盖。
+        2. 上游无该模型（未知 ID / 兼并条目未带 paid）→ 才回落 config.yaml
+           paid_model_rules 的 contains/prefixes/exact 匹配。
+        """
+        clean_m = model_id.removeprefix("models/").lower()
+        info = self.get_cached_model_info(clean_m)
+        if info:
+            if info.get("paid") is True:
+                return True
+            modes = info.get("accessModes")
+            if isinstance(modes, list) and any(m in (3, 4) for m in modes):
+                return True
+            codes = info.get("capabilityCodes")
+            if isinstance(codes, list) and 20 in codes:
+                return True
+            # 上游明确收录且无任何付费标记 → 免费模型，直接返回，
+            # 不再走 config.yaml 模糊匹配（避免关键词误伤免费模型）。
+            if info.get("paid") is False:
+                return False
+            # paid 未知（None，如 _EXTRA_GUARANTEED_MODELS 条目未带 paid
+            # 字段）→ 结论不明确，落到 config.yaml 规则。
+
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_configured_paid_model_rules,
         )
 
-        clean_m = model_id.removeprefix("models/").lower()
         rules = get_configured_paid_model_rules()
         for rule_cfg in rules.values():
             if not isinstance(rule_cfg, dict):
@@ -1015,17 +1060,6 @@ class ModelDiscoveryService:
                 or any(c in clean_m for c in contains)
             ):
                 return True
-
-        info = self.get_cached_model_info(clean_m)
-        if info:
-            if info.get("paid") is True:
-                return True
-            modes = info.get("accessModes")
-            if isinstance(modes, list) and modes and all(m in (3, 4) for m in modes):
-                return True
-            codes = info.get("capabilityCodes")
-            if isinstance(codes, list) and 20 in codes:
-                return True
         return False
 
     def get_required_tier(self, model_id: str) -> str:
@@ -1036,13 +1070,32 @@ class ModelDiscoveryService:
         return tiers[0]
 
     def get_required_tiers(self, model_id: str) -> list[str]:
-        """获取目标模型所允许调用的账号层级列表（由 upstream accessModes 与 config.yaml 共同驱动）。"""
+        """获取目标模型所允许调用的账号层级列表（上游 accessModes 优先，config.yaml 兜底）。
+
+        语义（2026-11-12 上游 ListModels 实测交叉验证，随模型列表 600s 刷新）：
+        - accessModes [1,3] → Pro 及以上（Pro/Ultra/Ultra_20X）
+        - accessModes [1,4] → 仅 Ultra 系（Ultra/Ultra_20X）
+        - paid=False 且无 modes → 免费模型，任何等级可用（返回空列表）
+        - modes 仅 [1]（Paid API key，如 antigravity）或 paid=True 无
+          modes → 上游未给网页端等级标记 → 回落 config.yaml 规则
+        - 模型不在目录 → config.yaml 规则，仍无匹配 → 空列表
+        """
         clean_m = model_id.removeprefix("models/").lower()
         info = self.get_cached_model_info(clean_m)
+        modes: list[int] = []
         if info:
-            modes = info.get("accessModes")
-            if isinstance(modes, list) and 4 in modes and 3 not in modes:
+            raw_modes = info.get("accessModes")
+            if isinstance(raw_modes, list):
+                modes = [m for m in raw_modes if isinstance(m, int)]
+        if modes:
+            if 4 in modes and 3 not in modes:
                 return ["Ultra", "Ultra_20X"]
+            if 3 in modes:
+                return ["Pro", "Ultra", "Ultra_20X"]
+        elif info and info.get("paid") is False:
+            # 上游明确免费：不进 config 模糊匹配（避免 contains "pro"/
+            # "image" 等关键词误伤免费模型）。
+            return []
 
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_configured_paid_model_rules,
@@ -1076,10 +1129,6 @@ class ModelDiscoveryService:
                 if isinstance(req, list) and req:
                     return [str(t) for t in req]
 
-        if info:
-            modes = info.get("accessModes")
-            if isinstance(modes, list) and 3 in modes:
-                return ["Pro", "Ultra", "Ultra_20X"]
         return []
 
     async def _fetch_via_http(
@@ -1220,7 +1269,12 @@ class ModelDiscoveryService:
             ):
                 unknown_flag_13 = item[83]
             paid = bool(len(item) > 77 and item[77] == 2)
+            # accessModes 主槽位 [82]，镜像槽位 [87]（实测两者恒等：carbon
+            # [1,4] / argon [1,3]）；主槽缺失时用镜像兜底。模式语义：
+            # 1=Paid API key、3=Pro 级可访问、4=仅 Ultra 系可访问。
             access_modes = _extract_int_list(item[82]) if len(item) > 82 else []
+            if not access_modes and len(item) > 87:
+                access_modes = _extract_int_list(item[87])
 
             # 过滤支持内容生成的模型
             if not any("generateContent" in str(m) for m in methods) and not any(
