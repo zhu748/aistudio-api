@@ -7,12 +7,15 @@ import re
 from fastapi import APIRouter, Depends, Request
 
 from aistudio_api.api.response_models import GeminiGenerateContentResponse
-from aistudio_api.application.api_service_gemini import handle_gemini_generate_content
+from aistudio_api.application.api_service_gemini import (
+    handle_gemini_count_tokens,
+    handle_gemini_generate_content,
+)
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 from .dependencies import get_client
-from .schemas import GeminiGenerateContentRequest
+from .schemas import GeminiCountTokensRequest, GeminiGenerateContentRequest
 
 logger = get_logger("routes.gemini")
 router = APIRouter()
@@ -61,6 +64,22 @@ async def generate_content(
         stream=False,
         anti_truncation=_parse_anti_truncation_header(http_request),
     )
+
+
+@router.post("/v1beta/{model_path:path}:countTokens")
+async def count_tokens(
+    model_path: str,
+    req: GeminiCountTokensRequest,
+    client: AIStudioClient = Depends(get_client),
+):
+    """Gemini 协议 ``models.countTokens``：转发到上游真实 CountTokens 端点。
+
+    2026-11 HAR 实测：上游该端点无需 WAA snapshot，响应首位即
+    AI Studio 界面展示的 token 总数（含 1 个固定开销 token）。
+    """
+    clean_model = _sanitize_model_path(model_path)
+    logger.debug("收到 countTokens 请求: model=%s", clean_model)
+    return await handle_gemini_count_tokens(clean_model, req, client)
 
 
 @router.post("/v1beta/{model_path:path}:streamGenerateContent")

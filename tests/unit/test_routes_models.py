@@ -124,10 +124,11 @@ async def test_model_discovery_falls_back_to_auth_file_cookies(tmp_path, monkeyp
     service._fetch_via_http = AsyncMock(return_value=fake_http_models)
 
     models = await service.get_models(session=mock_session, force_refresh=True)
-    # 上游模型全部保留，且本地补充模型（gemini-4-argon）被合并进列表
+    # 上游模型全部保留，且本地补充模型（gemini-4-argon / gemini-4-carbon）被合并进列表
     assert {str(m["id"]) for m in models} == {
         "dynamic-gemini-test",
         "gemini-4-argon",
+        "gemini-4-carbon",
     }
     assert service._fetch_via_http.called
     call_cookies, call_auth_user = service._fetch_via_http.call_args[0]
@@ -176,7 +177,8 @@ async def test_model_discovery_merges_extra_models_into_upstream_list():
 
     models = await service.get_models(cookies={"SAPISID": "test"}, force_refresh=True)
     ids = [str(m["id"]) for m in models]
-    assert ids == ["gemini-3.7-flash", "gemini-4-argon"]
+    # 2026-11：本地补充模型新增 gemini-4-carbon（旗舰，抓包同期目录实测）
+    assert ids == ["gemini-3.7-flash", "gemini-4-argon", "gemini-4-carbon"]
 
 
 @pytest.mark.asyncio

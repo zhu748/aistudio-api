@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import json
 from dataclasses import dataclass
 
 from aistudio_api.config import DEFAULT_TEXT_MODEL
@@ -14,7 +15,9 @@ from aistudio_api.domain.errors import (
     is_login_redirect_payload,
 )
 from aistudio_api.domain.models import ModelOutput
+from aistudio_api.infrastructure.account.cookie_parser import get_visit_id
 from aistudio_api.infrastructure.gateway.session import (
+    COUNT_TOKENS_URL,
     DEFAULT_UPSTREAM_HEADERS,
     GENERATE_CONTENT_URL,
     GatewaySession,
@@ -139,6 +142,11 @@ class AIStudioClient:
         if dyn_headers:
             headers.update(dyn_headers)
         headers["X-Goog-AuthUser"] = ctx.auth_user
+        # X-AIStudio-Visit-Id 会话级复用（HAR 实测：真实浏览器对同账号
+        # 每次 GenerateContent 均携带，且同页面会话内恒定不变）。
+        headers["X-AIStudio-Visit-Id"] = get_visit_id(
+            f"account:{ctx.auth_file or 'default'}"
+        )
         prepared = PreparedRequest(
             url=GENERATE_CONTENT_URL,
             headers=headers,
@@ -155,6 +163,48 @@ class AIStudioClient:
         )
         self.last_prepared_request = prepared
         return prepared
+
+    async def count_tokens(
+        self,
+        *,
+        model: str,
+        contents: list[AistudioContent],
+    ) -> int:
+        """调用上游 CountTokens（无需 WAA snapshot，鉴权链同 GenerateContent）。
+
+        响应数组 [total, [], [[[prompt], 1]], null, null, [[1, total]]] 的
+        首位即 AI Studio 界面展示的 token 总数（含 1 个固定开销 token）。
+        """
+        ctx = await self._session.ensure_ready()
+        normalized_model = model if model.startswith("models/") else f"models/{model}"
+        body = json.dumps(
+            [normalized_model, [c.to_wire() for c in contents]],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        headers = dict(DEFAULT_UPSTREAM_HEADERS)
+        headers["X-Goog-AuthUser"] = ctx.auth_user
+        status, raw = await self._session.send_request(
+            body=body,
+            url=COUNT_TOKENS_URL,
+            headers=headers,
+            ctx=ctx,
+        )
+        raw_text = raw.decode("utf-8", errors="replace")
+        if status != 200:
+            raise classify_error(status, raw_text)
+        if is_login_redirect_payload(raw_text):
+            raise SessionExpiredError("登录态已失效: 被重定向至 Google 登录页")
+        try:
+            parsed = json.loads(raw_text)
+            total = parsed[0] if isinstance(parsed, list) and parsed else None
+            if isinstance(total, int):
+                return total
+        except json.JSONDecodeError:
+            pass
+        raise TransportError(
+            f"upstream CountTokens returned malformed body: {raw_text[:200]}"
+        )
 
     async def stream_generate_content(
         self,
