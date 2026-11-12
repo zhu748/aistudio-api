@@ -84,6 +84,20 @@ if (differences.length) {
   for (const name of differences.slice(0, 20)) {
     const status = !built.has(name) ? 'missing from build' : !committed.has(name) ? 'missing from committed assets' : 'content differs'
     console.error(`  ${name}: ${status}`)
+    const builtBytes = built.get(name)
+    const committedBytes = committed.get(name)
+    if (builtBytes && committedBytes && textExtensions.has(path.extname(name).toLowerCase())) {
+      const builtText = builtBytes.toString('utf8')
+      const committedText = committedBytes.toString('utf8')
+      let offset = 0
+      while (offset < Math.min(builtText.length, committedText.length) && builtText[offset] === committedText[offset]) {
+        offset += 1
+      }
+      const start = Math.max(0, offset - 80)
+      const end = offset + 160
+      console.error(`    build:     ${JSON.stringify(builtText.slice(start, end))}`)
+      console.error(`    committed: ${JSON.stringify(committedText.slice(start, end))}`)
+    }
   }
   if (differences.length > 20) {
     console.error(`  ... and ${differences.length - 20} more differences`)
