@@ -18,6 +18,7 @@ SignerHealthTracker 的滑动窗口熔断判据与 Auth403RetryManager 的短路
 from __future__ import annotations
 
 import asyncio
+from typing import cast
 
 import pytest
 from fastapi import HTTPException
@@ -122,9 +123,7 @@ def _make_manager():
 
 
 def _drive_403(manager, exc, model="models/gemini-3.5-flash-lite"):
-    return asyncio.run(
-        manager.handle_403(exc, model=model, client=_StubClient())
-    )
+    return asyncio.run(manager.handle_403(exc, model=model, client=_StubClient()))
 
 
 def test_403_ladder_intact_when_not_degraded():
@@ -161,8 +160,12 @@ def test_403_short_circuits_when_degraded():
     with pytest.raises(HTTPException) as ei:
         _drive_403(mgr, exc)
     assert ei.value.status_code == 403
-    assert ei.value.detail["type"] == "signer_degraded"
-    assert "签名" in ei.value.detail["message"]
+    # starlette 0.50 将 detail 声明为 str（运行时可为任意 JSON 值），
+    # 需 cast 升宽后 isinstance 收窄才能静态安全地索引。
+    detail = cast("object", ei.value.detail)
+    assert isinstance(detail, dict)
+    assert detail["type"] == "signer_degraded"
+    assert "签名" in detail["message"]
 
 
 def test_403_records_rejection_events():
@@ -207,4 +210,6 @@ def test_ladder_trip_through_handle_403():
     assert _drive_403(mgr_c, exc) is True
     with pytest.raises(HTTPException) as ei2:
         _drive_403(mgr_c, exc)
-    assert ei2.value.detail["type"] == "signer_degraded"
+    detail2 = cast("object", ei2.value.detail)
+    assert isinstance(detail2, dict)
+    assert detail2["type"] == "signer_degraded"

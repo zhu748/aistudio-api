@@ -336,6 +336,8 @@ class WaaSigner:
 
         403 重签路径调用（Auth403RetryManager 第 3 次重试）：此时缓存
         proof 可能已失效或被风控标记，必须强制重新走签名服务。
+        带摘要失效时清除该 content_hash 下全部条目（跨账号/模型/层级：
+        缓存键为五元组，同一摘要可存在多条）。
         """
         if content_hash is None:
             removed = len(self._proof_cache)
@@ -343,8 +345,10 @@ class WaaSigner:
             if removed:
                 logger.info("WAA proof 缓存已全量失效: %d 条", removed)
             return removed
-        removed = self._proof_cache.pop(content_hash, None)
-        return 1 if removed is not None else 0
+        stale = [key for key in self._proof_cache if key[0] == content_hash]
+        for key in stale:
+            self._proof_cache.pop(key)
+        return len(stale)
 
     def _cache_key(
         self,
