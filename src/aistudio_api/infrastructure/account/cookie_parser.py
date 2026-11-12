@@ -63,14 +63,49 @@ def build_ext_bin(region: str | None = None) -> str:
 
 DEFAULT_EXT_BIN = build_ext_bin()
 
-# 真实 Chrome / Edge 发送 AI Studio 请求时附带的固定浏览器特征头。
-# 缺失这些头可能被风控指纹识别（HAR 实测于 2026-11）。
-# x-browser-validation 为会话级校验值；若 WAA 签名服务返回动态同名头，会覆盖此静态值。
-BROWSER_SIGNATURE_HEADERS: dict[str, str] = {
-    "X-Browser-Channel": "stable",
-    "X-Browser-Copyright": "Copyright 2026 Google LLC. All Rights Reserved.",
-    "X-Browser-Year": "2026",
-    "X-Browser-Validation": "Whavu7Z6lTQOg+XljzhS45x/NWQ=",
+# 2026-11 HAR 实测（Android Chrome 130 真机抓包）：Chrome 仅在访问
+# aistudio.google.com/app/_/bscframe（浏览器信号收集 iframe，GET）时携带
+# X-Browser-Channel/Copyright/Year/Validation 四个头；对 alkalimakersuite-pa
+# 的所有 RPC 请求（GenerateContent/CountTokens/...）从不携带。在 API 请求上
+# 发送这组头会构成真实客户端不存在的指纹偏离，故不再附加到 RPC 头集合。
+# 若 WAA 签名服务返回动态同名头，仍会按 client.py 的合并逻辑生效。
+
+
+def _default_accept_language() -> str:
+    """读取 AISTUDIO_ACCEPT_LANGUAGE 环境变量，默认与实测浏览器一致。"""
+    raw = (os.getenv("AISTUDIO_ACCEPT_LANGUAGE") or "").strip()
+    return raw or "zh-CN,zh;q=0.9"
+
+
+DEFAULT_ACCEPT_LANGUAGE = _default_accept_language()
+
+# X-AIStudio-Visit-Id 会话级复用（2026-11 HAR 实测）：真实浏览器在
+# 一个页面会话内对同一账号的所有 RPC（GenerateContent ×7、CountTokens、
+# ListApplets……）复用同一个 visit-id（v1_ + base64(uuid) 48 字符）；
+# 现在按“作用域”缓存复用，避免每次请求都换新值构成指纹偏离。
+_VISIT_ID_CACHE: dict[str, str] = {}
+
+
+def get_visit_id(scope: str = "default") -> str:
+    """按作用域（通常为账号标识）返回稳定的 X-AIStudio-Visit-Id 值。"""
+    vid = _VISIT_ID_CACHE.get(scope)
+    if not vid:
+        vid = "v1_" + base64.b64encode(str(uuid.uuid4()).encode("ascii")).decode(
+            "ascii"
+        )
+        _VISIT_ID_CACHE[scope] = vid
+    return vid
+
+
+# Firefox/Chrome 发起跨域 fetch（aistudio.google.com → clients6.google.com）
+# 时必带的 Sec-Fetch-* 三元组与 Accept 头；Python httpx 路径原先缺失
+# （HAR 实测 2026-11：35/35 个 GenerateContent 请求均携带）。
+CORS_FETCH_HEADERS: dict[str, str] = {
+    "Accept": "*/*",
+    "Accept-Language": DEFAULT_ACCEPT_LANGUAGE,
+    "Sec-Fetch-Site": "same-site",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
 }
 
 BENEFIT_TIER_TO_NAME: dict[int, str] = {
@@ -180,6 +215,13 @@ MINIMAL_COOKIE_WHITELIST: frozenset[str] = frozenset(
         "SIDCC",
         "__Secure-1PSIDCC",
         "__Secure-3PSIDCC",
+        # 2026-11 真机抓包（16 项 Cookie 全集）实测：真实浏览器对
+        # alkalimakersuite RPC 恒携带以下两项；此前被请求侧白名单过滤。
+        # __Secure-STRP: Google Private State Token（风控信任信号）；
+        # SEARCH_SAMESITE: SameSite 豁免标记。
+        # 放开后随核心鉴权 Cookie 一并上行，并使 WAA 铸签 Cookie 集与浏览器一致。
+        "__Secure-STRP",
+        "SEARCH_SAMESITE",
     }
 )
 
@@ -404,6 +446,7 @@ def build_makersuite_headers(
     auth_user: str = "0",
     tier: str | None = None,
     include_visit_id: bool = False,
+    visit_scope: str | None = None,
 ) -> dict[str, str]:
     """Build standard Google AI Studio MakerSuiteService RPC headers."""
     headers: dict[str, str] = {
@@ -415,10 +458,18 @@ def build_makersuite_headers(
         "Origin": DEFAULT_ORIGIN,
         "Referer": f"{DEFAULT_ORIGIN}/",
         "User-Agent": DEFAULT_BROWSER_USER_AGENT,
-        **BROWSER_SIGNATURE_HEADERS,
+        **CORS_FETCH_HEADERS,
     }
     if include_visit_id:
-        headers["X-AIStudio-Visit-Id"] = f"v1_{uuid.uuid4()}"
+        if visit_scope:
+            # 会话级复用：同作用域（账号）内稳定不变，对齐真实浏览器。
+            headers["X-AIStudio-Visit-Id"] = get_visit_id(visit_scope)
+        else:
+            # 官网格式为 v1_ + base64(UUID 字符串)（HAR 实测 48 字符）；
+            # 直接拼接裸 UUID 字符串会得到 40 字符的异常形态。
+            headers["X-AIStudio-Visit-Id"] = "v1_" + base64.b64encode(
+                str(uuid.uuid4()).encode("ascii")
+            ).decode("ascii")
     tier_header = get_tier_header_value(tier)
     if tier_header:
         headers["X-AIStudio-G1-Tier"] = tier_header

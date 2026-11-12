@@ -42,6 +42,35 @@ model_defaults:
         Hate: 5
         Sexually Explicit: 5
         Dangerous Content: 5
+      # 与仓库默认配置同步（2026-11 浏览器形态默认值，抓包对齐）：
+      # 详见 docs/CAPTURE_ALIGNMENT_2026-11.md 与 model_defaults._default_config。
+      generation_config_defaults:
+        max_tokens: 65536
+        temperature: 1
+        top_p: 0.95
+        top_k: 64
+        thinking_config:
+          level: 2
+    - name: aux_output_models
+      match:
+        contains:
+          - image
+          - imagen
+          - veo
+          - lyria
+          - tts
+          - live
+          - transcribe
+          - robotics
+          - omni
+          - nano-banana
+      clear_generation_config_indexes:
+        - 3
+        - 4
+        - 5
+        - 6
+        - 13
+        - 16
   models: {}
 paid_model_rules:
   ultra_required:

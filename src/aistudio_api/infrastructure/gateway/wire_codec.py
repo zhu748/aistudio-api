@@ -9,12 +9,22 @@ from aistudio_api.config import DEFAULT_TEXT_MODEL, settings
 from aistudio_api.infrastructure.request_context import current_request, request_event
 from aistudio_api.infrastructure.utils.logger import get_logger
 
-from .model_defaults import resolve_model_defaults
+from .model_defaults import (
+    browser_default_max_tokens,
+    browser_default_thinking_wire,
+    model_unknown_flag_13,
+    resolve_model_defaults,
+    snap_thinking_wire_to_model,
+)
 from .wire_parser import (
     WIRE_PART_FILE_DATA_INDEX,
     parse_response_part,
 )
-from .wire_spec import ThinkingConfigIndex, TopLevelIndex
+from .wire_spec import (
+    GenerationConfigIndex,
+    ThinkingConfigIndex,
+    TopLevelIndex,
+)
 from .wire_types import (
     AistudioContent,
     AistudioGenerationConfig,
@@ -235,10 +245,10 @@ class AistudioWireCodec:
             if request.tools or request.location is not None:
                 self._ensure_len(body, self.TIMEZONE_INDEX + 1)
                 tz_str = settings.timezone
+                # 2026-11 真机抓包实测：request_context 恒为单元素形态
+                # [[null,null,时区]]（旧三元素尾部 null,1 形态上游宽容但非浏览器形态）。
                 body[self.TIMEZONE_INDEX] = request.location or [
                     [None, None, tz_str],
-                    None,
-                    1,
                 ]
             else:
                 while len(body) > self.SNAPSHOT_INDEX + 1 and body[-1] is None:
@@ -282,6 +292,10 @@ class AistudioWireCodec:
         )
         model_defaults = resolve_model_defaults(model)
         gc = AistudioGenerationConfig()
+        user_overrides = dict(generation_config_overrides or {})
+        user_specified_max_tokens = (
+            max_tokens is not None or "max_tokens" in user_overrides
+        )
         defaults = model_defaults.generation_config_overrides()
         for attr, value in defaults.items():
             setattr(gc, attr, value)
@@ -302,10 +316,41 @@ class AistudioWireCodec:
             gc.top_p = top_p
         if top_k is not None:
             gc.top_k = top_k
-        for attr, value in (generation_config_overrides or {}).items():
+        for attr, value in user_overrides.items():
             if not hasattr(gc, attr):
                 continue
             setattr(gc, attr, value)
+
+        # ── 浏览器形态默认值的模型自适应终化（2026-11 抓包逆向结论）──
+        # 三条规则全部仅作用于「用户未显式指定」的默认槽位：
+        # 1) 默认思考档位跟随 ListModels 元数据（3.5-lite 默认 MINIMAL=4，
+        #    其余默认 MEDIUM=2），随后统一做档位吸附（不支持则升降档/丢弃）；
+        # 2) generation_config[13] 开关从 ListModels [83] 自动推导
+        #    （3.8-flash/carbon/argon 恒为 1，3.5-flash-lite 为 null）；
+        # 3) 默认 maxOutputTokens=65536 按模型输出上限钳制（carbon 32768）。
+        if "thinking_config" not in user_overrides and gc.thinking_config is not None:
+            gc.thinking_config = browser_default_thinking_wire(model)
+        gc.thinking_config = snap_thinking_wire_to_model(model, gc.thinking_config)
+        if gc.unknown_flag_13 is None and (
+            GenerationConfigIndex.UNKNOWN_FLAG_13
+            not in model_defaults.clear_generation_config_indexes
+        ):
+            flag13 = model_unknown_flag_13(model)
+            if flag13 is not None:
+                gc.unknown_flag_13 = flag13
+        if not user_specified_max_tokens and gc.max_tokens is not None:
+            capped = browser_default_max_tokens(model)
+            if isinstance(gc.max_tokens, (int, float)) and capped < gc.max_tokens:
+                gc.max_tokens = capped
+
+        # 清除语义后的压缩：尾部 null 裁剪；全空数组回退 []（抓包对齐：
+        # 无有效参数的请求体 generation_config 恒为空数组而非全 null 数组）。
+        values = gc.values
+        while values and values[-1] is None:
+            values.pop()
+        if not values:
+            gc.values = []
+
         effective_tools: list[list] | None = tools if tools else None
         if tool_config is not None:
             is_none_mode = False

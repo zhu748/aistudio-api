@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import time
@@ -17,7 +18,10 @@ from aistudio_api.api.response_models import (
     GeminiPartResponse,
 )
 from aistudio_api.api.responses import to_gemini_parts, to_gemini_usage_metadata
-from aistudio_api.api.schemas import GeminiGenerateContentRequest
+from aistudio_api.api.schemas import (
+    GeminiCountTokensRequest,
+    GeminiGenerateContentRequest,
+)
 from aistudio_api.api.state import runtime_state
 from aistudio_api.application.account_orchestrator import (
     ensure_active_account,
@@ -65,13 +69,32 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("api.gemini")
 
+# 日志注入防护（L6）：model_path 来自 URL，未过滤时控制字符可注入伪造日志行
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def sanitize_model_path(model_path: str) -> str:
+    """清洗路径参数中的控制字符，避免日志伪造（CRLF 注入）。"""
+    return _CONTROL_CHARS_RE.sub("", model_path)
+
+
 AUTH_403_MAX_RETRIES = (
     5  # 403 阶梯重试机制：前 2 次重放，后 2 次重新签名，最后 1 次切号
 )
 
 
 class Auth403RetryManager:
-    """403 阶梯重试管理器：前 2 次重放，后 2 次重新签名，最后 1 次切号。"""
+    """403 阶梯重试管理器：前 2 次重放，后 2 次重新签名，最后 1 次切号。
+
+    403「The caller does not have permission」的三种已知语义
+    （2026-11 抓包 + SOCKS5 代理实测，详见 docs/CAPTURE_ALIGNMENT_2026-11.md §8.3）：
+    1. proof 失效/摘要失配 —— 重签有效（阶梯第 3-4 跳）；
+    2. 远程签名服务单次使用/质量抖动 —— 重签有效；
+    3. 账号级生成限流/风控拦截 —— 会话与鉴权健康（CountTokens/
+       CheckUserStatus 同期 200），但原版有效 proof 重放也 403；此时
+       重签无效，阶梯最终切号是唯一出路。中间两次重签对该场景是
+       无效消耗，维持现阶梯是为覆盖 1/2 两类可自愈场景。
+    """
 
     def __init__(self, max_retries: int = AUTH_403_MAX_RETRIES) -> None:
         self.count: int = 0
@@ -117,6 +140,14 @@ class Auth403RetryManager:
         if self.count <= 4:
             self.current_prepared = None
             if self.count == 3:
+                # 失效 WAA proof 复用缓存：重签阶段必须走真正的签名服务。
+                # 否则 prepare_request 命中缓存会拿回刚刚被上游拒绝的同一枚
+                # proof，重签重试完全失效（2026-11 逆向验证 proof 与摘要绑定
+                # 且长有效期，见 signer.py 缓存说明）。
+                session = getattr(client, "session", None)
+                if session is not None and hasattr(session, "invalidate_proof_cache"):
+                    with contextlib.suppress(Exception):
+                        session.invalidate_proof_cache()
                 account_svc = runtime_state.account_service
                 # 用本管理器记录的“本次请求实际服务账号”而非全局活跃账号：
                 # 并发请求下全局活跃账号可能已被其他请求切走，轮换错误的
@@ -1168,4 +1199,66 @@ def _build_gemini_streaming_response(
         stream_response(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def handle_gemini_count_tokens(
+    model_path: str,
+    req: GeminiCountTokensRequest,
+    client: AIStudioClient,
+) -> dict[str, int]:
+    """Gemini ``:countTokens`` 处理器：转发到上游 CountTokens 真实端点。
+
+    上游无需 WAA snapshot（逆向验证 2026-11），失败分类与 generateContent
+    一致。CountTokens 不消耗生成配额，因此不进入 403 阶梯重试/账号轮换
+    复杂链路，仅在鉴权失败时切换一次账号重试。
+    """
+    clean_model = sanitize_model_path(model_path)
+    effective_contents = req.contents
+    if not effective_contents and req.generateContentRequest is not None:
+        effective_contents = req.generateContentRequest.contents
+    if not effective_contents:
+        raise HTTPException(
+            400, detail={"message": "contents is required", "type": "bad_request"}
+        )
+
+    normalized_req = GeminiGenerateContentRequest(contents=effective_contents)
+
+    for attempt in range(2):
+        await ensure_active_account(attempt, model=clean_model)
+        try:
+            normalized = normalize_gemini_request(normalized_req, clean_model)
+            total = await client.count_tokens(
+                model=normalized.model,
+                contents=normalized.contents,
+            )
+            logger.info(
+                "countTokens 完成: model=%s, total=%d",
+                normalized.model,
+                total,
+            )
+            return {"totalTokens": total}
+        except AuthError as exc:
+            # 登录态/权限失败：换账号重试一次，仍失败则如实上抛。
+            if attempt == 0 and await try_switch_account(model=clean_model):
+                logger.warning("countTokens 鉴权失败，已切换账号重试: %s", exc)
+                continue
+            status_code, msg, status_str = classify_gemini_error_payload(exc)
+            raise HTTPException(
+                status_code,
+                detail={"message": msg, "status": status_str, "type": "auth_error"},
+            ) from exc
+        except RequestError as exc:
+            clean_msg = clean_upstream_error_message(str(exc))
+            raise HTTPException(
+                exc.status if exc.status > 0 else 400,
+                detail={"message": clean_msg, "type": "bad_request"},
+            ) from exc
+        except AistudioError as exc:
+            raise HTTPException(
+                502, detail={"message": str(exc), "type": "upstream_error"}
+            ) from exc
+    raise HTTPException(
+        500,
+        detail={"message": "countTokens failed after retries", "type": "server_error"},
     )

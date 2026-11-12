@@ -13,6 +13,7 @@ import hashlib
 import os
 import re
 import time
+from collections import OrderedDict
 from contextlib import suppress
 from typing import Any
 
@@ -285,6 +286,28 @@ class RemoteProofSigner:
 class WaaSigner:
     """Unified WAA signing facade backed by RemoteProofSigner."""
 
+    # WAA proof 复用缓存（2026-11 HAR + 代理实测逆向结论，行为复杂):
+    #   - 浏览器级 attestation（真机抓包 proof）重放 3 天后仍 200，且与
+    #     contents 的 SHA-256 摘要严格绑定（同 token 换 prompt 立即 403）；
+    #   - 但远程签名服务（spinsnow / NodeVM 类）mint 的 proof 观测到
+    #     “单次使用”现象：同 proof 第二次请求即 403，且 mint 质量存在
+    #     概率性抖动（新 mint 也偶发 403，重试后恢复）；
+    #   - X-AIStudio-Visit-Id / UA 与 proof 无确定性绑定关系（3×3 交叉
+    #     实验证实 403 为概率性而非头缺失导致）。
+    # 因此缓存默认关闭（TTL=0）：仅在使用本地 SpiderMonkey 签名器等
+    # “浏览器级 attestation”场景下可按需开启（建议先小 TTL 实测重放性）。
+    # 403 重签路径会主动失效缓存，作为兜底防护。
+    _PROOF_CACHE_TTL_ENV = "AISTUDIO_WAA_PROOF_CACHE_TTL"
+    _PROOF_CACHE_MAX_ENTRIES = 256
+
+    @staticmethod
+    def _proof_cache_ttl() -> float:
+        raw = os.getenv(WaaSigner._PROOF_CACHE_TTL_ENV, "0")
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            return 0.0
+
     def __init__(
         self,
         proof_server_url: str | None = None,
@@ -295,6 +318,44 @@ class WaaSigner:
         self._reconfigure_lock: asyncio.Lock | None = None
         self._delayed_close_tasks: set[asyncio.Task[None]] = set()
         self._retired_signers: set[RemoteProofSigner] = set()
+        # proof 复用缓存：key=(content_hash, auth_user, tier, model, cookie_anchor)
+        # value=(monotonic_ts, proof, dynamic_headers)。cookie_anchor 取
+        # SAPISID 前 16 位，Cookie 轮换后锚点变化，天然隔离新旧会话。
+        self._proof_cache: OrderedDict[
+            tuple[str, str, str, str, str],
+            tuple[float, str, dict[str, str]],
+        ] = OrderedDict()
+
+    def invalidate_proof_cache(self, content_hash: str | None = None) -> int:
+        """失效 proof 缓存；content_hash 为空时清空全部，返回清除条数。
+
+        403 重签路径调用（Auth403RetryManager 第 3 次重试）：此时缓存
+        proof 可能已失效或被风控标记，必须强制重新走签名服务。
+        """
+        if content_hash is None:
+            removed = len(self._proof_cache)
+            self._proof_cache.clear()
+            if removed:
+                logger.info("WAA proof 缓存已全量失效: %d 条", removed)
+            return removed
+        removed = self._proof_cache.pop(content_hash, None)
+        return 1 if removed is not None else 0
+
+    def _cache_key(
+        self,
+        content_hash: str,
+        cookies: dict[str, str],
+        auth_user: str,
+        tier: str,
+        model: str,
+    ) -> tuple[str, str, str, str, str]:
+        anchor = (
+            cookies.get("SAPISID")
+            or cookies.get("__Secure-3PAPISID")
+            or cookies.get("APISID")
+            or ""
+        )[:16]
+        return (content_hash, str(auth_user), str(tier), str(model), anchor)
 
     def _get_reconfigure_lock(self) -> asyncio.Lock:
         """惰性创建切换锁（避免 import 时无事件循环可用）。"""
@@ -410,7 +471,7 @@ class WaaSigner:
         model: str = "models/gemini-3.7-flash",
         upstream_proxy: str | None = None,
     ) -> str:
-        """Compute content hash and generate fresh WAA proof token."""
+        """Compute content hash and generate WAA proof token (with reuse cache)."""
         prompt, content_hash = extract_content_digest(contents)
         wire_contents = [c.to_wire() for c in contents]
         logger.debug(
@@ -420,7 +481,29 @@ class WaaSigner:
             auth_user,
         )
 
-        return await self._remote_signer.mint_proof(
+        # 1) 缓存命中路径：命中时同时恢复动态头（签名服务返回的 UA/头
+        # 需要与 proof 成对使用，避免 proof 与指纹头错配）。
+        ttl = self._proof_cache_ttl()
+        key = self._cache_key(content_hash, cookies, auth_user, tier, model)
+        if ttl > 0:
+            cached = self._proof_cache.get(key)
+            if cached is not None:
+                ts, proof, cached_headers = cached
+                if time.monotonic() - ts < ttl:
+                    self._proof_cache.move_to_end(key)
+                    if cached_headers:
+                        self._remote_signer.last_headers = dict(cached_headers)
+                    logger.debug(
+                        "WAA proof 缓存命中: hash=%s, age=%.0fs, u/%s",
+                        content_hash[:8],
+                        time.monotonic() - ts,
+                        auth_user,
+                    )
+                    return proof
+                self._proof_cache.pop(key, None)
+
+        # 2) 未命中：走远程签名服务。
+        proof = await self._remote_signer.mint_proof(
             cookies=cookies,
             auth_user=auth_user,
             tier=tier,
@@ -429,3 +512,15 @@ class WaaSigner:
             wire_contents=wire_contents,
             upstream_proxy=upstream_proxy,
         )
+
+        # 3) 回填缓存（LRU 容量淘汰）。失败不回填；mint_proof 内部已重试。
+        if ttl > 0 and proof:
+            self._proof_cache[key] = (
+                time.monotonic(),
+                proof,
+                dict(self._remote_signer.last_headers),
+            )
+            self._proof_cache.move_to_end(key)
+            while len(self._proof_cache) > self._PROOF_CACHE_MAX_ENTRIES:
+                self._proof_cache.popitem(last=False)
+        return proof

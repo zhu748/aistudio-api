@@ -113,6 +113,39 @@ model_defaults:
         Sexually Explicit: 5
         Dangerous Content: 5
       drop_unsupported_params: true
+      # 2026-11 真机抓包（全量 9 条 GenerateContent 逆向）：浏览器对 gemini
+      # 文本模型恒定携带 maxOutputTokens=65536 / temperature=1 / topP=0.95 /
+      # topK=64 与思考配置（档位由构造时按 ListModels 元数据自适应）。
+      # 用户显式传入的参数仍优先；详见 docs/CAPTURE_ALIGNMENT_2026-11.md。
+      generation_config_defaults:
+        max_tokens: 65536
+        temperature: 1
+        top_p: 0.95
+        top_k: 64
+        thinking_config:
+          level: 2
+    # 特殊输出模型（图像/视频/语音/TTS/Live 等）豁免浏览器文本默认值：
+    # 清除槽位 3/4/5/6/13/16（maxTokens/temperature/topP/topK/flag13/thinking）。
+    - name: aux_output_models
+      match:
+        contains:
+          - image
+          - imagen
+          - veo
+          - lyria
+          - tts
+          - live
+          - transcribe
+          - robotics
+          - omni
+          - nano-banana
+      clear_generation_config_indexes:
+        - 3
+        - 4
+        - 5
+        - 6
+        - 13
+        - 16
   models: {}
 
 tier_quotas:

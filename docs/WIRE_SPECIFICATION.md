@@ -50,9 +50,9 @@ Google AI Studio 在 Web 端（`alkalimakersuite-pa.clients6.google.com`）与�
 | **`5`** | Field 6 | `system_instruction` | `list \| null` | 系统提示词内容（格式同 Content） |
 | **`6`** | Field 7 | `tools` | `list \| null` | 工具声明列表（内置工具与自定义函数） |
 | **`7`** | Field 8 | `evergreen_model_uri` | `string \| null` | 动态常青模型 URI（如 `"models/gemini-..."`） |
-| **`10`** | Field 11 | `request_flag` | `int` | 请求行为标记，固定值 `1` |
-| **`11`** | Field 12 | `session_token` | `string \| null` | 会话续接令牌（如 `"v1_..."`） |
-| **`13`** | Field 14 | `request_context` | `list \| null` | 请求上下文与时区声明，如 `[[null, null, "Asia/Tokyo"], null, 1]` |
+| **`10`** | Field 11 | `request_flag` | `int \| null` | 请求行为标记；2026-11 全量抓包未观测到非空值 |
+| **`11`** | Field 12 | `session_token` | `string \| null` | 会话续接令牌（如 `"v1_..."`）；同一对话后续请求回传上轮响应令牌，首轮请求不携带 |
+| **`13`** | Field 14 | `request_context` | `list \| null` | 请求上下文与时区声明，恒为单元素 `[[null, null, "Asia/Shanghai"]]`（2026-11 真机抓包实测；旧三元素尾部 `null,1` 形态上游宽容但非浏览器形态） |
 
 ---
 
@@ -117,6 +117,7 @@ Google AI Studio 在 Web 端（`alkalimakersuite-pa.clients6.google.com`）与�
 | **`10`** | `frequency_penalty` | `float \| null` | 频率惩罚系数 |
 | **`11`** | `response_logprobs` | `bool \| null` | 是否返回 Logprobs |
 | **`12`** | `logprobs` | `int \| null` | Logprobs 候选数 |
+| **`13`** | `unknown_flag_13` | `int \| null` | 未知开关：**与模型相关**（2026-11 抓包 + ListModels 交叉验证，目录槽位 `[83]=1` 的模型恒携 `1`，知 3.8-flash / carbon / argon 等；3.5-flash-lite 等为 null） |
 | **`14`** | `image_output_mode` | `list[int] \| null` | 生图输出模式：`[2]` (仅图片) 或 `[2, 1]` (图文混合) |
 | **`16`** | `thinking_config` | `list \| null` | 思考模式：`[mode, null, null, level]`（`1`=LOW, `2`=MEDIUM, `3`=HIGH, `4`=MINIMAL） |
 | **`17`** | `media_resolution` | `int \| null` | 多模态输入分辨率：`1`=LOW, `2`=MEDIUM, `3`=HIGH |
@@ -326,6 +327,44 @@ AI Studio Web 核心过滤数组：
 前端逻辑中 `1` (`STOP`) 与 `2` (`MAX_TOKENS`) 视为常规完成，其余在 `hCb` 中的代码均触发错误或警告弹窗处理。
 
 ---
+
+## 7.5 CountTokens 端点（2026-11 真机抓包实测）
+
+```
+POST /$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/CountTokens
+请求体: ["models/<model>", <contents_wire>]
+响应体: [total_tokens, [], [[[prompt_tokens], 1]], null, null, [[1, total_tokens]]]
+```
+
+- 请求体只占两个字段位（`model` = 数组 `[0]`，`contents` = 数组 `[1]`），不携带
+  WAA snapshot、生成参数与安全策略（实测无 proof 直接 200）；
+- 响应 `[0]` 即 AI Studio 界面展示的 token 总数（含 1 个固定开销 token，
+  如 "嘿" → 2）；`[2]` 与 `[5]` 为明细（`[[[total-1], 1]]` 与 `[[1, total]]`）；
+- 鉴权链与 GenerateContent 完全一致（API Key + SAPISIDHASH + Cookie + Origin）；
+- 网关层对应暴露 `POST /v1beta/{model}:countTokens`（Gemini 协议兼容）。
+
+## 7.6 浏览器恒定默认形态（2026-11 全量 9 条 GenerateContent 抓包逆向）
+
+真机抓包中所有 GenerateContent 请求（gemini-3.8-flash 与 gemini-3.5-flash-lite
+两类模型、多轮/工具/结构化输出场景全覆盖）呈现恒定默认 `generation_config`：
+
+```
+[null, null, null, 65536, 1, 0.95, 64, ...null..., <13?>, null, null, [1, null, null, <level>]]
+```
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| `maxOutputTokens` | `65536` | AI Studio UI 层硬编码默认（flash 模型输出上限恰为 65536） |
+| `temperature` / `topP` / `topK` | `1` / `0.95` / `64` | 与服务端默认一致，无行为变化 |
+| `thinking_config` | `[1, null, null, <level>]` | 档位取 **ListModels 元数据默认档**（目录槽位 `[71][5]`）：3.5-flash-lite 默认 `4`(MINIMAL)，3.8-flash / carbon / argon 默认 `2`(MEDIUM) |
+| `unknown_flag_13` | 目录 `[83]=1` 时为 `1` | 模型相关：3.8-flash / carbon / argon / 新代图像与 TTS 模型恒为 `1`，3.5-flash-lite 等为 null |
+
+- 项目落地：`model_defaults` 的 `gemini_models` 预设注入上述默认值，
+  `wire_codec.build_request` 在用户未显式指定时按 ListModels 元数据自适应
+  （默认思考档位 / flag13 自动推导 / 65536 按模型输出上限钳制如 carbon 32768）；
+- 特殊输出模型（图像 / 视频 / 语音 / TTS / Live）通过 `aux_output_models`
+  预设清除文本默认值（槽位 3/4/5/6/13/16），避免携带越界参数；
+- 用户显式传入的任何参数优先于浏览器形态默认值。
 
 ## 8. 前端逆向未公开特性参考
 

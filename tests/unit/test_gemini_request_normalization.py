@@ -220,13 +220,14 @@ def test_normalize_gemini_request_thinking_and_reasoning_effort():
     norm_plain = normalize_gemini_request(req_plain, "models/gemini-3.8-flash")
     assert norm_plain.generation_config_overrides == {"temperature": 0.7}
 
-    # 2. Empty thinkingConfig or includeThoughts=False or thinkingBudget=0 -> never forces HIGH
-    for empty_tc in (
-        {},
-        {"includeThoughts": True},
-        {"includeThoughts": False},
-        {"thinkingBudget": 0},
-        {"thinkingLevel": "NONE"},
+    # 2. Empty thinkingConfig / includeThoughts-only -> 不注入（浏览器默认档生效）
+    #    thinkingLevel=NONE / budget=0（显式关闭）-> 注入 None 抑制 profile 默认档
+    for empty_tc, expected in (
+        ({}, None),
+        ({"includeThoughts": True}, None),
+        ({"includeThoughts": False}, None),
+        ({"thinkingBudget": 0}, {"thinking_config": None}),
+        ({"thinkingLevel": "NONE"}, {"thinking_config": None}),
     ):
         req_tc = GeminiGenerateContentRequest.model_validate(
             {
@@ -235,7 +236,7 @@ def test_normalize_gemini_request_thinking_and_reasoning_effort():
             }
         )
         norm_tc = normalize_gemini_request(req_tc, "models/gemini-3.8-flash")
-        assert norm_tc.generation_config_overrides is None
+        assert norm_tc.generation_config_overrides == expected
 
     # 3. Positive thinkingBudget -> [1, budget]
     req_budget = GeminiGenerateContentRequest.model_validate(

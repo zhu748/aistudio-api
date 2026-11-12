@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -176,6 +176,218 @@ def canonicalize_model_alias(model: str) -> str:
     except Exception:
         pass
     return name
+
+
+def _cached_model_info_for(model: str) -> Mapping[str, object] | None:
+    """查询模型元数据（ListModels 缓存 → 静态保底目录），无则返回 None。
+
+    供浏览器形态默认值的模型自适应（思考默认档 / flag13 / 输出上限）使用；
+    惰性导入避免 model_discovery ↔ model_defaults 循环依赖。
+    """
+    name = normalize_model_name(model)
+    if not name:
+        return None
+    try:
+        from .model_discovery import model_discovery
+
+        return model_discovery.get_cached_model_info(name)
+    except Exception:
+        return None
+
+
+# 思考档位逻辑顺序（数值与逻辑序不同：MINIMAL=4 但强度最低）。
+# 与 AI Studio 前端 pmi() 映射一致。
+_THINKING_LEVEL_ORDER: tuple[ThinkingLevel, ...] = (
+    ThinkingLevel.MINIMAL,
+    ThinkingLevel.LOW,
+    ThinkingLevel.MEDIUM,
+    ThinkingLevel.HIGH,
+)
+
+
+def snap_thinking_level_to_supported(
+    model: str, level: ThinkingLevel
+) -> ThinkingLevel | None:
+    """将思考等级吸附到模型支持的最接近档位（自动升/降档）。
+
+    规则（依据上游 ListModels 的 thinkingLevels 元数据）:
+    - 档位已支持 → 原样返回
+    - 未支持 → 就近吸附；距离相同时优先升档（避免思考能力被意外削弱）
+      例: nano-banana-2.1 支持 MINIMAL/MEDIUM/HIGH，传入 LOW → 升到 MEDIUM
+    - 模型不支持任何思考等级 → 返回 None（丢弃配置，避免上游 400）
+    - 无模型元数据（未拉取/未命中）→ 原样返回（信任调用方）
+    """
+    info = _cached_model_info_for(model)
+    if not info:
+        return level
+    raw_levels = info.get("thinkingLevels")
+    if not isinstance(raw_levels, list):
+        return level
+    supported: list[int] = [
+        int(x)
+        for x in raw_levels
+        if isinstance(x, (int, float)) and not isinstance(x, bool)
+    ]
+    if not supported:
+        return None
+    if int(level) in supported:
+        return level
+    pos = _THINKING_LEVEL_ORDER.index(level)
+    best: ThinkingLevel | None = None
+    best_pos = -1
+    for i, lv in enumerate(_THINKING_LEVEL_ORDER):
+        if int(lv) not in supported:
+            continue
+        # 距离更近优先；距离相同取更强的档位（升档优先）
+        if (
+            best is None
+            or abs(i - pos) < abs(best_pos - pos)
+            or (abs(i - pos) == abs(best_pos - pos) and i > best_pos)
+        ):
+            best = lv
+            best_pos = i
+    if best is not None and best is not level:
+        from aistudio_api.infrastructure.utils.logger import get_logger
+
+        get_logger("model_defaults").info(
+            "思考档位自动兼容: model=%s, 请求=%s → 实际=%s",
+            model,
+            level.name,
+            best.name,
+        )
+    return best
+
+
+def snap_thinking_wire_to_model(
+    model: str, wire: list[object] | None
+) -> list[object] | None:
+    """对已编码的 thinking wire 数组做模型档位兼容吸附。
+
+    wire 结构: [mode, budget?, ..., level?]（level 在 index 3）。
+    - 含 level → 吸附档位（不支持任何思考则丢弃整段配置）
+    - 仅 budget → 模型不支持思考时丢弃（新目录已无预算模式模型）
+    """
+    if not isinstance(wire, list) or not wire:
+        return wire
+    level_raw = wire[3] if len(wire) > 3 else None
+    if isinstance(level_raw, int) and not isinstance(level_raw, bool):
+        try:
+            level = ThinkingLevel(level_raw)
+        except ValueError:
+            # Unknown upstream level code: keep the wire unchanged rather than
+            # raising ValueError out of the request path (→ HTTP 500).
+            return wire
+        snapped = snap_thinking_level_to_supported(model, level)
+        if snapped is None:
+            return None
+        new_wire = list(wire)
+        new_wire[3] = int(snapped)
+        return new_wire
+    # 仅预算模式（无 level）：检查模型是否支持思考
+    info = _cached_model_info_for(model)
+    if info:
+        raw_levels = info.get("thinkingLevels")
+        if isinstance(raw_levels, list) and not raw_levels:
+            return None
+    return wire
+
+
+def browser_default_thinking_wire(model: str) -> list[object]:
+    """返回模型「浏览器形态」默认思考 wire（抓包对齐的请求构造用）。
+
+    2026-11 真机抓包 + ListModels 元数据交叉验证：AI Studio 前端默认携带
+    思考配置 [1, null, null, <模型默认档>]，其中默认档取自目录元数据
+    ``[71][5]`` —— gemini-3.5-flash-lite 默认 MINIMAL(4)，gemini-3.8-flash /
+    carbon / argon 默认 MEDIUM(2)。无元数据时回退 MEDIUM(2)。
+    """
+    level: int = int(ThinkingLevel.MEDIUM)
+    info = _cached_model_info_for(model)
+    if info:
+        raw_level = info.get("defaultThinkingLevel")
+        if isinstance(raw_level, (int, float)) and not isinstance(raw_level, bool):
+            with contextlib.suppress(ValueError):
+                level = int(ThinkingLevel(int(raw_level)))
+    return [1, None, None, level]
+
+
+def model_unknown_flag_13(model: str) -> int | None:
+    """读取模型元数据中的 generation_config[13] 开关（2026-11 逆向结论）。
+
+    ListModels 槽位 [83] 与抓包 generation_config[13] 严格对应：
+    gemini-3.8-flash / carbon / argon 的 [83]=1 且请求恒带 1，
+    gemini-3.5-flash-lite 的 [83]=null 且请求恒为 null。
+    """
+    info = _cached_model_info_for(model)
+    if not info:
+        return None
+    raw = info.get("unknownFlag13")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return int(raw)
+    return None
+
+
+def model_output_token_limit(model: str) -> int | None:
+    """读取模型元数据输出上限（浏览器形态默认 max_tokens 的安全钳制用）。"""
+    info = _cached_model_info_for(model)
+    if not info:
+        return None
+    raw = info.get("outputTokenLimit")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return int(raw)
+    return None
+
+
+# 浏览器恒定默认 maxOutputTokens（2026-11 全量 9 条 GenerateContent 抓包实测；
+# 目录 flash 模型输出上限恰为 65536，旗舰为 32768 —— 构造时按元数据钳制）。
+_BROWSER_DEFAULT_MAX_TOKENS = 65536
+
+
+def browser_default_max_tokens(model: str) -> int:
+    """浏览器形态默认 max_tokens，按模型输出上限钳制（cap 仅作用于默认值）。"""
+    limit = model_output_token_limit(model)
+    if isinstance(limit, int) and 0 < limit < _BROWSER_DEFAULT_MAX_TOKENS:
+        return limit
+    return _BROWSER_DEFAULT_MAX_TOKENS
+
+
+_GENERATION_CONFIG_INDEX_BY_ATTR: dict[str, int] = {
+    "stop_sequences": 1,
+    "max_tokens": 3,
+    "temperature": 4,
+    "top_p": 5,
+    "top_k": 6,
+    "response_mime_type": 7,
+    "response_schema": 8,
+    "presence_penalty": 9,
+    "frequency_penalty": 10,
+    "response_logprobs": 11,
+    "logprobs": 12,
+    "unknown_flag_13": 13,
+    "image_output_mode": 14,
+    "thinking_config": 16,
+    "media_resolution": 17,
+    "seed": 18,
+}
+
+
+def effective_generation_config_overrides(
+    model_defaults: ModelDefaults,
+) -> dict[str, object]:
+    """应用清除语义后的有效生成参数（供归一化层读取，与 wire 构造共用语义）。
+
+    ``clear_generation_config_indexes`` 指定的槽位对应属性被置 None，
+    调用方过滤 None 后即为生效值；wire_codec.build_request 会在构造时
+    对同一份 ModelDefaults 执行等价的槽位清除，两条路径语义一致。
+    """
+    overrides = model_defaults.generation_config_overrides()
+    cleared = model_defaults.clear_generation_config_indexes
+    if not cleared:
+        return overrides
+    for key in list(overrides):
+        idx = _GENERATION_CONFIG_INDEX_BY_ATTR.get(key)
+        if idx is not None and idx in cleared:
+            overrides[key] = None
+    return overrides
 
 
 def _coerce_thinking_level(value: object) -> ThinkingLevel:
@@ -410,6 +622,41 @@ def _default_config() -> dict[str, object]:
                         "Dangerous Content": 5,
                     },
                     "drop_unsupported_params": True,
+                    # 2026-11 真机抓包（全量 9 条 GenerateContent 逆向）：浏览器
+                    # 对 gemini 文本模型恒定携带 maxOutputTokens=65536、
+                    # temperature=1、topP=0.95、topK=64 与思考配置
+                    # [1,null,null,<默认档>]（档位由 wire 构造时按 ListModels
+                    # 元数据自适应，见 model_defaults.browser_default_thinking_wire）。
+                    # 用户显式传入的参数仍优先；详见 docs/CAPTURE_ALIGNMENT_2026-11.md。
+                    "generation_config_defaults": {
+                        "max_tokens": 65536,
+                        "temperature": 1,
+                        "top_p": 0.95,
+                        "top_k": 64,
+                        "thinking_config": {"level": 2},
+                    },
+                },
+                # 特殊输出模型（图像/视频/语音/TTS/Live 等）豁免浏览器文本默认值：
+                # 这些模型的输出上限（如 TTS 8192）远低于 65536，携带文本默认
+                # 会造成未知行为；清除槽位 3/4/5/6/13/16（maxTokens/temperature/
+                # topP/topK/flag13/thinkingConfig）。
+                {
+                    "name": "aux_output_models",
+                    "match": {
+                        "contains": [
+                            "image",
+                            "imagen",
+                            "veo",
+                            "lyria",
+                            "tts",
+                            "live",
+                            "transcribe",
+                            "robotics",
+                            "omni",
+                            "nano-banana",
+                        ]
+                    },
+                    "clear_generation_config_indexes": [3, 4, 5, 6, 13, 16],
                 },
             ],
             "models": {},

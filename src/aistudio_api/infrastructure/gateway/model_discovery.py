@@ -89,6 +89,11 @@ _EXTRA_GUARANTEED_MODELS = [
         "displayName": "Gemini 4 Argon",
         "description": "Gemini 4 Argon flagship reasoning model",
     },
+    {
+        "id": "gemini-4-carbon",
+        "displayName": "Gemini 4 Carbon",
+        "description": "Gemini 4 Carbon flagship reasoning model",
+    },
 ]
 
 
@@ -114,7 +119,8 @@ def _merge_extra_models(
 
 
 # 本地保底默认模型列表（当网络未就绪或未配置账号时使用）。
-# 数据来源: 2026-11-09 上游 ListModels 实测快照（38 个模型，含思考等级与别名映射）。
+# 数据来源: 2026-11-12 上游 ListModels 实测快照（含思考等级与别名映射；
+# 2026-11-12 补录 gemini-4-carbon 与目录 [83] 开关映射）。
 # 覆盖旗舰/Flash/图像(Omni)/音乐(Lyria)/TTS/转写/Live/智能体/机器人/开源 Gemma 全类别。
 _FALLBACK_MODELS = [
     {
@@ -124,6 +130,7 @@ _FALLBACK_MODELS = [
         "category": "agent",
         "inputTokenLimit": 1048576,
         "outputTokenLimit": 65536,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": None,
         "thinkingLevels": [],
         "aliases": ["featured-agent", "antigravity-preview-05-2026"],
@@ -139,6 +146,7 @@ _FALLBACK_MODELS = [
         "category": "agent",
         "inputTokenLimit": 131072,
         "outputTokenLimit": 65536,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": None,
         "thinkingLevels": [],
         "aliases": ["deep-research-pro-preview-12-2025"],
@@ -154,6 +162,7 @@ _FALLBACK_MODELS = [
         "category": "agent",
         "inputTokenLimit": 131072,
         "outputTokenLimit": 65536,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": None,
         "thinkingLevels": [],
         "paid": True,
@@ -168,9 +177,30 @@ _FALLBACK_MODELS = [
         "category": "flagship",
         "inputTokenLimit": 1048576,
         "outputTokenLimit": 32768,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": 2,
         "thinkingLevels": [1, 2, 3],
         "paid": True,
+        "is_image_model": False,
+        "is_video_model": False,
+        "is_audio_model": False,
+    },
+    {
+        "id": "gemini-4-carbon",
+        "displayName": "Gemini 4 Carbon",
+        "description": "Gemini 4 Carbon",
+        "category": "flagship",
+        "inputTokenLimit": 1048576,
+        "outputTokenLimit": 32768,
+        "unknownFlag13": 1,
+        "defaultThinkingLevel": 2,
+        "thinkingLevels": [1, 2, 3],
+        "paid": True,
+        "supportedGenerationMethods": [
+            "generateContent",
+            "countTokens",
+            "batchGenerateContent",
+        ],
         "is_image_model": False,
         "is_video_model": False,
         "is_audio_model": False,
@@ -182,6 +212,7 @@ _FALLBACK_MODELS = [
         "category": "flash",
         "inputTokenLimit": 1048576,
         "outputTokenLimit": 65536,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": 2,
         "thinkingLevels": [1, 2, 3],
         "aliases": [
@@ -245,6 +276,7 @@ _FALLBACK_MODELS = [
         "category": "flagship",
         "inputTokenLimit": 1048576,
         "outputTokenLimit": 65536,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": 3,
         "thinkingLevels": [1, 2, 3],
         "aliases": [
@@ -270,6 +302,7 @@ _FALLBACK_MODELS = [
         "category": "flash",
         "inputTokenLimit": 1048576,
         "outputTokenLimit": 65536,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": 2,
         "thinkingLevels": [4, 1, 2, 3],
         "aliases": ["gemini-3.5-flash"],
@@ -314,6 +347,7 @@ _FALLBACK_MODELS = [
         "category": "flash",
         "inputTokenLimit": 1048576,
         "outputTokenLimit": 65536,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": 3,
         "thinkingLevels": [4, 1, 2, 3],
         "aliases": ["gemini-2.0-flash", "gemini-2.0-flash-001"],
@@ -329,6 +363,7 @@ _FALLBACK_MODELS = [
         "category": "image",
         "inputTokenLimit": 65536,
         "outputTokenLimit": 65536,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": 2,
         "thinkingLevels": [4, 2, 3],
         "paid": True,
@@ -343,6 +378,7 @@ _FALLBACK_MODELS = [
         "category": "image",
         "inputTokenLimit": 65536,
         "outputTokenLimit": 65536,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": 4,
         "thinkingLevels": [4, 3],
         "aliases": [
@@ -363,6 +399,7 @@ _FALLBACK_MODELS = [
         "category": "image",
         "inputTokenLimit": 65536,
         "outputTokenLimit": 65536,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": 4,
         "thinkingLevels": [4, 3],
         "aliases": ["gemini-3.1-flash-image-preview"],
@@ -378,6 +415,7 @@ _FALLBACK_MODELS = [
         "category": "image",
         "inputTokenLimit": 131072,
         "outputTokenLimit": 32768,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": None,
         "thinkingLevels": [],
         "aliases": ["gemini-3-pro-image-preview", "nano-banana-pro"],
@@ -407,6 +445,7 @@ _FALLBACK_MODELS = [
         "category": "image",
         "inputTokenLimit": 32768,
         "outputTokenLimit": 32768,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": None,
         "thinkingLevels": [],
         "aliases": ["gemini-2.5-flash-image-preview", "gemini-2.5-flash-preview-image"],
@@ -422,6 +461,7 @@ _FALLBACK_MODELS = [
         "category": "flagship",
         "inputTokenLimit": 1048576,
         "outputTokenLimit": 65536,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": 3,
         "thinkingLevels": [1, 2, 3],
         "paid": False,
@@ -436,6 +476,7 @@ _FALLBACK_MODELS = [
         "category": "flash",
         "inputTokenLimit": 1048576,
         "outputTokenLimit": 65536,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": 2,
         "thinkingLevels": [1, 2, 3],
         "paid": False,
@@ -621,6 +662,7 @@ _FALLBACK_MODELS = [
         "category": "audio",
         "inputTokenLimit": 8192,
         "outputTokenLimit": 16384,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": None,
         "thinkingLevels": [],
         "paid": False,
@@ -635,6 +677,7 @@ _FALLBACK_MODELS = [
         "category": "audio",
         "inputTokenLimit": 8192,
         "outputTokenLimit": 16384,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": None,
         "thinkingLevels": [],
         "paid": False,
@@ -649,6 +692,7 @@ _FALLBACK_MODELS = [
         "category": "video",
         "inputTokenLimit": 131072,
         "outputTokenLimit": 65536,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": None,
         "thinkingLevels": [],
         "aliases": ["omni-featured"],
@@ -664,6 +708,7 @@ _FALLBACK_MODELS = [
         "category": "video",
         "inputTokenLimit": 131072,
         "outputTokenLimit": 65536,
+        "unknownFlag13": 1,
         "defaultThinkingLevel": 3,
         "thinkingLevels": [3, 1],
         "aliases": [
@@ -1022,6 +1067,7 @@ class ModelDiscoveryService:
             auth_user=auth_user or "0",
             tier=tier,
             include_visit_id=True,
+            visit_scope="default",
         )
         from aistudio_api.config import settings
 
@@ -1131,6 +1177,17 @@ class ModelDiscoveryService:
                     default_thinking_level = t_cfg[5]
                 if len(t_cfg) > 6:
                     thinking_levels = _extract_int_list(t_cfg[6])
+            # 2026-11 抓包逆向 + ListModels 交叉验证：目录槽位 [83]=1 与
+            # GenerateContent 请求 generation_config[13]=1 严格对应
+            # （gemini-3.8-flash / carbon / argon 等新代模型为 1，
+            #   gemini-3.5-flash-lite 为 null）。
+            unknown_flag_13: int | None = None
+            if (
+                len(item) > 83
+                and isinstance(item[83], int)
+                and not isinstance(item[83], bool)
+            ):
+                unknown_flag_13 = item[83]
             paid = bool(len(item) > 77 and item[77] == 2)
             access_modes = _extract_int_list(item[82]) if len(item) > 82 else []
 
@@ -1188,6 +1245,7 @@ class ModelDiscoveryService:
                     "capabilityCodes": capability_codes,
                     "defaultThinkingLevel": default_thinking_level,
                     "thinkingLevels": thinking_levels,
+                    "unknownFlag13": unknown_flag_13,
                     "paid": paid,
                     "accessModes": access_modes,
                     "is_image_model": is_image,

@@ -164,7 +164,7 @@ class AistudioGenerationConfig:
 
     @property
     def unknown_flag_13(self):
-        """上游未知开关字段（HAR 实测恒为 1，透传保真用）。"""
+        """上游未知开关字段（模型相关：目录 [83]=1 的新代模型恒携 1，透传保真用）。"""
         idx = GenerationConfigIndex.UNKNOWN_FLAG_13
         return self.values[idx] if len(self.values) > idx else None
 

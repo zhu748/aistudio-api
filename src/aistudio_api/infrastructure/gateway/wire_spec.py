@@ -63,8 +63,10 @@ class GenerationConfigIndex(IntEnum):
     FREQUENCY_PENALTY = 10
     RESPONSE_LOGPROBS = 11
     LOGPROBS = 12
-    # HAR 实测（2026-11）：所有 GenerateContent 请求该槽位恒为 1，
-    # 为上游新增的未知开关，语义待逆向；定义常量以便透传保真。
+    # 2026-11 全量抓包 + ListModels 交叉验证：该槽位与模型相关 —— 目录
+    # 槽位 [83]=1 的模型（3.8-flash / carbon / argon 等新代）恒携 1，
+    # 其余（3.5-flash-lite 等）恒为 null。语义待逆向；定义常量以便透传保真，
+    # 构造时由 model_defaults.model_unknown_flag_13 按元数据自动推导。
     UNKNOWN_FLAG_13 = 13
     IMAGE_OUTPUT_MODE = 14
     THINKING_CONFIG = 16
