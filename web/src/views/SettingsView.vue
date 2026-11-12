@@ -8,6 +8,7 @@ import LogConfigCard from '@/components/settings/LogConfigCard.vue'
 import VisualConfigEditor from '@/components/config/VisualConfigEditor.vue'
 import SignerServerCard from '@/components/settings/SignerServerCard.vue'
 import AntiTruncationCard from '@/components/settings/AntiTruncationCard.vue'
+import { usePageRefresh } from '@/composables/usePageRefresh.ts'
 import {
   Server,
   CheckCircle2,
@@ -40,9 +41,11 @@ async function loadConfig() {
   loading.value = true
   try {
     config.value = await systemApi.getConfig()
+    return true
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : '获取系统配置失败'
     toast.error(msg)
+    return false
   } finally {
     loading.value = false
   }
@@ -51,13 +54,16 @@ async function loadConfig() {
 onMounted(() => {
   void loadConfig()
 })
+usePageRefresh(loadConfig)
 </script>
 
 <template>
   <div class="space-y-5">
     <!-- Compact Runtime Telemetry Bar -->
     <div class="grid grid-cols-2 lg:grid-cols-4 gap-3.5">
-      <div class="bg-white border border-slate-200/90 rounded-xl p-3.5 shadow-2xs flex items-center justify-between">
+      <div
+        class="bg-white border border-slate-200/90 rounded-xl p-3.5 shadow-2xs flex items-center justify-between"
+      >
         <div>
           <div class="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
             监听端口
@@ -71,14 +77,20 @@ onMounted(() => {
         </div>
       </div>
 
-      <div class="bg-white border border-slate-200/90 rounded-xl p-3.5 shadow-2xs flex items-center justify-between">
+      <div
+        class="bg-white border border-slate-200/90 rounded-xl p-3.5 shadow-2xs flex items-center justify-between"
+      >
         <div>
           <div class="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
             日志级别
           </div>
           <div class="flex items-baseline gap-2 mt-0.5">
-            <span class="text-base font-bold text-slate-900 font-mono">{{ config?.log_level || 'INFO' }}</span>
-            <span class="text-[11px] text-slate-400">{{ config?.dump_to_file ? '· 落盘开' : '· 仅终端' }}</span>
+            <span class="text-base font-bold text-slate-900 font-mono">{{
+              config?.log_level || 'INFO'
+            }}</span>
+            <span class="text-[11px] text-slate-400">{{
+              config?.dump_to_file ? '· 正文转储开' : '· 正文转储关'
+            }}</span>
           </div>
         </div>
         <div class="w-8 h-8 rounded-lg bg-brand-50 text-brand-600 flex items-center justify-center">
@@ -86,7 +98,9 @@ onMounted(() => {
         </div>
       </div>
 
-      <div class="bg-white border border-slate-200/90 rounded-xl p-3.5 shadow-2xs flex items-center justify-between">
+      <div
+        class="bg-white border border-slate-200/90 rounded-xl p-3.5 shadow-2xs flex items-center justify-between"
+      >
         <div>
           <div class="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
             全局出口代理
@@ -109,7 +123,9 @@ onMounted(() => {
         </div>
       </div>
 
-      <div class="bg-white border border-slate-200/90 rounded-xl p-3.5 shadow-2xs flex items-center justify-between">
+      <div
+        class="bg-white border border-slate-200/90 rounded-xl p-3.5 shadow-2xs flex items-center justify-between"
+      >
         <div>
           <div class="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
             控制台鉴权
@@ -136,7 +152,9 @@ onMounted(() => {
     </div>
 
     <!-- Section Sub-Navigation Tabs -->
-    <div class="bg-white border border-slate-200/90 rounded-xl p-1.5 shadow-2xs flex items-center gap-1 overflow-x-auto">
+    <div
+      class="bg-white border border-slate-200/90 rounded-xl p-1.5 shadow-2xs flex items-center gap-1 overflow-x-auto"
+    >
       <button
         v-for="tab in tabs"
         :key="tab.key"
@@ -179,7 +197,9 @@ onMounted(() => {
       >
         <div class="flex items-center gap-2">
           <AlertCircle class="w-4 h-4 text-amber-600 shrink-0" />
-          <span>控制台当前处于免密访问模式。公网部署建议设置环境变量 <code class="font-mono font-semibold bg-white/80 px-1.5 py-0.5 rounded border border-amber-200">AISTUDIO_WEB_PASSWORD</code> 开启后台密码保护。</span>
+          <span>控制台当前处于免密访问模式。公网部署建议设置环境变量
+            <code class="font-mono font-semibold bg-white/80 px-1.5 py-0.5 rounded border border-amber-200">AISTUDIO_WEB_PASSWORD</code>
+            开启后台密码保护。</span>
         </div>
       </div>
 

@@ -25,6 +25,7 @@ from aistudio_api.infrastructure.gateway.transport import HTTPStreamTransport
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 from aistudio_api.infrastructure.request_context import (
     current_request,
+    request_event,
     upstream_attempt,
 )
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -209,6 +210,7 @@ class GatewaySession:
             )
             observation.signer = redact_text(target_url)
 
+        request_event("signing", "正在生成请求签名")
         proof = await self._signer.generate_snapshot(
             contents=contents,
             cookies=cookies,
@@ -218,6 +220,7 @@ class GatewaySession:
             upstream_proxy=active_ctx.proxy_url or settings.proxy_url,
         )
         self._sync_signer_cookies(active_ctx)
+        request_event("signed", "请求签名完成")
         return proof
 
     def _sync_signer_cookies(self, active_ctx: SessionContext) -> None:

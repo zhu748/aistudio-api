@@ -6,7 +6,15 @@ import { systemApi } from '@/api/system.ts'
 import { useAuthStore } from '@/stores/auth.ts'
 import { useToastStore } from '@/stores/toast.ts'
 import type { LogEntry } from '@/types'
+import { useRoute } from 'vue-router'
+import { stageLabels } from '@/utils/requests.ts'
+import { usePageRefresh } from '@/composables/usePageRefresh.ts'
 
+const route = useRoute()
+const category = ref(typeof route.query.category === 'string' ? route.query.category : 'model')
+const requestFilter = ref(String(route.query.request_id || ''))
+const modelFilter = ref(String(route.query.model || ''))
+const accountFilter = ref(String(route.query.account_id || ''))
 const historical = ref(false)
 const entries = ref<LogEntry[]>([])
 const total = ref(0)
@@ -70,7 +78,11 @@ const visibleLogs = computed(() => {
   const needle = search.value.trim().toLowerCase()
   let list = entries.value
   if (needle) {
-    list = list.filter((e) => `${e.message} ${e.name} ${e.level}`.toLowerCase().includes(needle))
+    list = list.filter((e) =>
+      `${e.message} ${e.name} ${e.level} ${e.request_id || ''} ${e.model || ''} ${e.account_id || ''}`
+        .toLowerCase()
+        .includes(needle),
+    )
   }
   return order.value === 'desc' ? [...list].reverse() : list
 })
@@ -138,7 +150,7 @@ function closeStream() {
 async function connectStream() {
   closeStream()
   const seq = connectSeq
-  if (!live.value) {
+  if (!live.value || historical.value) {
     connState.value = 'idle'
     return
   }
@@ -147,6 +159,10 @@ async function connectStream() {
   const params = new URLSearchParams()
   params.set('level', level.value)
   params.set('limit', String(SNAPSHOT_LIMIT))
+  params.set('category', category.value)
+  if (requestFilter.value.trim()) params.set('request_id', requestFilter.value.trim())
+  if (modelFilter.value.trim()) params.set('model', modelFilter.value.trim())
+  if (accountFilter.value.trim()) params.set('account_id', accountFilter.value.trim())
 
   const authRequired = authStore.authEnabled
   if (authRequired) {
@@ -249,10 +265,25 @@ function handleRefresh() {
 }
 
 watch(historical, (value) => {
-  if (value) { closeStream(); connState.value = 'idle' }
-  else void connectStream()
+  if (value) {
+    closeStream()
+    connState.value = 'idle'
+  } else void connectStream()
 })
 watch(level, () => void connectStream())
+let filterTimer: ReturnType<typeof setTimeout> | null = null
+watch([category, requestFilter, modelFilter, accountFilter], () => {
+  closeStream()
+  entries.value = []
+  if (filterTimer) clearTimeout(filterTimer)
+  filterTimer = setTimeout(() => void connectStream(), 300)
+})
+watch(
+  () => route.query.request_id,
+  (value) => {
+    requestFilter.value = String(value || '')
+  },
+)
 watch(live, (enabled) => {
   if (enabled) void connectStream()
   else {
@@ -273,15 +304,61 @@ watch(searchInput, (val) => {
 onMounted(() => {
   void connectStream()
 })
+usePageRefresh(async () => {
+  if (!historical.value) await connectStream()
+  return historical.value || !loadError.value
+})
 
 onUnmounted(() => {
   closeStream()
   if (debounceTimer) clearTimeout(debounceTimer)
+  if (filterTimer) clearTimeout(filterTimer)
 })
 </script>
 
 <template>
   <div class="flex flex-col gap-3.5">
+    <div class="surface-card rounded-xl p-4 space-y-3">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div class="flex gap-1 rounded-lg bg-slate-100 p-1">
+          <button
+            v-for="item in [
+              { id: 'model', label: '模型请求' },
+              { id: 'system', label: '系统日志' },
+              { id: 'all', label: '全部日志' },
+            ]"
+            :key="item.id"
+            class="rounded-md px-3 py-1.5 text-sm cursor-pointer"
+            :class="
+              category === item.id ? 'bg-white text-brand-700 shadow-2xs font-semibold' : 'text-slate-500'
+            "
+            @click="category = item.id"
+          >
+            {{ item.label }}
+          </button>
+        </div>
+        <p class="text-xs text-slate-500">
+          {{
+            category === 'model' ? '仅展示模型调用及其签名、切号和网络异常' : '系统操作、后台任务与服务诊断'
+          }}
+        </p>
+      </div>
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <label class="field-label">请求 ID<input
+          v-model="requestFilter"
+          class="field-input font-mono"
+          placeholder="完整 Request ID"
+        ></label><label class="field-label">模型<input
+          v-model="modelFilter"
+          class="field-input"
+          placeholder="全部模型"
+        ></label><label class="field-label">账号<input
+          v-model="accountFilter"
+          class="field-input"
+          placeholder="账号 ID"
+        ></label>
+      </div>
+    </div>
     <div class="flex gap-2 text-xs">
       <button
         type="button"
@@ -299,7 +376,13 @@ onUnmounted(() => {
         历史归档
       </button>
     </div>
-    <HistoricalLogsPanel v-if="historical" />
+    <HistoricalLogsPanel
+      v-if="historical"
+      :category="category"
+      :request-id="requestFilter"
+      :model="modelFilter"
+      :account-id="accountFilter"
+    />
     <template v-else>
       <!-- Consolidated Log Control Bar -->
       <div class="bg-white border border-slate-200/90 rounded-xl p-3.5 shadow-2xs space-y-3">
@@ -324,7 +407,8 @@ onUnmounted(() => {
             </span>
 
             <span class="text-xs text-slate-500 font-mono tabular-nums truncate">
-              缓冲 <strong class="text-slate-800">{{ total }}</strong> / {{ capacity }} · 视图 <strong class="text-slate-800">{{ visibleLogs.length }}</strong> 条
+              缓冲 <strong class="text-slate-800">{{ total }}</strong> / {{ capacity }} · 视图
+              <strong class="text-slate-800">{{ visibleLogs.length }}</strong> 条
             </span>
           </div>
 
@@ -401,7 +485,7 @@ onUnmounted(() => {
             <input
               v-model="searchInput"
               type="text"
-              placeholder="过滤日志内容、模块名称或级别…"
+              placeholder="过滤内容、模型、账号、Request ID…"
               class="w-full bg-slate-50 border border-slate-200 rounded-lg pl-8 pr-3 py-1.5 text-xs font-mono text-slate-700 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
             >
           </div>
@@ -410,7 +494,11 @@ onUnmounted(() => {
             <button
               type="button"
               class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-              :class="order === 'desc' ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-500 hover:text-slate-900'"
+              :class="
+                order === 'desc'
+                  ? 'bg-white text-slate-900 font-semibold shadow-2xs'
+                  : 'text-slate-500 hover:text-slate-900'
+              "
               @click="order = 'desc'"
             >
               最新在前
@@ -418,7 +506,11 @@ onUnmounted(() => {
             <button
               type="button"
               class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-              :class="order === 'asc' ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-500 hover:text-slate-900'"
+              :class="
+                order === 'asc'
+                  ? 'bg-white text-slate-900 font-semibold shadow-2xs'
+                  : 'text-slate-500 hover:text-slate-900'
+              "
               @click="order = 'asc'"
             >
               时间正序
@@ -484,10 +576,31 @@ onUnmounted(() => {
               {{ entry.level }}
             </span>
             <span
+              v-if="entry.category !== 'model'"
               class="text-brand-400/90 shrink-0 max-w-[240px] truncate text-[11px]"
               :title="entry.name"
             >{{ entry.name }}</span>
-            <span class="text-slate-200 whitespace-pre-wrap break-all flex-1 min-w-[260px]">
+            <span
+              v-if="entry.model"
+              class="text-brand-300 text-xs break-all"
+            >{{ entry.model }}</span>
+            <span
+              v-if="entry.account_id"
+              class="text-slate-400 text-xs"
+            >{{ entry.account_id }}</span>
+            <span
+              v-if="entry.stage"
+              class="text-slate-500 text-xs"
+            >{{ stageLabels[entry.stage] || entry.stage }}</span>
+            <router-link
+              v-if="entry.request_id && entry.category === 'model'"
+              :to="{ path: '/requests', query: { request_id: entry.request_id } }"
+              class="text-sky-400 hover:underline text-xs font-mono"
+              :title="entry.request_id"
+            >
+              {{ entry.request_id.slice(0, 16) }}… ↗
+            </router-link>
+            <span class="text-slate-200 whitespace-pre-wrap break-words w-full leading-6 text-[13px]">
               {{ entry.message }}
             </span>
           </div>

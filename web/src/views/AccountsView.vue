@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useSystemStore } from '@/stores/system.ts'
 import { usePolling } from '@/composables/usePolling.ts'
+import { usePageRefresh } from '@/composables/usePageRefresh.ts'
 import { useConfirm } from '@/composables/useConfirm.ts'
 import type { AccountWithStats } from '@/types/accounts.ts'
 import Button from '@/components/ui/Button.vue'
@@ -37,6 +38,7 @@ const selectedGroup = ref<string>('ALL')
 // 预设方案与分组只在用户操作后变化（各 mutation 已自行刷新），降到 60s
 // 即可，把周期请求数从 5 个/8s 降到 3 个/8s + 2 个/60s。
 usePolling(accountsStore.fetchAll, 8000)
+usePageRefresh(accountsStore.fetchAll)
 usePolling(async () => {
   await Promise.all([accountsStore.fetchPresets(), accountsStore.fetchGroups()])
 }, 60000)

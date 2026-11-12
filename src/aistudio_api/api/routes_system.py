@@ -102,7 +102,7 @@ def stats_response() -> StatsResponse:
                                 enabled=acc.enabled,
                                 today_requests=m_daily.requests,
                                 today_success=m_daily.success,
-                                today_rate_limited=m_daily.rate_limited,
+                                today_rate_limited=m_daily.rate_limited_total,
                                 today_tokens=m_daily.total_tokens,
                                 today_reasoning_tokens=m_daily.reasoning_tokens,
                                 configured_quota=quota,
@@ -806,6 +806,10 @@ async def get_runtime_logs(
     limit: int = 300,
     search: str | None = None,
     order: str = "desc",
+    category: str = "model",
+    request_id: str = "",
+    model: str = "",
+    account_id: str = "",
 ) -> dict[str, object]:
     """查询最近运行日志（内存环形缓冲），供面板展示运行日志与报错。
 
@@ -833,6 +837,10 @@ async def get_runtime_logs(
         limit=clean_limit,
         search=search,
         order=clean_order,
+        category=category,
+        request_id=request_id,
+        model=model,
+        account_id=account_id,
     )
     stats = get_log_buffer_stats()
     return {
@@ -880,6 +888,11 @@ async def stream_runtime_logs(
     request: Request,
     level: str = "INFO",
     limit: int = 300,
+    category: str = "model",
+    request_id: str = "",
+    model: str = "",
+    account_id: str = "",
+    search: str = "",
 ) -> StreamingResponse:
     """SSE 实时日志流：连接后先下发历史快照，随后持续增量推送新日志。
 
@@ -904,7 +917,7 @@ async def stream_runtime_logs(
     from aistudio_api.infrastructure.utils.logger import (
         get_log_buffer_stats,
         get_recent_logs,
-        passes_min_level,
+        matches_log_entry,
         subscribe_log_entries,
         unsubscribe_log_entries,
     )
@@ -927,7 +940,15 @@ async def stream_runtime_logs(
 
         def _on_entry(entry: dict[str, object]) -> None:
             # 级别过滤在入队前完成，低于订阅级别的日志不占用连接带宽
-            if not passes_min_level(str(entry.get("level")), clean_level):
+            if not matches_log_entry(
+                entry,
+                min_level=clean_level,
+                category=category,
+                request_id=request_id,
+                model=model,
+                account_id=account_id,
+                search=search,
+            ):
                 return
 
             def _put() -> None:
@@ -966,9 +987,13 @@ async def stream_runtime_logs(
                 min_level=clean_level,
                 limit=clean_limit,
                 order="asc",
+                category=category,
+                request_id=request_id,
+                model=model,
+                account_id=account_id,
+                search=search,
             )
-            if snapshot:
-                yield _sse("snapshot", {"count": len(snapshot), "logs": snapshot})
+            yield _sse("snapshot", {"count": len(snapshot), "logs": snapshot})
             # 3) 先排空订阅瞬间积压的增量（跳过已包含在快照中的条目，按对象身份去重）
             snapshot_ids = {id(entry) for entry in snapshot}
             backlog: list[dict[str, object]] = []

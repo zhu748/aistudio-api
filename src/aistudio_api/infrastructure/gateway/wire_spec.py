@@ -43,6 +43,12 @@ class PartIndex(IntEnum):
     THOUGHT_SIGNATURE = 14
 
 
+class ThinkingConfigIndex(IntEnum):
+    MODE = 0
+    BUDGET = 1
+    LEVEL = 3
+
+
 class GenerationConfigIndex(IntEnum):
     """Indexes in the generationConfig array."""
 

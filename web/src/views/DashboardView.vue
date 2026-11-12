@@ -1,21 +1,14 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useSystemStore } from '@/stores/system.ts'
 import { usePolling } from '@/composables/usePolling.ts'
 import StatCard from '@/components/ui/StatCard.vue'
 import ModelStatsTable from '@/components/dashboard/ModelStatsTable.vue'
 import QuickApiExamples from '@/components/dashboard/QuickApiExamples.vue'
-import {
-  UserCheck,
-  Users,
-  Activity,
-  Brain,
-  Database,
-  ArrowRightLeft,
-  RotateCcw,
-  Cpu,
-} from 'lucide-vue-next'
+import RequestTrend from '@/components/dashboard/RequestTrend.vue'
+import { usePageRefresh } from '@/composables/usePageRefresh.ts'
+import { UserCheck, Users, Activity, Brain, Database, ArrowRightLeft, RotateCcw, Cpu } from 'lucide-vue-next'
 
 const accountsStore = useAccountsStore()
 const systemStore = useSystemStore()
@@ -47,7 +40,7 @@ const poolSummary = computed(() => {
   for (const a of rows) {
     if (a.enabled === false || a.session_expired) {
       disabledOrExpired += 1
-    } else if (a.is_available === false) {
+    } else if (a.availability === 'partial' || a.is_available === false) {
       limited += 1
     } else {
       ready += 1
@@ -58,7 +51,7 @@ const poolSummary = computed(() => {
 
 const successRateDisplay = computed(() => {
   const total = systemStore.totalRequests
-  if (!total) return '100.0%'
+  if (!total) return '—'
   return `${((systemStore.totalSuccess / total) * 100).toFixed(1)}%`
 })
 
@@ -76,17 +69,93 @@ async function handleQuickResetCooldown() {
 }
 
 async function loadData() {
-  await Promise.all([
-    accountsStore.fetchAll(),
-    systemStore.fetchStats(),
-  ])
+  const results = await Promise.all([accountsStore.fetchAll(), systemStore.fetchStats()])
+  return results.every(Boolean)
 }
 
 usePolling(loadData, 10000)
+usePageRefresh(loadData)
+watch(
+  () => systemStore.statsRange,
+  (value) => {
+    if (value !== 'custom') void systemStore.fetchStats()
+  },
+)
+function seconds(value?: number | null) {
+  return value == null ? '—' : `${(value / 1000).toFixed(2)}s`
+}
+const rangeQuery = computed(() => ({
+  since: String(systemStore.stats?.since || ''),
+  until: String(systemStore.stats?.until || ''),
+}))
 </script>
 
 <template>
   <div class="space-y-5">
+    <div class="surface-card rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
+      <div>
+        <h2 class="text-sm font-semibold">
+          调用概览
+        </h2>
+        <p class="text-xs text-slate-500 mt-1">
+          每次客户端调用按最终结果计一次；账号健康状态为当前值。
+        </p>
+      </div>
+      <div class="flex flex-wrap gap-2 items-center">
+        <select
+          v-model="systemStore.statsRange"
+          aria-label="统计时间范围"
+          class="field-input"
+        >
+          <option value="today">
+            今日（本地时间）
+          </option>
+          <option value="24h">
+            最近 24 小时
+          </option>
+          <option value="7d">
+            最近 7 天
+          </option>
+          <option value="14d">
+            最近 14 天
+          </option>
+          <option value="custom">
+            自定义时间
+          </option>
+        </select>
+        <template v-if="systemStore.statsRange === 'custom'">
+          <input
+            v-model="systemStore.customSince"
+            aria-label="统计开始时间"
+            type="datetime-local"
+            class="field-input"
+          ><input
+            v-model="systemStore.customUntil"
+            aria-label="统计结束时间"
+            type="datetime-local"
+            class="field-input"
+          ><button
+            class="px-3 py-2 bg-slate-900 text-white rounded-lg text-xs"
+            @click="systemStore.fetchStats()"
+          >
+            查询
+          </button>
+        </template>
+      </div>
+    </div>
+    <p
+      v-if="systemStore.statsError"
+      role="alert"
+      class="p-3 rounded-lg bg-rose-50 text-rose-700 text-sm"
+    >
+      {{ systemStore.statsError }} · 当前展示可能为上次成功获取的数据。
+    </p>
+    <p
+      v-if="systemStore.stats && !systemStore.stats.history_enabled"
+      class="p-3 rounded-lg bg-amber-50 text-amber-800 text-sm"
+    >
+      请求历史采集已关闭，当前仅展示已保留记录。
+    </p>
     <!-- Primary Telemetry Strip (4-Column Engineering Readout) -->
     <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3.5">
       <!-- 1. Active Routing Node -->
@@ -117,15 +186,17 @@ usePolling(loadData, 10000)
             v-if="activeAccountMeta"
             class="flex items-center gap-1.5 pt-1 text-[11px] font-mono"
           >
-            <span class="px-1.5 py-0.5 rounded bg-brand-50 text-brand-700 border border-brand-200/70 font-semibold">
+            <span
+              class="px-1.5 py-0.5 rounded bg-brand-50 text-brand-700 border border-brand-200/70 font-semibold"
+            >
               {{ activeAccountMeta.u }}
             </span>
-            <span class="px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-200/70 font-medium">
+            <span
+              class="px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-200/70 font-medium"
+            >
               {{ activeAccountMeta.tier }}
             </span>
-            <span class="text-slate-400 truncate">
-              分组: {{ activeAccountMeta.group }}
-            </span>
+            <span class="text-slate-400 truncate"> 分组: {{ activeAccountMeta.group }} </span>
           </div>
           <div
             v-else
@@ -140,7 +211,7 @@ usePolling(loadData, 10000)
       <StatCard
         label="凭据池健康水位"
         :value="`${poolSummary.ready} / ${poolSummary.total}`"
-        sub-value="可用就绪"
+        sub-value="凭据就绪且无已知冷却"
         color="default"
       >
         <template #icon>
@@ -158,12 +229,12 @@ usePolling(loadData, 10000)
               :class="poolSummary.limited > 0 ? 'text-amber-700 font-semibold' : 'text-slate-400'"
             >
               <span class="w-1.5 h-1.5 rounded-full bg-amber-500" />
-              受限 {{ poolSummary.limited }}
+              模型冷却 {{ poolSummary.limited }}
             </span>
             <span class="text-slate-300">·</span>
             <span class="inline-flex items-center gap-1 text-slate-400">
               <span class="w-1.5 h-1.5 rounded-full bg-slate-300" />
-              停用 {{ poolSummary.disabledOrExpired }}
+              停用/失效 {{ poolSummary.disabledOrExpired }}
             </span>
           </div>
         </template>
@@ -171,7 +242,7 @@ usePolling(loadData, 10000)
 
       <!-- 3. Request Throughput & 429 SLA -->
       <StatCard
-        label="请求吞吐与限流"
+        label="所选时段调用数"
         :value="systemStore.totalRequests.toLocaleString()"
         :sub-value="`成功率 ${successRateDisplay}`"
         color="default"
@@ -194,11 +265,11 @@ usePolling(loadData, 10000)
         </template>
         <template #footer>
           <div class="flex items-center gap-2 pt-1 text-[11px] font-mono tabular-nums">
-            <span class="text-emerald-700">
-              成功 {{ systemStore.totalSuccess.toLocaleString() }}
-            </span>
+            <span class="text-emerald-700"> 成功 {{ systemStore.totalSuccess.toLocaleString() }} </span>
             <span class="text-slate-300">·</span>
-            <span :class="systemStore.totalRateLimited > 0 ? 'text-amber-600 font-semibold' : 'text-slate-400'">
+            <span
+              :class="systemStore.totalRateLimited > 0 ? 'text-amber-600 font-semibold' : 'text-slate-400'"
+            >
               429限流 {{ systemStore.totalRateLimited.toLocaleString() }}
             </span>
             <span class="text-slate-300">·</span>
@@ -211,7 +282,7 @@ usePolling(loadData, 10000)
 
       <!-- 4. Token Telemetry -->
       <StatCard
-        label="累计 Token 消耗"
+        label="所选时段 Token"
         :value="systemStore.totalTokens.toLocaleString()"
         :sub-value="`入 ${systemStore.promptTokens.toLocaleString()} / 出 ${systemStore.completionTokens.toLocaleString()}`"
         color="default"
@@ -234,12 +305,180 @@ usePolling(loadData, 10000)
       </StatCard>
     </div>
 
+    <div class="grid grid-cols-2 xl:grid-cols-4 gap-3">
+      <StatCard
+        label="正在执行"
+        :value="systemStore.stats?.active || 0"
+      />
+      <StatCard
+        label="首包 P50"
+        :value="seconds(systemStore.stats?.totals.first_byte_p50_ms)"
+      />
+      <StatCard
+        label="总耗时 P95"
+        :value="seconds(systemStore.stats?.totals.latency_p95_ms)"
+      />
+      <StatCard
+        label="重试调用占比"
+        :value="
+          systemStore.stats?.totals.retry_rate == null
+            ? '—'
+            : `${systemStore.stats.totals.retry_rate.toFixed(1)}%`
+        "
+        :sub-value="`上游尝试 ${systemStore.stats?.totals.attempts || 0} 次`"
+      />
+    </div>
+    <RequestTrend
+      v-if="systemStore.stats"
+      :stats="systemStore.stats"
+    />
+
     <!-- Model Statistics Table with Account Breakdown Accordion -->
     <ModelStatsTable
       :stats="systemStore.stats?.models || {}"
+      :since="systemStore.stats?.since"
+      :until="systemStore.stats?.until"
     />
 
+    <div class="grid grid-cols-1 xl:grid-cols-2 gap-5">
+      <section class="surface-card rounded-xl overflow-hidden">
+        <h2 class="p-4 border-b border-slate-100 text-sm font-semibold">
+          账号调用分布
+        </h2>
+        <div class="overflow-x-auto">
+          <table class="w-full text-xs text-left">
+            <thead class="bg-slate-50 text-slate-500">
+              <tr>
+                <th class="p-3">
+                  最终服务账号
+                </th>
+                <th class="p-3 text-right">
+                  调用
+                </th>
+                <th class="p-3 text-right">
+                  成功率
+                </th>
+                <th class="p-3 text-right">
+                  Token
+                </th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-100">
+              <tr
+                v-for="(item, id) in systemStore.stats?.accounts"
+                :key="id"
+              >
+                <td class="p-3 max-w-56 truncate">
+                  <router-link
+                    :to="{
+                      path: '/requests',
+                      query: {
+                        ...rangeQuery,
+                        account_id: String(id) === '未调度' ? '__unassigned__' : String(id),
+                      },
+                    }"
+                    class="text-brand-700 hover:underline"
+                    :title="item.name"
+                  >
+                    {{ item.name }}
+                  </router-link>
+                </td>
+                <td class="p-3 text-right tabular-nums">
+                  {{ item.requests }}
+                </td>
+                <td class="p-3 text-right tabular-nums">
+                  {{ item.success_rate == null ? '—' : `${item.success_rate.toFixed(1)}%` }}
+                </td>
+                <td class="p-3 text-right tabular-nums">
+                  {{ item.total_tokens.toLocaleString() }}
+                </td>
+              </tr>
+              <tr v-if="!Object.keys(systemStore.stats?.accounts || {}).length">
+                <td
+                  colspan="4"
+                  class="p-8 text-center text-slate-400"
+                >
+                  暂无账号调用
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section class="surface-card rounded-xl overflow-hidden">
+        <h2 class="p-4 border-b border-slate-100 text-sm font-semibold">
+          客户端密钥分布
+        </h2>
+        <div class="overflow-x-auto">
+          <table class="w-full text-xs text-left">
+            <thead class="bg-slate-50 text-slate-500">
+              <tr>
+                <th class="p-3">
+                  密钥标识
+                </th>
+                <th class="p-3 text-right">
+                  调用
+                </th>
+                <th class="p-3 text-right">
+                  成功率
+                </th>
+                <th class="p-3 text-right">
+                  Token
+                </th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-100">
+              <tr
+                v-for="(item, id) in systemStore.stats?.keys"
+                :key="id"
+              >
+                <td class="p-3 font-mono">
+                  <router-link
+                    :to="{
+                      path: '/requests',
+                      query: { ...rangeQuery, key_id: String(id) === '匿名' ? '__anonymous__' : String(id) },
+                    }"
+                    class="text-brand-700 hover:underline"
+                  >
+                    {{ id }}
+                  </router-link>
+                </td>
+                <td class="p-3 text-right">
+                  {{ item.requests }}
+                </td>
+                <td class="p-3 text-right">
+                  {{ item.success_rate == null ? '—' : `${item.success_rate.toFixed(1)}%` }}
+                </td>
+                <td class="p-3 text-right">
+                  {{ item.total_tokens.toLocaleString() }}
+                </td>
+              </tr>
+              <tr v-if="!Object.keys(systemStore.stats?.keys || {}).length">
+                <td
+                  colspan="4"
+                  class="p-8 text-center text-slate-400"
+                >
+                  暂无密钥调用
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+    <p class="text-xs text-slate-500">
+      统计来自保留期内的请求记录（最多
+      {{ systemStore.stats?.history_days || 14 }} 天）；清空请求历史会同步清除此范围的统计。
+    </p>
+
     <!-- Multi-Protocol Quick API Reference Snippets -->
-    <QuickApiExamples />
+    <details class="surface-card rounded-xl p-4">
+      <summary class="text-sm font-medium cursor-pointer">
+        API 接入示例
+      </summary>
+      <div class="mt-4">
+        <QuickApiExamples />
+      </div>
+    </details>
   </div>
 </template>

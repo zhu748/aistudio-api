@@ -98,6 +98,10 @@ export interface AvailableModelItem {
 }
 
 export interface LogEntry {
+  category?: 'model' | 'system'
+  model?: string
+  account_id?: string
+  stage?: string
   request_id?: string
   ts: string
   ts_ms: number

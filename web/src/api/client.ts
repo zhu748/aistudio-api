@@ -79,10 +79,11 @@ const DEFAULT_TIMEOUT_MS = 30000
 export interface RequestOptions extends RequestInit {
   /** 覆盖默认超时（毫秒）。 */
   timeoutMs?: number
+  acceptableStatuses?: number[]
 }
 
 export async function request<T>(url: string, options: RequestOptions = {}): Promise<T> {
-  const { timeoutMs, ...init } = options
+  const { timeoutMs, acceptableStatuses = [], ...init } = options
   const headers = new Headers(init.headers || {})
   const token = getToken()
 
@@ -123,18 +124,13 @@ export async function request<T>(url: string, options: RequestOptions = {}): Pro
       throw err
     }
 
-    if (!response.ok) {
+    if (!response.ok && !acceptableStatuses.includes(response.status)) {
       if (response.status === 401) {
         clearToken()
         if (onUnauthorizedHandler) {
           onUnauthorizedHandler()
-        } else if (
-          typeof window !== 'undefined' &&
-          !window.location.pathname.startsWith('/login')
-        ) {
-          const redirect = encodeURIComponent(
-            window.location.pathname + window.location.search
-          )
+        } else if (typeof window !== 'undefined' && !window.location.pathname.startsWith('/login')) {
+          const redirect = encodeURIComponent(window.location.pathname + window.location.search)
           window.location.href = `/login?redirect=${redirect}`
         }
       }

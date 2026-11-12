@@ -110,6 +110,7 @@ class AccountModelDailyStats:
     requests: int = 0
     success: int = 0
     rate_limited: int = 0
+    rate_limited_total: int = 0
     errors: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -141,6 +142,9 @@ class AccountModelDailyStats:
             requests=_as_int(data.get("requests")),
             success=_as_int(data.get("success")),
             rate_limited=_as_int(data.get("rate_limited")),
+            rate_limited_total=_as_int(
+                data.get("rate_limited_total", data.get("rate_limited"))
+            ),
             errors=_as_int(data.get("errors")),
             prompt_tokens=_as_int(data.get("prompt_tokens")),
             completion_tokens=_as_int(data.get("completion_tokens")),
@@ -294,6 +298,7 @@ class AccountStats:
         m_stats = self.get_model_daily(model)
         m_stats.requests += 1
         m_stats.rate_limited += 1
+        m_stats.rate_limited_total += 1
         m_stats.last_used = now
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_configured_rotator_settings,
@@ -670,7 +675,8 @@ class AccountRotator:
                 today_models_data[m_key] = {
                     "requests": m_stats.requests,
                     "success": m_stats.success,
-                    "rate_limited": m_stats.rate_limited,
+                    "rate_limited": m_stats.rate_limited_total,
+                    "consecutive_rate_limited": m_stats.rate_limited,
                     "errors": m_stats.errors,
                     "prompt_tokens": m_stats.prompt_tokens,
                     "completion_tokens": m_stats.completion_tokens,
@@ -683,7 +689,9 @@ class AccountRotator:
                     ),
                     "cooldown_remaining": rem_cd,
                     "drip_mode": m_stats.drip_mode,
-                    "is_available": rem_cd == 0,
+                    "is_available": account.enabled
+                    and not stats.session_expired
+                    and rem_cd == 0,
                 }
 
             result[account.id] = {
@@ -711,6 +719,13 @@ class AccountRotator:
                     else None
                 ),
                 "is_available": account.enabled and stats.is_available(),
+                "availability": "disabled"
+                if not account.enabled
+                else "expired"
+                if stats.session_expired
+                else "partial"
+                if model_cooldowns_dict
+                else "ready",
                 "session_expired": stats.session_expired,
                 "auth_errors": stats.auth_errors,
                 "cooldown_remaining": int(stats.get_cooldown_remaining()),

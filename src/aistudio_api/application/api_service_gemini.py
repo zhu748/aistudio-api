@@ -54,7 +54,13 @@ from aistudio_api.infrastructure.gateway.client import (
 from aistudio_api.infrastructure.gateway.wire_spec import (
     WIRE_FINISH_REASON_CONTINUING,
 )
-from aistudio_api.infrastructure.request_context import current_request, record_result
+from aistudio_api.infrastructure.request_context import (
+    current_request,
+    record_attempt_error,
+    record_output_timing,
+    record_requested_parameters,
+    record_result,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("api.gemini")
@@ -83,6 +89,7 @@ class Auth403RetryManager:
         client: AIStudioClient,
         has_yielded_data: bool = False,
     ) -> bool:
+        record_attempt_error(403, str(exc))
         if has_yielded_data:
             raise HTTPException(
                 403, detail={"message": str(exc), "type": "auth_error"}
@@ -309,6 +316,8 @@ async def handle_attempt_exception(
     Returns True if the operation should be retried, or raises HTTPException / re-raises.
     """
     target_model = normalized_model or model_path
+    error_code, error_message, _ = classify_gemini_error_payload(exc)
+    record_attempt_error(error_code, error_message)
     account_svc = runtime_state.account_service
     # 统一解析「本次尝试实际服务的账号」：serving_account_id 存在时用它
     # （避免并发下全局活跃账号串号），否则回退全局活跃账号。
@@ -501,6 +510,15 @@ def _build_gemini_response_from_output(
 ) -> GeminiGenerateContentResponse:
     """把缓冲完成的 ModelOutput 组装为 Gemini 完整响应（非流式 JSON 与
     缓冲变体的单条 SSE 事件共用）。"""
+    if output.thinking or output.reasoning_images:
+        record_output_timing("thinking")
+    if (
+        output.text
+        or output.function_calls
+        or output.function_responses
+        or output.images
+    ):
+        record_output_timing("body")
     return GeminiGenerateContentResponse(
         candidates=[
             GeminiCandidateResponse(
@@ -537,6 +555,22 @@ async def handle_gemini_generate_content(
     observation = current_request.get()
     if observation is not None:
         observation.model = model_path
+        if not observation.request_parameters:
+            record_requested_parameters(
+                {
+                    **(
+                        req.generationConfig.model_dump(exclude_none=True)
+                        if req.generationConfig
+                        else {}
+                    ),
+                    "reasoningEffort": (
+                        req.generationConfig.reasoningEffort
+                        if req.generationConfig
+                        else None
+                    )
+                    or req.reasoningEffort,
+                }
+            )
     # 抗截断模型变体：带后缀的模型强制开启抗截断；请求头 X-Anti-Truncation
     # 显式传值时以请求头为准。非流式变体额外强制缓冲（非流式）上游传输。
     force_buffer = False
@@ -975,6 +1009,9 @@ def _build_gemini_streaming_response(
                         async for event_type, text in anti_stream:
                             if event_type == "usage":
                                 final_usage = text if isinstance(text, dict) else None
+                                observation = current_request.get()
+                                if observation is not None and final_usage is not None:
+                                    observation.usage = dict(final_usage)
                             elif event_type == "finish_reason":
                                 if text not in _IGNORED_WIRE_FINISH_REASONS:
                                     final_finish_reason = (
@@ -996,6 +1033,7 @@ def _build_gemini_streaming_response(
                                 )
                                 buffered_thought_sig = None
                                 if chunk:
+                                    record_output_timing(event_type)
                                     if not has_yielded_data:
                                         ttft_ms = (
                                             time.perf_counter() - stream_start_time

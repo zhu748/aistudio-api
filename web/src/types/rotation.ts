@@ -16,6 +16,7 @@ export interface ModelDailyDetail {
 }
 
 export interface AccountRotationStats {
+  availability?: 'ready' | 'partial' | 'expired' | 'disabled'
   name?: string
   email?: string | null
   auth_user?: string

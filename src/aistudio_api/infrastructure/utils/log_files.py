@@ -9,7 +9,7 @@ import queue
 from pathlib import Path
 
 from aistudio_api.config import resolve_data_dir
-from aistudio_api.infrastructure.request_context import current_request
+from aistudio_api.infrastructure.request_context import log_context
 from aistudio_api.infrastructure.utils.redaction import redact_text
 
 _listener: logging.handlers.QueueListener | None = None
@@ -19,10 +19,8 @@ _file_handler: logging.handlers.RotatingFileHandler | None = None
 
 class ContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        context = current_request.get()
-        record.request_id = getattr(record, "request_id", "") or (
-            context.request_id if context else ""
-        )
+        for key, value in log_context().items():
+            setattr(record, key, getattr(record, key, "") or value)
         record.msg, record.args = redact_text(record.getMessage()), ()
         return True
 
@@ -37,6 +35,10 @@ class JsonFormatter(logging.Formatter):
                 "name": record.name,
                 "message": redact_text(record.getMessage())[:8192],
                 "request_id": getattr(record, "request_id", ""),
+                **{
+                    key: getattr(record, key, "system" if key == "category" else "")
+                    for key in ("category", "model", "account_id", "stage")
+                },
             },
             ensure_ascii=False,
         )
@@ -113,8 +115,13 @@ def read_log_history(
     request_id: str = "",
     page: int = 1,
     page_size: int = 100,
+    category: str = "all",
+    model: str = "",
+    account_id: str = "",
+    order: str = "desc",
 ) -> dict[str, object]:
-    minimum = getattr(logging, level, logging.INFO)
+    from aistudio_api.infrastructure.utils.logger import matches_log_entry
+
     matched: list[dict[str, object]] = []
     folder = log_directory()
     paths = [
@@ -130,14 +137,18 @@ def read_log_history(
                     item = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if (
-                    getattr(logging, item.get("level", "INFO"), logging.INFO) < minimum
-                    or (request_id and item.get("request_id") != request_id)
-                    or (search and search.lower() not in str(item).lower())
+                if not isinstance(item, dict) or not matches_log_entry(
+                    item,
+                    min_level=level,
+                    search=search,
+                    request_id=request_id,
+                    category=category,
+                    model=model,
+                    account_id=account_id,
                 ):
                     continue
                 matched.append(item)
-    matched.sort(key=lambda item: int(str(item["ts_ms"])), reverse=True)
+    matched.sort(key=lambda item: int(str(item["ts_ms"])), reverse=order != "asc")
     offset = (page - 1) * page_size
     return {
         "items": matched[offset : offset + page_size],

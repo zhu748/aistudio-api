@@ -18,6 +18,7 @@ export interface AccountBreakdownItem {
 }
 
 export interface ModelStatItem {
+  accounts?: (ModelStatItem & { account_id: string; name: string })[]
   requests: number
   success: number
   rate_limited: number
@@ -30,6 +31,15 @@ export interface ModelStatItem {
   finish_reasons?: Record<string, number>
   last_used?: string | null
   account_breakdown?: AccountBreakdownItem[]
+  attempts?: number
+  retried?: number
+  success_rate?: number | null
+  retry_rate?: number | null
+  latency_p50_ms?: number | null
+  latency_p95_ms?: number | null
+  first_byte_p50_ms?: number | null
+  first_byte_p95_ms?: number | null
+  results?: Record<string, number>
 }
 
 export interface StatsTotals {
@@ -47,4 +57,18 @@ export interface StatsTotals {
 export interface StatsResponse {
   models: Record<string, ModelStatItem>
   totals: StatsTotals
+}
+
+export interface RequestMetricsResponse {
+  models: Record<string, ModelStatItem>
+  totals: ModelStatItem
+  accounts: Record<string, ModelStatItem & { name: string }>
+  keys: Record<string, ModelStatItem>
+  series: (ModelStatItem & { timestamp: number })[]
+  since: number
+  until: number
+  interval_seconds: number
+  history_days: number
+  history_enabled: boolean
+  active: number
 }

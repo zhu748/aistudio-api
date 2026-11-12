@@ -17,30 +17,44 @@ const emit = defineEmits<{
 const accountsStore = useAccountsStore()
 const inputName = ref('')
 const inputProxy = ref('')
+const inputNotes = ref('')
+const saving = ref(false)
 
 watch(
-  () => props.account,
-  (acc) => {
-    if (acc) {
+  () => [props.modelValue, props.account?.id],
+  () => {
+    const acc = props.account
+    if (props.modelValue && acc) {
       inputName.value = acc.name || ''
       inputProxy.value = acc.proxy_url || ''
+      inputNotes.value = acc.notes || ''
     }
   },
-  { immediate: true }
+  { immediate: true },
 )
 
 async function handleSave() {
-  if (!props.account) return
+  if (!props.account || saving.value) return
   const trimmed = inputName.value.trim()
   if (!trimmed) return
 
   const trimmedProxy = inputProxy.value.trim()
   const proxyChanged = trimmedProxy !== (props.account.proxy_url || '')
-  if (proxyChanged) {
-    await accountsStore.updateAccountProxy(props.account.id, trimmedProxy || null)
+  saving.value = true
+  try {
+    if (proxyChanged && !(await accountsStore.updateAccountProxy(props.account.id, trimmedProxy || null)))
+      return
+    if (
+      inputNotes.value !== (props.account.notes || '') &&
+      !(await accountsStore.updateAccountNotes(props.account.id, inputNotes.value))
+    )
+      return
+    if (trimmed !== props.account.name && !(await accountsStore.updateAccountName(props.account.id, trimmed)))
+      return
+    emit('update:modelValue', false)
+  } finally {
+    saving.value = false
   }
-  await accountsStore.updateAccountName(props.account.id, trimmed)
-  emit('update:modelValue', false)
 }
 </script>
 
@@ -53,9 +67,7 @@ async function handleSave() {
   >
     <div class="space-y-4">
       <div class="space-y-1.5">
-        <label class="block text-xs font-semibold text-slate-700">
-          账号备注名称
-        </label>
+        <label class="block text-xs font-semibold text-slate-700"> 账号备注名称 </label>
         <input
           v-model="inputName"
           type="text"
@@ -75,9 +87,17 @@ async function handleSave() {
           class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
         >
         <p class="text-[11px] text-slate-400 leading-relaxed">
-          该账号的模型请求、Cookie 续期与等级探测均走此独立代理；留空则自动回退至全局 <code class="font-mono">AISTUDIO_PROXY</code>。
+          该账号的模型请求、Cookie 续期与等级探测均走此独立代理；留空则自动回退至全局
+          <code class="font-mono">AISTUDIO_PROXY</code>。
         </p>
       </div>
+      <label class="field-label">账号备注<textarea
+        v-model="inputNotes"
+        rows="3"
+        class="field-input resize-y"
+        placeholder="账号用途、维护说明等"
+      />
+      </label>
     </div>
 
     <template #footer>
@@ -92,6 +112,7 @@ async function handleSave() {
         variant="primary"
         size="sm"
         :disabled="!inputName.trim()"
+        :loading="saving"
         @click="handleSave"
       >
         保存修改

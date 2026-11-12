@@ -62,6 +62,10 @@ async def lifespan(_app: FastAPI):
     )
 
     start_file_logging()
+    if settings.request_history:
+        from aistudio_api.infrastructure.request_history import request_history
+
+        await asyncio.to_thread(request_history().recover_interrupted)
     # 启动时自动检查并拉起本地 WAA 签名服务（若配置为本地节点）。
     # 内含阻塞 I/O，下放线程池避免卡住启动期事件循环。
     await asyncio.to_thread(ensure_signer_ready)
