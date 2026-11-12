@@ -83,7 +83,14 @@ def _extract_model_aliases(raw: object) -> list[str]:
 
 # 本地补充模型：无论上游 ListModels 是否返回，都确保出现在模型列表中
 # （README 宣传的模型 / config.yaml 已配置对应付费规则与层级配额）
+# 注意：gemini-4-hydrogen 为免费模型（2026-11-12 线上目录实测 paid[77]=None /
+# accessModes[82]=None），与 argon/carbon 的付费定位不同，不得挂付费规则。
 _EXTRA_GUARANTEED_MODELS = [
+    {
+        "id": "gemini-4-hydrogen",
+        "displayName": "Gemini 4 Hydrogen",
+        "description": "Gemini 4 Hydrogen flagship reasoning model",
+    },
     {
         "id": "gemini-4-argon",
         "displayName": "Gemini 4 Argon",
@@ -196,6 +203,30 @@ _FALLBACK_MODELS = [
         "defaultThinkingLevel": 2,
         "thinkingLevels": [1, 2, 3],
         "paid": True,
+        "supportedGenerationMethods": [
+            "generateContent",
+            "countTokens",
+            "batchGenerateContent",
+        ],
+        "is_image_model": False,
+        "is_video_model": False,
+        "is_audio_model": False,
+    },
+    {
+        # 2026-11-12 线上目录实测收录：免费 4 系列模型（paid[77]=None /
+        # accessModes[82]=None，Free 号可用）；输出上限 65536 高于 carbon，
+        # 思考档 [1,2,3,5] 默认 HIGH(3)，[83]=1。
+        "id": "gemini-4-hydrogen",
+        "displayName": "Gemini 4 Hydrogen",
+        "description": "Gemini 4 Hydrogen",
+        "category": "flagship",
+        "inputTokenLimit": 1048576,
+        "outputTokenLimit": 65536,
+        "unknownFlag13": 1,
+        "defaultThinkingLevel": 3,
+        "thinkingLevels": [1, 2, 3, 5],
+        "aliases": [],
+        "paid": False,
         "supportedGenerationMethods": [
             "generateContent",
             "countTokens",

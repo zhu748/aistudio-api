@@ -74,10 +74,10 @@ model_defaults:
   models: {}
 paid_model_rules:
   ultra_required:
-    contains: ["veo", "ultra"]
+    contains: ["veo", "ultra", "antigravity", "carbon"]
     required_tiers: ["Ultra", "Ultra_20X"]
   pro_required:
-    contains: ["argon", "gemini-4", "image", "imagen"]
+    contains: ["argon", "image", "imagen"]
     required_tiers: ["Pro", "Ultra", "Ultra_20X"]
 rotator:
   max_retries: 5
@@ -109,7 +109,7 @@ tier_quotas:
   Pro:
     argon_models:
       match:
-        contains: ["argon", "gemini-4"]
+        contains: ["argon", "carbon"]
       daily_limit: 50
     flash_models:
       match:
@@ -127,7 +127,7 @@ tier_quotas:
   Ultra:
     argon_models:
       match:
-        contains: ["argon", "gemini-4"]
+        contains: ["argon", "carbon"]
       daily_limit: 250
     flash_models:
       match:

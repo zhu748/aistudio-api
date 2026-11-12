@@ -124,9 +124,10 @@ async def test_model_discovery_falls_back_to_auth_file_cookies(tmp_path, monkeyp
     service._fetch_via_http = AsyncMock(return_value=fake_http_models)
 
     models = await service.get_models(session=mock_session, force_refresh=True)
-    # 上游模型全部保留，且本地补充模型（gemini-4-argon / gemini-4-carbon）被合并进列表
+    # 上游模型全部保留，且本地补充模型（hydrogen/argon/carbon）被合并进列表
     assert {str(m["id"]) for m in models} == {
         "dynamic-gemini-test",
+        "gemini-4-hydrogen",
         "gemini-4-argon",
         "gemini-4-carbon",
     }
@@ -177,8 +178,14 @@ async def test_model_discovery_merges_extra_models_into_upstream_list():
 
     models = await service.get_models(cookies={"SAPISID": "test"}, force_refresh=True)
     ids = [str(m["id"]) for m in models]
-    # 2026-11：本地补充模型新增 gemini-4-carbon（旗舰，抓包同期目录实测）
-    assert ids == ["gemini-3.7-flash", "gemini-4-argon", "gemini-4-carbon"]
+    # 2026-11：本地补充模型新增 gemini-4-carbon（旗舰）与
+    # gemini-4-hydrogen（免费 4 系列，同日线上目录实测）
+    assert ids == [
+        "gemini-3.7-flash",
+        "gemini-4-hydrogen",
+        "gemini-4-argon",
+        "gemini-4-carbon",
+    ]
 
 
 @pytest.mark.asyncio
@@ -244,6 +251,37 @@ async def test_gemini_4_argon_tier_gating_from_config():
     assert service.is_model_allowed_for_tier("gemini-4-argon", "Ultra") is True
     assert service.is_paid_model("gemini-4-argon") is True
     assert service.get_required_tiers("gemini-4-argon") == ["Pro", "Ultra", "Ultra_20X"]
+
+
+@pytest.mark.asyncio
+async def test_gemini_4_series_tier_gating_per_model():
+    """gemini-4 系列必须按模型逐个门控，禁止 "gemini-4" 前缀一刀切。
+
+    2026-11-12 线上目录实测（第五轮逆向，ListModes 槽位）：
+      hydrogen: paid[77]=None / accessModes[82]=None -> 免费模型；
+      argon:    paid=2 / accessModes=[1,3]           -> Pro+；
+      carbon:   paid=2 / accessModes=[1,4]           -> Ultra-only。
+    历史 bug：paid_model_rules.pro_required.contains 含 "gemini-4" 子串，
+    把免费的 hydrogen 误拦成 Pro 必需（用户实测 Free 号可正常使用）。
+    """
+    from aistudio_api.infrastructure.gateway.model_discovery import (
+        ModelDiscoveryService,
+    )
+
+    service = ModelDiscoveryService()
+    # hydrogen：免费 —— 所有层级放行，不进付费名单
+    assert service.is_paid_model("gemini-4-hydrogen") is False
+    assert service.get_required_tiers("gemini-4-hydrogen") == []
+    for tier in ("Free", "Plus", "Pro", "Ultra", "Ultra_20X"):
+        assert service.is_model_allowed_for_tier("gemini-4-hydrogen", tier) is True
+    # argon：Pro+（既有行为保持）
+    assert service.get_required_tiers("gemini-4-argon") == ["Pro", "Ultra", "Ultra_20X"]
+    assert service.is_model_allowed_for_tier("gemini-4-argon", "Free") is False
+    # carbon：Ultra-only（目录 accessModes=[1,4]：含 4 不含 3）
+    assert service.is_paid_model("gemini-4-carbon") is True
+    assert service.get_required_tiers("gemini-4-carbon") == ["Ultra", "Ultra_20X"]
+    assert service.is_model_allowed_for_tier("gemini-4-carbon", "Pro") is False
+    assert service.is_model_allowed_for_tier("gemini-4-carbon", "Ultra") is True
 
 
 @pytest.mark.asyncio

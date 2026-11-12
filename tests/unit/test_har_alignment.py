@@ -138,6 +138,25 @@ def test_fallback_catalog_contains_gemini_4_carbon():
     assert "gemini-4-carbon" in extras
 
 
+def test_fallback_catalog_contains_gemini_4_hydrogen_free_model():
+    """2026-11-12 线上目录收录 gemini-4-hydrogen：免费 4 系列模型。
+
+    上游实测槽位：paid[77]=None / accessModes[82]=None（Free 号可用，
+    与 3.8-flash 同形态），输出上限 65536（高于 carbon 的 32768），
+    思考档 [1,2,3,5] 默认 HIGH(3)，[83]=1。
+    """
+    hydrogen = next(m for m in _FALLBACK_MODELS if m["id"] == "gemini-4-hydrogen")
+    assert hydrogen["outputTokenLimit"] == 65536
+    assert hydrogen["inputTokenLimit"] == 1048576
+    assert hydrogen["defaultThinkingLevel"] == 3
+    assert hydrogen["thinkingLevels"] == [1, 2, 3, 5]
+    assert hydrogen["unknownFlag13"] == 1
+    assert hydrogen["paid"] is False
+    assert "generateContent" in hydrogen["supportedGenerationMethods"]
+    extras = {m["id"] for m in _EXTRA_GUARANTEED_MODELS}
+    assert "gemini-4-hydrogen" in extras
+
+
 def test_fallback_catalog_flag13_matches_listmodels_mapping():
     """目录 [83]=1 ↔ gen_config[13]=1 的映射（3.8-flash/argon=1，3.5-lite 无）。"""
     by_id = {m["id"]: m for m in _FALLBACK_MODELS}
@@ -332,9 +351,13 @@ def test_snap_thinking_wire_drops_budget_only_for_non_thinking_models():
 def test_model_metadata_helpers():
     assert model_unknown_flag_13("gemini-3.8-flash") == 1
     assert model_unknown_flag_13("gemini-3.5-flash-lite") is None
+    assert model_unknown_flag_13("gemini-4-hydrogen") == 1
     assert model_output_token_limit("gemini-4-carbon") == 32768
     assert browser_default_max_tokens("gemini-4-carbon") == 32768
     assert browser_default_max_tokens("gemini-3.8-flash") == 65536
+    # hydrogen 输出上限 65536：默认值不被钳制（高于碳的 32768）
+    assert model_output_token_limit("gemini-4-hydrogen") == 65536
+    assert browser_default_max_tokens("gemini-4-hydrogen") == 65536
 
 
 def test_effective_generation_config_overrides_applies_clear_semantics():

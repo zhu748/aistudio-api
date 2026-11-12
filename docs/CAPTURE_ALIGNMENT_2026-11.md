@@ -340,3 +340,57 @@ HEAD 第三轮 §9.7 attempts=3 恢复实战）。403 的出现/消失由 spinsn
    原版 proof 出网 200；§8.4 新旧 request_context 形态均 200 双向验证）
    与可观测/熔断（被动防护，不产生 403）——均不在「挑战获取 / proof
    铸造」路径上，而 403 的根因恰在该路径的服务侧（挑战新鲜度）。
+
+---
+
+## 11. 2026-11-12 第五轮：新模型 gemini-4-hydrogen 收录与付费门控修复
+
+用户报告：上游新增 `gemini-4-hydrogen`，**Free 号可直接使用**，但项目
+将其拦截为「需要 Pro 订阅」。
+
+### 11.1 线上目录实测（同 cookie + 同 SOCKS5 代理，ListModels body=`[]`）
+
+gemini-4 系列的付费定位按槽位逐个核实（paid[77] / accessModes[82]）：
+
+| 模型 | paid[77] | accessModes[82] | 上游门控 |
+|---|---|---|---|
+| **gemini-4-hydrogen** | **None** | **None** | **免费**（与 3.8-flash / 3.5-lite 同形态） |
+| gemini-4-argon | 2 | [1, 3] | Pro+ |
+| gemini-4-carbon | 2 | [1, 4] | **Ultra-only**（含 4 不含 3） |
+
+hydrogen 目录元数据：输出上限 65536（高于 carbon 32768）、思考档
+[1,2,3,5] 默认 HIGH(3)、[83]=1、capabilityCodes 不含 20（非视频类）、
+方法集 generateContent/countTokens/batchGenerateContent。
+
+### 11.2 根因：`gemini-4` 子串一刀切误伤免费新模型
+
+`config.yaml paid_model_rules.pro_required.contains` 含 **`gemini-4`**
+子串 —— 任何新 4 系列模型默认落入 Pro 门槛。`ensure_active_account`
+据此对 Free 号直接 403「模型需要 Google AI Studio Pro 订阅」。
+名称规则本应只是目录未命中时的兜底，却因前缀粒度反客为主。
+
+### 11.3 修复（按模型逐个归类，目录数据为第一权威）
+
+- `pro_required.contains` 移除 `gemini-4`，保留 `argon` 等具名规则；
+- `ultra_required.contains` 新增 `carbon`（目录 modes=[1,4] 实证 Ultra-only，
+  修正此前「carbon 属 Pro 级」的隐含假设 —— §8.4 当日 carbon 403 的
+  更优解释即 tier 拦截而非账号限流）；
+- tier_quotas 三处 `argon_models` 桶的 `gemini-4` 匹配词替换为 `carbon`
+  （免费 hydrogen 不进付费配额桶）；
+- model_defaults.py 内置默认规则与 conftest 测试配置同步上述变更；
+- 保底目录/补充模型收录 hydrogen（输出 65536 / 思考档 [1,2,3,5] 默认 3 /
+  flag13=1 / paid=False），思考默认档与输出钳制经既有目录元数据链路
+  自动传导（`browser_default_thinking_wire` / `browser_default_max_tokens`）。
+
+### 11.4 E2E 验证（完整服务 + 抓包账号 + SOCKS5 代理）
+
+| 实验 | 结果 |
+|---|---|
+| `/v1/models` 收录 hydrogen（38 模型，含 4 系全部） | 200 ✓ |
+| hydrogen generateContent · Pro 账号 | **200**，返回 `H2-E2E-OK`（thinking=high 默认档、max_tokens=65536 钳制均正确传导；attempts=2：mint 403 → 重放恢复 200，与 §9.7 既有结论一致） |
+| **hydrogen · 账号降为 Free 层级后（用户报障场景）** | **200 不拦截**，返回 `H2-FREE-PASS` ✓ |
+| 对照：argon · Free 层级 | **403「需要 Pro 订阅」**（付费门控未被误伤） |
+
+回归测试：`test_gemini_4_series_tier_gating_per_model`（hydrogen 全层级
+放行 / argon Pro+ / carbon Ultra-only）与保底目录元数据断言 2 项；
+全量 616 项通过，ruff / pyright 全绿。
