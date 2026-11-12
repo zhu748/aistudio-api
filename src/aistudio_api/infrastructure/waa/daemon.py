@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 
 from aistudio_api.infrastructure.gateway.model_defaults import (
     get_active_waa_server,
+    set_runtime_waa_override,
     switch_active_waa_server,
 )
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -144,6 +145,8 @@ def _fallback_to_remote(reason: str, *, bin_path: Path) -> None:
         bin_path,
         build_cmd,
     )
+    # 只读配置文件也必须让当前进程真正回退，避免继续请求已失败的本机端口。
+    set_runtime_waa_override("remote_spinsnow")
     try:
         switch_active_waa_server("remote_spinsnow")
     except OSError as e:
@@ -155,16 +158,21 @@ def _fallback_to_remote(reason: str, *, bin_path: Path) -> None:
         )
 
 
-def ensure_signer_ready() -> None:
+def ensure_signer_ready(*, server_url: str | None = None) -> str | None:
     """检查本地 WAA 签名服务状态，未运行时自动拉起或切换至远程节点。
 
     本函数含阻塞 I/O（探活/子进程等待），禁止直接在事件循环线程内调用，
     请使用 ``await asyncio.to_thread(ensure_signer_ready)``。
+    返回本地启动失败原因；指定 server_url 时仅准备该节点，不改变激活配置，
+    供面板测试未激活的本地节点使用。
     """
     global _daemon_proc
     with _daemon_lock:
-        active_waa = get_active_waa_server()
-        url = str(active_waa.get("url") or "")
+        url = (
+            server_url
+            if server_url is not None
+            else str(get_active_waa_server().get("url") or "")
+        )
 
         root_dir = Path(__file__).resolve().parents[4]
         bin_name = "waa-signer.exe" if sys.platform == "win32" else "waa-signer"
@@ -176,36 +184,38 @@ def ensure_signer_ready() -> None:
                 logger.info(
                     "检测到本地 WAA 签名服务已就绪 (%s)。当前配置为远程节点 [%s]，如需启用本地原生引擎可在 Web 控制台或 config.yaml 中切换为 local_spidermonkey",
                     bin_path.name,
-                    active_waa.get("id", "remote"),
+                    url,
                 )
-            return
+            return None
 
         # 1. 检查本地 8081 是否已有健康实例在运行
-        if is_service_healthy("http://127.0.0.1:8081"):
+        if is_service_healthy(url):
             logger.debug("本地 WAA 签名服务运行正常 (127.0.0.1:8081)")
-            return
+            return None
 
         # 端口已被其它进程占用但 /health 不通过：不要贸然再拉起一个实例
         # （会立刻因端口冲突退出）。但也绝不能就这么返回——那会让配置继续指向
         # 一个不可用的本地节点，后续所有签名请求都失败。这里直接回退远程节点，
         # 且不去停止/杀死占用端口的进程（它不在我们的管理范围内）。
         if is_port_open("127.0.0.1", 8081):
-            logger.warning(
+            reason = (
                 "端口 127.0.0.1:8081 已被占用，但 /health 探活失败；"
-                "已回退远程签名节点。请确认占用该端口的进程，"
-                "或释放端口后重启以启用本地签名引擎。"
+                "请确认占用该端口的进程，或释放端口后重试"
             )
-            try:
-                switch_active_waa_server("remote_spinsnow")
-            except OSError as e:
-                logger.warning("回退远程签名节点时写入 config.yaml 失败: %s", e)
-            return
+            if server_url is None:
+                _fallback_to_remote(reason, bin_path=bin_path)
+            return reason
 
         # 2. 检查本地编译产物是否存在
         is_executable = bin_path.is_file() and (
             sys.platform == "win32" or os.access(bin_path, os.X_OK)
         )
-        launch_failed = False
+        reason = (
+            f"本地签名器没有执行权限: {bin_path}，请为该文件添加执行权限"
+            if bin_path.is_file()
+            else f"未检测到本地 WAA 签名服务二进制产物: {bin_path}，"
+            "请运行 waa-signer 构建脚本，或重新构建包含本地签名器的 Docker 镜像"
+        )
         if is_executable:
             proxy = os.getenv("AISTUDIO_PROXY") or os.getenv("HTTPS_PROXY") or ""
             cmd = [str(bin_path), "-listen", "127.0.0.1:8081"]
@@ -218,12 +228,16 @@ def ensure_signer_ready() -> None:
                     "stdout": subprocess.PIPE,
                     "stderr": subprocess.STDOUT,
                     "cwd": str(bin_path.parent.parent),
+                    # PORT 属于 PaaS 主服务；旧版签名器在解析 -listen 前就
+                    # 检查它，显式覆盖默认监听地址也能兼容这些已有二进制。
+                    "env": {**os.environ, "LISTEN_ADDR": "127.0.0.1:8081"},
                 }
                 from aistudio_api.config import settings
 
                 if settings.signer_secret:
                     popen_kwargs["env"] = {
                         **os.environ,
+                        "LISTEN_ADDR": "127.0.0.1:8081",
                         "SIGNER_SHARED_SECRET": settings.signer_secret,
                     }
                 if sys.platform == "win32":
@@ -241,31 +255,31 @@ def ensure_signer_ready() -> None:
                     name="signer-logs",
                 ).start()
                 _daemon_proc = proc
-                # 等待检查就绪（最多 2 秒）
-                for _ in range(20):
-                    time.sleep(0.1)
-                    if is_service_healthy("http://127.0.0.1:8081"):
+                # 冷启动给 10 秒宽限；提前退出时立即报告退出码。
+                deadline = time.monotonic() + 10.0
+                reason = "本地 WAA 签名服务启动后 10 秒内未通过 /health 探活，请查看 waa.process 日志"
+                while time.monotonic() < deadline:
+                    returncode = proc.poll()
+                    if returncode is not None:
+                        reason = f"本地 WAA 签名服务提前退出（退出码 {returncode}），请查看 waa.process 日志"
+                        break
+                    if is_service_healthy(url):
                         logger.info("本地 WAA 签名服务已就绪 (PID %d)", proc.pid)
-                        return
-                launch_failed = True
-                logger.warning(
-                    "本地 WAA 签名服务启动后 2 秒内未通过探活，将回退远程节点"
-                )
+                        return None
+                    time.sleep(0.1)
+                logger.warning("%s", reason)
             except Exception as e:
-                launch_failed = True
-                logger.warning("启动本地 WAA 签名服务失败: %s", e)
+                reason = f"启动本地 WAA 签名服务失败: {e}"
+                logger.warning("%s", reason)
 
         # 3. 若无本地二进制或拉起失败，先回收子进程，再回退到远程签名节点
         #    （不回收会留下僵尸进程并长期占用 8081，导致后续重启无法绑定端口）。
         if _daemon_proc is not None:
             _stop_signer_daemon_locked()
 
-        reason = (
-            "本地 WAA 签名服务启动失败或未通过探活"
-            if launch_failed
-            else "未检测到本地 WAA 签名服务二进制产物"
-        )
-        _fallback_to_remote(reason, bin_path=bin_path)
+        if server_url is None:
+            _fallback_to_remote(reason, bin_path=bin_path)
+        return reason
 
 
 def _stop_signer_daemon_locked() -> None:
