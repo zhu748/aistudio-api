@@ -105,6 +105,7 @@ async def test_missing_h2_does_not_break_mock_request(monkeypatch):
     import httpx
 
     monkeypatch.setattr(transport_mod, "_h2_available", False)
+    monkeypatch.setattr(transport_mod.settings, "proxy_url", None)
 
     transport = HTTPStreamTransport(proxy_url=None, timeout=30.0)
 
@@ -114,12 +115,13 @@ async def test_missing_h2_does_not_break_mock_request(monkeypatch):
     mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     transport._clients[""] = mock_client
 
-    status, body = await transport.send_request(
-        url="https://example.com/api",
-        headers={"Content-Type": "application/json"},
-        body="{}",
-    )
-
-    assert status == 200
-    assert body == b'["ok"]'
-    await transport.close()
+    try:
+        status, body = await transport.send_request(
+            url="https://example.com/api",
+            headers={"Content-Type": "application/json"},
+            body="{}",
+        )
+        assert status == 200
+        assert body == b'["ok"]'
+    finally:
+        await transport.close()

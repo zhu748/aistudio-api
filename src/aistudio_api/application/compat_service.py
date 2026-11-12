@@ -41,6 +41,7 @@ from aistudio_api.api.schemas_compat import (
 )
 from aistudio_api.config import settings
 from aistudio_api.infrastructure.gateway.model_defaults import get_compat_settings
+from aistudio_api.infrastructure.request_context import record_result
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("compat")
@@ -1385,6 +1386,9 @@ async def openai_stream_adapter(
                             yield _sse(_chunk({"content": text}, None))
         except Exception as exc:
             saw_error = True
+            record_result(
+                "error", error=f"Stream conversion failed: {type(exc).__name__}: {exc}"
+            )
             logger.warning("OpenAI 流式转换异常: %s", exc)
             yield _sse(
                 _error_chunk(f"{type(exc).__name__}: {exc}", "internal_error", 500)
@@ -1724,6 +1728,9 @@ async def claude_stream_adapter(
                             yield event
     except Exception as exc:
         logger.warning("Claude 流式转换异常: %s", exc)
+        record_result(
+            "error", error=f"Stream conversion failed: {type(exc).__name__}: {exc}"
+        )
         for event in emitter.error(500, f"{type(exc).__name__}: {exc}"):
             yield event
         return

@@ -1,6 +1,16 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { LayoutDashboard, Users, Sliders, Key, LogOut, ScrollText, Terminal, Network, ListChecks } from 'lucide-vue-next'
+import {
+  LayoutDashboard,
+  Users,
+  Sliders,
+  Key,
+  LogOut,
+  ScrollText,
+  Terminal,
+  Network,
+  ListChecks,
+} from 'lucide-vue-next'
 import { useAuthStore } from '@/stores/auth.ts'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useRouter, useRoute } from 'vue-router'
@@ -19,18 +29,19 @@ const authStore = useAuthStore()
 const accountsStore = useAccountsStore()
 const router = useRouter()
 const route = useRoute()
-const { state: healthState } = useSystemHealth(15000)
+const { state: healthState, readiness } = useSystemHealth(30000)
 
 const accountCountBadge = computed(() => {
   const total = accountsStore.accountRows.length
   if (!total) return ''
-  const ready = accountsStore.accountRows.filter((a) => a.enabled !== false && a.is_available !== false && !a.session_expired).length
+  const ready = accountsStore.accountRows.filter(
+    (a) =>
+      a.enabled !== false && a.is_available !== false && a.availability !== 'partial' && !a.session_expired,
+  ).length
   return `${ready}/${total}`
 })
 
 const navItems = computed(() => [
-  { name: '请求记录', path: '/requests', icon: ListChecks, badge: '' },
-  { name: '代理与出口', path: '/proxies', icon: Network, badge: '' },
   {
     name: '控制面板',
     path: '/',
@@ -43,17 +54,14 @@ const navItems = computed(() => [
     icon: Users,
     badge: accountCountBadge.value,
   },
+  { name: '请求记录', path: '/requests', icon: ListChecks, badge: '' },
+  { name: '模型请求日志', path: '/logs', icon: ScrollText, badge: '实时' },
+  { name: '代理与出口', path: '/proxies', icon: Network, badge: '' },
   {
     name: '系统与协议配置',
     path: '/settings',
     icon: Sliders,
     badge: '',
-  },
-  {
-    name: '实时运行日志',
-    path: '/logs',
-    icon: ScrollText,
-    badge: 'SSE',
   },
 ])
 
@@ -86,7 +94,9 @@ function handleLogout() {
     <!-- Brand Identity Header -->
     <div class="h-14 px-4 border-b border-slate-100 flex items-center justify-between">
       <div class="flex items-center gap-2.5 min-w-0">
-        <div class="w-7 h-7 rounded-lg bg-slate-900 text-white flex items-center justify-center shadow-2xs shrink-0">
+        <div
+          class="w-7 h-7 rounded-lg bg-slate-900 text-white flex items-center justify-center shadow-2xs shrink-0"
+        >
           <Terminal class="w-3.5 h-3.5 text-brand-400" />
         </div>
         <div class="min-w-0">
@@ -122,7 +132,9 @@ function handleLogout() {
             <component
               :is="item.icon"
               class="w-4 h-4 shrink-0 transition-colors"
-              :class="route.path === item.path ? 'text-brand-400' : 'text-slate-400 group-hover:text-slate-600'"
+              :class="
+                route.path === item.path ? 'text-brand-400' : 'text-slate-400 group-hover:text-slate-600'
+              "
             />
             <span class="truncate">{{ item.name }}</span>
           </div>
@@ -130,11 +142,7 @@ function handleLogout() {
           <span
             v-if="item.badge"
             class="px-1.5 py-0.5 text-[10px] font-mono rounded tabular-nums shrink-0"
-            :class="
-              route.path === item.path
-                ? 'bg-slate-800 text-slate-200'
-                : 'bg-slate-100 text-slate-500'
-            "
+            :class="route.path === item.path ? 'bg-slate-800 text-slate-200' : 'bg-slate-100 text-slate-500'"
           >
             {{ item.badge }}
           </span>
@@ -147,15 +155,21 @@ function handleLogout() {
           已挂载协议端点
         </div>
         <div class="space-y-1.5 font-mono text-[11px]">
-          <div class="flex items-center justify-between px-2 py-1 rounded-md bg-slate-50 border border-slate-200/60 text-slate-600">
+          <div
+            class="flex items-center justify-between px-2 py-1 rounded-md bg-slate-50 border border-slate-200/60 text-slate-600"
+          >
             <span class="text-slate-400">Gemini</span>
             <span class="text-slate-800 font-medium">/v1beta</span>
           </div>
-          <div class="flex items-center justify-between px-2 py-1 rounded-md bg-slate-50 border border-slate-200/60 text-slate-600">
+          <div
+            class="flex items-center justify-between px-2 py-1 rounded-md bg-slate-50 border border-slate-200/60 text-slate-600"
+          >
             <span class="text-slate-400">OpenAI</span>
             <span class="text-slate-800 font-medium">/v1/chat/*</span>
           </div>
-          <div class="flex items-center justify-between px-2 py-1 rounded-md bg-slate-50 border border-slate-200/60 text-slate-600">
+          <div
+            class="flex items-center justify-between px-2 py-1 rounded-md bg-slate-50 border border-slate-200/60 text-slate-600"
+          >
             <span class="text-slate-400">Claude</span>
             <span class="text-slate-800 font-medium">/v1/messages</span>
           </div>
@@ -178,7 +192,14 @@ function handleLogout() {
         <span class="text-[10px] text-slate-400 font-mono">管理</span>
       </button>
 
-      <div class="flex items-center justify-between px-2.5 py-2 bg-white border border-slate-200/80 rounded-lg text-xs">
+      <div
+        class="flex items-center justify-between px-2.5 py-2 bg-white border border-slate-200/80 rounded-lg text-xs"
+        :title="
+          readiness
+            ? `可用账号 ${readiness.available_accounts} · 签名服务${readiness.signer_ok ? '就绪' : '不可用'}`
+            : '检查服务与模型调用条件'
+        "
+      >
         <div class="flex items-center gap-2 min-w-0">
           <span
             class="w-2 h-2 rounded-full shrink-0 transition-colors"
@@ -186,10 +207,19 @@ function handleLogout() {
               'bg-emerald-500 animate-pulse': healthState === 'online',
               'bg-rose-500': healthState === 'offline',
               'bg-amber-400 animate-pulse': healthState === 'checking',
+              'bg-amber-500': healthState === 'degraded',
             }"
           />
           <span class="font-medium text-slate-700 truncate">
-            {{ healthState === 'online' ? '网关服务在线' : healthState === 'offline' ? '网关服务离线' : '健康探测中…' }}
+            {{
+              healthState === 'online'
+                ? '模型服务就绪'
+                : healthState === 'degraded'
+                  ? '在线 · 尚未就绪'
+                  : healthState === 'offline'
+                    ? '网关服务离线'
+                    : '健康探测中…'
+            }}
           </span>
         </div>
 

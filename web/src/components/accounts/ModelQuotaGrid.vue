@@ -23,7 +23,7 @@ function getModelDetail(modelKey: string): ModelDailyDetail | null {
     <div class="flex items-center justify-between text-[11px] font-semibold text-slate-700">
       <span class="flex items-center gap-1.5">
         <Flame class="w-3.5 h-3.5 text-brand-600" />
-        <span>模型今日配额消耗矩阵</span>
+        <span>模型今日用量 · 本地参考额度</span>
       </span>
       <span class="text-slate-400 font-normal font-mono tabular-nums">
         最近活跃: {{ formatDate(account.last_used) }}
@@ -48,8 +48,12 @@ function getModelDetail(modelKey: string): ModelDailyDetail | null {
               {{ String(modelKey).replace(/^models\//, '') }}
             </span>
             <div class="shrink-0 flex items-center gap-1">
+              <span
+                v-if="account.enabled === false || account.session_expired"
+                class="text-xs text-slate-500"
+              >{{ account.enabled === false ? '已停用' : '凭据失效' }}</span>
               <button
-                v-if="account.model_cooldowns && account.model_cooldowns[String(modelKey)]"
+                v-else-if="account.model_cooldowns && account.model_cooldowns[String(modelKey)]"
                 type="button"
                 class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-rose-50 text-rose-700 hover:bg-rose-100 border border-rose-200 cursor-pointer flex items-center gap-0.5"
                 title="点击重置该模型锁定"
@@ -85,7 +89,8 @@ function getModelDetail(modelKey: string): ModelDailyDetail | null {
             class="mt-2 space-y-1 font-mono text-[10px]"
           >
             <div class="flex justify-between text-slate-500">
-              <span>今日调用 <strong class="text-slate-800">{{ reqCount }}</strong> / {{ getModelDetail(String(modelKey))!.configured_quota }}</span>
+              <span>调度调用 <strong class="text-slate-800">{{ reqCount }}</strong> / 参考
+                {{ getModelDetail(String(modelKey))!.configured_quota }}</span>
               <span>{{ Math.round(getModelDetail(String(modelKey))!.quota_used_percent) }}%</span>
             </div>
             <div class="w-full bg-slate-100 rounded-full h-1.5 overflow-hidden">
@@ -98,7 +103,9 @@ function getModelDetail(modelKey: string): ModelDailyDetail | null {
                       ? 'bg-amber-400'
                       : 'bg-brand-500',
                 ]"
-                :style="{ width: `${Math.min(100, Math.round(getModelDetail(String(modelKey))!.quota_used_percent))}%` }"
+                :style="{
+                  width: `${Math.min(100, Math.round(getModelDetail(String(modelKey))!.quota_used_percent))}%`,
+                }"
               />
             </div>
           </div>
@@ -110,9 +117,24 @@ function getModelDetail(modelKey: string): ModelDailyDetail | null {
           </div>
         </div>
 
+        <div
+          v-if="getModelDetail(String(modelKey))"
+          class="text-xs text-slate-500 flex flex-wrap gap-x-3 gap-y-1"
+        >
+          <span>成功 {{ getModelDetail(String(modelKey))!.success }}</span><span>今日 429 {{ getModelDetail(String(modelKey))!.rate_limited }}</span><span>错误 {{ getModelDetail(String(modelKey))!.errors }}</span><router-link
+            :to="{ path: '/requests', query: { model: String(modelKey), account_id: account.id } }"
+            class="text-brand-700 hover:underline"
+          >
+            请求记录 ↗
+          </router-link>
+        </div>
         <!-- Token breakdown pills if available -->
         <div
-          v-if="getModelDetail(String(modelKey)) && (getModelDetail(String(modelKey))!.reasoning_tokens > 0 || getModelDetail(String(modelKey))!.cached_tokens > 0)"
+          v-if="
+            getModelDetail(String(modelKey)) &&
+              (getModelDetail(String(modelKey))!.reasoning_tokens > 0 ||
+                getModelDetail(String(modelKey))!.cached_tokens > 0)
+          "
           class="pt-1.5 border-t border-slate-100 flex items-center gap-1.5 flex-wrap font-mono text-[10px]"
         >
           <span

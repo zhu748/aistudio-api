@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -27,7 +28,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from aistudio_api.infrastructure.request_context import current_request
+from aistudio_api.infrastructure.request_context import log_context
 from aistudio_api.infrastructure.utils.common import atomic_write_json
 from aistudio_api.infrastructure.utils.redaction import redact_text
 
@@ -73,7 +74,10 @@ class RingBufferHandler(logging.Handler):
                 "level": record.levelname,
                 "name": record.name,
                 "message": message,
-                "request_id": getattr(record, "request_id", ""),
+                **{
+                    key: getattr(record, key, value)
+                    for key, value in log_context().items()
+                },
             }
             with _log_ring_lock:
                 _log_ring.append(entry)
@@ -103,32 +107,64 @@ def get_recent_logs(
     limit: int = 300,
     search: str | None = None,
     order: str = "desc",
+    category: str = "all",
+    request_id: str = "",
+    model: str = "",
+    account_id: str = "",
 ) -> list[dict[str, object]]:
     """读取环形缓冲中的最近日志，支持级别过滤与关键字检索。
 
     ``order='desc'`` 时最新日志排在最前（面板默认），``asc`` 按时间正序。
     """
-    min_no = _LEVEL_ORDER.get(str(min_level).strip().upper(), logging.INFO)
-    needle = (search or "").strip().lower()
     # 锁内快照：避免迭代期间其他线程 append 触发
     # "deque mutated during iteration" RuntimeError
     with _log_ring_lock:
         snapshot = list(_log_ring)
     matched: list[dict[str, object]] = []
     for entry in snapshot:
-        if _LEVEL_ORDER.get(str(entry.get("level")), logging.INFO) < min_no:
+        if not matches_log_entry(
+            entry,
+            min_level=min_level,
+            search=search or "",
+            category=category,
+            request_id=request_id,
+            model=model,
+            account_id=account_id,
+        ):
             continue
-        if needle:
-            haystack = (
-                f"{entry.get('message', '')} {entry.get('name', '')} "
-                f"{entry.get('level', '')}"
-            ).lower()
-            if needle not in haystack:
-                continue
         matched.append(entry)
     if str(order).strip().lower() == "asc":
         return matched[-limit:]
     return list(reversed(matched))[:limit]
+
+
+def matches_log_entry(
+    entry: dict[str, object],
+    *,
+    min_level: str = "INFO",
+    search: str = "",
+    category: str = "all",
+    request_id: str = "",
+    model: str = "",
+    account_id: str = "",
+) -> bool:
+    if not passes_min_level(str(entry.get("level", "INFO")), min_level):
+        return False
+    if category in ("model", "system") and entry.get("category", "system") != category:
+        return False
+    if request_id and entry.get("request_id") != request_id:
+        return False
+    if account_id and entry.get("account_id") != account_id:
+        return False
+    if model and str(entry.get("model", "")).removeprefix(
+        "models/"
+    ) != model.removeprefix("models/"):
+        return False
+    return (
+        not search
+        or search.strip().lower()
+        in " ".join(str(value) for value in entry.values()).lower()
+    )
 
 
 def clear_recent_logs() -> int:
@@ -228,10 +264,8 @@ class UnifiedFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         record.msg = redact_text(record.getMessage())
         record.args = ()
-        context = current_request.get()
-        record.request_id = getattr(record, "request_id", "") or (
-            context.request_id if context else ""
-        )
+        for key, value in log_context().items():
+            setattr(record, key, getattr(record, key, "") or value)
         orig_levelname = record.levelname
         if self.use_color and record.levelname in _COLORS:
             color = _COLORS[record.levelname]
@@ -622,6 +656,8 @@ def _mask_json_value(value: object) -> object:
     用于请求/响应体，避免 Authorization/Cookie/API Key 等凭据随 Dump
     落到控制台、内存环形缓冲（/api/logs、SSE）或磁盘文件。
     """
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     if isinstance(value, dict):
         return {
             str(k): (

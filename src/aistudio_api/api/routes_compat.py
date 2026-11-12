@@ -37,6 +37,10 @@ from aistudio_api.application.compat_service import (
     openai_to_gemini_request,
 )
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
+from aistudio_api.infrastructure.request_context import (
+    current_request,
+    record_requested_parameters,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 from .routes_gemini import _parse_anti_truncation_header
@@ -118,6 +122,19 @@ async def openai_chat_completions(
     client: AIStudioClient = Depends(get_client),
 ):
     """OpenAI Chat Completions 兼容端点。"""
+    record_requested_parameters(
+        {
+            "reasoning_effort": req.reasoning_effort,
+            "temperature": req.temperature,
+            "top_p": req.top_p,
+            "max_tokens": req.max_tokens,
+            "max_completion_tokens": req.max_completion_tokens,
+        }
+    )
+    observation = current_request.get()
+    if observation is not None:
+        observation.requested_model = req.model
+        observation.is_stream = req.stream
     try:
         gemini_req, resolved_model = await openai_to_gemini_request(req)
     except ValueError as exc:
@@ -171,6 +188,19 @@ async def claude_messages(
     client: AIStudioClient = Depends(get_client),
 ):
     """Anthropic Claude Messages 兼容端点。"""
+    record_requested_parameters(
+        {
+            "thinking": req.thinking,
+            "temperature": req.temperature,
+            "top_p": req.top_p,
+            "top_k": req.top_k,
+            "max_tokens": req.max_tokens,
+        }
+    )
+    observation = current_request.get()
+    if observation is not None:
+        observation.requested_model = req.model
+        observation.is_stream = req.stream
     try:
         gemini_req, resolved_model = await claude_to_gemini_request(req)
     except ValueError as exc:

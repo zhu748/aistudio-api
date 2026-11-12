@@ -25,6 +25,8 @@ const props = defineProps<{
   active: boolean
   activating?: boolean
   forceExpanded?: boolean
+  selectable?: boolean
+  selected?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -33,6 +35,8 @@ const emit = defineEmits<{
   editName: []
   clearCooldown: []
   clearModel: [model: string]
+  select: []
+  details: []
 }>()
 
 const modelsExpanded = ref(false)
@@ -141,6 +145,14 @@ async function handleDetectTier() {
     <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-2.5">
       <!-- Left Zone: Switch + Index + Identity + Badges -->
       <div class="flex items-center gap-2.5 min-w-0 flex-wrap sm:flex-nowrap">
+        <input
+          v-if="selectable"
+          type="checkbox"
+          :checked="selected"
+          :aria-label="`选择账号 ${account.email || account.name || account.id}`"
+          class="accent-brand-600 w-4 h-4"
+          @change="emit('select')"
+        >
         <!-- Enable/Disable Switch -->
         <button
           type="button"
@@ -148,7 +160,10 @@ async function handleDetectTier() {
           :aria-checked="isEnabled"
           :disabled="togglingEnabled"
           class="relative inline-flex h-4.5 w-8 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none"
-          :class="[isEnabled ? 'bg-brand-600' : 'bg-slate-300', { 'opacity-50 cursor-wait': togglingEnabled }]"
+          :class="[
+            isEnabled ? 'bg-brand-600' : 'bg-slate-300',
+            { 'opacity-50 cursor-wait': togglingEnabled },
+          ]"
           title="启用或禁用此账号参与网关调度"
           @click="handleToggleEnabled"
         >
@@ -177,9 +192,13 @@ async function handleDetectTier() {
         <!-- Primary Identity & Secondary Meta -->
         <div class="min-w-0 flex-1">
           <div class="flex items-center gap-1.5 flex-wrap">
-            <span class="font-semibold text-slate-900 text-xs truncate max-w-[220px]">
+            <button
+              class="font-semibold text-slate-900 hover:text-brand-700 text-sm truncate max-w-[260px] cursor-pointer text-left"
+              title="查看账号详情与最近调用"
+              @click="emit('details')"
+            >
               {{ account.email || account.name || 'Google Account' }}
-            </span>
+            </button>
 
             <button
               type="button"
@@ -273,7 +292,10 @@ async function handleDetectTier() {
       <!-- Right Zone: Telemetry Readout + Status Pill + Action Cluster -->
       <div class="flex items-center justify-between lg:justify-end gap-2.5 shrink-0 flex-wrap">
         <!-- Tabular Telemetry -->
-        <div class="flex items-center gap-2 text-xs font-mono tabular-nums">
+        <div
+          class="flex items-center gap-2 text-xs font-mono tabular-nums"
+          title="账号调用数含调度重试事件，最终客户端调用请查看请求记录"
+        >
           <span class="text-slate-600">今日 <strong class="text-slate-900">{{ todayRequests }}</strong></span>
           <span class="text-slate-300">·</span>
           <span class="text-slate-500">累计 <strong class="text-slate-700">{{ account.requests || 0 }}</strong></span>
@@ -307,18 +329,18 @@ async function handleDetectTier() {
           <span>凭据失效</span>
         </div>
         <div
-          v-else-if="active"
+          v-else-if="active && account.availability !== 'partial'"
           class="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200"
         >
           <CheckCircle2 class="w-3 h-3" />
           <span>当前激活</span>
         </div>
         <div
-          v-else-if="account.is_available === false"
+          v-else-if="account.availability === 'partial' || account.is_available === false"
           class="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-md border border-amber-200"
         >
           <Clock class="w-3 h-3" />
-          <span>配额受限</span>
+          <span>{{ active ? '当前激活 · 模型冷却' : '部分模型冷却' }}</span>
         </div>
         <div
           v-else

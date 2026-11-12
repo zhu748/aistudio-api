@@ -186,7 +186,9 @@ async def test_stream_protocol_ready_snapshot_live_and_cleanup():
     marker = "SSE_LIVE_MARKER_a1b2"
     baseline = get_log_subscriber_count()
 
-    resp = await stream_runtime_logs(request=_make_stream_request(), level="INFO")
+    resp = await stream_runtime_logs(
+        request=_make_stream_request(), level="INFO", category="all"
+    )
     assert resp.media_type == "text/event-stream"
     assert resp.headers["cache-control"] == "no-cache"
     agen = cast(AsyncGenerator[str, None], resp.body_iterator)
@@ -245,7 +247,7 @@ async def test_stream_level_filter_blocks_lower_levels():
     baseline = get_log_subscriber_count()
 
     resp = await stream_runtime_logs(
-        request=_make_stream_request(), level="WARNING", limit=5
+        request=_make_stream_request(), level="WARNING", limit=5, category="all"
     )
     agen = cast(AsyncGenerator[str, None], resp.body_iterator)
     collected: list[str] = []
