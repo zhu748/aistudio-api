@@ -196,12 +196,14 @@ def _cached_model_info_for(model: str) -> Mapping[str, object] | None:
 
 
 # 思考档位逻辑顺序（数值与逻辑序不同：MINIMAL=4 但强度最低）。
-# 与 AI Studio 前端 pmi() 映射一致。
+# 与 AI Studio 前端 pmi() 映射一致；VERY_HIGH(5) 为 2026-11 目录实测新档，
+# 强度序在 HIGH 之上（gemini-4-hydrogen 的 thinkingLevels=[1,2,3,5]）。
 _THINKING_LEVEL_ORDER: tuple[ThinkingLevel, ...] = (
     ThinkingLevel.MINIMAL,
     ThinkingLevel.LOW,
     ThinkingLevel.MEDIUM,
     ThinkingLevel.HIGH,
+    ThinkingLevel.VERY_HIGH,
 )
 
 

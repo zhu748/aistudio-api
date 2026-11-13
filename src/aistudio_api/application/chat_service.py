@@ -339,6 +339,9 @@ _REASONING_EFFORT_TO_LEVEL: dict[str, ThinkingLevel] = {
     "LOW": ThinkingLevel.LOW,
     "MEDIUM": ThinkingLevel.MEDIUM,
     "HIGH": ThinkingLevel.HIGH,
+    # 2026-11 目录实测新档（gemini-4-hydrogen thinkingLevels=[1,2,3,5]）；
+    # openai/claude 兼容层透传 very_high 文本，此处按 upper 后带下划线命中。
+    "VERY_HIGH": ThinkingLevel.VERY_HIGH,
 }
 
 
@@ -354,6 +357,11 @@ def _parse_thinking_level(raw_level: object) -> ThinkingLevel | None:
         return None
     if label in _REASONING_EFFORT_TO_LEVEL:
         return _REASONING_EFFORT_TO_LEVEL[label]
+    # 分隔符变体兼容：VERY_HIGH / VERY-HIGH / VERYHIGH 等写法统一命中。
+    compact = label.replace("_", "").replace("-", "")
+    for key, value in _REASONING_EFFORT_TO_LEVEL.items():
+        if key.replace("_", "") == compact:
+            return value
     return ThinkingLevel[label]
 
 
