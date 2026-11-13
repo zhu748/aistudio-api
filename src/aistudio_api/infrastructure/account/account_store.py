@@ -291,6 +291,8 @@ class AccountStore:
         # {"accounts": {}} 写回磁盘。该标志让「拒绝静默清空」在所有后续调用
         # 中持续生效，直到人工恢复文件并重启。
         self._corrupt_registry: bool = False
+        # presets.json 同款损坏标记：隔离后拒绝静默回退/覆盖（见 _load_presets）
+        self._corrupt_presets: bool = False
         self._ensure_dirs()
         self._ensure_default_presets()
         self._initialized = True
@@ -447,24 +449,27 @@ class AccountStore:
 
     def get_active_account(self) -> AccountMeta | None:
         """获取当前活跃账号，若未设置或已被禁用则回退到首个可用账号。"""
-        registry = self._load_registry()
-        if (
-            registry.active_account_id
-            and registry.active_account_id in registry.accounts
-        ):
-            active = registry.accounts[registry.active_account_id]
-            if active.enabled:
-                return active
-        if registry.accounts:
-            first_enabled = next(
-                (acc for acc in registry.accounts.values() if acc.enabled),
-                None,
-            )
-            if first_enabled is not None:
-                registry.active_account_id = first_enabled.id
-                self._save_registry(registry)
-                return first_enabled
-        return None
+        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
+        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
+        with self._lock:
+            registry = self._load_registry()
+            if (
+                registry.active_account_id
+                and registry.active_account_id in registry.accounts
+            ):
+                active = registry.accounts[registry.active_account_id]
+                if active.enabled:
+                    return active
+            if registry.accounts:
+                first_enabled = next(
+                    (acc for acc in registry.accounts.values() if acc.enabled),
+                    None,
+                )
+                if first_enabled is not None:
+                    registry.active_account_id = first_enabled.id
+                    self._save_registry(registry)
+                    return first_enabled
+            return None
 
     def get_active_auth_path(self) -> Path | None:
         """获取当前活跃账号的 auth.json 路径。"""
@@ -475,17 +480,20 @@ class AccountStore:
 
     def set_active_account(self, account_id: str) -> AccountMeta | None:
         """设置活跃账号，返回账号元数据或 None（如果不存在）。"""
-        registry = self._load_registry()
-        acc = self._find_registered_account(registry, account_id)
-        if acc is None:
-            return None
-        changed = registry.active_account_id != acc.id
-        registry.active_account_id = acc.id
-        now = datetime.now(UTC).isoformat()
-        acc.last_used = now
-        if changed:
-            self._save_registry(registry)
-        return acc
+        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
+        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
+        with self._lock:
+            registry = self._load_registry()
+            acc = self._find_registered_account(registry, account_id)
+            if acc is None:
+                return None
+            changed = registry.active_account_id != acc.id
+            registry.active_account_id = acc.id
+            now = datetime.now(UTC).isoformat()
+            acc.last_used = now
+            if changed:
+                self._save_registry(registry)
+            return acc
 
     def save_account(
         self,
@@ -651,75 +659,87 @@ class AccountStore:
 
     def update_account(self, account_id: str, name: str) -> AccountMeta | None:
         """更新账号名称。"""
-        registry = self._load_registry()
-        acc = self._find_registered_account(registry, account_id)
-        if acc is None:
-            return None
-        acc.name = name
-        # 同步更新 meta.json
-        account_dir = _safe_account_dir(self._accounts_dir, acc.id)
-        meta_path = account_dir / "meta.json"
-        if meta_path.exists():
-            _atomic_write_json(meta_path, acc.to_dict())
-        self._save_registry(registry)
-        return acc
+        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
+        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
+        with self._lock:
+            registry = self._load_registry()
+            acc = self._find_registered_account(registry, account_id)
+            if acc is None:
+                return None
+            acc.name = name
+            # 同步更新 meta.json
+            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+            meta_path = account_dir / "meta.json"
+            if meta_path.exists():
+                _atomic_write_json(meta_path, acc.to_dict())
+            self._save_registry(registry)
+            return acc
 
     def update_account_email(self, account_id: str, email: str) -> bool:
         """更新账号的登录邮箱，并持久化 meta.json 与 registry.json。"""
-        registry = self._load_registry()
-        acc = self._find_registered_account(registry, account_id)
-        if acc is None or acc.email == email:
-            return False
-        acc.email = email
-        account_dir = _safe_account_dir(self._accounts_dir, acc.id)
-        meta_path = account_dir / "meta.json"
-        if meta_path.exists():
-            _atomic_write_json(meta_path, acc.to_dict())
-        self._save_registry(registry)
-        return True
+        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
+        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
+        with self._lock:
+            registry = self._load_registry()
+            acc = self._find_registered_account(registry, account_id)
+            if acc is None or acc.email == email:
+                return False
+            acc.email = email
+            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+            meta_path = account_dir / "meta.json"
+            if meta_path.exists():
+                _atomic_write_json(meta_path, acc.to_dict())
+            self._save_registry(registry)
+            return True
 
     def update_account_proxy(self, account_id: str, proxy_url: str | None) -> bool:
         """更新账号的独立出口代理（None 表示回退全局代理），并持久化 meta.json 与 registry.json。"""
-        from aistudio_api.infrastructure.account.cookie_parser import (
-            normalize_proxy_url,
-        )
+        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
+        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
+        with self._lock:
+            from aistudio_api.infrastructure.account.cookie_parser import (
+                normalize_proxy_url,
+            )
 
-        clean_proxy = normalize_proxy_url(proxy_url)
-        registry = self._load_registry()
-        acc = self._find_registered_account(registry, account_id)
-        if acc is None or acc.proxy_url == clean_proxy:
-            return False
-        acc.proxy_url = clean_proxy
-        account_dir = _safe_account_dir(self._accounts_dir, acc.id)
-        meta_path = account_dir / "meta.json"
-        if meta_path.exists():
-            _atomic_write_json(meta_path, acc.to_dict())
-        self._save_registry(registry)
-        return True
+            clean_proxy = normalize_proxy_url(proxy_url)
+            registry = self._load_registry()
+            acc = self._find_registered_account(registry, account_id)
+            if acc is None or acc.proxy_url == clean_proxy:
+                return False
+            acc.proxy_url = clean_proxy
+            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+            meta_path = account_dir / "meta.json"
+            if meta_path.exists():
+                _atomic_write_json(meta_path, acc.to_dict())
+            self._save_registry(registry)
+            return True
 
     def update_account_tier(
         self, account_id: str, tier: str, checked_at: float | None = None
     ) -> bool:
         """更新账号的订阅权益等级 (Free / Pro / Ultra / Ultra_20X / Plus)，并持久化 meta.json 与 registry.json。"""
-        from aistudio_api.infrastructure.account.cookie_parser import (
-            normalize_benefit_tier,
-        )
+        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
+        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
+        with self._lock:
+            from aistudio_api.infrastructure.account.cookie_parser import (
+                normalize_benefit_tier,
+            )
 
-        registry = self._load_registry()
-        acc = self._find_registered_account(registry, account_id)
-        if acc is None:
-            return False
-        clean_tier = normalize_benefit_tier(tier)
-        changed = acc.tier != clean_tier
-        acc.tier = clean_tier
-        if checked_at is not None:
-            acc.tier_checked_at = checked_at
-        account_dir = _safe_account_dir(self._accounts_dir, acc.id)
-        meta_path = account_dir / "meta.json"
-        if meta_path.exists():
-            _atomic_write_json(meta_path, acc.to_dict())
-        self._save_registry(registry)
-        return changed
+            registry = self._load_registry()
+            acc = self._find_registered_account(registry, account_id)
+            if acc is None:
+                return False
+            clean_tier = normalize_benefit_tier(tier)
+            changed = acc.tier != clean_tier
+            acc.tier = clean_tier
+            if checked_at is not None:
+                acc.tier_checked_at = checked_at
+            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+            meta_path = account_dir / "meta.json"
+            if meta_path.exists():
+                _atomic_write_json(meta_path, acc.to_dict())
+            self._save_registry(registry)
+            return changed
 
     def _sync_sibling_cookies_locked(self, registry: Registry) -> bool:
         """同步共享同一浏览器会话 (SAPISID / SID) 的多登兄弟账号 (u/0..u/N) 的滚动 Cookie。"""
@@ -749,6 +769,7 @@ class AccountStore:
         for group in groups.values():
             if len(group) <= 1:
                 continue
+
             # 按是否存在 __Secure-1PSIDTS 以及最近轮换时间排序（最旧在前，最新在后，后者覆盖前者）。
             # last_rotated_at 为 None 表示「从未后台轮换」——通常是刚导入的新鲜
             # Cookie；归一为 0.0 会把它排在最旧、被库内陈旧轮换值覆盖并固化。
@@ -946,46 +967,55 @@ class AccountStore:
         self, account_id: str, enabled: bool | None = None
     ) -> AccountMeta | None:
         """切换账号的启用/禁用状态。若未指定 enabled 则取反。"""
-        registry = self._load_registry()
-        acc = self._find_registered_account(registry, account_id)
-        if acc is None:
-            return None
-        acc.enabled = not acc.enabled if enabled is None else bool(enabled)
-        account_dir = _safe_account_dir(self._accounts_dir, acc.id)
-        meta_path = account_dir / "meta.json"
-        if meta_path.exists():
-            _atomic_write_json(meta_path, acc.to_dict())
-        self._save_registry(registry)
-        return acc
+        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
+        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
+        with self._lock:
+            registry = self._load_registry()
+            acc = self._find_registered_account(registry, account_id)
+            if acc is None:
+                return None
+            acc.enabled = not acc.enabled if enabled is None else bool(enabled)
+            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+            meta_path = account_dir / "meta.json"
+            if meta_path.exists():
+                _atomic_write_json(meta_path, acc.to_dict())
+            self._save_registry(registry)
+            return acc
 
     def update_account_group(self, account_id: str, group: str) -> AccountMeta | None:
         """更新账号所属业务分组。"""
-        registry = self._load_registry()
-        acc = self._find_registered_account(registry, account_id)
-        if acc is None:
-            return None
-        clean_group = str(group or "default").strip() or "default"
-        acc.group = clean_group
-        account_dir = _safe_account_dir(self._accounts_dir, acc.id)
-        meta_path = account_dir / "meta.json"
-        if meta_path.exists():
-            _atomic_write_json(meta_path, acc.to_dict())
-        self._save_registry(registry)
-        return acc
+        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
+        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
+        with self._lock:
+            registry = self._load_registry()
+            acc = self._find_registered_account(registry, account_id)
+            if acc is None:
+                return None
+            clean_group = str(group or "default").strip() or "default"
+            acc.group = clean_group
+            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+            meta_path = account_dir / "meta.json"
+            if meta_path.exists():
+                _atomic_write_json(meta_path, acc.to_dict())
+            self._save_registry(registry)
+            return acc
 
     def update_account_notes(self, account_id: str, notes: str) -> AccountMeta | None:
         """更新账号运维备注信息。"""
-        registry = self._load_registry()
-        acc = self._find_registered_account(registry, account_id)
-        if acc is None:
-            return None
-        acc.notes = str(notes or "")
-        account_dir = _safe_account_dir(self._accounts_dir, acc.id)
-        meta_path = account_dir / "meta.json"
-        if meta_path.exists():
-            _atomic_write_json(meta_path, acc.to_dict())
-        self._save_registry(registry)
-        return acc
+        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
+        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
+        with self._lock:
+            registry = self._load_registry()
+            acc = self._find_registered_account(registry, account_id)
+            if acc is None:
+                return None
+            acc.notes = str(notes or "")
+            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+            meta_path = account_dir / "meta.json"
+            if meta_path.exists():
+                _atomic_write_json(meta_path, acc.to_dict())
+            self._save_registry(registry)
+            return acc
 
     def list_groups(self) -> list[str]:
         """获取当前所有账号中存在的不重复分组列表。"""
@@ -997,23 +1027,30 @@ class AccountStore:
 
     def batch_toggle_group(self, group: str, enabled: bool) -> list[AccountMeta]:
         """按分组批量启用或禁用账号。"""
-        registry = self._load_registry()
-        modified: list[AccountMeta] = []
-        for acc in registry.accounts.values():
-            if acc.group == group:
-                acc.enabled = enabled
-                account_dir = _safe_account_dir(self._accounts_dir, acc.id)
-                meta_path = account_dir / "meta.json"
-                if meta_path.exists():
-                    _atomic_write_json(meta_path, acc.to_dict())
-                modified.append(acc)
-        if modified:
-            self._save_registry(registry)
-        return modified
+        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
+        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
+        with self._lock:
+            registry = self._load_registry()
+            modified: list[AccountMeta] = []
+            for acc in registry.accounts.values():
+                if acc.group == group:
+                    acc.enabled = enabled
+                    account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+                    meta_path = account_dir / "meta.json"
+                    if meta_path.exists():
+                        _atomic_write_json(meta_path, acc.to_dict())
+                    modified.append(acc)
+            if modified:
+                self._save_registry(registry)
+            return modified
 
-    # ─── 预设方案 (Presets) 管理 ───
+        # ─── 预设方案 (Presets) 管理 ───
+
     def _ensure_default_presets(self) -> None:
-        if self._presets_path.exists():
+        # 隔离标记检查：坏文件被隔离后文件不存在 ≠ 首次启动，
+        # 此处重建默认文件会破坏「拒绝静默清空」契约（_load_presets
+        # 的持久标记会被这份新写的默认文件掩盖）。
+        if self._presets_path.exists() or self._has_corrupt_presets_marker():
             return
         defaults = {p.id: p for p in _load_system_presets_from_config()}
         if defaults:
@@ -1024,7 +1061,20 @@ class AccountStore:
             if self._presets is not None:
                 return self._presets
             sys_presets = _load_system_presets_from_config()
+            if self._corrupt_presets:
+                # 与 registry.json 同一契约：坏文件已被隔离，继续失败，
+                # 否则回退态（仅系统预设）会被 _save_presets 全量写回。
+                raise RuntimeError(
+                    "预设文件 presets.json 此前已判定损坏并被隔离；"
+                    "请人工恢复备份后重启（拒绝静默清空以免丢失全部自定义预设）"
+                )
             if not self._presets_path.exists():
+                if self._has_corrupt_presets_marker():
+                    self._corrupt_presets = True
+                    raise RuntimeError(
+                        "预设文件 presets.json 已被隔离但尚未人工恢复；"
+                        "请恢复备份后重启（拒绝静默清空以免丢失全部自定义预设）"
+                    )
                 defaults = {p.id: p for p in sys_presets}
                 if defaults:
                     self._save_presets(defaults)
@@ -1041,12 +1091,61 @@ class AccountStore:
                     if sys_p.id not in presets or presets[sys_p.id].is_system:
                         presets[sys_p.id] = sys_p
                 self._presets = presets
-            except Exception:
-                self._presets = {p.id: p for p in sys_presets}
+            except Exception as e:
+                # 损坏/不可解析绝不静默回退系统预设：那样下一次
+                # _save_presets 会把回退态写盘，永久抹掉全部自定义预设。
+                # 照抄 registry 的「隔离 + 拒绝覆盖」契约。
+                self._corrupt_presets = True
+                self._quarantine_corrupt_presets(e)
+                raise RuntimeError(
+                    "预设文件 presets.json 损坏，已隔离备份；"
+                    "请人工恢复后重启（拒绝静默清空以免丢失全部自定义预设）"
+                ) from e
             return self._presets
+
+    def _has_corrupt_presets_marker(self) -> bool:
+        """目录里是否残留 presets 的隔离备份（跨重启的持久损坏标记）。"""
+        try:
+            return any(
+                p.name.startswith(".corrupt.") and p.name.endswith(".presets.json")
+                for p in self._presets_path.parent.glob(".corrupt.*.presets.json")
+            )
+        except OSError:
+            return False
+
+    def _quarantine_corrupt_presets(self, error: Exception) -> None:
+        """把损坏的 presets.json 改名隔离，避免下次 _save_presets 覆盖它。"""
+        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
+        for suffix in range(16):
+            name = (
+                f".corrupt.{stamp}.presets.json"
+                if suffix == 0
+                else f".corrupt.{stamp}.{suffix}.presets.json"
+            )
+            backup = self._presets_path.parent / name
+            if backup.exists():
+                continue
+            try:
+                shutil.move(str(self._presets_path), str(backup))
+            except Exception:
+                # 隔离失败也不能掩盖原始错误；仍由调用方抛出 RuntimeError
+                return
+            logging.getLogger("account_store").error(
+                "presets.json 解析失败(%s)，已隔离到 %s；请人工恢复",
+                type(error).__name__,
+                backup.name,
+            )
+            return
 
     def _save_presets(self, presets: dict[str, AccountPreset]) -> None:
         with self._lock:
+            if self._corrupt_presets:
+                # 坏文件尚未人工恢复：拒绝覆盖写，防止把隔离备份变成唯一
+                # 遗迹后又被回退态覆盖。
+                raise RuntimeError(
+                    "预设文件 presets.json 处于损坏隔离状态，拒绝覆盖写；"
+                    "请人工恢复备份后重启"
+                )
             self._presets = presets
             payload = {pid: p.to_dict() for pid, p in presets.items()}
             _atomic_write_json(self._presets_path, payload)
@@ -1107,43 +1206,46 @@ class AccountStore:
         self, preset_id: str
     ) -> tuple[AccountPreset, list[str], list[str]]:
         """应用预设：根据规则或快照批量更新账号 enabled 状态。"""
-        preset = self.get_preset(preset_id)
-        if preset is None:
-            raise ValueError(f"预设方案不存在: {preset_id}")
+        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
+        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
+        with self._lock:
+            preset = self.get_preset(preset_id)
+            if preset is None:
+                raise ValueError(f"预设方案不存在: {preset_id}")
 
-        registry = self._load_registry()
-        enabled_ids: list[str] = []
-        disabled_ids: list[str] = []
+            registry = self._load_registry()
+            enabled_ids: list[str] = []
+            disabled_ids: list[str] = []
 
-        for acc in registry.accounts.values():
-            should_enable = False
-            if preset.action == "enable_all":
-                should_enable = True
-            elif preset.action == "disable_all":
+            for acc in registry.accounts.values():
                 should_enable = False
-            elif preset.action == "snapshot":
-                should_enable = acc.id in preset.account_ids
-            elif preset.action == "filter_tier":
-                should_enable = acc.tier in preset.target_tiers
-            elif preset.action == "filter_group":
-                should_enable = acc.group in preset.target_groups
-            else:
-                should_enable = acc.id in preset.account_ids
+                if preset.action == "enable_all":
+                    should_enable = True
+                elif preset.action == "disable_all":
+                    should_enable = False
+                elif preset.action == "snapshot":
+                    should_enable = acc.id in preset.account_ids
+                elif preset.action == "filter_tier":
+                    should_enable = acc.tier in preset.target_tiers
+                elif preset.action == "filter_group":
+                    should_enable = acc.group in preset.target_groups
+                else:
+                    should_enable = acc.id in preset.account_ids
 
-            acc.enabled = should_enable
-            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
-            meta_path = account_dir / "meta.json"
-            if meta_path.exists():
-                _atomic_write_json(meta_path, acc.to_dict())
+                acc.enabled = should_enable
+                account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+                meta_path = account_dir / "meta.json"
+                if meta_path.exists():
+                    _atomic_write_json(meta_path, acc.to_dict())
 
-            if should_enable:
-                enabled_ids.append(acc.id)
-            else:
-                disabled_ids.append(acc.id)
+                if should_enable:
+                    enabled_ids.append(acc.id)
+                else:
+                    disabled_ids.append(acc.id)
 
-        # 如果当前活跃账号被禁用了，清除活跃标记以便重新择优激活
-        if registry.active_account_id in disabled_ids:
-            registry.active_account_id = None
+            # 如果当前活跃账号被禁用了，清除活跃标记以便重新择优激活
+            if registry.active_account_id in disabled_ids:
+                registry.active_account_id = None
 
-        self._save_registry(registry)
-        return preset, enabled_ids, disabled_ids
+            self._save_registry(registry)
+            return preset, enabled_ids, disabled_ids

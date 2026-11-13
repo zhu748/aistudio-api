@@ -156,17 +156,19 @@ async def request_payload(request_id: str) -> dict[str, object]:
 
     def read() -> dict[str, object]:
         target = get_dump_dir() / f"{request_id}.json"
-        if not target.is_file():
-            return {
-                "available": False,
-                "note": "此请求未采集正文，或转储已过保留期。可在日志与调试中为后续请求开启文件转储。",
-            }
-        if target.stat().st_size > settings.dump_max_bytes * 4 + 65536:
-            return {
-                "available": False,
-                "note": "转储超过当前读取上限，请在服务器端查看。",
-            }
+        # stat 与 read 一并放入 try：_prune_dumps（每 60s）会在
+        # is_file 通过后、读取前清掉文件，锁外的 stat 会抛 500。
         try:
+            if not target.is_file():
+                return {
+                    "available": False,
+                    "note": "此请求未采集正文，或转储已过保留期。可在日志与调试中为后续请求开启文件转储。",
+                }
+            if target.stat().st_size > settings.dump_max_bytes * 4 + 65536:
+                return {
+                    "available": False,
+                    "note": "转储超过当前读取上限，请在服务器端查看。",
+                }
             payload = json.loads(target.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {"available": False, "note": "转储文件暂时不可读取。"}

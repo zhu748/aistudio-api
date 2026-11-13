@@ -301,9 +301,7 @@ def encode_schema_to_wire(
                 else None
             )
             if isinstance(desc_now, str) and desc_now:
-                wire[SchemaIndex.DESCRIPTION] = (
-                    f"{desc_now} (default: {default_str})"
-                )
+                wire[SchemaIndex.DESCRIPTION] = f"{desc_now} (default: {default_str})"
             else:
                 wire[SchemaIndex.DESCRIPTION] = f"(default: {default_str})"
 
@@ -948,13 +946,9 @@ def normalize_gemini_request(
             # 字符串原样入 wire 会被上游拒绝或静默忽略
             media_res = generation_config.mediaResolution
             if isinstance(media_res, str):
-                media_res = (
-                    media_res.strip().upper().removeprefix("MEDIA_RESOLUTION_")
-                )
+                media_res = media_res.strip().upper().removeprefix("MEDIA_RESOLUTION_")
                 media_res = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}.get(media_res)
-            if isinstance(media_res, (int, float)) and not isinstance(
-                media_res, bool
-            ):
+            if isinstance(media_res, (int, float)) and not isinstance(media_res, bool):
                 generation_config_overrides["media_resolution"] = int(media_res)
             # 无法识别的形态按 drop 策略忽略（不透传非法值）
         if generation_config.thinkingConfig is not None:
