@@ -143,15 +143,28 @@ async def lifespan(_app: FastAPI):
         checked_count = 0
         sem = asyncio.Semaphore(4)
 
-        # 按代理分池的探活客户端：绑定独立代理的账号各走各的出口
+        # 按代理分池的探活客户端：绑定独立代理的账号各走各的出口。
+        # turn/turns/sstp 先解析为本地回环 SOCKS5（桥接子进程冷启动放
+        # 线程池），解析失败抛错 → _check_one 捕获后跳过该账号（fail-
+        # closed，绝不静默改直连）。
         probe_clients: dict[str, httpx.AsyncClient] = {}
 
-        def _get_probe_client(proxy_url: str | None) -> httpx.AsyncClient:
+        async def _resolve_probe_proxy(raw: str | None) -> str | None:
+            effective = raw or settings.proxy_url
+            if not effective:
+                return None
+            from aistudio_api.infrastructure.proxy_bridge import (
+                resolve_proxy_url_async,
+            )
+
+            return await resolve_proxy_url_async(effective)
+
+        async def _get_probe_client(proxy_url: str | None) -> httpx.AsyncClient:
             key = proxy_url or ""
             if key not in probe_clients:
                 probe_clients[key] = httpx.AsyncClient(
                     timeout=8.0,
-                    proxy=proxy_url if proxy_url is not None else settings.proxy_url,
+                    proxy=await _resolve_probe_proxy(proxy_url),
                     follow_redirects=True,
                 )
             return probe_clients[key]
@@ -169,7 +182,9 @@ async def lifespan(_app: FastAPI):
                         if not cdict:
                             return
                         checked_count += 1
-                        probe_client = _get_probe_client(getattr(a, "proxy_url", None))
+                        probe_client = await _get_probe_client(
+                            getattr(a, "proxy_url", None)
+                        )
                         if not a.email:
                             em = await probe_account_email(
                                 cdict,
@@ -254,11 +269,15 @@ async def lifespan(_app: FastAPI):
                         client_key = acc_proxy or ""
                         rot_client = rot_clients.get(client_key)
                         if rot_client is None:
+                            from aistudio_api.infrastructure.proxy_bridge import (
+                                resolve_proxy_url_async,
+                            )
+
                             rot_client = httpx.AsyncClient(
                                 timeout=15.0,
-                                proxy=acc_proxy
-                                if acc_proxy is not None
-                                else settings.proxy_url,
+                                proxy=await resolve_proxy_url_async(
+                                    acc_proxy or settings.proxy_url
+                                ),
                                 follow_redirects=False,
                             )
                             rot_clients[client_key] = rot_client
@@ -337,6 +356,10 @@ async def lifespan(_app: FastAPI):
         except Exception as e:
             logger.debug("关闭客户端异常: %s", e)
     await asyncio.to_thread(stop_signer_daemon)
+    # 终止全部 TURN/SSTP 桥接子进程（fail-closed 组件随主进程同生命周期）
+    from aistudio_api.infrastructure.proxy_bridge import shutdown_bridge_processes
+
+    await asyncio.to_thread(shutdown_bridge_processes)
     # 统计与调度状态都改成了防抖写入（record 后 2s 才落盘）；若进程在最后一次
     # 记账后 2s 内退出，最后一次增量会丢失。关闭时显式刷新一次内存态。
     try:
