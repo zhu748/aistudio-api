@@ -94,7 +94,10 @@ _GEMINI_TO_OPENAI_FINISH: dict[str, str] = {
     "TOO_MANY_TOOL_CALLS": "content_filter",
     "NO_IMAGE": "content_filter",
     "MISSING_THOUGHT_SIGNATURE": "content_filter",
-    "OTHER": "stop",
+    # OTHER = streaming.py 检测到流截断时下发（无上游 finishReason）。
+    # 映射 "stop" 会让 SDK 把残缺回答当完整答案；"length" 语义是"输出因
+    # 上限提前终止"，客户端可据此提示用户重试，与截断的实际表现一致。
+    "OTHER": "length",
     "FINISH_REASON_UNSPECIFIED": "stop",
 }
 
@@ -111,6 +114,10 @@ _CLAUDE_REFUSAL_FINISH = frozenset(
         "IMAGE_OTHER",
         "IMAGE_RECITATION",
         "LANGUAGE",
+        # 工具调用异常终结（OpenAI 侧映射 content_filter，语义对齐 refusal）
+        "MALFORMED_FUNCTION_CALL",
+        "UNEXPECTED_TOOL_CALL",
+        "TOO_MANY_TOOL_CALLS",
     }
 )
 
@@ -285,9 +292,11 @@ def resolve_compat_model(requested: str, *, channel: str) -> str:
             return str(value)
     # 2. 最长前缀匹配（键长优先，支持 "claude-sonnet" 命中 "claude-sonnet-4-5"）
     #    加 "-" 边界，避免 "claude-sonnet" 误命中 "claude-sonnetic-foo"。
+    #    兼容未清洗的通配符键（"claude-sonnet-*"）：剥掉尾部 "*" 与悬挂
+    #    "-" 后再匹配（get_compat_settings 已清洗，这里兜底直连配置场景）。
     for key in sorted((str(k) for k in mapping), key=len, reverse=True):
-        key_lower = str(key).lower()
-        if lowered == key_lower or lowered.startswith(key_lower + "-"):
+        key_clean = str(key).lower().rstrip("*").rstrip("-")
+        if lowered == key_clean or lowered.startswith(key_clean + "-"):
             return str(mapping[key])
     # 3. 家族回退
     default_model = _as_str(compat.get(f"{channel}_default_model"))
@@ -419,8 +428,21 @@ def _openai_tool_content_to_response(content: object) -> dict[str, object]:
 def _openai_tools_to_gemini(
     tools: list[dict[str, object]] | None,
 ) -> list[GeminiTool] | None:
-    if not tools:
+    """OpenAI/Responses function 工具声明 → Gemini functionDeclarations。
+
+    兼容两种形态：Chat Completions 把 name/description/parameters 放在
+    ``tool.function`` 子对象里，Responses API 直接放在 tool 顶层——两侧
+    字段都做 fallback，只认单一形态会静默丢掉另一侧的参数 schema。
+    空列表返回 ``[]`` 而非 None：``None`` 表示"未传 tools"（会触发
+    default_tools 注入），``[]`` 表示客户端显式禁用工具。
+    """
+    if tools is None:
         return None
+    # 显式空列表返回空列表（而非 None）：None 会触发 normalize 层注入
+    # config.yaml 的 default_tools（Google Search 等），违背客户端
+    # "显式禁用工具" 的意图
+    if not tools:
+        return []
     declarations: list[dict[str, object]] = []
     for tool in tools:
         # 只转换 function 工具；custom / web_search 等其他类型不误声明为函数
@@ -434,9 +456,13 @@ def _openai_tools_to_gemini(
             continue
         decl: dict[str, object] = {"name": name}
         description = function.get("description")
+        if not (isinstance(description, str) and description):
+            description = tool.get("description")
         if isinstance(description, str) and description:
             decl["description"] = description
         parameters = function.get("parameters")
+        if not (isinstance(parameters, dict) and parameters):
+            parameters = tool.get("parameters")
         if isinstance(parameters, dict) and parameters:
             decl["parameters"] = parameters
         declarations.append(decl)
@@ -551,7 +577,9 @@ async def openai_to_gemini_request(
                 GeminiContent(role="model", parts=parts or [GeminiPart(text="")])
             )
             continue
-        if role == "tool":
+        if role in ("tool", "function"):
+            # 旧版 "function" 角色（LangChain 等客户端）与 "tool" 同义：
+            # 函数名优先取 tool_call_id 反查，其次 message.name 字段
             name = tool_name_by_id.get(
                 message.tool_call_id or "", message.name or "unknown"
             )
@@ -597,6 +625,8 @@ async def openai_to_gemini_request(
         generation_config["seed"] = req.seed
     if req.stop is not None:
         stops = [req.stop] if isinstance(req.stop, str) else list(req.stop)
+        # 过滤空串停止词：空 stopSequences 会被上游 400 拒绝
+        stops = [s for s in stops if isinstance(s, str) and s]
         if stops:
             generation_config["stopSequences"] = stops
     if req.logprobs:
@@ -945,6 +975,10 @@ def _openai_finish_reason(finish_reason: str | None, *, has_tool_calls: bool) ->
     # 安全/异常终结优先于 tool_calls：同一帧带 functionCall 但被 SAFETY 拦截时
     # 必须报 content_filter，不能误报成成功完成的 tool_calls。
     mapped = _GEMINI_TO_OPENAI_FINISH.get(raw)
+    if mapped is None:
+        # 未来新增的上游枚举不得静默变 "stop"（客户端会误信回答完整）
+        logger.warning("未识别的 Gemini finishReason: %s，按 length 处理", raw)
+        mapped = "length"
     if mapped == "content_filter":
         return "content_filter"
     if raw == "MAX_TOKENS":
@@ -1051,6 +1085,27 @@ def build_openai_completion(
     }
 
 
+def _coerce_tool_args(args: object) -> dict[str, object]:
+    """functionCall args → 合法 dict 载荷（Claude tool_use.input 必须为对象）。
+
+    上游 wire 层会以 JSON 字符串形式分片下发参数（``arguments`` 路径），
+    兼容层拿到的可能是字符串片段：完整合法 JSON 则解析；解析失败（分片
+    残段）兜底为 ``{"input": <原文>}``，绝不能把裸字符串直接塞进协议
+    必填 object 的字段。
+    """
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str) and args.strip():
+        try:
+            parsed = json.loads(args)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+        return {"input": args}
+    return {}
+
+
 def _claude_stop_reason(
     finish_reason: str | None,
     *,
@@ -1061,7 +1116,10 @@ def _claude_stop_reason(
     stop_seq: str | None = None
     if stop_sequences and full_text:
         for sequence in stop_sequences:
-            if sequence and full_text.endswith(sequence):
+            # contains 判定而非 endswith：上游若未按 Gemini 语义吃掉 stop
+            # 序列（文本中间出现），endswith 永远不成立，stop_reason 会
+            # 误报 end_turn，客户端无法感知提前停止。
+            if sequence and sequence in full_text:
                 stop_seq = sequence
                 break
     raw = finish_reason or "STOP"
@@ -1071,6 +1129,10 @@ def _claude_stop_reason(
     if raw in _CLAUDE_REFUSAL_FINISH:
         return "refusal", None
     if raw == "MAX_TOKENS":
+        return "max_tokens", None
+    # OTHER = 上游流被截断（streaming.py 无 finishReason 时下发 OTHER），
+    # 伪装成 end_turn 会让客户端把残缺回答当完整答案继续跑。
+    if raw in ("OTHER", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"):
         return "max_tokens", None
     if has_tool_use:
         return "tool_use", None
@@ -1124,13 +1186,12 @@ def build_claude_message(
         if function_call is not None:
             has_tool_use = True
             call_id = function_call.id or f"toolu_{secrets.token_hex(12)}"
-            tool_input = function_call.args if function_call.args is not None else {}
             blocks.append(
                 {
                     "type": "tool_use",
                     "id": call_id,
                     "name": function_call.name,
-                    "input": tool_input,
+                    "input": _coerce_tool_args(function_call.args),
                 }
             )
 
@@ -1440,7 +1501,15 @@ async def openai_stream_adapter(
 
 
 class _ClaudeStreamEmitter:
-    """Claude SSE 事件发射器：管理 content block 的开闭与索引状态。"""
+    """Claude SSE 事件发射器：管理 content block 的开闭与索引状态。
+
+    tool_use 块带跨帧拼接状态：上游 wire 层可能以 JSON 字符串形式分片
+    下发同一函数调用的参数（或分片下发函数名、全量重发同一 call），按
+    call_id / name 前缀合并到当前块，块关闭时统一解析下发，避免把分片
+    拆成多个残缺 tool_use 块（input 丢失或重复）。
+    """
+
+    # tool 块按“call_id 相同”或“名称分片前缀”合并跨帧分片（见 tool_use）
 
     def __init__(self, message_id: str, model: str) -> None:
         self.message_id = message_id
@@ -1452,6 +1521,16 @@ class _ClaudeStreamEmitter:
         self.finish_reason_raw: str | None = None
         self.usage_frame: dict[str, object] | None = None
         self.saw_error = False
+        # stop sequence 命中状态：命中后丢弃后续正文增量（Claude 语义是
+        # 在 stop sequence 处截断文本，透传其后内容会让客户端拿到多余文本）
+        self.stop_hit: str | None = None
+        # 当前 tool 块状态（_tool_open=False 表示无挂起块；call_id 可能为
+        # 空串——上游部分分片帧不带 id，不能用 None 区分两种状态）
+        self._tool_open = False
+        self._tool_call_id: str = ""
+        self._tool_name: str = ""
+        self._tool_args_buf: str = ""
+        self._tool_dict: dict[str, object] | None = None
 
     def sse(self, event: str, payload: dict[str, object]) -> str:
         return (
@@ -1506,9 +1585,12 @@ class _ClaudeStreamEmitter:
         return events
 
     def _ensure_block(self, kind: str) -> list[str]:
+        # 挂起的 tool 块先冲刷：若 text/thinking 增量在 tool 分片之后到达，
+        # 不冲刷会让增量混入 tool 块之前的旧块（同 kind 早退路径）
+        events = self._flush_tool_block()
         if self.open_kind == kind:
-            return []
-        events = self._close_events()
+            return events
+        events += self._close_events()
         self.index += 1
         block: dict[str, object]
         if kind == "thinking":
@@ -1557,7 +1639,33 @@ class _ClaudeStreamEmitter:
         )
         return events
 
-    def tool_use(self, call_id: str, name: str, args: object) -> list[str]:
+    def _flush_tool_block(self) -> list[str]:
+        """关闭当前累积中的 tool 块：解析合并后的参数并一次性下发。"""
+        if not self._tool_open:
+            return []
+        call_id, name = self._tool_call_id, self._tool_name
+        if self._tool_dict is not None:
+            args: object = self._tool_dict
+        elif self._tool_args_buf.strip():
+            try:
+                parsed = json.loads(self._tool_args_buf)
+            except json.JSONDecodeError:
+                # 分片合并后仍无法解析：保底把原文包成合法对象载荷
+                args = {"input": self._tool_args_buf}
+                logger.warning(
+                    "Claude 流式 tool_use 参数合并后仍非法: name=%s, len=%d",
+                    name,
+                    len(self._tool_args_buf),
+                )
+            else:
+                args = parsed if isinstance(parsed, dict) else {"input": parsed}
+        else:
+            args = {}
+        self._tool_open = False
+        self._tool_call_id = ""
+        self._tool_name = ""
+        self._tool_args_buf = ""
+        self._tool_dict = None
         events = self._close_events()
         self.index += 1
         self.has_tool_use = True
@@ -1584,10 +1692,7 @@ class _ClaudeStreamEmitter:
                     "index": self.index,
                     "delta": {
                         "type": "input_json_delta",
-                        "partial_json": json.dumps(
-                            args if args is not None else {},
-                            ensure_ascii=False,
-                        ),
+                        "partial_json": json.dumps(args, ensure_ascii=False),
                     },
                 },
             )
@@ -1600,8 +1705,49 @@ class _ClaudeStreamEmitter:
         )
         return events
 
+    def tool_use(self, call_id: str, name: str, args: object) -> list[str]:
+        """处理一帧 functionCall：分片并入当前块，完整调用立即冲刷。
+
+        合并判定：
+        - 同 call_id 的后续帧 → 并入（dict 覆盖、字符串追加、name 取更长值）
+        - call_id 为空且新 name 是旧 name 的前缀延续（名称分片）→ 并入
+        - 其余 → 视为新调用，先冲刷上一个块
+        """
+        if args is None:
+            args = {}
+        same_call = self._tool_open and call_id and call_id == self._tool_call_id
+        name_shard = (
+            self._tool_open
+            and not call_id
+            and self._tool_name
+            and self._tool_name.startswith(name)
+        )
+        if same_call or name_shard:
+            if isinstance(args, dict):
+                # 全量 dict 重发覆盖累积的字符串分片（wire 层两种形态混发）
+                self._tool_dict = args
+                self._tool_args_buf = ""
+            elif isinstance(args, str) and args:
+                self._tool_args_buf += args
+            if name and len(name) > len(self._tool_name):
+                self._tool_name = name
+            return []
+        # 新调用：先冲刷上一个块
+        events = self._flush_tool_block()
+        self._tool_open = True
+        self._tool_call_id = call_id
+        self._tool_name = name
+        if isinstance(args, dict):
+            self._tool_dict = args
+            self._tool_args_buf = ""
+        else:
+            self._tool_dict = None
+            self._tool_args_buf = args if isinstance(args, str) else ""
+        return events
+
     def image(self, media_type: str, data: str) -> list[str]:
-        events = self._close_events()
+        events = self._flush_tool_block()
+        events += self._close_events()
         self.index += 1
         events.append(
             self.sse(
@@ -1630,7 +1776,8 @@ class _ClaudeStreamEmitter:
 
     def error(self, status: int, message: str) -> list[str]:
         self.saw_error = True
-        events = self._close_events()
+        events = self._flush_tool_block()
+        events += self._close_events()
         events.append(
             self.sse(
                 "error",
@@ -1646,15 +1793,22 @@ class _ClaudeStreamEmitter:
         return events
 
     def finish(self, stop_sequences: list[str] | None) -> list[str]:
-        events = self._close_events()
+        events = self._flush_tool_block()
+        events += self._close_events()
         if self.saw_error:
             return events
-        stop_reason, stop_seq = _claude_stop_reason(
-            self.finish_reason_raw,
-            has_tool_use=self.has_tool_use,
-            full_text="".join(self.text_parts),
-            stop_sequences=stop_sequences,
-        )
+        # stop sequence 已在流中命中：直接用命中值（full_text 已被截断，
+        # 重扫文本判定必然失败）
+        if self.stop_hit is not None:
+            stop_reason: str = "stop_sequence"
+            stop_seq: str | None = self.stop_hit
+        else:
+            stop_reason, stop_seq = _claude_stop_reason(
+                self.finish_reason_raw,
+                has_tool_use=self.has_tool_use,
+                full_text="".join(self.text_parts),
+                stop_sequences=stop_sequences,
+            )
         usage = _usage_from_gemini(self.usage_frame)
         usage_payload: dict[str, object] = {
             "input_tokens": usage["prompt"],
@@ -1686,6 +1840,9 @@ async def claude_stream_adapter(
     emitter = _ClaudeStreamEmitter(f"msg_{secrets.token_hex(12)}", requested_model)
     yield emitter.message_start()
     yield emitter.ping()
+    # 分片 functionCall 各帧可能都不带 id：为整个调用生成一个稳定 id，
+    # 避免每帧随机 id 导致合并状态机永远判定为"新调用"
+    pending_tool_id = ""
     # 确定性关闭内层 SSE 生成器（3.6）：自身异常或客户端断连时立即释放上游连接
     source_aclose: Callable[[], Awaitable[None]] | None = getattr(
         source, "aclose", None
@@ -1709,9 +1866,15 @@ async def claude_stream_adapter(
             for part in _frame_parts(candidate):
                 function_call = _as_dict(part.get("functionCall"))
                 if function_call:
-                    call_id = _as_str(function_call.get("id")) or (
-                        f"toolu_{secrets.token_hex(12)}"
-                    )
+                    call_id = _as_str(function_call.get("id"))
+                    if not call_id:
+                        # 同名续帧沿用同一 id（名称分片/无 id 全量重发），
+                        # 不同名的新调用换新 id
+                        if not pending_tool_id:
+                            pending_tool_id = f"toolu_{secrets.token_hex(12)}"
+                        call_id = pending_tool_id
+                    else:
+                        pending_tool_id = call_id
                     name = _as_str(function_call.get("name")) or "unknown"
                     args = function_call.get("args")
                     for event in emitter.tool_use(call_id, name, args):
@@ -1731,6 +1894,19 @@ async def claude_stream_adapter(
                         for event in emitter.thinking_delta(text):
                             yield event
                     else:
+                        # stop sequence 命中后丢弃后续正文（Claude 语义是
+                        # 文本在 stop sequence 处截断，不透传其后内容）；
+                        # 命中点在本帧中间时，命中点之前的文本仍需下发
+                        if emitter.stop_hit is not None:
+                            continue
+                        if stop_sequences:
+                            for sequence in stop_sequences:
+                                if sequence and sequence in text:
+                                    emitter.stop_hit = sequence
+                                    text = text.split(sequence, 1)[0]
+                                    break
+                        if not text:
+                            continue
                         for event in emitter.text_delta(text):
                             yield event
     except Exception as exc:
@@ -1793,9 +1969,10 @@ def is_compat_request(request: Request) -> bool:
         return False
     return (
         path == "/v1/chat/completions"
+        or path == "/v1/responses"
         or path == "/v1/models"
-        or path.startswith(("/v1/models/", "/v1/messages/"))
         or path == "/v1/messages"
+        or path.startswith(("/v1/responses/", "/v1/models/", "/v1/messages/"))
     )
 
 

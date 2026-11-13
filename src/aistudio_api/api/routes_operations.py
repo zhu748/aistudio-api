@@ -72,7 +72,9 @@ async def export_requests(
 ) -> dict[str, object]:
     return await asyncio.to_thread(
         request_history().query,
-        page_size=10000,
+        # 导出上限：10 万行历史理论响应 GB 级且同步 JSON 构造长期占用
+        # 线程池；5000 行覆盖常规审计，更大范围请用时间窗分批导出
+        page_size=5000,
         since=since,
         until=until,
         model=model,

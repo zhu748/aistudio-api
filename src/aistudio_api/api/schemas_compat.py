@@ -47,6 +47,39 @@ class OpenAIChatCompletionRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# OpenAI Responses (/v1/responses)
+# ---------------------------------------------------------------------------
+
+
+class OpenAIResponsesRequest(BaseModel):
+    """OpenAI Responses API 请求（宽松容错：未知字段一律忽略）。
+
+    兼容 openai-python / Codex CLI 等 Responses 客户端。``input`` 支持
+    字符串或 item 数组（message / function_call / function_call_output /
+    reasoning）；``instructions`` 独立于 system 消息映射。
+    """
+
+    model: str
+    input: str | list[dict[str, object]] | None = None
+    instructions: str | None = None
+    max_output_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    stream: bool = False
+    tools: list[dict[str, object]] | None = None
+    tool_choice: str | dict[str, object] | None = None
+    parallel_tool_calls: bool | None = None
+    reasoning: dict[str, object] | None = None
+    text: dict[str, object] | None = None
+    metadata: dict[str, object] | None = None
+    store: bool | None = None
+    previous_response_id: str | None = None
+    truncation: str | None = None
+    user: str | None = None
+    include: list[str] | None = None
+
+
+# ---------------------------------------------------------------------------
 # Anthropic Messages (/v1/messages)
 # ---------------------------------------------------------------------------
 
