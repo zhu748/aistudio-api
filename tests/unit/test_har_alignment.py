@@ -516,3 +516,62 @@ def test_hydrogen_fallback_snapshot_has_very_high_level():
 def test_browser_default_thinking_wire_hydrogen():
     """hydrogen 浏览器形态默认档取目录元数据 defaultThinkingLevel=3(HIGH)。"""
     assert browser_default_thinking_wire("gemini-4-hydrogen") == [1, None, None, 3]
+
+
+def test_parse_thinking_level_xhigh_variants():
+    """xhigh（较新 openai 客户端 effort 词汇）及分隔符变体统一解析为 VERY_HIGH。"""
+    from aistudio_api.application.chat_service import _parse_thinking_level
+
+    assert _parse_thinking_level("xhigh") is ThinkingLevel.VERY_HIGH
+    assert _parse_thinking_level("XHIGH") is ThinkingLevel.VERY_HIGH
+    assert _parse_thinking_level("X-HIGH") is ThinkingLevel.VERY_HIGH
+    assert _parse_thinking_level("x_high") is ThinkingLevel.VERY_HIGH
+    assert _parse_thinking_level(5) is ThinkingLevel.VERY_HIGH
+    # 既有档位不受影响
+    assert _parse_thinking_level("very_high") is ThinkingLevel.VERY_HIGH
+    assert _parse_thinking_level("high") is ThinkingLevel.HIGH
+
+
+def test_claude_budget_tier_maps_to_very_high():
+    """Claude thinking.budget_tokens 分档：超大预算（>32768）冲 VERY_HIGH(5) 档。
+
+    档位随模型目录自动吸附：模型不支持 5 档（carbon [1,2,3]）时降回 HIGH，
+    hydrogen [1,2,3,5] 原样生效——Claude 客户端由此可触达最高思考档。
+    """
+    from aistudio_api.application.compat_service import _claude_thinking_to_level
+
+    assert (
+        _claude_thinking_to_level({"type": "enabled", "budget_tokens": 64000})
+        == "VERY_HIGH"
+    )
+    assert (
+        _claude_thinking_to_level({"type": "enabled", "budget_tokens": 40960})
+        == "VERY_HIGH"
+    )
+    # 分档边界：32768 仍是 HIGH（升档阈值 exclusive）
+    assert (
+        _claude_thinking_to_level({"type": "enabled", "budget_tokens": 32768}) == "HIGH"
+    )
+    assert (
+        _claude_thinking_to_level({"type": "enabled", "budget_tokens": 16000}) == "HIGH"
+    )
+    assert (
+        _claude_thinking_to_level({"type": "enabled", "budget_tokens": 8192})
+        == "MEDIUM"
+    )
+    assert (
+        _claude_thinking_to_level({"type": "enabled", "budget_tokens": 2048}) == "LOW"
+    )
+    # 仅 enabled 未给预算 → 默认 HIGH；显式关闭 → None
+    assert _claude_thinking_to_level({"type": "enabled"}) == "HIGH"
+    assert _claude_thinking_to_level({"type": "disabled"}) is None
+    assert _claude_thinking_to_level(None) is None
+
+
+def test_xhigh_snap_chain_per_model_catalog():
+    """xhigh → VERY_HIGH 后按模型目录吸附：hydrogen 原样、carbon 降 HIGH。"""
+    level = ThinkingLevel.VERY_HIGH
+    assert snap_thinking_level_to_supported("gemini-4-hydrogen", level) is level
+    assert (
+        snap_thinking_level_to_supported("gemini-4-carbon", level) is ThinkingLevel.HIGH
+    )

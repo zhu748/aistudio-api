@@ -342,6 +342,10 @@ _REASONING_EFFORT_TO_LEVEL: dict[str, ThinkingLevel] = {
     # 2026-11 目录实测新档（gemini-4-hydrogen thinkingLevels=[1,2,3,5]）；
     # openai/claude 兼容层透传 very_high 文本，此处按 upper 后带下划线命中。
     "VERY_HIGH": ThinkingLevel.VERY_HIGH,
+    # xhigh：较新 openai 客户端 effort 词汇（GPT-5.1-codex-max 系选择器），
+    # 与 VERY_HIGH(5) 同档；分隔符变体（X-HIGH/X_HIGH/XHIGH）由下方
+    # compact 匹配统一命中。
+    "XHIGH": ThinkingLevel.VERY_HIGH,
 }
 
 
