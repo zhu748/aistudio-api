@@ -58,9 +58,22 @@ export interface ProxyAccount {
   proxy: string
 }
 
+export interface BridgeInstance {
+  port: number
+  uri: string
+  alive: boolean
+  started_at: number
+}
+
 export interface ProxyStatus {
   global_proxy: string
   signer: string
+  bridge?: {
+    available: boolean
+    binary: string
+    idle_minutes: number
+    instances: BridgeInstance[]
+  }
   accounts: ProxyAccount[]
 }
 
@@ -120,9 +133,12 @@ export const operationsApi = {
     })
   },
   testProxy(options: { account_id?: string; proxy_url?: string } = {}) {
-    return request<{ proxy: string; checks: ProxyCheck[] }>('/api/proxies/test', {
-      method: 'POST',
-      body: JSON.stringify(options),
-    })
+    return request<{ proxy: string; effective_proxy?: string; checks: ProxyCheck[] }>(
+      '/api/proxies/test',
+      {
+        method: 'POST',
+        body: JSON.stringify(options),
+      },
+    )
   },
 }

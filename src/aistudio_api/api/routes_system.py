@@ -736,7 +736,18 @@ async def test_signer_server(req: TestSignerServerRequest) -> dict[str, object]:
         }
 
     is_local = host in ("127.0.0.1", "localhost", "::1")
-    proxy = None if is_local else settings.proxy_url
+    try:
+        from aistudio_api.infrastructure.proxy_bridge import resolve_proxy_url_async
+
+        proxy = None if is_local else await resolve_proxy_url_async(settings.proxy_url)
+    except Exception as exc:
+        # turn/sstp 桥接冷启动失败：远程签名节点探活不可达，返回可操作
+        # 指引（fail-closed，不静默改直连探测）。
+        return {
+            "ok": False,
+            "error": f"出站代理解析失败：{exc}",
+            "elapsed_ms": 0.0,
+        }
 
     def _extract_active_cookies() -> str:
         """从当前活跃账号取核心 Cookie，仅用于本机节点的新版协议深度探活。"""

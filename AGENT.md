@@ -205,8 +205,12 @@ aistudio-api/
 │   │   └── models.py              # 领域数据结构 (Candidate, ModelOutput 等)
 │   ├── infrastructure/            # 基础设施层
 │   │   ├── account/               # Cookie 解析、SAPISIDHASH 计算与凭据存储 (account_store, cookie_parser)
+│   │   ├── proxy_bridge.py       # TURN/SSTP 桥接子进程池与统一代理解析入口 (resolve_proxy_url)
 │   │   ├── waa/                   # WAA 证明令牌签名客户端 (signer)
 │   │   └── gateway/               # 会话管理 (session)、HTTP/2 传输层 (transport)、模型发现 (model_discovery)、Wire 编解码与流式管道
+├── proxybridge/                  # 独立 Go TURN/TURNS/SSTP → 本地 SOCKS5 桥接器 (aistudio-proxy-bridge)
+│   ├── build.sh                  # 纯 Go 一键构建脚本（无 CGO 依赖）
+│   └── NOTICE.txt                # 第三方依赖许可（源码移植自同作者 vertex2openai，MIT）
 ├── waa-signer/                    # 独立 Go WAA 签名服务 (SpiderMonkey 152 + Firefox 152 DOM)
 │   ├── build.sh                   # 跨平台一键自动下载依赖与静态构建脚本
 │   ├── cmd/waa-signer/main.go     # HTTP 服务入口 (/health, /v1/proof/mint, /v1/rpc/send)

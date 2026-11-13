@@ -4,6 +4,7 @@ import { Network, RefreshCw, Save } from 'lucide-vue-next'
 import { operationsApi, type ProxyStatus, type ProxyCheck } from '@/api/operations.ts'
 import { useToastStore } from '@/stores/toast.ts'
 import Button from '@/components/ui/Button.vue'
+import ProxyInputField from '@/components/ui/ProxyInputField.vue'
 import { usePageRefresh } from '@/composables/usePageRefresh.ts'
 
 const toast = useToastStore()
@@ -52,7 +53,7 @@ async function test(accountId = '', draft = false) {
       accountId ? { account_id: accountId } : draft ? { proxy_url: proxy.value.trim() } : {},
     )
     checks.value = result.checks
-    checkedProxy.value = result.proxy || '直连'
+    checkedProxy.value = result.effective_proxy || result.proxy || '直连'
   } catch (err) {
     toast.error(err instanceof Error ? err.message : '诊断失败')
   } finally {
@@ -83,35 +84,52 @@ usePageRefresh(load)
         </Button>
       </div>
       <form
-        class="flex flex-wrap gap-2"
+        class="space-y-2"
         @submit.prevent="save"
       >
-        <input
-          v-model="proxy"
-          aria-label="全局代理地址"
-          autocomplete="off"
-          placeholder="输入完整新地址；留空保存为直连"
-          class="flex-1 min-w-64 border border-slate-200 rounded-lg px-3 py-2 text-xs font-mono"
-        >
-        <Button
-          :disabled="!!testing"
-          @click="test('', true)"
-        >
-          测试输入
-        </Button>
-        <Button
-          type="submit"
-          variant="primary"
-          :loading="saving"
-        >
-          <Save class="w-3.5 h-3.5" />保存
-        </Button>
+        <div class="flex flex-wrap gap-2 items-start">
+          <div class="flex-1 min-w-64">
+            <ProxyInputField
+              v-model="proxy"
+              placeholder="输入完整新地址；留空保存为直连。粘贴自动识别类型"
+            />
+          </div>
+          <Button
+            :disabled="!!testing"
+            @click="test('', true)"
+          >
+            测试输入
+          </Button>
+          <Button
+            type="submit"
+            variant="primary"
+            :loading="saving"
+          >
+            <Save class="w-3.5 h-3.5" />保存
+          </Button>
+        </div>
       </form>
       <p class="text-xs text-slate-500">
-        支持 HTTP、HTTPS、SOCKS5。修改立即影响后续请求，账号独立代理优先；重启时环境变量配置优先。
+        支持 HTTP、HTTPS、SOCKS5 与 TURN / TURNS / SSTP（后三者由桥接器转换为本地 SOCKS5，修改立即生效，账号独立代理优先；重启时环境变量配置优先）。
       </p>
       <div class="text-xs bg-slate-50 rounded-lg p-3 flex flex-wrap justify-between gap-2">
-        <span>签名节点：<code>{{ status.signer }}</code></span><Button
+        <span class="flex flex-wrap gap-4">
+          <span>签名节点：<code>{{ status.signer }}</code></span>
+          <span>
+            TURN/SSTP 桥接器：
+            <span
+              v-if="status.bridge?.available"
+              class="text-emerald-600"
+            >
+              可用<template v-if="status.bridge.instances.length">（{{ status.bridge.instances.length }} 个运行中）</template>
+            </span>
+            <span
+              v-else
+              class="text-amber-600"
+            >未安装 aistudio-proxy-bridge（使用 turn/sstp 前需构建或改用 Docker 镜像）</span>
+          </span>
+        </span>
+        <Button
           size="xs"
           :loading="testing === 'global'"
           :disabled="!!testing"

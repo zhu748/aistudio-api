@@ -1149,7 +1149,19 @@ class ModelDiscoveryService:
             include_visit_id=True,
             visit_scope="default",
         )
-        from aistudio_api.config import settings
+
+        async def _resolve_listmodels_proxy(raw: str | None) -> str | None:
+            """传入代理或全局默认 → httpx 可用形态（turn/sstp 转本地 SOCKS5）。"""
+            from aistudio_api.config import settings
+
+            effective = raw or settings.proxy_url
+            if not effective:
+                return None
+            from aistudio_api.infrastructure.proxy_bridge import (
+                resolve_proxy_url_async,
+            )
+
+            return await resolve_proxy_url_async(effective)
 
         url = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ListModels"
         # 复用 transport 层的共享 SSLContext 与 h2 探测：裸建 AsyncClient 会
@@ -1161,7 +1173,7 @@ class ModelDiscoveryService:
 
         async with httpx.AsyncClient(
             timeout=10.0,
-            proxy=proxy_url or settings.proxy_url,
+            proxy=await _resolve_listmodels_proxy(proxy_url),
             trust_env=False,
             http2=_http2_enabled(),
             verify=_shared_ssl_context(),

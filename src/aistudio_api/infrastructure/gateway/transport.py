@@ -24,6 +24,10 @@ from aistudio_api.infrastructure.account.cookie_parser import (
     get_tier_header_value,
     load_cookies_from_auth_file,
 )
+from aistudio_api.infrastructure.proxy_bridge import (
+    resolve_proxy_url_async,
+    resolve_proxy_url_cached,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("transport")
@@ -420,8 +424,12 @@ class HTTPStreamTransport:
         照抄 WaaSigner.reconfigure 的「retired + 延迟关闭」模式：立即从
         池中摘除、延迟 aclose，让并发在途请求持有的引用能安全跑完，
         而非滞留到进程退出（反复切代理会累积多个满配连接池）。
+
+        保留键用 resolve_proxy_url_cached（无副作用）：桥接代理（turn/sstp）
+        的客户端池以「已解析的本地 SOCKS5」为键，而冷启动解析会在此处
+        触发子进程拉起，退役路径绝不能有这种副作用。
         """
-        keep_key = keep_proxy or ""
+        keep_key = resolve_proxy_url_cached(keep_proxy) or ""
         retired: list[httpx.AsyncClient] = []
         async with self._get_client_lock():
             for key in [k for k in self._clients if k != keep_key]:
@@ -454,8 +462,16 @@ class HTTPStreamTransport:
         task.add_done_callback(self._retired_close_tasks.discard)
 
     async def _get_client(self, proxy_url: str | None = None) -> httpx.AsyncClient:
-        """获取（或创建）绑定指定出口代理的客户端；proxy_url=None 时使用全局默认代理。"""
-        effective = self.proxy_url if proxy_url is None else (proxy_url or None)
+        """获取（或创建）绑定指定出口代理的客户端；proxy_url=None 时使用全局默认代理。
+
+        turn / turns / sstp 代理在此处解析为本地回环 SOCKS5（桥接子进程
+        由 proxy_bridge 托管，首次冷启动放线程池，不阻塞事件循环）；
+        客户端池以解析后的地址为键，同一桥接节点复用同一连接池。
+        """
+        effective_raw = self.proxy_url if proxy_url is None else (proxy_url or None)
+        effective = (
+            await resolve_proxy_url_async(effective_raw) if effective_raw else None
+        )
         key = effective or ""
         client = self._clients.get(key)
         if client is not None and not client.is_closed:

@@ -30,6 +30,7 @@
   - [Linux / macOS](#linux--macos)
   - [Docker 部署](#docker-部署)
 - [账号凭据 (Cookie) 获取与导入指引](#账号凭据-cookie-获取与导入指引)
+- [代理协议支持（TURN/SSTP）](#代理协议支持turnsstp)
 - [第三方客户端配置指引 (NextChat / Cherry Studio 等)](#第三方客户端配置指引-nextchat--cherry-studio--one-api-等)
 - [配置与环境变量](#配置与环境变量)
 - [API 调用示例](#api-调用示例)
@@ -242,7 +243,7 @@ docker compose up -d
    - `AISTUDIO_WEB_PASSWORD`（**必填**）：Web 管理面板登录密码，公网部署务必设置；
    - `AISTUDIO_COOKIES` / `AISTUDIO_COOKIES_2`（**推荐**）：环境变量注入账号 Cookie，重启后自动恢复，格式见[环境变量注入账号](#环境变量注入账号无磁盘部署)；更多账号可在面板继续添加 `AISTUDIO_COOKIES_3`、`AISTUDIO_COOKIES_4` ...；
    - `AISTUDIO_API_KEYS`（**推荐**）：API 调用鉴权 Key（逗号分隔多个，如 `sk-aaa,sk-bbb`），重启后自动恢复，防止 API 接口裸奔；
-   - `AISTUDIO_PROXY`（可选）：出站代理，如 `socks5://user:pass@host:port`，Google 对数据中心 IP 风控严格时配置；
+   - `AISTUDIO_PROXY`（可选）：出站代理，如 `socks5://user:pass@host:port` 或 `turn:host:3478`，Google 对数据中心 IP 风控严格时配置；
 4. 等待构建完成（多阶段构建会自动编译本地 WAA 签名器，约 5~10 分钟）；
 5. 访问 Render 分配的 `https://<service>.onrender.com` 进入管理控制台，导入 Cookie 账号即可使用。
 
@@ -304,11 +305,37 @@ environment:
 | `Cookie` | `SID=xxx; HSID=yyy` | 不带代理，走全局 `AISTUDIO_PROXY` |
 | `Cookie+代理` | `SID=xxx; HSID=yyy+http://10.0.0.1:7890` | 代理在后 |
 
-- 代理支持 `http://` / `https://` / `socks5://` 完整地址，也支持 `127.0.0.1:7890` 简写（自动补全为 HTTP 代理）；
+- 代理支持 `http://` / `https://` / `socks5://` / `socks5h://` 完整地址，也支持 `127.0.0.1:7890` 简写（自动补全为 HTTP 代理）与 TURN / TURNS / SSTP（由内置桥接器转换为本地 SOCKS5，详见[代理协议支持](#代理协议支持turnsstp)）；
 - Cookie 内容支持任意常见格式：请求头 KV、JSON 数组（Cookie-Editor 导出）、Netscape 文本；
 - 绑定了独立代理的账号，其请求、Cookie 轮换、探活全部走该代理出口；
 - 同一账号重启后重复注入不会产生副本（按会话锚点确定性去重），从环境变量中移除则自动清理；
 - 多行环境变量不便时可改用编号变量（`AISTUDIO_COOKIES_1`、`AISTUDIO_COOKIES_2` ...）或 `AISTUDIO_COOKIES_FILE` 文件注入；单行内多条亦可用字面 `\n` 分隔。
+
+---
+
+## 代理协议支持（TURN/SSTP）
+
+全局代理与每账号独立代理均支持以下协议：
+
+| 协议 | 形态示例 | 说明 |
+|---|---|---|
+| `http://` / `https://` | `http://user:pass@1.2.3.4:8080` | 直接消费 |
+| `socks5://` / `socks5h://` | `socks5://1.2.3.4:1080` | 直接消费（socks5h = 远程 DNS 解析） |
+| `turn://` | `turn:turn.example.com:3478?transport=tcp` | RFC 6062 TCP 中继（长期凭据或匿名分配服务器），由桥接器转换为本地 SOCKS5 |
+| `turns://` | `turns://user:pass@host:5349?sni=cert.example.com` | TURN over TLS 1.2+ |
+| `sstp://` | `sstp://user:pass@vpn.example.com:443?mtu=1280` | MS-SSTP VPN（MS-CHAPv2 认证，必须提供用户名密码） |
+
+TURN/TURNS/SSTP 三类协议无法被 HTTP 客户端直接消费，本服务内置独立的 Go 桥接器（`proxybridge/`，产物 `aistudio-proxy-bridge`）把每个节点转换为**仅监听 127.0.0.1 的本地 SOCKS5**，再由 httpx 统一走该出口；同节点同进程内端口稳定，与 WAA 签名器共享同一出口 IP。桥接子进程按节点惰性启动、崩溃自动重启、空闲 30 分钟自动回收（`AISTUDIO_PROXY_BRIDGE_IDLE_MINUTES`）。
+
+**桥接器获取方式**（任选其一）：
+
+- Docker 部署：镜像已内置（`bridge-builder` 构建阶段）；
+- 本地 / Termux：`bash proxybridge/build.sh`（需要 Go >= 1.27，纯 Go 无 CGO 依赖）；
+- 外部二进制：设 `AISTUDIO_PROXY_BRIDGE_BIN=/path/to/aistudio-proxy-bridge`。
+
+桥接不可用（未安装二进制 / 节点无法握手）时，相关请求与探活会直接报错并给出中文指引，**绝不静默降级直连**，防止真实出口 IP 意外泄漏。管理面板「代理诊断」页会显示桥接器安装状态与运行实例。
+
+Web 面板在「导入账号」「编辑账号」与「全局代理」处提供**代理类型下拉框与粘贴智能识别**：粘贴含协议头的地址（含 RFC 7065 的 `turn:` 无斜线写法）自动切换类型；无协议简写（如 `1.2.3.4:3478`）按所选类型补全前缀；SSTP 缺凭据、SOCKS/TURN 缺端口等常见问题会即时提示。
 
 ---
 
@@ -341,7 +368,9 @@ environment:
 | `AISTUDIO_WEB_PASSWORD` | string | `""` | Web 控制台访问密码（亦可设置 `AISTUDIO_ADMIN_PASSWORD`）。仅配置 API Key 未设密码时，面板改由任意有效 API Key 登录且 Key 明文脱敏展示；两者均未配置时启动会自动生成随机管理密码并打印到日志 |
 | `AISTUDIO_API_KEYS` | string | `""` | API 调用鉴权 Key，多个用逗号/换行分隔或 JSON 数组（如 `sk-aaa,sk-bbb`）；亦可单数 `AISTUDIO_API_KEY` 注入单个。与 config.yaml 中配置的 Key 合并生效，无磁盘部署重启后自动恢复 |
 | `AISTUDIO_ALLOW_NO_AUTH` | bool | `false` | 显式声明在可信内网完全开放（免鉴权）。未配置任何凭据时默认自动生成随机管理密码保护面板；确需裸奔模式必须显式设置此变量（1=开启） |
-| `AISTUDIO_PROXY` | string | `""` | 出口代理地址，支持 `http://`、`https://` 或 `socks5://` |
+| `AISTUDIO_PROXY` | string | `""` | 出口代理地址，支持 `http://`、`https://`、`socks5://`、`socks5h://` 与 TURN / TURNS / SSTP（后三者需桥接器，见[代理协议支持](#代理协议支持turnsstp)） |
+| `AISTUDIO_PROXY_BRIDGE_BIN` | string | 自动发现 | TURN/SSTP 桥接器二进制路径；留空时依次查找仓库 `proxybridge/bin/`、Docker 镜像内置路径与 `PATH` |
+| `AISTUDIO_PROXY_BRIDGE_IDLE_MINUTES` | float | `30` | TURN/SSTP 桥接实例空闲回收阈值（分钟；0 = 不回收） |
 | `AISTUDIO_COOKIES` | string | `""` | 启动时注入的账号 Cookie，多条用换行分隔，单条支持 `代理+Cookie` / `Cookie` / `Cookie+代理` 三种格式（详见下方[环境变量注入账号](#环境变量注入账号无磁盘部署)） |
 | `AISTUDIO_COOKIES_<N>` | string | `""` | 编号变量注入（`AISTUDIO_COOKIES_1`、`AISTUDIO_COOKIES_2` ...），适合无法传入多行环境变量的平台，与 `AISTUDIO_COOKIES` 可同时使用 |
 | `AISTUDIO_COOKIES_FILE` | string | `""` | Cookie 注入文件路径（内容格式与 `AISTUDIO_COOKIES` 相同，支持多行文本或 JSON 字符串数组），适合超出环境变量长度限制的批量凭据 |
