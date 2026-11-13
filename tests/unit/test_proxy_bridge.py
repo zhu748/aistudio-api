@@ -5,13 +5,17 @@
 - 桥接器私有配置的权限与凭据传递契约（不进命令行、0600 临时文件用后即删）；
 - 崩溃重启的端口复用与换端口重试；
 - 启动失败的受控错误码 → 中文文案映射（不回显子进程任意输出）；
-- 空闲回收与关停清扫。
+- 空闲回收与关停清扫（含日志等状态文件的同步清理）；
+- 孤儿清扫的进程存活探测（Windows 下 os.kill(pid,0) 会误杀，走 OpenProcess）；
+- Go 签名器的 socks5h 归一与「传入代理或全局默认」统一入口。
 """
 
 from __future__ import annotations
 
 import json
 import stat
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import cast
@@ -21,9 +25,12 @@ from unittest.mock import MagicMock
 import pytest
 
 import aistudio_api.infrastructure.proxy_bridge as pb
+from aistudio_api.config import settings
 from aistudio_api.infrastructure.proxy_bridge import (
     ProxyBridgeError,
     ProxyBridgeManager,
+    normalize_proxy_for_go_signer,
+    resolve_effective_proxy_async,
     resolve_proxy_url,
     resolve_proxy_url_async,
     resolve_proxy_url_cached,
@@ -110,6 +117,45 @@ def test_cached_resolve_returns_local_socks5_when_running(
     assert resolve_proxy_url_cached("turn://1.2.3.4:3478") == "socks5://127.0.0.1:12080"
 
 
+@pytest.mark.parametrize(
+    ("resolved", "expected"),
+    [
+        ("socks5h://127.0.0.1:1080", "socks5://127.0.0.1:1080"),
+        ("socks5h://u:p@1.2.3.4:1080", "socks5://u:p@1.2.3.4:1080"),
+        ("socks5://127.0.0.1:1080", "socks5://127.0.0.1:1080"),
+        ("http://127.0.0.1:7890", "http://127.0.0.1:7890"),
+        ("https://proxy.example.com:443", "https://proxy.example.com:443"),
+    ],
+)
+def test_normalize_proxy_for_go_signer(resolved: str, expected: str) -> None:
+    """Go 签名器只认 http/https/socks5：socks5h 归一为 socks5，其余原样。"""
+    assert normalize_proxy_for_go_signer(resolved) == expected
+
+
+async def test_resolve_effective_proxy_async_prefers_raw_over_global(
+    isolated_bridge_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """传入代理优先；缺省（None / 空串）回退全局默认；两者皆空为直连。"""
+    monkeypatch.setattr(settings, "proxy_url", "socks5://9.9.9.9:1080", raising=True)
+    assert (
+        await resolve_effective_proxy_async("http://1.2.3.4:8080")
+        == "http://1.2.3.4:8080"
+    )
+    assert await resolve_effective_proxy_async(None) == "socks5://9.9.9.9:1080"
+    assert await resolve_effective_proxy_async("") == "socks5://9.9.9.9:1080"
+    monkeypatch.setattr(settings, "proxy_url", "", raising=True)
+    assert await resolve_effective_proxy_async(None) is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="仅验证 POSIX 信号 0 路径")
+def test_process_alive_posix_distinguishes_live_and_reaped() -> None:
+    """存活进程为 True；已被 wait() 收尸的子进程 pid 为 False。"""
+    assert pb._process_alive(__import__("os").getpid())
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()  # 收尸后 pid 释放，os.kill 必然 ProcessLookupError
+    assert not pb._process_alive(proc.pid)
+
+
 # ---------------------------------------------------------------------------
 # 桥接器进程管理（子进程全 mock）
 # ---------------------------------------------------------------------------
@@ -167,6 +213,8 @@ def test_private_config_stable_port_and_idle_cleanup(
     ]
     # 私有配置与 ready 标记在启动后立即删除（凭据不落常驻文件）
     assert not Path(instance.log_path).with_suffix(".json").exists()
+    # 日志文件在实例运行期间存在，回收时同步清理（不在 data/ 累积）
+    assert instance.log_path.exists()
     # 空闲回收：阈值内不回收，超时后回收
     with mock.patch.object(pb, "_idle_minutes", return_value=1):
         instance.last_used = time.time() - 30
@@ -174,6 +222,7 @@ def test_private_config_stable_port_and_idle_cleanup(
         instance.last_used = time.time() - 120
         assert manager.reap_idle() == 1
     cast("MagicMock", instance.process).terminate.assert_called_once()
+    assert not instance.log_path.exists()
     manager.shutdown_all()
 
 
@@ -274,8 +323,12 @@ def test_shutdown_all_terminates_and_rejects_new_lookups(
     ):
         assert manager.get_local_socks5("turn://1.2.3.4:3478")
         instance = next(iter(manager._instances.values()))
+        log_path = instance.log_path
+        assert log_path.exists()
         manager.shutdown_all()
         cast("MagicMock", instance.process).terminate.assert_called_once()
+        # 关停清扫同步删除实例日志，不在 data/proxy-bridge/ 滞留
+        assert not log_path.exists()
         with pytest.raises(ProxyBridgeError):
             manager.get_local_socks5("turn://1.2.3.4:3478")
     # reopen 供下一轮测试隔离（不复活旧实例）

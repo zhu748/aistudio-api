@@ -1127,18 +1127,16 @@ def parse_emails_from_ogs_html(
 async def _resolve_probe_proxy(proxy_url: str | None) -> str | None:
     """把传入代理（或全局默认代理）解析为 httpx 可用形态。
 
-    turn / turns / sstp 经 infrastructure/proxy_bridge 转换为本地回环
-    SOCKS5；解析失败直接上抛（fail-closed，绝不静默降级直连导致真实
-    IP 泄漏）。延迟导入避免与 proxy_bridge 的模块循环。
+    统一委托 infrastructure/proxy_bridge.resolve_effective_proxy_async：
+    turn / turns / sstp 转换为本地回环 SOCKS5（子进程冷启动放线程池），
+    解析失败直接上抛（fail-closed，绝不静默降级直连导致真实 IP 泄漏）。
+    延迟导入避免与 proxy_bridge 的模块循环。
     """
-    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.proxy_bridge import (
+        resolve_effective_proxy_async,
+    )
 
-    effective = proxy_url or settings.proxy_url
-    if not effective:
-        return None
-    from aistudio_api.infrastructure.proxy_bridge import resolve_proxy_url_async
-
-    return await resolve_proxy_url_async(effective)
+    return await resolve_effective_proxy_async(proxy_url)
 
 
 async def probe_account_emails_map(

@@ -28,6 +28,7 @@ from aistudio_api.infrastructure.account.cookie_parser import (
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 from aistudio_api.infrastructure.proxy_bridge import (
     ProxyBridgeError,
+    normalize_proxy_for_go_signer,
     resolve_proxy_url_async,
 )
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -201,18 +202,16 @@ class RemoteProofSigner:
         if wire_contents is not None:
             payload["wireContents"] = wire_contents
         if upstream_proxy:
-            # Go 签名器的 scheme 白名单只认 http/https/socks5（proxydial 会把
-            # socks5h 归一为 socks5，但 transport_browser 的校验直接拒收），
-            # turn/turns/sstp 也必须先解析为本地回环 SOCKS5。签名与模型请求
-            # 必须同出口 IP，故始终随请求传当前代理。
+            # Go 签名器的 scheme 白名单只认 http/https/socks5（详见
+            # normalize_proxy_for_go_signer），turn/turns/sstp 也必须先解析为
+            # 本地回环 SOCKS5。签名与模型请求必须同出口 IP，故始终随请求传
+            # 当前代理。
             try:
                 resolved_proxy = await resolve_proxy_url_async(upstream_proxy)
             except ProxyBridgeError as exc:
                 raise TransportError(f"出站代理解析失败: {exc}") from exc
             if resolved_proxy:
-                if resolved_proxy.startswith("socks5h://"):
-                    resolved_proxy = "socks5://" + resolved_proxy[len("socks5h://") :]
-                payload["proxy"] = resolved_proxy
+                payload["proxy"] = normalize_proxy_for_go_signer(resolved_proxy)
         request_headers = {
             "Content-Type": "application/json",
             **signer_authorization(self.server_url),
