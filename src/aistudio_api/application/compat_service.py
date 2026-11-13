@@ -606,7 +606,7 @@ async def openai_to_gemini_request(
     generation_config.update(_openai_response_format_to_config(req.response_format))
     if req.reasoning_effort is not None:
         effort = req.reasoning_effort.strip().lower()
-        if effort in ("minimal", "low", "medium", "high", "very_high", "none"):
+        if effort in ("minimal", "low", "medium", "high", "very_high", "xhigh", "none"):
             generation_config["reasoningEffort"] = effort
         else:
             logger.debug("忽略无法识别的 reasoning_effort: %s", req.reasoning_effort)
@@ -824,7 +824,12 @@ def _claude_tool_choice_to_config(
 
 
 def _claude_thinking_to_level(thinking: dict[str, object] | None) -> str | None:
-    """Claude thinking.budget_tokens → Gemini 思考等级（档位兼容由管线自动吸附）。"""
+    """Claude thinking.budget_tokens → Gemini 思考等级（档位兼容由管线自动吸附）。
+
+    预算→档位映射：≤2048 LOW / ≤8192 MEDIUM / ≤32768 HIGH / >32768 VERY_HIGH
+    （Anthropic budget_tokens 上限 64k，超大预算视为冲顶档诉求；模型目录
+    不支持 5 档时由吸附链路自动降档，如 carbon [1,2,3] 降回 HIGH）。
+    """
     if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
         return None
     budget = _as_int(thinking.get("budget_tokens"))
@@ -834,7 +839,9 @@ def _claude_thinking_to_level(thinking: dict[str, object] | None) -> str | None:
         return "LOW"
     if budget <= 8192:
         return "MEDIUM"
-    return "HIGH"
+    if budget <= 32768:
+        return "HIGH"
+    return "VERY_HIGH"
 
 
 async def claude_to_gemini_request(
