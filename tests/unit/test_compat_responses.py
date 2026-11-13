@@ -350,7 +350,7 @@ async def test_stream_adapter_event_sequence() -> None:
 
 @pytest.mark.asyncio
 async def test_stream_adapter_function_call_events() -> None:
-    frames = [
+    frames: list[dict[str, object]] = [
         {
             "candidates": [
                 {
@@ -396,7 +396,9 @@ async def test_stream_adapter_function_call_events() -> None:
 
 @pytest.mark.asyncio
 async def test_stream_adapter_error_emits_failed() -> None:
-    frames = [{"error": {"code": 429, "message": "rate limited"}}]
+    frames: list[dict[str, object]] = [
+        {"error": {"code": 429, "message": "rate limited"}}
+    ]
     raw = ""
     async for chunk in responses_stream_adapter(
         _sse_frames(frames), requested_model="gpt-5.2"
@@ -474,7 +476,10 @@ async def test_responses_endpoint_non_streaming(
     assert payload["status"] == "completed"
     output_items = cast(list[dict[str, object]], payload["output"])
     assert any(
-        cast(dict[str, object], item.get("content", [{}])[0]).get("text")
+        cast(
+            dict[str, object],
+            cast(list[dict[str, object]], item.get("content", [{}]))[0],
+        ).get("text")
         == "Hello from upstream"
         for item in output_items
         if item["type"] == "message"

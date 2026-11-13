@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import cast
 
 import pytest
 
@@ -107,6 +108,9 @@ def test_trailing_slash_auth_not_bypassed() -> None:
         async def receive():
             return {"type": "http.request", "body": b"", "more_body": False}
 
+        async def send(message):
+            return None
+
         await mw(
             {
                 "type": "http",
@@ -117,7 +121,7 @@ def test_trailing_slash_auth_not_bypassed() -> None:
                 "query_string": b"",
             },
             receive,
-            lambda m: None,
+            send,
         )
 
     asyncio.run(run())
@@ -146,8 +150,14 @@ def test_decode_part_keeps_text_alongside_payload() -> None:
 def test_short_tuple_executable_code_still_safe() -> None:
     from aistudio_api.infrastructure.gateway.wire_types import AistudioPart
 
-    AistudioPart(executable_code=("PYTHON",)).to_wire()
-    AistudioPart(code_execution_result=("OUTCOME_OK",)).to_wire()
+    # 短元组（缺 language/outcome 字段）是线上真实出现过的畸形数据，
+    # to_wire() 必须兜底不抛异常。
+    part = AistudioPart()
+    part.executable_code = cast("tuple[str, str]", ("PYTHON",))
+    part.to_wire()
+    result_part = AistudioPart()
+    result_part.code_execution_result = cast("tuple[str, str]", ("OUTCOME_OK",))
+    result_part.to_wire()
 
 
 def test_streaming_code_chunk_not_dropped() -> None:
@@ -157,7 +167,7 @@ def test_streaming_code_chunk_not_dropped() -> None:
     from aistudio_api.infrastructure.gateway.wire_parser import parse_response_chunk
 
     parser = IncrementalJSONStreamParser()
-    code_part = [None] * 9
+    code_part: list[object] = [None] * 9
     code_part[8] = [1, "print(1)"]
     chunk = json.dumps([[[[[[[code_part, "model"]]]], []]]])
     parsed = None
@@ -208,10 +218,12 @@ def test_rotator_partial_config_deep_merged() -> None:
         cfg.write_text("rotator:\n  max_retries: 3\n", encoding="utf-8")
         md._CONFIG_CACHE.clear()
         merged = md._load_yaml_config(cfg)
-        rot = merged.get("rotator") or {}
+        rot = cast(dict[str, object], merged.get("rotator") or {})
         assert rot.get("max_retries") == 3
-        assert isinstance(rot.get("cooldowns"), dict) and rot["cooldowns"]
-        assert isinstance(rot.get("tier_weights"), dict) and rot["tier_weights"]
+        cooldowns = cast(dict[str, object], rot.get("cooldowns") or {})
+        assert isinstance(rot.get("cooldowns"), dict) and cooldowns
+        tier_weights = cast(dict[str, object], rot.get("tier_weights") or {})
+        assert isinstance(rot.get("tier_weights"), dict) and tier_weights
 
 
 def test_delete_account_holds_lock() -> None:

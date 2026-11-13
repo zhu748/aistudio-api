@@ -7,6 +7,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -311,7 +312,7 @@ def test_read_log_history_early_stop(tmp_path: Path) -> None:
         patch.object(lf, "_queue_handler", None),
     ):
         r = lf.read_log_history(page=1, page_size=100)
-        assert len(r["items"]) == 100
+        assert len(cast(list[object], r["items"])) == 100
         assert r["total_truncated"] is True
         assert read_files == ["runtime.jsonl"]  # 未读旧备份
 

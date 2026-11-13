@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -56,9 +56,9 @@ def _sse_frames(frames: list[dict[str, object]]) -> AsyncGenerator[str, None]:
     return gen()
 
 
-def _parse_sse_events(raw: str) -> list[dict[str, object]]:
+def _parse_sse_events(raw: str) -> list[dict[str, Any]]:
     """解析适配器产出的 SSE 文本流为 (event, data) 字典列表。"""
-    events: list[dict[str, object]] = []
+    events: list[dict[str, Any]] = []
     for block in raw.split("\n\n"):
         block = block.strip()
         if not block:
@@ -156,7 +156,8 @@ def test_openai_completion_truncated_finish_is_length() -> None:
     """截断流（OTHER）构造的 completion 必须 finish_reason=length。"""
     resp = _gemini_response([GeminiPartResponse(text="被截断的回答")], finish="OTHER")
     payload = build_openai_completion(resp, "gpt-4o")
-    assert payload["choices"][0]["finish_reason"] == "length"
+    choices = cast(list[dict[str, object]], payload["choices"])
+    assert choices[0]["finish_reason"] == "length"
 
 
 @pytest.mark.asyncio
@@ -228,7 +229,8 @@ def test_openai_tools_responses_top_level_shape() -> None:
     decl = decls[0]
     assert decl["name"] == "get_weather"
     assert decl["description"] == "Get current weather"
-    assert decl["parameters"]["required"] == ["city"]
+    params = cast(dict[str, object], decl["parameters"])
+    assert params["required"] == ["city"]
     # Chat 形态（function 子对象）仍兼容
     chat_tools = [
         {
@@ -242,7 +244,10 @@ def test_openai_tools_responses_top_level_shape() -> None:
     ]
     chat_result = _openai_tools_to_gemini(chat_tools)
     assert chat_result is not None
-    assert chat_result[0].functionDeclarations[0]["parameters"] == {
+    chat_decls = chat_result[0].functionDeclarations
+    assert chat_decls is not None
+    chat_params = cast(dict[str, object], chat_decls[0]["parameters"])
+    assert chat_params == {
         "type": "object",
         "properties": {},
     }
@@ -270,7 +275,7 @@ async def test_openai_explicit_empty_tools_not_injected() -> None:
 
 async def _run_claude_stream(
     frames: list[dict[str, object]], stop_sequences: list[str] | None = None
-) -> list[dict[str, object]]:
+) -> list[dict[str, Any]]:
     raw = ""
     async for chunk in claude_stream_adapter(
         _sse_frames(frames),
@@ -528,7 +533,8 @@ def test_build_claude_message_str_args_coerced() -> None:
         finish="STOP",
     )
     payload = build_claude_message(resp, "claude-sonnet-4-5", None)
-    tool_blocks = [b for b in payload["content"] if b["type"] == "tool_use"]
+    content = cast(list[dict[str, object]], payload["content"])
+    tool_blocks = [b for b in content if b["type"] == "tool_use"]
     assert len(tool_blocks) == 1
     assert isinstance(tool_blocks[0]["input"], dict)
     assert tool_blocks[0]["input"] == {"input": '{"city": "Tok'}
@@ -542,7 +548,7 @@ def test_build_claude_message_str_args_coerced() -> None:
 
 async def _run_responses_stream(
     frames: list[dict[str, object]],
-) -> list[dict[str, object]]:
+) -> list[dict[str, Any]]:
     raw = ""
     async for chunk in responses_stream_adapter(
         _sse_frames(frames), requested_model="gpt-5"
@@ -723,7 +729,8 @@ async def test_responses_request_system_content_array() -> None:
     gemini_req, _ = await responses_to_gemini_request(req)
     first = gemini_req.contents[0]
     assert first.role == "user"
-    assert "You are a calculator." in first.parts[0].text
+    first_text = first.parts[0].text
+    assert first_text is not None and "You are a calculator." in first_text
 
 
 # ---------------------------------------------------------------------------
