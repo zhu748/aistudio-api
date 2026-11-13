@@ -16,7 +16,7 @@ dependencies = [
   # brotli/zstandard 解码器才能广播完整浏览器值并解开响应体
   "brotli>=1.1.0",
   "zstandard>=0.23.0",
-  "pydantic==2.12.5",
+  "pydantic==2.14.3",
   "uvicorn>=0.30.0",
   "python-dotenv>=1.0.0",
   "PyYAML>=6.0.0",
