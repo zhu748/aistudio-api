@@ -428,3 +428,91 @@ def test_normalize_empty_thinking_config_leaves_default_active():
 def test_visit_id_regex_shape():
     vid = get_visit_id("regex-check")
     assert re.fullmatch(r"v1_[A-Za-z0-9+/=]+", vid)
+
+
+# ───────────────── 思考档位上下兼容（VERY_HIGH 新档） ─────────────────
+# 2026-11 上游 ListModels 目录实测：gemini-4-hydrogen thinkingLevels=[1,2,3,5]
+# （新档 5=VERY_HIGH），carbon/argon 仍 [1,2,3]。档位数据随模型列表同一次
+# 拉取缓存（600s TTL 自动刷新），fallback 快照含同步实测值。
+
+
+def test_thinking_level_enum_has_very_high():
+    assert int(ThinkingLevel.VERY_HIGH) == 5
+    # wire 层数值档位直取：VERY_HIGH(5) 可被解析（此前 ValueError 保持原样）
+    assert ThinkingLevel(5) is ThinkingLevel.VERY_HIGH
+
+
+def test_snap_very_high_downgrades_to_model_max():
+    """传入档位高于模型支持的最高档 → 降至模型最高档（向下兼容）。"""
+    # carbon 最高支持 HIGH(3)：请求 VERY_HIGH(5) → 吸附降档到 HIGH
+    assert (
+        snap_thinking_level_to_supported("gemini-4-carbon", ThinkingLevel.VERY_HIGH)
+        == ThinkingLevel.HIGH
+    )
+    # argon 同为 [1,2,3]
+    assert (
+        snap_thinking_level_to_supported("gemini-4-argon", ThinkingLevel.VERY_HIGH)
+        == ThinkingLevel.HIGH
+    )
+    # hydrogen 支持 [1,2,3,5]：VERY_HIGH 原样通过
+    assert (
+        snap_thinking_level_to_supported("gemini-4-hydrogen", ThinkingLevel.VERY_HIGH)
+        == ThinkingLevel.VERY_HIGH
+    )
+
+
+def test_snap_below_model_min_upgrades_to_min():
+    """传入档位低于模型支持的最低档 → 升至模型最低档（向上兼容）。"""
+    # carbon 最低支持 LOW(1)：请求 MINIMAL(4，强度最低) → 就近升到 LOW
+    # （距离相同优先升档策略保证不意外削弱）
+    assert (
+        snap_thinking_level_to_supported("gemini-4-carbon", ThinkingLevel.MINIMAL)
+        == ThinkingLevel.LOW
+    )
+
+
+def test_snap_wire_with_very_high_level():
+    """wire 数组档位吸附：level=5 对 hydrogen 原样、对 carbon 降到 3。"""
+    # hydrogen：[1,None,None,5] → 原样（5 在支持列表）
+    assert snap_thinking_wire_to_model("gemini-4-hydrogen", [1, None, None, 5]) == [
+        1,
+        None,
+        None,
+        5,
+    ]
+    # carbon：[1,None,None,5] → [1,None,None,3]
+    assert snap_thinking_wire_to_model("gemini-4-carbon", [1, None, None, 5]) == [
+        1,
+        None,
+        None,
+        3,
+    ]
+
+
+def test_parse_thinking_level_very_high_variants():
+    """reasoningEffort 文本 / 数值 / 分隔符变体统一解析为 VERY_HIGH。"""
+    from aistudio_api.application.chat_service import _parse_thinking_level
+
+    assert _parse_thinking_level("very_high") is ThinkingLevel.VERY_HIGH
+    assert _parse_thinking_level("VERY-HIGH") is ThinkingLevel.VERY_HIGH
+    assert _parse_thinking_level("VERYHIGH") is ThinkingLevel.VERY_HIGH
+    assert _parse_thinking_level(5) is ThinkingLevel.VERY_HIGH
+    # 既有档位不受影响
+    assert _parse_thinking_level("high") is ThinkingLevel.HIGH
+    assert _parse_thinking_level("none") is None
+
+
+def test_hydrogen_fallback_snapshot_has_very_high_level():
+    """fallback 快照含 hydrogen 实测 [1,2,3,5]（冷启动吸附与线上一致）。"""
+    info = model_discovery.get_cached_model_info("gemini-4-hydrogen")
+    assert info is not None
+    assert info.get("thinkingLevels") == [1, 2, 3, 5]
+    assert info.get("defaultThinkingLevel") == 3
+    carbon = model_discovery.get_cached_model_info("gemini-4-carbon")
+    assert carbon is not None
+    assert carbon.get("thinkingLevels") == [1, 2, 3]
+
+
+def test_browser_default_thinking_wire_hydrogen():
+    """hydrogen 浏览器形态默认档取目录元数据 defaultThinkingLevel=3(HIGH)。"""
+    assert browser_default_thinking_wire("gemini-4-hydrogen") == [1, None, None, 3]
