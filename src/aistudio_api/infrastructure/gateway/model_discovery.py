@@ -156,7 +156,9 @@ _FALLBACK_MODELS = [
         "displayName": "Deep Research Preview (Apr-21-2026)",
         "description": "Preview release (April 21th, 2026) of Deep Research",
         "category": "agent",
-        "inputTokenLimit": 131072,
+        # 2026-11-13 线上目录实测：inputTokenLimit 已从 131072 提升至
+        # 1048576（deep-research 系列 8x 扩容），out 仍 65536。
+        "inputTokenLimit": 1048576,
         "outputTokenLimit": 65536,
         "unknownFlag13": 1,
         "defaultThinkingLevel": None,
@@ -173,7 +175,8 @@ _FALLBACK_MODELS = [
         "displayName": "Deep Research Max Preview (Apr-21-2026)",
         "description": "Preview release (April 21st, 2026) of Deep Research Max",
         "category": "agent",
-        "inputTokenLimit": 131072,
+        # 2026-11-13 线上目录实测：inputTokenLimit 同步扩容至 1048576。
+        "inputTokenLimit": 1048576,
         "outputTokenLimit": 65536,
         "unknownFlag13": 1,
         "defaultThinkingLevel": None,
@@ -330,7 +333,10 @@ _FALLBACK_MODELS = [
             "gemini-1.5-pro",
             "gemini-2.5-pro-preview-05-06",
         ],
-        "paid": False,
+        # 2026-11-13 线上目录实测：paid[77]=2 / accessModes[82]=[1,3]，
+        # 已从免费转为 Pro 级付费门控（冷启动等级判定与线上一致）。
+        "paid": True,
+        "accessModes": [1, 3],
         "is_image_model": False,
         "is_video_model": False,
         "is_audio_model": False,
@@ -510,7 +516,9 @@ _FALLBACK_MODELS = [
         "unknownFlag13": 1,
         "defaultThinkingLevel": 3,
         "thinkingLevels": [1, 2, 3],
-        "paid": False,
+        # 2026-11-13 线上目录实测：paid[77]=2 / accessModes[82]=[1,3]。
+        "paid": True,
+        "accessModes": [1, 3],
         "is_image_model": False,
         "is_video_model": False,
         "is_audio_model": False,

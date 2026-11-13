@@ -38,6 +38,127 @@ __all__ = [
     "strip_to_aistudio_fingerprint",
 ]
 
+# ---------------------------------------------------------------------------
+# Firefox 152 真实浏览器线缆形态（waa-signer Go 浏览器模型 + 本地 H2 捕获实测）
+# ---------------------------------------------------------------------------
+# 真机模型源：waa-signer/internal/aistudio/transport_browser.go 的
+# firefoxRequestHeaderOrder（Go 浏览器级传输层复刻，逐头逆向得出）。
+# 本地 H2 捕获实证（aistudio-research/09_wire_fidelity.py）：httpx 按传入
+# 头序列的顺序发送 HTTP/2 HEADERS 帧，故按此表排序即可对齐真实浏览器的
+# 线缆头序。已知的 httpx 栈硬偏差（无法在本层修复，详见
+# docs/REQUEST_BEHAVIOR_ALIGNMENT.md 线缆保真审计）：
+#   - 伪头顺序 :method/:authority/:scheme/:path ≠ Firefox :method/:path/:authority/:scheme
+#   - h2 库强制 cookie 合并置尾（Firefox：cookie 位于 sec-fetch-* 之前）
+#   - H2 SETTINGS 帧参数集与窗口更新节奏（Go uTLS 通道已对齐）
+_FIREFOX_RPC_HEADER_ORDER: tuple[str, ...] = (
+    "user-agent",
+    "accept",
+    "accept-language",
+    "accept-encoding",
+    "referer",
+    "x-aistudio-g1-tier",
+    "x-aistudio-visit-id",
+    "x-goog-ext-519733851-bin",
+    "x-goog-api-key",
+    "x-goog-authuser",
+    "authorization",
+    "content-type",
+    "x-user-agent",
+    "content-length",
+    "origin",
+    "cookie",
+    "sec-fetch-dest",
+    "sec-fetch-mode",
+    "sec-fetch-site",
+    "te",
+)
+
+
+def _firefox_accept_encoding() -> str:
+    """Firefox 152 的 Accept-Encoding 值，按本机解码能力安全降级。
+
+    真实 Firefox 152 发送 ``gzip, deflate, br, zstd``。上游会按此值压缩响应，
+    httpx 必须具备对应解码器（brotli / zstandard）才能解开，否则 RPC 解析
+    收到未解码字节。故仅当解码器齐全时广播完整 Firefox 值，否则按能力降级
+    （安装 brotli+zstandard 后与浏览器逐字节一致）。
+    """
+    parts = ["gzip", "deflate"]
+    try:
+        import brotli  # noqa: F401  # pyright: ignore[reportUnusedImport]
+
+        parts.append("br")
+    except ImportError:
+        pass
+    try:
+        import zstandard  # noqa: F401  # pyright: ignore[reportUnusedImport]
+
+        parts.append("zstd")
+    except ImportError:
+        pass
+    return ", ".join(parts)
+
+
+# 浏览器自行附加、不进入 CORS 预检 access-control-request-headers 的头名
+# （Go transport_browser.go browserManagedHeaders 同集）。
+_BROWSER_MANAGED_HEADER_NAMES: frozenset[str] = frozenset(
+    {
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "origin",
+        "cookie",
+        "content-length",
+        "host",
+        "upgrade-insecure-requests",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "sec-fetch-storage-access",
+        "priority",
+        "te",
+    }
+)
+
+
+def _firefox_wire_header_list(
+    clean_headers: dict[str, str], body_length: int
+) -> list[tuple[str, str]]:
+    """把白名单头集重建为 Firefox 152 线缆顺序的有序头列表。
+
+    - 顺序严格遵循 ``_FIREFOX_RPC_HEADER_ORDER``（真实浏览器 RPC 形态）；
+    - 强制补齐浏览器必带的 ``te: trailers`` 与 Firefox 值的
+      ``accept-encoding``（httpx 缺省会发 gzip,deflate[,br]，与浏览器不一致）；
+    - 显式携带 ``content-length``（真实浏览器在头块中段携带；httpx 缺省会
+      追加到尾部——显式提供可保位）；
+    - 顺序表之外的白名单残头按字母序殿后（Go orderedHeaderNames 语义）。
+    """
+    lowered = {str(k).lower(): str(v) for k, v in clean_headers.items()}
+    ordered: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for name in _FIREFOX_RPC_HEADER_ORDER:
+        if name == "te":
+            ordered.append(("Te", "trailers"))
+            seen.add(name)
+            continue
+        if name == "accept-encoding":
+            ordered.append(("Accept-Encoding", _firefox_accept_encoding()))
+            seen.add(name)
+            continue
+        if name == "content-length":
+            ordered.append(("Content-Length", str(body_length)))
+            seen.add(name)
+            continue
+        value = lowered.get(name)
+        if value is not None:
+            ordered.append((_CANONICAL_HEADER_NAMES.get(name, name), value))
+            seen.add(name)
+    for name in sorted(set(lowered) - seen):
+        ordered.append((_CANONICAL_HEADER_NAMES.get(name, name), lowered[name]))
+    return ordered
+
 # httpx 的 HTTP/2 支持是可选依赖（h2 包）。若环境未安装 h2 而仍传
 # http2=True，AsyncClient 在创建时即抛 ImportError（"Using http2=True, but
 # the 'h2' package is not installed"），所有上游请求全部 500——曾在
@@ -234,8 +355,9 @@ _UPSTREAM_ALLOWED_HEADERS: frozenset[str] = frozenset(
 )
 
 # 调用方必须显式设置、禁止透传推断值的头（host/content-length 由
-# httpx 依据目标 URL 与请求体自动生成；accept-encoding/连接管理头由
-# httpx 传输层控制——均不属于浏览器指纹集，透传只会引入客户端痕迹）
+# Firefox 线缆重建层按目标 URL 与请求体生成；accept-encoding 由
+# _firefox_wire_header_list 重建为 Firefox 152 值——均不属于调用方可控头，
+# 透传只会引入客户端痕迹）
 _UPSTREAM_REBUILT_HEADERS: frozenset[str] = frozenset(
     {"host", "content-length", "accept-encoding"}
 )
@@ -314,8 +436,9 @@ def _ensure_authorization_header(
 
     incoming_auth = clean_headers.get("authorization") or ""
     incoming_auth = incoming_auth if isinstance(incoming_auth, str) else ""
-    # host/content-length/accept-encoding 属于 httpx 传输层管辖，不得透传。
-    # 白名单本就不含这三个头名，此处保留为纵深防御（防止未来白名单扩张）。
+    # host / content-length / accept-encoding 由 Firefox 线缆重建层
+    # （_firefox_wire_header_list）统一重建；白名单本就不含这三个头名，
+    # 此处保留为纵深防御（防止未来白名单扩张）。
     clean_headers.pop("host", None)
     clean_headers.pop("content-length", None)
     clean_headers.pop("accept-encoding", None)
@@ -348,8 +471,29 @@ def _ensure_authorization_header(
     }
 
 
+def _is_browser_rpc_target(url: str) -> bool:
+    """URL 是否为浏览器跨域 RPC 目标（aistudio 页面只跨域调 clients6）。
+
+    预检仅对 https + *.clients6.google.com 生效；测试注入的本地/示例
+    URL 不触发（也便于验证脚本打桩）。
+    """
+    match = re.match(r"^https://([^/:]+)", url)
+    if not match:
+        return False
+    return match.group(1).lower().endswith(".clients6.google.com")
+
+
 class HTTPStreamTransport:
     """Direct HTTP streaming and non-streaming transport layer."""
+
+    # 真实浏览器行为常量（waa-signer Go 浏览器模型同源）：
+    # - Firefox network.http.max-persistent-connections-per-server = 6
+    #   （对单一主机已建立与建立中的连接数上限；H2 多路复用下流量承载充裕）
+    # - CORS 预检缓存：Access-Control-Max-Age 上限 24h（Firefox 行为），
+    #   缺省回退 5s（Go 同值）；预检失败也缓存 5s，避免每请求一次 OPTIONS 风暴
+    _FIREFOX_MAX_CONNECTIONS = 6
+    _PREFLIGHT_MAX_AGE_CAP = 24.0 * 3600.0
+    _PREFLIGHT_FALLBACK_MAX_AGE = 5.0
 
     def __init__(self, proxy_url: str | None = None, timeout: float = 120.0) -> None:
         self.proxy_url = proxy_url or settings.proxy_url
@@ -363,6 +507,9 @@ class HTTPStreamTransport:
         self._retired_clients: set[httpx.AsyncClient] = set()
         # 按代理地址分池的客户端缓存：key 为代理 URL（空串表示直连）
         self._clients: dict[str, httpx.AsyncClient] = {}
+        # CORS 预检结果缓存：key = "POST <url> <acr-headers>"，值为到期时刻
+        # （time.monotonic 基准；浏览器同源预检缓存语义）
+        self._preflight_cache: dict[str, float] = {}
         self._active_clients: dict[httpx.AsyncClient, int] = {}
         self._client_idle: dict[httpx.AsyncClient, asyncio.Event] = {}
         self._closed = False
@@ -408,6 +555,7 @@ class HTTPStreamTransport:
                 if not client.is_closed:
                     await client.aclose()
             self._clients.clear()
+            self._preflight_cache.clear()
         pending = list(self._retired_close_tasks)
         for task in pending:
             task.cancel()
@@ -499,6 +647,10 @@ class HTTPStreamTransport:
     async def _get_client(self, proxy_url: str | None = None) -> httpx.AsyncClient:
         """获取（或创建）绑定指定出口代理的客户端；proxy_url=None 时使用全局默认代理。
 
+        连接池上限对齐 Firefox network.http.max-persistent-connections-per-server
+        = 6（每个代理出口对上游主机的持久连接数与真实浏览器一致；H2 多路复
+        用下单连接可承载约 100 并发流，6 连接足够承载页面并发突发）。
+
         turn / turns / sstp 代理在此处解析为本地回环 SOCKS5（桥接子进程
         由 proxy_bridge 托管，首次冷启动放线程池，不阻塞事件循环）；
         客户端池以解析后的地址为键，同一桥接节点复用同一连接池。
@@ -525,10 +677,104 @@ class HTTPStreamTransport:
                 trust_env=False,
                 http2=_http2_enabled(),
                 verify=_shared_ssl_context(),
-                limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+                limits=httpx.Limits(
+                    max_keepalive_connections=self._FIREFOX_MAX_CONNECTIONS,
+                    max_connections=self._FIREFOX_MAX_CONNECTIONS,
+                ),
             )
             self._clients[key] = client
             return client
+
+    async def _ensure_cors_preflight(
+        self,
+        *,
+        url: str,
+        rpc_headers: dict[str, str],
+        client: httpx.AsyncClient,
+    ) -> None:
+        """像真实浏览器一样先发 CORS 预检 OPTIONS（结果按 Max-Age 缓存）。
+
+        真实 AI Studio 页面脚本发 RPC（非简单请求：content-type 非 safelisted
+        + authorization 等自定义头）前，浏览器必须先向同一 URL 发匿名 OPTIONS
+        预检，并按 Access-Control-Max-Age 缓存（Firefox 上限 24h）。本项目
+        主链路原先从不发预检——这是可观测的请求行为偏离，本方法补齐。
+
+        形态对齐 waa-signer Go ensurePreflight：
+        - 匿名（无 Cookie/Authorization）；
+        - access-control-request-headers = 脚本设置头（非浏览器托管头）
+          的小写字母序列表；
+        - 预检头序同 Firefox 线缆序；预检失败仅告警不阻断主请求
+          （浏览器语义下预检必成，失败属网络异常，阻断只会伤可用性）。
+
+        预检与主请求共用连接池（连接层与 Go 匿名分池模型的差异已在
+        docs/REQUEST_BEHAVIOR_ALIGNMENT.md 记录）。
+        """
+        if not _is_browser_rpc_target(url):
+            return
+
+        header_names = {str(k).lower() for k in rpc_headers}
+        acr_names = sorted(
+            name
+            for name in header_names
+            if name not in _BROWSER_MANAGED_HEADER_NAMES
+        )
+        acr_value = ",".join(acr_names)
+        key = f"POST {url} {acr_value}"
+        now = time.monotonic()
+        expiry = self._preflight_cache.get(key)
+        if expiry is not None and now < expiry:
+            return
+
+        lowered = {str(k).lower(): str(v) for k, v in rpc_headers.items()}
+        preflight_headers: list[tuple[str, str]] = [
+            ("User-Agent", lowered.get("user-agent") or ""),
+            ("Accept", "*/*"),
+            ("Accept-Language", lowered.get("accept-language") or ""),
+            ("Accept-Encoding", _firefox_accept_encoding()),
+            ("Access-Control-Request-Method", "POST"),
+            ("Access-Control-Request-Headers", acr_value),
+            ("Referer", lowered.get("referer") or ""),
+            ("Origin", lowered.get("origin") or ""),
+            ("Sec-Fetch-Dest", "empty"),
+            ("Sec-Fetch-Mode", "cors"),
+            ("Sec-Fetch-Site", "same-site"),
+            ("Priority", "u=4"),
+            ("Te", "trailers"),
+        ]
+        preflight_headers = [
+            (name, value) for name, value in preflight_headers if value
+        ]
+
+        max_age = self._PREFLIGHT_FALLBACK_MAX_AGE
+        try:
+            resp = await client.options(url, headers=preflight_headers)
+            if not 200 <= resp.status_code < 300:
+                logger.warning(
+                    "CORS 预检返回 HTTP %d（不阻断主请求）: url=%s",
+                    resp.status_code,
+                    url,
+                )
+            else:
+                raw_age = resp.headers.get("access-control-max-age")
+                try:
+                    parsed_age = float(raw_age) if raw_age else None
+                except ValueError:
+                    parsed_age = None
+                if parsed_age is not None:
+                    max_age = min(parsed_age, self._PREFLIGHT_MAX_AGE_CAP)
+                logger.debug(
+                    "CORS 预检完成: url=%s, status=%d, max_age=%.0fs",
+                    url,
+                    resp.status_code,
+                    max_age,
+                )
+        except Exception as e:
+            logger.warning(
+                "CORS 预检发送失败（不阻断主请求）: url=%s, error=%s",
+                url,
+                e,
+            )
+        self._preflight_cache[key] = time.monotonic() + max_age
 
     async def send_request(
         self,
@@ -551,6 +797,9 @@ class HTTPStreamTransport:
             auth_file=auth_file,
             cookies=cookies,
         )
+        body_bytes = body.encode("utf-8")
+        # Firefox 线缆形态重建：有序头列表（含 te/accept-encoding/content-length）
+        wire_headers = _firefox_wire_header_list(clean_headers, len(body_bytes))
         logger.debug(
             "发送请求: url=%s, body_len=%d, u/%s",
             url,
@@ -560,10 +809,12 @@ class HTTPStreamTransport:
 
         effective_proxy = self.proxy_url if proxy_url is None else proxy_url
         async with self._lease_client(effective_proxy) as client:
+            # 真实浏览器行为：首个（及缓存过期后的）跨域 RPC 前先发 CORS 预检
+            await self._ensure_cors_preflight(
+                url=url, rpc_headers=clean_headers, client=client
+            )
             try:
-                resp = await client.post(
-                    url, headers=clean_headers, content=body.encode("utf-8")
-                )
+                resp = await client.post(url, headers=wire_headers, content=body_bytes)
                 # Set-Cookie 回写下放线程池（3.4）：逐账号读盘/写盘的同步 I/O
                 # 若留在事件循环内会拖慢所有并发请求的首字延迟。
                 set_cookies = resp.headers.get_list("set-cookie")
@@ -611,14 +862,21 @@ class HTTPStreamTransport:
             auth_file=auth_file,
             cookies=cookies,
         )
+        body_bytes = body.encode("utf-8")
+        # Firefox 线缆形态重建：有序头列表（含 te/accept-encoding/content-length）
+        wire_headers = _firefox_wire_header_list(clean_headers, len(body_bytes))
         logger.debug("建立流式请求: url=%s, u/%s", url, auth_user)
 
         effective_proxy = self.proxy_url if proxy_url is None else proxy_url
         async with self._lease_client(effective_proxy) as client:
+            # 真实浏览器行为：首个（及缓存过期后的）跨域 RPC 前先发 CORS 预检
+            await self._ensure_cors_preflight(
+                url=url, rpc_headers=clean_headers, client=client
+            )
             resp = None
             try:
                 req = client.build_request(
-                    "POST", url, headers=clean_headers, content=body.encode("utf-8")
+                    "POST", url, headers=wire_headers, content=body_bytes
                 )
                 resp = await client.send(req, stream=True)
                 set_cookies = resp.headers.get_list("set-cookie")

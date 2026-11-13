@@ -22,8 +22,17 @@ from aistudio_api.infrastructure.gateway.session import (
     GENERATE_CONTENT_URL,
     GatewaySession,
     SessionContext,
+    extract_page_prompt,
 )
-from aistudio_api.infrastructure.gateway.wire_codec import encode_request_body
+from aistudio_api.infrastructure.gateway.session_token import (
+    account_session_token_scope,
+    get_session_token,
+    record_session_token,
+)
+from aistudio_api.infrastructure.gateway.wire_codec import (
+    attach_session_token,
+    encode_request_body,
+)
 from aistudio_api.infrastructure.gateway.wire_parser import parse_text_output
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -125,6 +134,12 @@ class AIStudioClient:
             max_tokens=max_tokens,
             generation_config_overrides=generation_config_overrides,
             snapshot=snapshot,
+        )
+        # 浏览器行为对齐：回传上一轮响应携带的会话令牌（wire 槽 11）。
+        # 04 号实验实证——在已签名 body 上追加槽 11 不影响 WAA proof
+        # （proof 只绑定 contents 摘要），上游 200 接受。
+        body = attach_session_token(
+            body, get_session_token(account_session_token_scope(ctx.auth_file))
         )
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_active_waa_server,
@@ -306,8 +321,27 @@ class AIStudioClient:
             raise SessionExpiredError("登录态已失效: 被重定向至 Google 登录页")
         if is_html_payload(raw_text):
             raise TransportError("upstream returned HTML error page on HTTP 200")
+        # 真实页面行为：GenerateContent 发出 2.2s 后补一次 CountTokens
+        if effective_prep.url.rstrip("/").endswith("/GenerateContent"):
+            scheduler = getattr(
+                self._session, "schedule_browser_counttokens_followup", None
+            )
+            if callable(scheduler):
+                scheduler(
+                    effective_prep.ctx,
+                    model,
+                    extract_page_prompt(effective_prep.body),
+                )
         output = parse_text_output(raw_text)
         output.model = model
+        # 会话令牌（响应槽 7 v1_...）：记录供下一轮请求回传 wire 槽 11
+        if output.response_id:
+            record_session_token(
+                account_session_token_scope(
+                    effective_prep.ctx.auth_file if effective_prep.ctx else None
+                ),
+                output.response_id,
+            )
         return output
 
 

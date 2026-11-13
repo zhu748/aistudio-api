@@ -240,12 +240,12 @@ async def test_build_gemini_streaming_response_passes_requested_model():
     resp = _build_gemini_streaming_response(
         client=mock_client,
         req=req,
-        model_path="gemini-2.5-pro",
+        model_path="gemini-3.8-flash",
     )
 
     chunks = [chunk async for chunk in resp.body_iterator]
     assert len(chunks) > 0
-    assert passed_model == "models/gemini-2.5-pro"
+    assert passed_model == "models/gemini-3.8-flash"
 
 
 @pytest.mark.asyncio

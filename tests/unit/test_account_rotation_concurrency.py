@@ -274,7 +274,7 @@ async def test_try_switch_account_avalanche_protection():
     ):
         # 3 个并发协程同时遇到 429 并尝试切号
         tasks = [
-            try_switch_account(model="gemini-2.5-pro", failed_account_id="acc_1")
+            try_switch_account(model="gemini-3.8-flash", failed_account_id="acc_1")
             for _ in range(3)
         ]
         results = await asyncio.gather(*tasks)
