@@ -52,7 +52,7 @@ def _sample_response(
         ],
         usageMetadata=GeminiUsageMetadata(
             promptTokenCount=10,
-            candidatesTokenCount=20,
+            candidatesTokenCount=16,
             totalTokenCount=30,
             thoughtsTokenCount=4,
             cachedContentTokenCount=2,
@@ -197,9 +197,12 @@ async def test_system_message_item_joins_instructions() -> None:
     )
     gemini_req, _ = await responses_to_gemini_request(req)
     assert gemini_req.systemInstruction is not None
-    assert gemini_req.systemInstruction.parts[0].text == "Base system prompt."
-    # developer 消息以 [SYSTEM] 前缀并入 contents（保序）
-    assert gemini_req.contents[0].parts[0].text == "[SYSTEM] Extra developer rule."
+    assert (
+        gemini_req.systemInstruction.parts[0].text
+        == "Base system prompt.\n\nExtra developer rule."
+    )
+    assert len(gemini_req.contents) == 1
+    assert gemini_req.contents[0].parts[0].text == "Go"
 
 
 # ---------------------------------------------------------------------------

@@ -150,7 +150,7 @@ def _encode_schema_combiners(
     one_of = schema.get("oneOf") or schema.get("one_of")
     if isinstance(one_of, list) and one_of:
         wire[SchemaIndex.ONE_OF] = [
-            encode_schema_to_wire(
+            _encode_schema_to_wire(
                 sub if isinstance(sub, dict) else {},
                 include_required=include_required,
             )
@@ -161,7 +161,7 @@ def _encode_schema_combiners(
     any_of = schema.get("anyOf") or schema.get("any_of")
     if isinstance(any_of, list) and any_of:
         wire[SchemaIndex.ANY_OF] = [
-            encode_schema_to_wire(
+            _encode_schema_to_wire(
                 sub if isinstance(sub, dict) else {},
                 include_required=include_required,
             )
@@ -172,7 +172,7 @@ def _encode_schema_combiners(
     all_of = schema.get("allOf") or schema.get("all_of")
     if isinstance(all_of, list) and all_of:
         wire[SchemaIndex.ALL_OF] = [
-            encode_schema_to_wire(
+            _encode_schema_to_wire(
                 sub if isinstance(sub, dict) else {},
                 include_required=include_required,
             )
@@ -182,12 +182,90 @@ def _encode_schema_combiners(
 
     not_schema = schema.get("not") or schema.get("not_")
     if isinstance(not_schema, dict):
-        wire[SchemaIndex.NOT] = encode_schema_to_wire(
+        wire[SchemaIndex.NOT] = _encode_schema_to_wire(
             not_schema, include_required=include_required
         )
 
 
 def encode_schema_to_wire(
+    schema: dict[str, object], *, include_required: bool = True
+) -> list[object]:
+    """Resolve local JSON Schema references before encoding the wire subset."""
+    remaining = 10_000
+
+    def expand(node: object, refs: tuple[str, ...] = (), depth: int = 0) -> object:
+        nonlocal remaining
+        remaining -= 1
+        if depth > 64 or remaining < 0:
+            raise ValueError("JSON Schema expansion exceeds complexity limit")
+        if isinstance(node, list):
+            return [expand(item, refs, depth + 1) for item in node]
+        if not isinstance(node, dict):
+            return node
+        reference = node.get("$ref")
+        if reference is not None:
+            if not isinstance(reference, str) or not reference.startswith("#/"):
+                raise ValueError("Only local JSON Schema $ref references are supported")
+            if reference in refs:
+                raise ValueError(
+                    f"Recursive JSON Schema reference is not supported: {reference}"
+                )
+            target: object = schema
+            for segment in reference[2:].split("/"):
+                key = segment.replace("~1", "/").replace("~0", "~")
+                if not isinstance(target, dict) or key not in target:
+                    raise ValueError(f"Unresolved JSON Schema reference: {reference}")
+                target = target[key]
+            resolved = expand(target, (*refs, reference), depth + 1)
+            siblings = {key: value for key, value in node.items() if key != "$ref"}
+            if siblings:
+                return {"allOf": [resolved, expand(siblings, refs, depth + 1)]}
+            return resolved
+        result: dict[str, object] = {}
+        for key, value in node.items():
+            if key in ("$defs", "definitions"):
+                continue
+            if key in (
+                "properties",
+                "patternProperties",
+                "dependentSchemas",
+            ) and isinstance(value, dict):
+                result[key] = {
+                    name: expand(child, refs, depth + 1)
+                    for name, child in value.items()
+                }
+            elif key in (
+                "items",
+                "prefixItems",
+                "prefix_items",
+                "anyOf",
+                "any_of",
+                "oneOf",
+                "one_of",
+                "allOf",
+                "all_of",
+                "not",
+                "not_",
+                "additionalProperties",
+                "propertyNames",
+                "contains",
+                "if",
+                "then",
+                "else",
+            ):
+                result[key] = expand(value, refs, depth + 1)
+            else:
+                # Literal data and property names can themselves contain '$ref'.
+                result[key] = value
+        return result
+
+    resolved = expand(schema)
+    if not isinstance(resolved, dict):
+        raise ValueError("JSON Schema must resolve to an object")
+    return _encode_schema_to_wire(resolved, include_required=include_required)
+
+
+def _encode_schema_to_wire(
     schema: dict[str, object], *, include_required: bool = True
 ) -> list[object]:
     type_code, schema_type, is_nullable = _resolve_schema_type_code(schema)
@@ -216,12 +294,12 @@ def encode_schema_to_wire(
     items = schema.get("items")
     if schema_type == "array" or items is not None:
         if isinstance(items, dict):
-            wire[SchemaIndex.ITEMS] = encode_schema_to_wire(
+            wire[SchemaIndex.ITEMS] = _encode_schema_to_wire(
                 items,
                 include_required=include_required,
             )
         elif isinstance(items, list) and items and isinstance(items[0], dict):
-            wire[SchemaIndex.ITEMS] = encode_schema_to_wire(
+            wire[SchemaIndex.ITEMS] = _encode_schema_to_wire(
                 items[0],
                 include_required=include_required,
             )
@@ -233,7 +311,7 @@ def encode_schema_to_wire(
         wire[SchemaIndex.PROPERTIES] = [
             [
                 name,
-                encode_schema_to_wire(
+                _encode_schema_to_wire(
                     prop if isinstance(prop, dict) else {},
                     include_required=include_required,
                 ),
@@ -781,6 +859,8 @@ def normalize_gemini_request(
                 continue
             if part.fileData is not None:
                 raise ValueError("fileData is not supported yet")
+            if part.thoughtSignature:
+                parts.append(AistudioPart(thought_signature=part.thoughtSignature))
         contents.append(AistudioContent(role=role, parts=parts))
     system_instruction = None
     if req.systemInstruction is not None:

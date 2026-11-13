@@ -21,7 +21,17 @@ async def resolve_public_address(host: str, port: int) -> str:
     return resolved[0]
 
 
-class PublicMediaTransport(httpx.AsyncHTTPTransport):
+class PublicMediaTransport(httpx.AsyncBaseTransport):
+    def __init__(self, proxy: str | None = None) -> None:
+        self.proxy = proxy
+        self._origins: dict[tuple[str, str, int | None], httpx.AsyncHTTPTransport] = {}
+
+    async def aclose(self) -> None:
+        await asyncio.gather(
+            *(transport.aclose() for transport in self._origins.values())
+        )
+        self._origins.clear()
+
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         url = request.url
         if url.scheme not in ("http", "https") or url.username or url.password:
@@ -37,4 +47,17 @@ class PublicMediaTransport(httpx.AsyncHTTPTransport):
             stream=request.stream,
             extensions={**request.extensions, "sni_hostname": url.host},
         )
-        return await super().handle_async_request(pinned)
+        # Pinned IPs can be shared by unrelated HTTPS hosts. Keep their pools
+        # separate so a connection authenticated for one SNI is never reused for another.
+        key = (url.scheme, url.host, url.port)
+        transport = self._origins.get(key)
+        if transport is None:
+            from aistudio_api.infrastructure.gateway.transport import (
+                _shared_ssl_context,
+            )
+
+            transport = httpx.AsyncHTTPTransport(
+                proxy=self.proxy, verify=_shared_ssl_context()
+            )
+            self._origins[key] = transport
+        return await transport.handle_async_request(pinned)
