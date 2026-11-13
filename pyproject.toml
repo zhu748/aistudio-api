@@ -26,7 +26,7 @@ dev = [
   "openai>=3.50.0",
   "anthropic>=2.8.0",
   "httpx2>=2.16.0",
-  "google-auth<2.48.0",
+  "google-auth<2.63.0",
   "pyright>=1.1.300",
   "ruff>=0.8.0; sys_platform != 'android'",
 ]
@@ -37,7 +37,7 @@ test = [
   "openai>=3.50.0",
   "anthropic>=2.8.0",
   "httpx2>=2.16.0",
-  "google-auth<2.48.0",
+  "google-auth<2.63.0",
 ]
 
 [project.scripts]
