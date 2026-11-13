@@ -147,18 +147,14 @@ def test_openai_finish_reason_other_maps_to_length() -> None:
     """OTHER（流截断信号）不得伪装成正常 stop。"""
     assert _openai_finish_reason("OTHER", has_tool_calls=False) == "length"
     # 未知枚举也不静默变 stop
-    assert (
-        _openai_finish_reason("SOME_FUTURE_REASON", has_tool_calls=False) == "length"
-    )
+    assert _openai_finish_reason("SOME_FUTURE_REASON", has_tool_calls=False) == "length"
     assert _openai_finish_reason("MAX_TOKENS", has_tool_calls=False) == "length"
     assert _openai_finish_reason("STOP", has_tool_calls=False) == "stop"
 
 
 def test_openai_completion_truncated_finish_is_length() -> None:
     """截断流（OTHER）构造的 completion 必须 finish_reason=length。"""
-    resp = _gemini_response(
-        [GeminiPartResponse(text="被截断的回答")], finish="OTHER"
-    )
+    resp = _gemini_response([GeminiPartResponse(text="被截断的回答")], finish="OTHER")
     payload = build_openai_completion(resp, "gpt-4o")
     assert payload["choices"][0]["finish_reason"] == "length"
 
@@ -433,13 +429,20 @@ async def test_claude_stream_full_resend_deduped() -> None:
 @pytest.mark.asyncio
 async def test_claude_stream_text_then_tool_then_text_indexes() -> None:
     """文本 → 工具 → 文本交错时 block index 连续且三事件配对。"""
+
     def text_frame(t: str) -> dict[str, object]:
         return {"candidates": [{"content": {"parts": [{"text": t}]}}]}
 
     def fc_frame(name: str, args: object) -> dict[str, object]:
         return {
             "candidates": [
-                {"content": {"parts": [{"functionCall": {"id": "x", "name": name, "args": args}}]}}
+                {
+                    "content": {
+                        "parts": [
+                            {"functionCall": {"id": "x", "name": name, "args": args}}
+                        ]
+                    }
+                }
             ]
         }
 
@@ -470,11 +473,7 @@ async def test_claude_stream_text_then_tool_then_text_indexes() -> None:
 async def test_claude_stream_stop_sequence_mid_text_truncated() -> None:
     """stop sequence 命中在文本中间：截断其后内容并报 stop_sequence。"""
     frames = [
-        {
-            "candidates": [
-                {"content": {"parts": [{"text": "Hello END more text"}]}}
-            ]
-        },
+        {"candidates": [{"content": {"parts": [{"text": "Hello END more text"}]}}]},
         {
             "candidates": [{"content": {"parts": []}, "finishReason": "STOP"}],
             "usageMetadata": {
@@ -606,11 +605,7 @@ async def test_responses_stream_text_then_reasoning_delta_index() -> None:
     """message(0) 先开、reasoning(1) 后开：message 的 delta 仍报 0。"""
     frames = [
         {"candidates": [{"content": {"parts": [{"text": "Answer"}]}}]},
-        {
-            "candidates": [
-                {"content": {"parts": [{"text": "hmm", "thought": True}]}}
-            ]
-        },
+        {"candidates": [{"content": {"parts": [{"text": "hmm", "thought": True}]}}]},
         {
             "candidates": [{"content": {"parts": []}, "finishReason": "STOP"}],
             "usageMetadata": {
@@ -879,7 +874,9 @@ async def test_openai_multi_tool_stream_indexes_stable() -> None:
         for c in chunks
         if c.get("choices") and c["choices"][0].get("delta", {}).get("tool_calls")
     ]
-    assert [c["choices"][0]["delta"]["tool_calls"][0]["index"] for c in tool_chunks] == [
+    assert [
+        c["choices"][0]["delta"]["tool_calls"][0]["index"] for c in tool_chunks
+    ] == [
         0,
         1,
     ]

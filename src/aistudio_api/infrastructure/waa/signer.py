@@ -12,6 +12,7 @@ import contextvars
 import hashlib
 import os
 import re
+import threading
 import time
 from collections import OrderedDict
 from contextlib import suppress
@@ -113,6 +114,10 @@ class RemoteProofSigner:
         self.proxy_url = proxy_url or None
         self.timeout = timeout
         self._client: httpx.AsyncClient | None = None
+        # 惰性建池互斥：进程级单例被首批并发签名请求共享，
+        # 无锁并发首调会各建一个 AsyncClient、后赋值者胜出，
+        # 其余实例失去引用泄漏连接池（同 transport._get_client 的教训）。
+        self._client_lock = threading.Lock()
 
     @property
     def last_headers(self) -> dict[str, str]:
@@ -125,17 +130,26 @@ class RemoteProofSigner:
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or lazily initialize shared HTTP client with connection pooling."""
-        if self._client is None or self._client.is_closed:
-            from aistudio_api.infrastructure.waa.daemon import is_local_signer_url
+        if self._client is not None and not self._client.is_closed:
+            return self._client
+        # httpx.AsyncClient 的构造不触网，同步临界区即可，无需 await；
+        # 双重检查防并发首调重复建池。
+        with self._client_lock:
+            if self._client is None or self._client.is_closed:
+                from aistudio_api.infrastructure.waa.daemon import (
+                    is_local_signer_url,
+                )
 
-            is_local = is_local_signer_url(self.server_url)
-            effective_proxy = None if is_local else self.proxy_url
-            self._client = httpx.AsyncClient(
-                timeout=self.timeout,
-                proxy=effective_proxy,
-                trust_env=False,
-                limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
-            )
+                is_local = is_local_signer_url(self.server_url)
+                effective_proxy = None if is_local else self.proxy_url
+                self._client = httpx.AsyncClient(
+                    timeout=self.timeout,
+                    proxy=effective_proxy,
+                    trust_env=False,
+                    limits=httpx.Limits(
+                        max_keepalive_connections=20, max_connections=50
+                    ),
+                )
         return self._client
 
     async def close(self) -> None:
@@ -321,6 +335,7 @@ class WaaSigner:
         url = proof_server_url or DEFAULT_PROOF_SERVER_URL
         self._remote_signer = RemoteProofSigner(server_url=url, proxy_url=proxy_url)
         self._reconfigure_lock: asyncio.Lock | None = None
+        self._reconfigure_lock_guard = threading.Lock()
         self._delayed_close_tasks: set[asyncio.Task[None]] = set()
         self._retired_signers: set[RemoteProofSigner] = set()
         # proof 复用缓存：key=(content_hash, auth_user, tier, model, cookie_anchor)
@@ -367,9 +382,16 @@ class WaaSigner:
         return (content_hash, str(auth_user), str(tier), str(model), anchor)
 
     def _get_reconfigure_lock(self) -> asyncio.Lock:
-        """惰性创建切换锁（避免 import 时无事件循环可用）。"""
+        """惰性创建切换锁（避免 import 时无事件循环可用）。
+
+        创建本身用 threading.Lock 保护：两个并发协程同时首调时若无同步，
+        会各自 new 一个 Lock 并各持「不同的锁」，reconfigure 的原子替换
+        序列（retired 维护 + 延迟关闭）失去互斥。
+        """
         if self._reconfigure_lock is None:
-            self._reconfigure_lock = asyncio.Lock()
+            with self._reconfigure_lock_guard:
+                if self._reconfigure_lock is None:
+                    self._reconfigure_lock = asyncio.Lock()
         return self._reconfigure_lock
 
     async def reconfigure(
