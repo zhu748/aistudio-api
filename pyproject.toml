@@ -11,6 +11,11 @@ requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115.0",
   "httpx[socks,http2]>=0.28.0",
+  # Firefox 152 线缆对齐（docs/REQUEST_BEHAVIOR_ALIGNMENT.md）：上游按
+  # accept-encoding: gzip, deflate, br, zstd 压缩响应，httpx 需具备
+  # brotli/zstandard 解码器才能广播完整浏览器值并解开响应体
+  "brotli>=1.1.0",
+  "zstandard>=0.23.0",
   "pydantic==2.12.5",
   "uvicorn>=0.30.0",
   "python-dotenv>=1.0.0",

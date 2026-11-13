@@ -15,7 +15,14 @@ from aistudio_api.domain.errors import (
     is_login_redirect_payload,
 )
 from aistudio_api.infrastructure.gateway.client import PreparedRequest
-from aistudio_api.infrastructure.gateway.session import GatewaySession
+from aistudio_api.infrastructure.gateway.session import (
+    GatewaySession,
+    extract_page_prompt,
+)
+from aistudio_api.infrastructure.gateway.session_token import (
+    account_session_token_scope,
+    record_session_token,
+)
 from aistudio_api.infrastructure.gateway.stream_parser import (
     IncrementalJSONStreamParser,
 )
@@ -64,6 +71,20 @@ class StreamingGateway:
             raise RuntimeError("gateway session is required for streaming")
         request_body = request.body
         logger.debug("开始流式解析: model=%s, body_len=%d", model, len(request_body))
+        # 会话令牌作用域（响应 chunk 槽 7 → 下一轮请求 wire 槽 11，浏览器行为）
+        token_scope = account_session_token_scope(
+            request.ctx.auth_file if request.ctx is not None else None
+        )
+        # 真实页面行为：GenerateContent 发出 2.2s 后补一次 CountTokens
+        # （当前用户轮次；Go 签名器 SendProtected 同源行为）
+        if request.url.rstrip("/").endswith("/GenerateContent"):
+            scheduler = getattr(
+                self._session, "schedule_browser_counttokens_followup", None
+            )
+            if callable(scheduler):
+                scheduler(
+                    request.ctx, model, extract_page_prompt(request_body)
+                )
         parser = IncrementalJSONStreamParser()
         utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         latest_usage: dict[str, object] | None = None
@@ -95,6 +116,9 @@ class StreamingGateway:
                 and parsed_chunk[WIRE_RESPONSE_ID_INDEX]
             ):
                 latest_response_id = str(parsed_chunk[WIRE_RESPONSE_ID_INDEX])
+                # 槽 7 即会话令牌（v1_...，同会话恒同值）：记录供下一轮请求
+                # 回传 wire 槽 11（非法形态被缓存层静默拒绝）
+                record_session_token(token_scope, latest_response_id)
                 events.append(("response_id", latest_response_id))
             candidate = parse_response_chunk(parsed_chunk)
             if candidate.finish_reason is not None and candidate.finish_reason not in (

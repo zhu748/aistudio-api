@@ -394,3 +394,66 @@ hydrogen 目录元数据：输出上限 65536（高于 carbon 32768）、思考�
 回归测试：`test_gemini_4_series_tier_gating_per_model`（hydrogen 全层级
 放行 / argon Pro+ / carbon Ultra-only）与保底目录元数据断言 2 项；
 全量 616 项通过，ruff / pyright 全绿。
+
+---
+
+## 12. 2026-11-13 第六轮：本地签名器沙箱实证 + 目录漂移 + 消融矩阵复核
+
+账号 jshsosjs77@gmail.com（实测 tier=Pro）+ 同 SOCKS5 代理，双签名器对照 + 全目录快照。
+
+### 12.1 本地 waa-signer 首次沙箱编译与 E2E（决定性对照）
+
+- 工具链：Go 1.27.4 + **zig cc 0.16**（x86_64-linux-musl 静态）+ SpiderMonkey
+  v152.0.4-aistudio2api.1 静态库。gcc 直接编译失败（SM 依赖 libc++ `std::__1::`
+  符号），必须 zig cc / clang+libc++；
+- E2E 对照（同账号同代理同请求）：
+
+| 签名器 | generateContent ×5 | attempts | 延迟 |
+|---|---|---|---|
+| remote_spinsnow | 全 200（阶梯恢复） | **3-4** | 3.6-6.9s |
+| **local_spidermonkey** | 全 200 | **全 1** | 冷启动 8.5s → 1.7-3.7s |
+
+  proof 铸造 `pool_state=hot` 时 5-6ms/枚、proof_len 1563-1607（厚环境载荷）；
+  「每次取新鲜挑战」在 Go 侧日志实证——mint 成功率 100%。
+- 附带：本地签名器 `POST /v1/rpc/send` 提供 Firefox 152 uTLS + **HTTP/2/HTTP/3**
+  连接池直发受保护 RPC（浏览器级 TLS 指纹通道，Python 主链路未用，为传输
+  形态升级预留）。
+
+### 12.2 ListModels 目录快照漂移（已落地）
+
+41 模型快照与保底目录逐项对比，4 处漂移修正（`_FALLBACK_MODELS`）：
+
+- deep-research / deep-research-max：inputTokenLimit 131072 → **1048576**（8x 扩容）；
+- **gemini-3.1-pro-preview 与 gemini-pro-latest：paid False → True**（[77]=2 /
+  [82]=[1,3]）。连带 `gemini-2.5-pro` 别名被付费门控（上游真实行为，两个测试
+  夹具已换免费模型）。
+- 新模型 `gemini-decision-1`（in/out=262144/1，无 methods/flag13/思考档，
+  **404 不支持 countTokens**）——特殊 decision 模型，暂不收录保底目录。
+
+### 12.3 头消融矩阵复核（CountTokens 探针，H2）
+
+UA（Firefox/Chrome/无）、Accept-Language × Ext-region（US/CN/JP/DE/无）、
+Sec-Fetch-* / X-User-Agent / X-Goog-Ext / Visit-Id 移除、HTTP/1.1 —— **全部
+200**；仅 Origin / Authorization 缺失 401。项目头集合必需项齐备，其余纯指纹
+对齐价值。连接复用 ~270ms vs 新建 ~1100ms 实证连接池价值。
+
+### 12.4 Session Token（wire 槽 11）机制定位
+
+响应每个 chunk 的 **slot 7** 携带 `v1_...` 会话令牌（同会话恒同值）——浏览器
+下一轮请求 wire 槽 11 回传的即此值。注入实验：携带令牌 200 被接受、
+prompt_tokens 无变化 → 非内容恢复机制，为会话续接/遥测信号。项目未传播该
+字段（缺失未观测到任何 403/429 影响，非必需，属行为对齐缺口）。
+
+### 12.5 其他目录发现
+
+- **Veo 已被 Omni 吸收**：omni-1.1-flash 别名表（slot56）含全部 veo-3.1/2.0
+  旧名；别名对 `[name, weight]`（1=普通 / 2=预览 / 3=特色位）；
+- `gemini-3.7-flash`（config 默认模型）确认为 gemini-3.8-flash 别名（权重 1）；
+- `paid[77]=1` 新观测（gemini-3.1-flash-lite-image）——语义待定；
+- 全目录采样默认恒 temp=1 / top_p=0.95 / top_k=64；
+- hydrogen countTokens 响应形态变体：`[32,null,...]`（thinking 模型开销 32
+  vs 常规 2，槽位结构不同）。
+
+研究产物：`/home/z/my-project/aistudio-research/`（RESEARCH_REPORT.md +
+5 组实验脚本与快照）。回归：861 passed（excluded 2 个需 google-genai SDK
+的文件，沙箱未装该可选依赖）。
