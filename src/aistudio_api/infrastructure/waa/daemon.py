@@ -217,7 +217,33 @@ def ensure_signer_ready(*, server_url: str | None = None) -> str | None:
             "请运行 waa-signer 构建脚本，或重新构建包含本地签名器的 Docker 镜像"
         )
         if is_executable:
-            proxy = os.getenv("AISTUDIO_PROXY") or os.getenv("HTTPS_PROXY") or ""
+            # 全局代理传给 Go 签名器（仅 http/https/socks5；turn/sstp 先解析
+            # 为本地回环 SOCKS5，解析失败按无代理启动并在日志里给出指引——
+            # 签名器拉起失败会整体回退远程节点，不应因代理单点问题阻断启动）。
+            raw_proxy = (
+                os.getenv("AISTUDIO_PROXY") or os.getenv("HTTPS_PROXY") or ""
+            ).strip()
+            proxy = ""
+            if raw_proxy:
+                try:
+                    from aistudio_api.infrastructure.proxy_bridge import (
+                        resolve_proxy_url,
+                    )
+
+                    resolved_proxy = resolve_proxy_url(raw_proxy)
+                except Exception as e:
+                    logger.warning(
+                        "全局代理 %s 解析失败，本地签名器本次直连启动: %s", raw_proxy, e
+                    )
+                    resolved_proxy = None
+                if resolved_proxy:
+                    # Go 侧 proxydial 归一 socks5h，但 transport_browser 的
+                    # scheme 白名单拒收，统一归一为 socks5
+                    if resolved_proxy.startswith("socks5h://"):
+                        resolved_proxy = (
+                            "socks5://" + resolved_proxy[len("socks5h://") :]
+                        )
+                    proxy = resolved_proxy
             cmd = [str(bin_path), "-listen", "127.0.0.1:8081"]
             if proxy:
                 cmd.extend(["-proxy", proxy])

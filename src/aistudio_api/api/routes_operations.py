@@ -226,11 +226,20 @@ async def historical_logs(
 
 @router.get("/proxies")
 async def list_proxies() -> dict[str, object]:
+    from aistudio_api.infrastructure.proxy_bridge import bridge_status
+
     service = runtime_state.account_service
     accounts = service.list_accounts() if service else []
+    status = bridge_status()
     return {
         "global_proxy": redact_text(settings.proxy_url or ""),
         "signer": redact_text(str(get_active_waa_server().get("url") or "")),
+        "bridge": {
+            "available": status["available"],
+            "binary": status["binary"],
+            "idle_minutes": status["idle_minutes"],
+            "instances": status["instances"],
+        },
         "accounts": [
             {
                 "account_id": a.id,
@@ -302,6 +311,10 @@ async def update_global_proxy(req: GlobalProxyRequest) -> dict[str, object]:
 @router.post("/proxies/test")
 async def test_proxy(req: ProxyTestRequest) -> dict[str, object]:
     from aistudio_api.infrastructure.account.cookie_parser import normalize_proxy_url
+    from aistudio_api.infrastructure.proxy_bridge import (
+        ProxyBridgeError,
+        resolve_proxy_url_async,
+    )
 
     proxy = settings.proxy_url
     if req.account_id:
@@ -315,11 +328,18 @@ async def test_proxy(req: ProxyTestRequest) -> dict[str, object]:
         if req.proxy_url.strip() and not proxy:
             raise HTTPException(400, "代理地址无效")
 
+    # turn/turns/sstp 需先拉起桥接子进程转换为本地 SOCKS5；冷启动失败
+    # 直接把可操作的中文指引返回给面板（fail-closed，不静默改直连测试）。
+    try:
+        resolved_proxy = await resolve_proxy_url_async(proxy)
+    except ProxyBridgeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
     async def check(name: str, url: str) -> dict[str, object]:
         start = time.perf_counter()
         try:
             async with httpx.AsyncClient(
-                proxy=proxy, trust_env=False, timeout=8, follow_redirects=False
+                proxy=resolved_proxy, trust_env=False, timeout=8, follow_redirects=False
             ) as client:
                 response = await client.get(url)
                 result: dict[str, object] = {
@@ -342,6 +362,7 @@ async def test_proxy(req: ProxyTestRequest) -> dict[str, object]:
     )
     return {
         "proxy": redact_text(proxy or ""),
+        "effective_proxy": redact_text(resolved_proxy or ""),
         "checks": checks,
         "ok": all(c["ok"] for c in checks),
     }
@@ -359,16 +380,26 @@ async def readiness() -> JSONResponse:
     url = str(get_active_waa_server().get("url") or settings.proof_server_url)
     signer_ok = False
     try:
+        from aistudio_api.infrastructure.proxy_bridge import resolve_proxy_url_async
         from aistudio_api.infrastructure.waa.daemon import is_local_signer_url
 
+        signer_proxy = (
+            None
+            if is_local_signer_url(url)
+            else await resolve_proxy_url_async(settings.proxy_url)
+        )
         async with httpx.AsyncClient(
             timeout=3,
-            proxy=None if is_local_signer_url(url) else settings.proxy_url,
+            proxy=signer_proxy,
             trust_env=False,
         ) as client:
             response = await client.get(url.rstrip("/") + "/health")
             signer_ok = response.is_success
     except httpx.HTTPError:
+        pass
+    except Exception:
+        # 桥接冷启动失败等代理解析错误：就绪探活直接判签名节点不可达，
+        # 不影响主体服务的 503 语义（fail-closed，不静默跳过代理）。
         pass
     ready = bool(runtime_state.client and available and signer_ok)
     return JSONResponse(

@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import Modal from '@/components/ui/Modal.vue'
 import Button from '@/components/ui/Button.vue'
+import ProxyInputField from '@/components/ui/ProxyInputField.vue'
 import { Sparkles, FileText, Upload, FolderOpen, CheckCircle2 } from 'lucide-vue-next'
 
 defineProps<{
@@ -259,14 +260,12 @@ async function handleSubmit() {
         <div class="space-y-1.5">
           <label class="text-xs font-semibold text-slate-700 flex items-center justify-between">
             <span>独立出口代理 <span class="text-slate-400 font-normal">(可选)</span></span>
-            <span class="text-[11px] text-slate-400 font-normal">也可直接附在 Cookie 文本首尾</span>
+            <span class="text-[11px] text-slate-400 font-normal">粘贴自动识别类型，也可直接附在 Cookie 文本首尾</span>
           </label>
-          <input
+          <ProxyInputField
             v-model="proxyInput"
-            type="text"
-            placeholder="socks5://user:pass@127.0.0.1:1080 或 127.0.0.1:7890"
-            class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono outline-none focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
-          >
+            placeholder="socks5://user:pass@127.0.0.1:1080、127.0.0.1:7890 或 turn:host:3478"
+          />
         </div>
 
         <!-- Auto Probe Toggle -->

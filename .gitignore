@@ -40,3 +40,7 @@ repomix.config.*
 waa-signer/bin/
 waa-signer/.deps/
 
+
+# TURN/SSTP 桥接器构建产物
+proxybridge/bin/
+proxybridge/.deps/

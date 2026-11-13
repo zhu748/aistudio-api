@@ -26,6 +26,10 @@ from aistudio_api.infrastructure.account.cookie_parser import (
     get_tier_header_value,
 )
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
+from aistudio_api.infrastructure.proxy_bridge import (
+    ProxyBridgeError,
+    resolve_proxy_url_async,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("waa.signer")
@@ -132,16 +136,19 @@ class RemoteProofSigner:
         """Get or lazily initialize shared HTTP client with connection pooling."""
         if self._client is not None and not self._client.is_closed:
             return self._client
+        # 解析在锁外完成：turn/sstp 全局代理需惰性启动桥接子进程（可能
+        # 占用秒级耗时），不能在 threading.Lock 临界区内 await；并发首调
+        # 各自解析后由双重检查收敛到同一客户端实例。
+        from aistudio_api.infrastructure.waa.daemon import is_local_signer_url
+
+        is_local = is_local_signer_url(self.server_url)
+        effective_proxy = (
+            None if is_local else await resolve_proxy_url_async(self.proxy_url)
+        )
         # httpx.AsyncClient 的构造不触网，同步临界区即可，无需 await；
         # 双重检查防并发首调重复建池。
         with self._client_lock:
             if self._client is None or self._client.is_closed:
-                from aistudio_api.infrastructure.waa.daemon import (
-                    is_local_signer_url,
-                )
-
-                is_local = is_local_signer_url(self.server_url)
-                effective_proxy = None if is_local else self.proxy_url
                 self._client = httpx.AsyncClient(
                     timeout=self.timeout,
                     proxy=effective_proxy,
@@ -194,7 +201,18 @@ class RemoteProofSigner:
         if wire_contents is not None:
             payload["wireContents"] = wire_contents
         if upstream_proxy:
-            payload["proxy"] = upstream_proxy
+            # Go 签名器的 scheme 白名单只认 http/https/socks5（proxydial 会把
+            # socks5h 归一为 socks5，但 transport_browser 的校验直接拒收），
+            # turn/turns/sstp 也必须先解析为本地回环 SOCKS5。签名与模型请求
+            # 必须同出口 IP，故始终随请求传当前代理。
+            try:
+                resolved_proxy = await resolve_proxy_url_async(upstream_proxy)
+            except ProxyBridgeError as exc:
+                raise TransportError(f"出站代理解析失败: {exc}") from exc
+            if resolved_proxy:
+                if resolved_proxy.startswith("socks5h://"):
+                    resolved_proxy = "socks5://" + resolved_proxy[len("socks5h://") :]
+                payload["proxy"] = resolved_proxy
         request_headers = {
             "Content-Type": "application/json",
             **signer_authorization(self.server_url),

@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Stage 1: Build native Go WAA signer daemon
 # go.mod 要求 go 1.27（golang 官方镜像 GOTOOLCHAIN=local，低版本镜像会拒绝构建）
 FROM golang:1.27-bookworm AS signer-builder
@@ -36,6 +37,18 @@ RUN if [ ! -f "bin/waa-signer" ] || ! file bin/waa-signer | grep -q "ELF"; then 
         chmod +x build.sh && ./build.sh; \
     fi
 
+# Stage 1b: Build TURN/SSTP proxy bridge (pure Go, no CGO)
+# 把 TURN (RFC 6062) / TURNS / SSTP (MS-CHAPv2) 节点转换为本地回环 SOCKS5，
+# 供 Python 侧 infrastructure/proxy_bridge.py 以子进程方式托管。无本地 Go
+# 环境时也可用 AISTUDIO_PROXY_BRIDGE_BIN 指向外部二进制。
+FROM golang:1.27-bookworm AS bridge-builder
+COPY proxybridge/go.mod proxybridge/go.sum /build/proxybridge/
+WORKDIR /build/proxybridge
+RUN go mod download
+COPY proxybridge/*.go /build/proxybridge/
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/aistudio-proxy-bridge .
+
 # Stage 2: Runtime Python environment
 # Use Debian 12 (bookworm) explicitly so package names stay stable.
 FROM python:3.11-slim-bookworm
@@ -66,6 +79,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy precompiled native WAA signer service from builder stage
 COPY --from=signer-builder /build/waa-signer/bin/waa-signer /app/waa-signer/bin/waa-signer
 RUN chmod +x /app/waa-signer/bin/waa-signer
+# Copy TURN/SSTP proxy bridge from builder stage
+COPY --from=bridge-builder /build/proxybridge/bin/aistudio-proxy-bridge /app/proxybridge/bin/aistudio-proxy-bridge
+RUN chmod +x /app/proxybridge/bin/aistudio-proxy-bridge
 
 # Copy application code and default configuration template
 COPY src/ src/

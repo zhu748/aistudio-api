@@ -230,6 +230,7 @@ async def _fetch_remote_media(url: str) -> tuple[str, str]:
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError(f"Unsupported media URL: {url[:128]}")
     try:
+        from aistudio_api.infrastructure.proxy_bridge import resolve_proxy_url_async
         from aistudio_api.infrastructure.safe_media import PublicMediaTransport
 
         async with (
@@ -237,7 +238,9 @@ async def _fetch_remote_media(url: str) -> tuple[str, str]:
                 timeout=15.0,
                 follow_redirects=True,
                 max_redirects=5,
-                transport=PublicMediaTransport(proxy=settings.proxy_url),
+                transport=PublicMediaTransport(
+                    proxy=await resolve_proxy_url_async(settings.proxy_url)
+                ),
                 trust_env=False,
             ) as http,
             http.stream("GET", url) as response,

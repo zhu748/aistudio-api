@@ -508,6 +508,9 @@ _PROXY_SCHEMES: tuple[str, ...] = (
     "https://",
     "socks5://",
     "socks5h://",
+    "turn://",
+    "turns://",
+    "sstp://",
 )
 
 # host:port（如 127.0.0.1:7890 / proxy.example.com:8080）
@@ -517,19 +520,285 @@ _USERINFO_HOST_PORT_RE = re.compile(r"[^@\s]+@[A-Za-z0-9_.\-]+:\d{2,5}")
 # host:port:user:pass（curl -x 风格，如 1.2.3.4:1080:user:pass）
 _HOST_PORT_USERINFO_RE = re.compile(r"[A-Za-z0-9_.\-]+:\d{2,5}:[^:\s]+:[^:\s]+")
 
+# ================= TURN / TURNS / SSTP 桥接代理解析 =================
+# 接法学习自 vertex2openai：这三类协议无法被 httpx 直接消费，由独立的
+# Go 桥接器（proxybridge/）转成本地回环 SOCKS5。解析层只负责严格校验
+# 与规范化；子进程管理见 infrastructure/proxy_bridge.py。
+
+_BRIDGE_SCHEMES: tuple[str, ...] = ("turn", "turns", "sstp")
+_BRIDGE_DEFAULT_PORTS: dict[str, int] = {"turn": 3478, "turns": 5349, "sstp": 443}
+# RFC 7065 TURN URI 无斜线形态（turn:host:port?transport=tcp）；sstp 同样
+# 接受无斜线简写以提升粘贴识别容错。
+_BRIDGE_NO_SLASH_RE = re.compile(r"^(?:turns?|sstp):(?!//)", re.IGNORECASE)
+# 桥接代理允许的高级参数（query 白名单，按协议分发）
+_BRIDGE_ALLOWED_OPTIONS: dict[str, frozenset[str]] = {
+    "turn": frozenset({"transport", "realm"}),
+    "turns": frozenset({"transport", "realm", "sni", "ca", "insecure"}),
+    "sstp": frozenset({"sni", "ca", "insecure", "mtu"}),
+}
+
+
+class ProxyFormatError(ValueError):
+    """代理地址格式错误（文案不含凭据，可直接透传给调用方展示）。"""
+
+
+def parse_bridge_proxy_uri(uri: str) -> dict[str, object]:
+    """严格解析 TURN / TURNS / SSTP 代理 URI，返回桥接器配置字典。
+
+    支持：RFC 7065 无斜线形态、query 参数凭据（``username`` / ``password``）、
+    userinfo（含 base64 一段式自动解码）、高级参数白名单校验。
+    返回键：``scheme / server / server_port / username / password /
+    tls_server_name / ca_file / insecure / realm / mtu / options / name``。
+    格式非法时抛 :class:`ProxyFormatError`（错误文案不回显凭据）。
+    """
+    from urllib.parse import parse_qs, unquote, urlsplit
+
+    value = str(uri).strip()
+    value = re.sub(r"^(turns?|sstp):(?!//)", r"\1://", value, flags=re.IGNORECASE)
+    try:
+        if any(ord(c) < 32 or ord(c) == 127 for c in value) or re.search(
+            r"%(?![0-9a-fA-F]{2})", value
+        ):
+            raise ValueError
+        parts = urlsplit(value)
+        scheme = parts.scheme.lower()
+        if scheme not in _BRIDGE_SCHEMES:
+            raise ValueError
+        host = parts.hostname
+        port = parts.port if parts.port is not None else _BRIDGE_DEFAULT_PORTS[scheme]
+        if not host or not 1 <= port <= 65535 or parts.path not in {"", "/"}:
+            raise ValueError
+        if any(c.isspace() or c in "%/@?#\\" for c in host):
+            raise ValueError
+        if ":" in host:
+            import ipaddress
+
+            ipaddress.IPv6Address(host)
+        else:
+            host = host.encode("idna").decode("ascii")
+        query = parse_qs(
+            parts.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+            encoding="utf-8",
+            errors="strict",
+        )
+        if any(len(values) != 1 for values in query.values()):
+            raise ValueError
+        query = {key: values[0] for key, values in query.items()}
+        username = unquote(parts.username or "", errors="strict")
+        password = unquote(parts.password or "", errors="strict")
+        # 协议://Base64(用户名:密码)@主机 一段式 userinfo 自动解码
+        if username and not password and ":" not in username:
+            import base64
+
+            try:
+                decoded = base64.b64decode(
+                    username + "=" * (-len(username) % 4),
+                    altchars=b"-_",
+                    validate=True,
+                ).decode()
+                if ":" in decoded:
+                    username, _, password = decoded.partition(":")
+            except (ValueError, UnicodeError):
+                pass
+        if (username or password) and ({"username", "password"} & query.keys()):
+            raise ValueError
+        username = username or query.pop("username", "")
+        password = password or query.pop("password", "")
+        name = unquote(parts.fragment, errors="strict")
+        if any(
+            ord(c) < 32 or ord(c) == 127
+            for text in [host, username, password, name, *query.values()]
+            for c in text
+        ):
+            raise ValueError
+    except (ValueError, UnicodeError):
+        raise ProxyFormatError(
+            "TURN / SSTP 地址无效，请检查主机、端口、凭据编码和重复参数。"
+        ) from None
+
+    # SSTP 认证（MS-CHAPv2）必须提供凭据；TURN / TURNS 允许匿名分配服务器
+    # （未认证 Allocate 直接成功），由桥接器启动期探测自动选择客户端形态。
+    if scheme == "sstp" and (not username or not password):
+        raise ProxyFormatError(
+            "SSTP 需要同时填写用户名和密码；链接内的特殊字符须进行 URL 编码。"
+        )
+    allowed = _BRIDGE_ALLOWED_OPTIONS[scheme]
+    if query.keys() - allowed:
+        raise ProxyFormatError(
+            f"{scheme.upper()} 代理包含不支持的高级参数（"
+            f"{'/'.join(sorted(query.keys() - allowed))}），请查看接入文档。"
+        )
+    if scheme in {"turn", "turns"} and query.get("transport", "tcp").lower() != "tcp":
+        raise ProxyFormatError(
+            "TURN 代理仅支持 RFC 6062 TCP 中继，transport 必须为 tcp。"
+        )
+    if scheme == "turn" and ({"sni", "ca", "insecure"} & query.keys()):
+        raise ProxyFormatError("TLS 参数仅适用于 turns:// 或 sstp://。")
+    if "insecure" in query and query["insecure"].lower() not in {
+        "0",
+        "1",
+        "false",
+        "true",
+    }:
+        raise ProxyFormatError("insecure 必须是 true / false 或 1 / 0。")
+    if "sni" in query and (
+        not query["sni"] or any(c.isspace() or c in "/@?#\\%" for c in query["sni"])
+    ):
+        raise ProxyFormatError("证书名称（SNI）必须是有效的主机名或 IP。")
+    try:
+        if not re.fullmatch(r"[0-9]{3,4}", query.get("mtu", "1400")):
+            raise ValueError
+        mtu = int(query.get("mtu", "1400"))
+        if not 576 <= mtu <= 1400:  # 与 Go 侧 TUN 钳位上限对齐
+            raise ValueError
+    except ValueError:
+        raise ProxyFormatError("SSTP MTU 必须是 576–1400 的整数。") from None
+    return {
+        "scheme": scheme,
+        "server": host,
+        "server_port": port,
+        "username": username,
+        "password": password,
+        "tls_server_name": query.get("sni") or host,
+        "ca_file": query.get("ca", ""),
+        "insecure": query.get("insecure", "false").lower() in {"true", "1"},
+        "realm": query.get("realm", ""),
+        "mtu": mtu,
+        "options": query,
+        "name": name,
+    }
+
+
+def build_bridge_proxy_uri(
+    scheme: str,
+    host: str,
+    port: int | str | None,
+    username: str = "",
+    password: str = "",
+    *,
+    options: dict[str, object] | None = None,
+    name: str = "",
+) -> str:
+    """构建无歧义的桥接代理 URI；凭据与保留字符一律百分号编码。
+
+    显式默认值（``transport=tcp`` / ``insecure=false`` / ``mtu=1400`` /
+    ``sni=主机``）会被剔除，保证等价输入得到同一规范 URI（进程池键稳定）。
+    """
+    import ipaddress
+    from urllib.parse import quote, urlencode
+
+    scheme = str(scheme).strip().lower()
+    if scheme not in _BRIDGE_SCHEMES:
+        raise ProxyFormatError("请选择 TURN、TURNS 或 SSTP 代理类型。")
+    if port is None or str(port).strip() == "":
+        port = _BRIDGE_DEFAULT_PORTS[scheme]
+    host = str(host or "").strip().strip("[]")
+    if not host or any(c.isspace() or c in "/@?#\\" for c in host):
+        raise ProxyFormatError("请填写有效的代理 IP 或主机名。")
+    if ":" in host:
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            raise ProxyFormatError("IPv6 地址无效。") from None
+        host = f"[{host}]"
+    try:
+        port_text = str(port).strip()
+        if not re.fullmatch(r"[0-9]{1,5}", port_text):
+            raise ValueError
+        port_num = int(port_text)
+        if not 1 <= port_num <= 65535:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ProxyFormatError("代理端口必须是 1–65535 的整数。") from None
+    username, password = str(username or ""), str(password or "")
+    if any(ord(c) < 32 or ord(c) == 127 for c in username + password):
+        raise ProxyFormatError("代理账号和密码不能包含换行或控制字符。")
+    if password and not username:
+        raise ProxyFormatError("填写密码时也需要填写用户名。")
+    auth = (
+        quote(username, safe="") + ":" + quote(password, safe="") + "@"
+        if username
+        else ""
+    )
+    uri = f"{scheme}://{auth}{host}:{port_num}"
+    if options:
+        if not isinstance(options, dict):
+            raise ProxyFormatError("高级代理参数必须是键值对。")
+        normalized: dict[str, str] = {}
+        for key, raw in options.items():
+            value = (
+                str(raw).lower()
+                if isinstance(raw, bool)
+                else str(raw)
+                if raw is not None
+                else ""
+            )
+            if value == "":
+                continue
+            normalized[str(key)] = value
+        # 剔除与规范默认等价的参数，避免等价 URI 分裂进程池
+        defaults = {
+            "transport": "tcp",
+            "insecure": "false",
+            "mtu": "1400",
+            "sni": host.strip("[]"),
+        }
+        normalized = {k: v for k, v in normalized.items() if defaults.get(k) != v}
+        if normalized:
+            uri += "?" + urlencode(sorted(normalized.items()))
+    if name:
+        if any(ord(c) < 32 or ord(c) == 127 for c in name):
+            raise ProxyFormatError("代理备注不能包含控制字符。")
+        uri += "#" + quote(name, safe="")
+    return uri
+
+
+def _normalize_bridge_proxy_url(text: str) -> str | None:
+    """TURN / TURNS / SSTP 输入的规范化入口；非法时返回 None。"""
+    try:
+        cfg = parse_bridge_proxy_uri(text)
+    except ProxyFormatError:
+        return None
+    raw_options = cfg["options"]
+    options = (
+        {str(key): value for key, value in raw_options.items()}
+        if isinstance(raw_options, dict)
+        else {}
+    )
+    try:
+        return build_bridge_proxy_uri(
+            str(cfg["scheme"]),
+            str(cfg["server"]),
+            int(cfg["server_port"]),  # type: ignore[arg-type]
+            str(cfg["username"]),
+            str(cfg["password"]),
+            options=options,
+            name=str(cfg["name"]),
+        )
+    except (ProxyFormatError, TypeError, ValueError):
+        return None
+
 
 def normalize_proxy_url(candidate: str | None) -> str | None:
     """规整代理地址：无法识别时返回 None。
 
     支持：带协议头（``socks5://user:pass@host:port``，原样保留）、隐式 HTTP
     （``127.0.0.1:7890``）、无协议头带凭据（``user:pass@host:port``）、
-    curl -x 风格（``host:port:user:pass`` → ``http://user:pass@host:port``）。
+    curl -x 风格（``host:port:user:pass`` → ``http://user:pass@host:port``），
+    以及 TURN / TURNS / SSTP（含 RFC 7065 无斜线形态，规范化为桥接 URI）。
     """
     if not candidate:
         return None
     text = candidate.strip().rstrip("/")
     if not text:
         return None
+    if _BRIDGE_NO_SLASH_RE.match(text):
+        return _normalize_bridge_proxy_url(text)
+    lowered = text.lower()
+    if lowered.startswith(("turn://", "turns://", "sstp://")):
+        return _normalize_bridge_proxy_url(text)
     if "://" not in text and _HOST_PORT_USERINFO_RE.fullmatch(text):
         host, port, user, password = text.split(":", 3)
         text = f"http://{user}:{password}@{host}:{port}"
@@ -559,9 +828,17 @@ def normalize_proxy_url(candidate: str | None) -> str | None:
 
 
 def _looks_like_proxy(candidate: str) -> bool:
-    """判断片段是否形似代理地址：不含 Cookie 特征（= / ; / 空白）且可规整。"""
+    """判断片段是否形似代理地址：不含 Cookie 特征（= / ; / 空白）且可规整。
+
+    TURN / SSTP 链接例外：RFC 7065 的 query（``transport=tcp``）天然含 ``=``，
+    按协议前缀优先识别后再交给 normalize 严格校验。
+    """
     text = candidate.strip()
-    if not text or "=" in text or ";" in text or re.search(r"\s", text):
+    if not text or re.search(r"\s", text):
+        return False
+    if re.match(r"^(?:turns?|sstp):", text, re.IGNORECASE):
+        return normalize_proxy_url(text) is not None
+    if "=" in text or ";" in text:
         return False
     return normalize_proxy_url(text) is not None
 
@@ -847,6 +1124,23 @@ def parse_emails_from_ogs_html(
     return mapping
 
 
+async def _resolve_probe_proxy(proxy_url: str | None) -> str | None:
+    """把传入代理（或全局默认代理）解析为 httpx 可用形态。
+
+    turn / turns / sstp 经 infrastructure/proxy_bridge 转换为本地回环
+    SOCKS5；解析失败直接上抛（fail-closed，绝不静默降级直连导致真实
+    IP 泄漏）。延迟导入避免与 proxy_bridge 的模块循环。
+    """
+    from aistudio_api.config import settings
+
+    effective = proxy_url or settings.proxy_url
+    if not effective:
+        return None
+    from aistudio_api.infrastructure.proxy_bridge import resolve_proxy_url_async
+
+    return await resolve_proxy_url_async(effective)
+
+
 async def probe_account_emails_map(
     raw_or_dict: object,
     auth_user: str = "0",
@@ -865,8 +1159,6 @@ async def probe_account_emails_map(
         return {}
 
     import httpx
-
-    from aistudio_api.config import settings
 
     u_index = str(auth_user or "0")
     # 最小化 Cookie 白名单（L12）：探活只发核心鉴权 Cookie，避免把
@@ -900,7 +1192,9 @@ async def probe_account_emails_map(
         if client is not None:
             return await _do_fetch(client)
         async with httpx.AsyncClient(
-            timeout=8.0, proxy=proxy_url or settings.proxy_url, follow_redirects=True
+            timeout=8.0,
+            proxy=await _resolve_probe_proxy(proxy_url),
+            follow_redirects=True,
         ) as new_client:
             return await _do_fetch(new_client)
     except Exception as e:
@@ -950,8 +1244,6 @@ async def probe_account_benefit_tier(
 
     import httpx
 
-    from aistudio_api.config import settings
-
     u_index = str(auth_user or "0")
     headers = build_makersuite_headers(
         filter_minimal_cookies(cookie_dict),
@@ -966,7 +1258,7 @@ async def probe_account_benefit_tier(
                 return parse_benefit_tier_response(resp.text)
             return "Free"
         async with httpx.AsyncClient(
-            timeout=8.0, proxy=proxy_url or settings.proxy_url
+            timeout=8.0, proxy=await _resolve_probe_proxy(proxy_url)
         ) as new_cli:
             resp = await new_cli.post(tier_url, headers=headers, content="[]")
             if resp.status_code == 200:
@@ -1002,8 +1294,6 @@ async def probe_aistudio_session(
 
     import httpx
 
-    from aistudio_api.config import settings
-
     cookie_header = "; ".join(f"{k}={v}" for k, v in min_cookies.items())
     headers = {
         "Cookie": cookie_header,
@@ -1032,7 +1322,7 @@ async def probe_aistudio_session(
             return await _do_probe(client)
         async with httpx.AsyncClient(
             timeout=10.0,
-            proxy=proxy_url or settings.proxy_url,
+            proxy=await _resolve_probe_proxy(proxy_url),
             follow_redirects=False,
         ) as new_client:
             return await _do_probe(new_client)
@@ -1069,8 +1359,6 @@ async def rotate_google_cookies(
         return {"ok": False, "status": 0, "updated": [], "skipped": "missing_seed"}
 
     import httpx
-
-    from aistudio_api.config import settings
 
     rotate_cookies_map = filter_minimal_cookies(cookies, include_account_host=True)
     cookie_header = "; ".join(f"{k}={v}" for k, v in rotate_cookies_map.items())
@@ -1118,7 +1406,7 @@ async def rotate_google_cookies(
         if client is not None:
             return await _do_rotate(client)
         async with httpx.AsyncClient(
-            timeout=timeout, proxy=proxy_url or settings.proxy_url
+            timeout=timeout, proxy=await _resolve_probe_proxy(proxy_url)
         ) as new_client:
             return await _do_rotate(new_client)
     except Exception as e:
@@ -1148,8 +1436,6 @@ async def probe_google_accounts_infinite(
 
     import httpx
 
-    from aistudio_api.config import settings
-
     valid_accounts: list[dict[str, object]] = []
 
     auth_user_idx = 0
@@ -1157,7 +1443,7 @@ async def probe_google_accounts_infinite(
     consecutive_forbidden = 0
     deadline = time.monotonic() + probe_deadline_seconds
     async with httpx.AsyncClient(
-        timeout=10.0, proxy=proxy_url or settings.proxy_url
+        timeout=10.0, proxy=await _resolve_probe_proxy(proxy_url)
     ) as client:
         emails_map = await probe_account_emails_map(
             cookie_dict, auth_user="0", client=client
