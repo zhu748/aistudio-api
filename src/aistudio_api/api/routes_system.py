@@ -279,33 +279,60 @@ class ConfigYamlUpdateRequest(BaseModel):
 
 
 def _mask_yaml_api_keys(yaml_content: str) -> str:
-    """对 YAML 文本中 api_keys 块的 key 字段值脱敏（仅展示用）。
+    """结构层脱敏：api_keys 的 Key 明文与 waa.servers 的自定义 headers。
 
-    按缩进识别顶层 ``api_keys:`` 块的边界，只替换其中 ``key: <value>``
-    行的值，不影响其余内容与注释，保证面板编辑器中的往返安全。
+    文本级掩码（逐行匹配 ``key:``）无法覆盖 flow/JSON 风格与纯字符串
+    列表等合法 YAML 形态（2026-11 安全审查实测全部漏脱敏），此处
+    safe_load 解析后按结构掩码再序列化；解析失败时整体隐藏，绝不
+    回传原文。代价是注释丢失——仅对非管理密码会话调用，管理员仍
+    拿到原文。远程签名器的 Authorization 共享密钥一并掩码。
     """
-    import re
+    from aistudio_api.api.dependencies import mask_api_key
 
-    lines = yaml_content.splitlines(keepends=True)
-    out: list[str] = []
-    in_api_keys_block = False
-    for line in lines:
-        stripped = line.rstrip("\n")
-        if not stripped.startswith((" ", "\t", "#")) and stripped.strip():
-            # 顶层键：进入/退出 api_keys 块
-            in_api_keys_block = stripped.rstrip().endswith(":") and (
-                stripped.split(":", 1)[0].strip() == "api_keys"
-            )
-        elif in_api_keys_block and stripped.strip().startswith("key:"):
-            m = re.match(r"^(\s*key:\s*).+$", stripped)
-            if m:
-                from aistudio_api.api.dependencies import mask_api_key
+    def _mask_item(item: object) -> object:
+        if isinstance(item, str):
+            return mask_api_key(item) if item else item
+        if isinstance(item, dict):
+            out = dict(item)
+            key = out.get("key")
+            if isinstance(key, str) and key:
+                out["key"] = mask_api_key(key)
+            return out
+        return item
 
-                raw_value = stripped[m.end(1) :].strip().strip("'\"")
-                if raw_value:
-                    line = m.group(1) + mask_api_key(raw_value) + "\n"
-        out.append(line)
-    return "".join(out)
+    try:
+        parsed = yaml.safe_load(yaml_content)
+    except yaml.YAMLError:
+        return "(配置解析失败，已隐藏)"
+    if parsed is None:
+        return yaml_content
+    if not isinstance(parsed, dict):
+        return "(不支持的配置结构，已隐藏)"
+
+    raw_keys = parsed.get("api_keys")
+    if isinstance(raw_keys, list):
+        parsed["api_keys"] = [_mask_item(item) for item in raw_keys]
+    elif isinstance(raw_keys, dict):
+        parsed["api_keys"] = _mask_item(raw_keys)
+
+    waa = parsed.get("waa")
+    if isinstance(waa, dict):
+        servers = waa.get("servers")
+        if isinstance(servers, list):
+            for server in servers:
+                if not isinstance(server, dict):
+                    continue
+                headers = server.get("headers")
+                if isinstance(headers, dict) and headers:
+                    server["headers"] = dict.fromkeys(headers, "***")
+                if server.get("auth_token_env"):
+                    server["auth_token_env"] = "***"
+    try:
+        return yaml.dump(
+            parsed, allow_unicode=True, sort_keys=False, default_flow_style=False
+        )
+    except Exception:
+        return "(配置脱敏失败，已隐藏)"
 
 
 @protected_router.get("/config")
@@ -418,7 +445,7 @@ class TestSignerServerRequest(BaseModel):
 
 
 @protected_router.get("/config/signer-servers")
-async def get_signer_servers() -> dict[str, object]:
+async def get_signer_servers(request: Request) -> dict[str, object]:
     """获取所有配置的 WAA 签名服务器列表及当前激活项。
 
     激活判定与运行时完全一致，优先级从高到低：
@@ -447,11 +474,22 @@ async def get_signer_servers() -> dict[str, object]:
     raw_servers = waa.get("servers")
     servers = raw_servers if isinstance(raw_servers, list) else []
 
+    from aistudio_api.api.dependencies import is_admin_password_session
+
+    # 自定义 headers 可含远程签名器的 Authorization 共享密钥、
+    # auth_token_env 指向的环境变量——非管理密码会话一律掩码
+    mask_sensitive = not is_admin_password_session(request)
     result_servers = []
     for s in servers:
         if isinstance(s, dict):
             s_id = str(s.get("id") or "").strip()
             item = dict(s)
+            if mask_sensitive:
+                headers = item.get("headers")
+                if isinstance(headers, dict) and headers:
+                    item["headers"] = dict.fromkeys(headers, "***")
+                if item.get("auth_token_env"):
+                    item["auth_token_env"] = "***"
             item["is_active"] = s_id == active_id
             item["is_env_default"] = bool(env_override) and s_id == env_override
             # 兼容旧字段：面板不再将其渲染为“锁定”，仅表示环境变量默认节点

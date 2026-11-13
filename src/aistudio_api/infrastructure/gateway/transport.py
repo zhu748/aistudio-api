@@ -28,6 +28,11 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("transport")
 
+__all__ = [
+    "HTTPStreamTransport",
+    "strip_to_aistudio_fingerprint",
+]
+
 # httpx 的 HTTP/2 支持是可选依赖（h2 包）。若环境未安装 h2 而仍传
 # http2=True，AsyncClient 在创建时即抛 ImportError（"Using http2=True, but
 # the 'h2' package is not installed"），所有上游请求全部 500——曾在
@@ -166,7 +171,7 @@ def _persist_set_cookies(
             new_cookies=target_map,
         )
     except Exception as e:
-        logger.debug("持久化 Set-Cookie 失败: %s", e)
+        logger.warning("持久化 Set-Cookie 失败: %s", e)
 
 
 def _mask_proxy_url(proxy_url: str | None) -> str:
@@ -174,6 +179,109 @@ def _mask_proxy_url(proxy_url: str | None) -> str:
     if not proxy_url:
         return "(直连)"
     return re.sub(r"//[^@/]+@", "//***@", str(proxy_url))
+
+
+# ---------------------------------------------------------------------------
+# 上游请求头白名单（指纹剥离核心）
+# ---------------------------------------------------------------------------
+# 项目对所有上游（alkalimakersuite-pa.clients6.google.com）请求**重建**
+# 而非转发请求头：只有真实 aistudio.google.com 浏览器会发送的头才允许
+# 出现（2026-11 HAR 抓包 + 消融矩阵对齐，见 docs/CAPTURE_ALIGNMENT_2026-11.md §2）。
+# 调用方（兼容层路由 / 签名服务动态头 / 账号探活等）传入的任何其它头
+# ——包括客户端应用自带头（Claude Code / one-api / curl 的 UA、
+# x-stainless-*、x-app-* 等指纹）——一律在网关边界剥除，绝不透传上游，
+# 防止客户端指纹混入逆向指纹集构成可识别特征。
+#
+# 允许集（值由白名单外的逻辑重建，这里只管名字）：
+#   - 路由/浏览器基础头：Content-Type / Origin / Referer / User-Agent /
+#     X-User-Agent / Accept / Accept-Language / Sec-Fetch-Site /
+#     Sec-Fetch-Mode / Sec-Fetch-Dest（CORS fetch 三元组 + Accept 系）
+#   - Google RPC 头：X-Goog-Api-Key / X-Goog-AuthUser /
+#     X-Goog-Ext-519733851-bin / X-AIStudio-G1-Tier / X-AIStudio-Visit-Id
+#   - 凭据头（本函数重建）：Authorization / Cookie
+#   - WAA 签名服务动态头：X-Goog-Api-Key / X-Goog-AuthUser /
+#     X-Goog-Ext-519733851-bin / X-AIStudio-Visit-Id / User-Agent /
+#     X-User-Agent（waa-signer 返回的动态集即这些，全部落在允许集内）
+#   - 抗截断等内部机制不会经由 headers 通道携带业务信息
+_UPSTREAM_ALLOWED_HEADERS: frozenset[str] = frozenset(
+    {
+        # 基础 HTTP / 浏览器头
+        "content-type",
+        "origin",
+        "referer",
+        "user-agent",
+        "x-user-agent",
+        "accept",
+        "accept-language",
+        "sec-fetch-site",
+        "sec-fetch-mode",
+        "sec-fetch-dest",
+        # Google AI Studio RPC 头
+        "x-goog-api-key",
+        "x-goog-authuser",
+        "x-goog-ext-519733851-bin",
+        "x-aistudio-g1-tier",
+        "x-aistudio-visit-id",
+        # 凭据头（值在本函数内重建）
+        "authorization",
+        "cookie",
+    }
+)
+
+# 调用方必须显式设置、禁止透传推断值的头（host/content-length 由
+# httpx 依据目标 URL 与请求体自动生成；accept-encoding/连接管理头由
+# httpx 传输层控制——均不属于浏览器指纹集，透传只会引入客户端痕迹）
+_UPSTREAM_REBUILT_HEADERS: frozenset[str] = frozenset(
+    {"host", "content-length", "accept-encoding"}
+)
+
+
+def strip_to_aistudio_fingerprint(
+    headers: dict[str, str],
+) -> dict[str, str]:
+    """剥离一切非 AI Studio 逆向指纹头，仅保留白名单内的头名。
+
+    黑名单式剔除（旧实现）无法防御未知客户端头的混入：任何调用方新增
+    透传逻辑都会把客户端应用的头（SDK 指纹、代理头、自定义头）带上游。
+    白名单取交集后，出站请求头集恒定为 ``_UPSTREAM_ALLOWED_HEADERS`` 的
+    子集，与真实浏览器指纹对齐。
+
+    返回键统一折叠为小写：WAA 签名服务（Go）返回 ``X-Goog-Authuser``，
+    Python 侧字面量是 ``X-Goog-AuthUser``，若原样保留两种大小写变体，
+    调用方 ``dict.update()`` 会新增而非覆盖，上游将收到重复且值冲突的
+    头（真实浏览器只发单个 canonical 头，双变体本身构成非浏览器指纹）。
+    同名变体后写入者胜出（调用方 update 语义下动态签名值优先于静态模板）。
+    """
+    stripped: dict[str, str] = {}
+    for key, value in headers.items():
+        lowered = key.lower()
+        if lowered in _UPSTREAM_ALLOWED_HEADERS:
+            stripped[lowered] = str(value)
+    return stripped
+
+
+# 小写头名 → canonical 形态（与真实 Chrome 浏览器发出的头名大小写一致）。
+# 白名单键集的 canonical 重建在 ``_ensure_authorization_header`` 末尾执行，
+# 保证出站指纹与浏览器一致而非全小写的非标准形态。
+_CANONICAL_HEADER_NAMES: dict[str, str] = {
+    "content-type": "Content-Type",
+    "origin": "Origin",
+    "referer": "Referer",
+    "user-agent": "User-Agent",
+    "x-user-agent": "X-User-Agent",
+    "accept": "Accept",
+    "accept-language": "Accept-Language",
+    "sec-fetch-site": "Sec-Fetch-Site",
+    "sec-fetch-mode": "Sec-Fetch-Mode",
+    "sec-fetch-dest": "Sec-Fetch-Dest",
+    "x-goog-api-key": "X-Goog-Api-Key",
+    "x-goog-authuser": "X-Goog-AuthUser",
+    "x-goog-ext-519733851-bin": "X-Goog-Ext-519733851-bin",
+    "x-aistudio-g1-tier": "X-AIStudio-G1-Tier",
+    "x-aistudio-visit-id": "X-AIStudio-Visit-Id",
+    "authorization": "Authorization",
+    "cookie": "Cookie",
+}
 
 
 def _ensure_authorization_header(
@@ -187,46 +295,52 @@ def _ensure_authorization_header(
 
     纯同步函数（L4）：无任何 await，声明为 async 只会让每个请求多一次
     协程创建与调度的纯开销。
-    """
-    incoming_auth = ""
-    for k, v in headers.items():
-        if k.lower() == "authorization" and v:
-            incoming_auth = str(v)
-            break
 
-    clean_headers = {
-        k: v
-        for k, v in headers.items()
-        if k.lower()
-        not in (
-            "host",
-            "content-length",
-            "authorization",
-            "x-goog-authuser",
-            "x-aistudio-g1-tier",
-        )
-    }
-    clean_headers["X-Goog-AuthUser"] = str(auth_user or "0")
+    处理顺序：先白名单剥离并折叠为小写键（仅保留 AI Studio 逆向指纹头），
+    再重建必需的凭据头，最后按 canonical 形态重建键名。凭据头
+    （Authorization/Cookie）优先使用本地账号 Cookie 计算/组装——本地
+    Cookie 经 Set-Cookie 回写持续轮换（__Secure-1PSIDTS/SIDCC），而签名
+    服务 proof 缓存命中时回传的是缓存时刻的旧 Cookie 快照，用它压制
+    本地新值会在滚动窗口内引发连环 401。``incoming_auth``/incoming
+    Cookie 仅在本地无凭据时兜底。
+    """
+    # strip 后键恒为小写（大小写变体已折叠），后续用小写键操作即可
+    clean_headers = strip_to_aistudio_fingerprint(headers)
+
+    incoming_auth = clean_headers.get("authorization") or ""
+    incoming_auth = incoming_auth if isinstance(incoming_auth, str) else ""
+    # host/content-length/accept-encoding 属于 httpx 传输层管辖，不得透传。
+    # 白名单本就不含这三个头名，此处保留为纵深防御（防止未来白名单扩张）。
+    clean_headers.pop("host", None)
+    clean_headers.pop("content-length", None)
+    clean_headers.pop("accept-encoding", None)
+
+    clean_headers["x-goog-authuser"] = str(auth_user or "0")
     effective_tier = tier if tier is not None else _get_active_account_tier()
     tier_header = get_tier_header_value(effective_tier)
     if tier_header:
-        clean_headers["X-AIStudio-G1-Tier"] = tier_header
+        clean_headers["x-aistudio-g1-tier"] = tier_header
 
     raw_cookie_dict = cookies or _get_auth_cookies(auth_file)
     cookie_dict = filter_minimal_cookies(raw_cookie_dict) if raw_cookie_dict else None
 
-    if incoming_auth:
-        clean_headers["Authorization"] = incoming_auth
-    elif cookie_dict:
+    if cookie_dict:
+        # 本地凭据权威：总是用最新 Cookie 计算/组装凭据头（覆盖签名服务
+        # 缓存的旧值）；本地无凭据时才回退 incoming（聊胜于无）。
         fresh_auth = calculate_sapisid_hash(cookie_dict)
         if fresh_auth:
-            clean_headers["Authorization"] = fresh_auth
-    if "Cookie" not in clean_headers and cookie_dict:
-        clean_headers["Cookie"] = "; ".join(
+            clean_headers["authorization"] = fresh_auth
+        clean_headers["cookie"] = "; ".join(
             f"{k}={v}" for k, v in cookie_dict.items() if v
         )
+    if "authorization" not in clean_headers and incoming_auth:
+        clean_headers["authorization"] = incoming_auth
 
-    return clean_headers
+    # canonical 重建：与真实浏览器头名大小写对齐（httpx 按传入键原样发送）
+    return {
+        _CANONICAL_HEADER_NAMES.get(key, key): value
+        for key, value in clean_headers.items()
+    }
 
 
 class HTTPStreamTransport:

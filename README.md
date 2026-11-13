@@ -48,7 +48,7 @@
 | 功能模块 | 说明 |
 |---|---|
 | **Gemini 协议兼容** | 支持 `/v1beta/...` 接口规范，包括 Thinking 思维链、多模态、Function Calling 工具调用及图片生成 |
-| **OpenAI / Claude 协议兼容** | 额外提供 `/v1/chat/completions`（OpenAI Chat Completions）与 `/v1/messages`（Anthropic Claude Messages）兼容端点：流式/非流式、工具调用、多模态图片、思考链（`reasoning_content` / thinking 块）、模型名自动映射（`gpt-*` / `claude-*` → 配置的 Gemini 模型），完整复用多账号轮换与抗截断传输 |
+| **OpenAI / Claude 协议兼容** | 额外提供 `/v1/chat/completions`（OpenAI Chat Completions）、`/v1/responses`（OpenAI Responses，Codex CLI / openai-python 新协议）与 `/v1/messages`（Anthropic Claude Messages）兼容端点：流式/非流式、工具调用、多模态图片、思考链（`reasoning_content` / reasoning summary / thinking 块）、模型名自动映射（`gpt-*` / `claude-*` → 配置的 Gemini 模型），完整复用多账号轮换与抗截断传输 |
 | **动态模型发现** | 自动向上游同步可用模型列表，支持 `gemini-3.7-flash`、`gemini-3.8-flash` 等最新模型 |
 | **多账号自动轮换** | 支持多账号管理与故障自动切换，按模型独立记录 429 配额，每日美西午夜自动重置 |
 | **运行状态持久化** | 模型调用量、Token 消耗统计 (`stats.json`) 以及账号 429 限额与冷却状态 (`rotator_state.json`) 自动落盘，容器/服务重启不丢失状态 |
@@ -410,7 +410,7 @@ anti_truncation:
 
 ### OpenAI / Claude 协议兼容层 (compat)
 
-`/v1/chat/completions` 与 `/v1/messages` 两个兼容端点的模型名映射配置（支持 `config.yaml` 热重载）：
+`/v1/chat/completions`、`/v1/responses` 与 `/v1/messages` 三个兼容端点的模型名映射配置（支持 `config.yaml` 热重载）：
 
 ```yaml
 # config.yaml
@@ -426,7 +426,8 @@ compat:
 - 直接填 Gemini 模型名（含 `-at` / `-at-stream` 抗截断变体）时原样透传，不经过映射；
 - 兼容层与原生 `/v1beta` 共享同一账号池、模型目录、鉴权 Key 与付费模型门控；
 - 多模态图片 / 音频 / 文档：远程 URL 由服务端代下载，内联 base64 与远程下载统一受 20MB 原始字节上限（超限返回 400）；`count_tokens` 估算不计入 base64 媒体数据；
-- 工具调用只转换自定义函数工具（OpenAI `type: function` / Claude 无 type 或 `type: custom`），`web_search` 等服务端工具类型会被跳过而非误声明为函数。
+- 工具调用只转换自定义函数工具（OpenAI `type: function` / Claude 无 type 或 `type: custom`），`web_search` 等服务端工具类型会被跳过而非误声明为函数；
+- **上游请求头指纹剥离**：所有出站请求头在网关边界按白名单重建（`transport.strip_to_aistudio_fingerprint`），仅保留 AI Studio 真实浏览器指纹头集（Content-Type / Origin / Referer / UA / Sec-Fetch-* / X-Goog-* / X-AIStudio-* / 凭据头）。客户端应用的任何请求头（SDK 指纹 `x-stainless-*`、`anthropic-version`、代理头、追踪头等）一律剥除，绝不透传上游，避免客户端指纹混入逆向指纹特征。
 
 ## API 调用示例
 
@@ -520,6 +521,52 @@ curl http://localhost:8080/v1/messages \
 - 流式返回完整 Claude 事件序列（`message_start` / `content_block_delta` / `message_delta` / `message_stop`），思考链走 thinking 块；
 - 工具（`tools` / `tool_choice`）、`thinking.budget_tokens`（自动换算为 Gemini 思考等级）、图片 / PDF 块、`stop_sequences` 均已支持；
 - `POST /v1/messages/count_tokens` 提供粗略 token 估算，`GET /v1/models` 在携带 `anthropic-version` 头时返回 Claude 格式。
+</details>
+
+<details>
+<summary><b>6. OpenAI Responses 格式（/v1/responses）</b></summary>
+
+```bash
+curl http://localhost:8080/v1/responses \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.7-flash",
+    "instructions": "你是一个简洁的中文助手。",
+    "input": "用简短的一句话介绍量子计算。",
+    "reasoning": {"effort": "high"},
+    "stream": true
+  }'
+```
+
+- OpenAI 新一代 Responses 协议（openai-python / Codex CLI 等客户端使用），事件形状与官方 SDK `types/responses/*` 逐字段对齐；
+- `input` 支持字符串或 item 数组（`message` / `function_call` / `function_call_output`），`instructions` 映射为 system instruction；
+- 流式返回语义化事件序列（`response.created` → `response.output_item.added` → `response.output_text.delta` → `response.completed`），`sequence_number` 从 0 连续递增；思考链走 `response.reasoning_summary_text.delta`，工具调用走 `response.function_call_arguments.delta/done`；
+- `reasoning.effort`（`minimal`/`low`/`medium`/`high`/`xhigh`/`max`）、`text.format`（JSON 模式 / JSON Schema）、function tools 均已支持；上游截断 / 安全拦截时正确下发 `response.incomplete`（含 `incomplete_details.reason`）；
+- 模型名映射与 Chat Completions 共用 `compat.openai.default_model` 配置。
+
+使用 openai-python SDK 直连：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="your-api-key")
+
+response = client.responses.create(
+    model="gemini-3.7-flash",
+    input="用简短的一句话介绍量子计算。",
+)
+print(response.output_text)
+
+# 流式
+with client.responses.stream(
+    model="gemini-3.7-flash",
+    input="用简短的一句话介绍量子计算。",
+) as stream:
+    for event in stream:
+        if event.type == "response.output_text.delta":
+            print(event.delta, end="", flush=True)
+```
 </details>
 
 ---

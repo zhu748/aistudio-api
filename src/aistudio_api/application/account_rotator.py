@@ -305,12 +305,14 @@ class AccountStats:
         )
 
         rot_cfg = get_configured_rotator_settings()
-        cooldowns = rot_cfg["cooldowns"]
+        cooldowns = rot_cfg.get("cooldowns")
         if not isinstance(cooldowns, dict):
             raise RuntimeError("rotator 配置缺少 cooldowns 配置块")
-        cd_short = float(str(cooldowns["rate_limited_short"]))
-        cd_drip = float(str(cooldowns["rate_limited_drip"]))
-        cd_drip_ext = float(str(cooldowns["rate_limited_drip_extended"]))
+        default_cds = {"rate_limited_short": 120, "rate_limited_drip": 30,
+                       "rate_limited_drip_extended": 120}
+        cd_short = float(str(cooldowns.get("rate_limited_short", default_cds["rate_limited_short"])))
+        cd_drip = float(str(cooldowns.get("rate_limited_drip", default_cds["rate_limited_drip"])))
+        cd_drip_ext = float(str(cooldowns.get("rate_limited_drip_extended", default_cds["rate_limited_drip_extended"])))
 
         is_drip = m_stats.drip_mode
         limit_count = m_stats.rate_limited

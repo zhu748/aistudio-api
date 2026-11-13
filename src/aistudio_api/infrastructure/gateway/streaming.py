@@ -110,6 +110,11 @@ class StreamingGateway:
                 events.append(("tool_calls", candidate.function_calls))
             if candidate.images:
                 events.append(("images", candidate.images))
+            if candidate.code_output:
+                # 代码执行输出（executableCode/codeExecutionResult 文本）：
+                # 缺此分支时纯代码 chunk 的 events 为空，内容静默丢失
+                # （非流式 parse_text_output 保留，两路径不对称）
+                events.append(("body", candidate.code_output))
             if candidate.text:
                 events.append(("body", candidate.text))
             if candidate.thought_signature:

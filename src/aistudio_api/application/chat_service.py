@@ -110,15 +110,27 @@ def _resolve_schema_type_code(schema: dict[str, object]) -> tuple[int, str, bool
                 or schema.get("all_of")
             )
             if isinstance(combiner, list) and combiner:
+                # OpenAI 常用 {type:"null"} 表达可空：剔除 null 分支后
+                # 若只剩一种类型，正确语义是「该类型 + nullable」，而非
+                # 降级成 object（null-first / object+null 组合此前都错编）
                 branch_types = [
                     str(b.get("type") or "").split(".")[-1].strip().lower()
                     for b in combiner
                     if isinstance(b, dict) and b.get("type")
                 ]
-                if "object" in branch_types:
+                has_null = "null" in branch_types
+                non_null = [t for t in branch_types if t != "null"]
+                if has_null and len(non_null) == 1:
+                    schema_type = non_null[0]
+                    is_nullable = True
+                elif "object" in non_null:
                     schema_type = "object"
-                elif branch_types:
-                    schema_type = branch_types[0]
+                    if has_null:
+                        is_nullable = True
+                elif non_null:
+                    schema_type = non_null[0]
+                    if has_null:
+                        is_nullable = True
                 else:
                     schema_type = "object"
             else:
@@ -272,6 +284,29 @@ def encode_schema_to_wire(
     if isinstance(min_items, int):
         wire[SchemaIndex.MIN_ITEMS] = min_items
 
+    example = schema.get("example", schema.get("examples"))
+    if isinstance(example, (str, int, float, bool)):
+        wire[SchemaIndex.EXAMPLE] = example
+
+    # default (Field 25) 不存在于 Google Schema Proto（wire_spec 逆向
+    # 结论：注入下标 23+ 会 400）。把 default 折叠进 description 尾部
+    # 而非静默丢弃——模型仍可感知默认值语义
+    default_val = schema.get("default")
+    if default_val is not None:
+        default_str = str(default_val)
+        if default_str:
+            desc_now = (
+                wire[SchemaIndex.DESCRIPTION]
+                if len(wire) > SchemaIndex.DESCRIPTION
+                else None
+            )
+            if isinstance(desc_now, str) and desc_now:
+                wire[SchemaIndex.DESCRIPTION] = (
+                    f"{desc_now} (default: {default_str})"
+                )
+            else:
+                wire[SchemaIndex.DESCRIPTION] = f"(default: {default_str})"
+
     property_ordering = schema.get("propertyOrdering") or schema.get(
         "property_ordering"
     )
@@ -366,7 +401,14 @@ def _parse_thinking_level(raw_level: object) -> ThinkingLevel | None:
     for key, value in _REASONING_EFFORT_TO_LEVEL.items():
         if key.replace("_", "") == compact:
             return value
-    return ThinkingLevel[label]
+    try:
+        return ThinkingLevel[label]
+    except KeyError:
+        # 无效档位是客户端参数错误（400），KeyError 会漏到未分类异常
+        # 路径变成 500 且误给服务账号记健康度惩罚
+        raise ValueError(
+            f"未识别的 thinkingLevel/reasoningEffort: {raw_level}"
+        ) from None
 
 
 # 思考档位吸附与浏览器形态默认值的模型自适应已下沉至基础设施层
@@ -902,9 +944,19 @@ def normalize_gemini_request(
         if generation_config.seed is not None:
             generation_config_overrides["seed"] = generation_config.seed
         if generation_config.mediaResolution is not None:
-            generation_config_overrides["media_resolution"] = (
-                generation_config.mediaResolution
-            )
+            # 官方 REST 是字符串枚举，wire 槽位 17 只收 int（1/2/3）；
+            # 字符串原样入 wire 会被上游拒绝或静默忽略
+            media_res = generation_config.mediaResolution
+            if isinstance(media_res, str):
+                media_res = (
+                    media_res.strip().upper().removeprefix("MEDIA_RESOLUTION_")
+                )
+                media_res = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}.get(media_res)
+            if isinstance(media_res, (int, float)) and not isinstance(
+                media_res, bool
+            ):
+                generation_config_overrides["media_resolution"] = int(media_res)
+            # 无法识别的形态按 drop 策略忽略（不透传非法值）
         if generation_config.thinkingConfig is not None:
             normalized_thinking = _normalize_gemini_thinking_config(
                 generation_config.thinkingConfig

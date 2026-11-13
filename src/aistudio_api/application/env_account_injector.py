@@ -141,7 +141,7 @@ async def probe_env_sub_accounts(store: AccountStore, account_ids: list[str]) ->
                 cookies, proxy_url=acc.proxy_url
             )
         except Exception as e:
-            logger.debug("环境变量账号 %s 子账号探活失败: %s", account_id, e)
+            logger.warning("环境变量账号 %s 子账号探活失败: %s", account_id, e)
             continue
 
         for p in probed:
