@@ -225,11 +225,12 @@ def ensure_signer_ready(*, server_url: str | None = None) -> str | None:
             ).strip()
             proxy = ""
             if raw_proxy:
-                try:
-                    from aistudio_api.infrastructure.proxy_bridge import (
-                        resolve_proxy_url,
-                    )
+                from aistudio_api.infrastructure.proxy_bridge import (
+                    normalize_proxy_for_go_signer,
+                    resolve_proxy_url,
+                )
 
+                try:
                     resolved_proxy = resolve_proxy_url(raw_proxy)
                 except Exception as e:
                     logger.warning(
@@ -237,13 +238,7 @@ def ensure_signer_ready(*, server_url: str | None = None) -> str | None:
                     )
                     resolved_proxy = None
                 if resolved_proxy:
-                    # Go 侧 proxydial 归一 socks5h，但 transport_browser 的
-                    # scheme 白名单拒收，统一归一为 socks5
-                    if resolved_proxy.startswith("socks5h://"):
-                        resolved_proxy = (
-                            "socks5://" + resolved_proxy[len("socks5h://") :]
-                        )
-                    proxy = resolved_proxy
+                    proxy = normalize_proxy_for_go_signer(resolved_proxy)
             cmd = [str(bin_path), "-listen", "127.0.0.1:8081"]
             if proxy:
                 cmd.extend(["-proxy", proxy])

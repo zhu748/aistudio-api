@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -46,6 +47,30 @@ if TYPE_CHECKING:
 _log_cfg = get_configured_logging_settings()
 setup_logging(str(_log_cfg.get("level", "INFO")))
 logger = get_logger("server")
+
+
+async def _pooled_probe_client(
+    pool: dict[str, httpx.AsyncClient], proxy_url: str | None
+) -> httpx.AsyncClient:
+    """按代理分池获取探活客户端（并发安全，全局代理回退含在内）。
+
+    turn/sstp 冷启动解析是真实 await 让出点：原「检查-构造-赋值」写法
+    在并发首调下会重复建池，多余实例脱离 pool 无人关闭（连接泄漏给
+    GC）；改为先解析、``setdefault`` 仲裁入池，竞争中后到者立即自关。
+    账号代理为空时回退全局默认（fail-closed：解析失败上抛由调用方处理）。
+    """
+    key = proxy_url or ""
+    existing = pool.get(key)
+    if existing is not None:
+        return existing
+    from aistudio_api.infrastructure.proxy_bridge import resolve_effective_proxy_async
+
+    resolved = await resolve_effective_proxy_async(proxy_url)
+    client = httpx.AsyncClient(timeout=8.0, proxy=resolved, follow_redirects=True)
+    winner = pool.setdefault(key, client)
+    if winner is not client:
+        await client.aclose()  # 并发竞争中后到者自关，唯一实例入池
+    return winner
 
 
 @asynccontextmanager
@@ -119,7 +144,6 @@ async def lifespan(_app: FastAPI):
     )
 
     async def _auto_refresh_tiers() -> None:
-        import httpx
 
         from aistudio_api.infrastructure.account.cookie_parser import (
             load_cookies_from_auth_file,
@@ -146,28 +170,12 @@ async def lifespan(_app: FastAPI):
         # 按代理分池的探活客户端：绑定独立代理的账号各走各的出口。
         # turn/turns/sstp 先解析为本地回环 SOCKS5（桥接子进程冷启动放
         # 线程池），解析失败抛错 → _check_one 捕获后跳过该账号（fail-
-        # closed，绝不静默改直连）。
+        # closed，绝不静默改直连）。池化经 _pooled_probe_client：并发
+        # 首调只建一个客户端（历史上检查-构造-赋值间隙的 await 会泄漏）。
         probe_clients: dict[str, httpx.AsyncClient] = {}
 
-        async def _resolve_probe_proxy(raw: str | None) -> str | None:
-            effective = raw or settings.proxy_url
-            if not effective:
-                return None
-            from aistudio_api.infrastructure.proxy_bridge import (
-                resolve_proxy_url_async,
-            )
-
-            return await resolve_proxy_url_async(effective)
-
         async def _get_probe_client(proxy_url: str | None) -> httpx.AsyncClient:
-            key = proxy_url or ""
-            if key not in probe_clients:
-                probe_clients[key] = httpx.AsyncClient(
-                    timeout=8.0,
-                    proxy=await _resolve_probe_proxy(proxy_url),
-                    follow_redirects=True,
-                )
-            return probe_clients[key]
+            return await _pooled_probe_client(probe_clients, proxy_url)
 
         try:
 
@@ -270,14 +278,12 @@ async def lifespan(_app: FastAPI):
                         rot_client = rot_clients.get(client_key)
                         if rot_client is None:
                             from aistudio_api.infrastructure.proxy_bridge import (
-                                resolve_proxy_url_async,
+                                resolve_effective_proxy_async,
                             )
 
                             rot_client = httpx.AsyncClient(
                                 timeout=15.0,
-                                proxy=await resolve_proxy_url_async(
-                                    acc_proxy or settings.proxy_url
-                                ),
+                                proxy=await resolve_effective_proxy_async(acc_proxy),
                                 follow_redirects=False,
                             )
                             rot_clients[client_key] = rot_client
