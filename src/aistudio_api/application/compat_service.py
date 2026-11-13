@@ -606,7 +606,7 @@ async def openai_to_gemini_request(
     generation_config.update(_openai_response_format_to_config(req.response_format))
     if req.reasoning_effort is not None:
         effort = req.reasoning_effort.strip().lower()
-        if effort in ("minimal", "low", "medium", "high", "none"):
+        if effort in ("minimal", "low", "medium", "high", "very_high", "none"):
             generation_config["reasoningEffort"] = effort
         else:
             logger.debug("忽略无法识别的 reasoning_effort: %s", req.reasoning_effort)
