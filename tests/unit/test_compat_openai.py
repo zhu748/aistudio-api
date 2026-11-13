@@ -235,6 +235,37 @@ async def test_openai_request_basic_conversion() -> None:
 
 
 @pytest.mark.asyncio
+async def test_openai_reasoning_effort_xhigh_passthrough_and_snap() -> None:
+    """reasoning_effort="xhigh"（较新客户端 effort 词汇）透传为 reasoningEffort，
+    归一化层解析为 VERY_HIGH(5)，再按模型目录吸附（hydrogen 原样/carbon 降 HIGH）。"""
+    from aistudio_api.application.chat_service import _parse_thinking_level
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        snap_thinking_level_to_supported,
+    )
+    from aistudio_api.infrastructure.gateway.wire_types import ThinkingLevel
+
+    req = OpenAIChatCompletionRequest.model_validate(
+        {
+            "model": "gemini-4-hydrogen",
+            "messages": [{"role": "user", "content": "Hello!"}],
+            "reasoning_effort": "xhigh",
+        }
+    )
+    gemini_req, resolved = await openai_to_gemini_request(req)
+
+    assert resolved == "gemini-4-hydrogen"
+    assert gemini_req.generationConfig is not None
+    assert gemini_req.generationConfig.reasoningEffort == "xhigh"
+
+    level = _parse_thinking_level(gemini_req.generationConfig.reasoningEffort)
+    assert level is ThinkingLevel.VERY_HIGH
+    assert snap_thinking_level_to_supported("gemini-4-hydrogen", level) is level
+    assert (
+        snap_thinking_level_to_supported("gemini-4-carbon", level) is ThinkingLevel.HIGH
+    )
+
+
+@pytest.mark.asyncio
 async def test_openai_request_tools_and_tool_roundtrip() -> None:
     req = OpenAIChatCompletionRequest.model_validate(
         {
