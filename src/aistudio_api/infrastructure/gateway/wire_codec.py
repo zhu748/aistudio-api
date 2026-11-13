@@ -22,6 +22,7 @@ from .wire_parser import (
 )
 from .wire_spec import (
     GenerationConfigIndex,
+    PartIndex,
     ThinkingConfigIndex,
     TopLevelIndex,
 )
@@ -222,21 +223,26 @@ class AistudioWireCodec:
         body[self.GENERATION_CONFIG_INDEX] = request.generation_config.values
         body[self.SNAPSHOT_INDEX] = request.snapshot
 
-        if request.system_instruction:
-            self._ensure_len(body, self.SYSTEM_INSTRUCTION_INDEX + 1)
-            body[self.SYSTEM_INSTRUCTION_INDEX] = request.system_instruction.to_wire()
-        if request.tools:
-            self._ensure_len(body, self.TOOLS_INDEX + 1)
-            body[self.TOOLS_INDEX] = request.tools
-        if request.evergreen_model_uri:
-            self._ensure_len(body, self.EVERGREEN_MODEL_URI_INDEX + 1)
-            body[self.EVERGREEN_MODEL_URI_INDEX] = request.evergreen_model_uri
-        if request.request_flag is not None:
-            self._ensure_len(body, self.REQUEST_FLAG_INDEX + 1)
-            body[self.REQUEST_FLAG_INDEX] = request.request_flag
-        if request.session_token is not None:
-            self._ensure_len(body, self.SESSION_TOKEN_INDEX + 1)
-            body[self.SESSION_TOKEN_INDEX] = request.session_token
+        # Typed fields are authoritative even when cleared after decoding a
+        # captured request. Keeping an old raw slot silently re-enables tools
+        # or sends a stale system instruction/session token.
+        optional_fields: tuple[tuple[int, object], ...] = (
+            (
+                self.SYSTEM_INSTRUCTION_INDEX,
+                request.system_instruction.to_wire()
+                if request.system_instruction is not None
+                else None,
+            ),
+            (self.TOOLS_INDEX, request.tools),
+            (self.EVERGREEN_MODEL_URI_INDEX, request.evergreen_model_uri),
+            (self.REQUEST_FLAG_INDEX, request.request_flag),
+            (self.SESSION_TOKEN_INDEX, request.session_token),
+            (self.TIMEZONE_INDEX, request.location),
+        )
+        for index, value in optional_fields:
+            if value is not None or len(body) > index:
+                self._ensure_len(body, index + 1)
+                body[index] = value
 
         model_defaults = resolve_model_defaults(request.model)
         if model_defaults.disable_safety_settings:
@@ -547,16 +553,9 @@ class AistudioWireCodec:
                     str(parsed.code_execution_result[1]),
                 )
 
-        # text 独立判定（与 executable_code 同理）：上游同一 part 可
-        # 同时携带 text 与 inline_data/function_call，elif 链会丢 text
-        if (
-            not code_part_handled
-            and (
-                part.inline_data is None
-                and part.executable_code is None
-                and part.code_execution_result is None
-            )
-        ) or (not code_part_handled and part.inline_data is not None):
+        # Text and structural payloads occupy independent slots. Preserve the
+        # absence of a text slot as well as an explicitly empty signature part.
+        if len(raw_part) > PartIndex.TEXT and isinstance(raw_part[PartIndex.TEXT], str):
             part.text = parsed.text
         return part
 

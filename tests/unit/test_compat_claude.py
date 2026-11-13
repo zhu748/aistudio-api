@@ -721,7 +721,7 @@ def test_build_claude_message_reports_cache_read_tokens() -> None:
     )
     message = cast(dict[str, Any], build_claude_message(response, "m", None))
     usage = cast(dict[str, Any], message["usage"])
-    assert usage["input_tokens"] == 100
+    assert usage["input_tokens"] == 36
     assert usage["output_tokens"] == 20
     assert usage["cache_read_input_tokens"] == 64
 

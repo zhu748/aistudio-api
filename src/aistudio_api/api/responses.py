@@ -42,11 +42,17 @@ def to_gemini_usage_metadata(
     completion_tokens = _coerce_usage_int(usage.get("completion_tokens"))
     if completion_tokens == 0:
         completion_tokens = visible_tokens + reasoning_tokens
-    candidates_tokens = completion_tokens
+    # Gemini counts visible candidates and thoughts separately. The internal
+    # completion_tokens (and OpenAI output_tokens) includes both.
+    candidates_tokens = (
+        visible_tokens
+        if "visible_tokens" in completion_details
+        else max(0, completion_tokens - reasoning_tokens)
+    )
     prompt_tokens = _coerce_usage_int(usage.get("prompt_tokens"))
     total_tokens = _coerce_usage_int(usage.get("total_tokens"))
-    if total_tokens == 0 and (prompt_tokens or candidates_tokens):
-        total_tokens = prompt_tokens + candidates_tokens
+    if total_tokens == 0 and (prompt_tokens or completion_tokens):
+        total_tokens = prompt_tokens + completion_tokens
     raw_cached = usage.get("cached_tokens")
     cached_tokens = (
         _coerce_usage_int(raw_cached)
@@ -69,6 +75,7 @@ def to_gemini_parts(
     thinking: str = "",
     images: list[GeneratedImage] | None = None,
     reasoning_images: list[GeneratedImage] | None = None,
+    thought_signature: str = "",
 ) -> list[GeminiPartResponse]:
     parts: list[GeminiPartResponse] = []
     if thinking:
@@ -129,6 +136,13 @@ def to_gemini_parts(
         if fr_id:
             resp_payload.id = str(fr_id)
         parts.append(GeminiPartResponse(functionResponse=resp_payload))
+    # Browser streams can send the signature in a final empty-text part, after
+    # all visible content. Preserve that opaque carrier in buffered responses,
+    # without assigning it to an unrelated thinking/image/function part.
+    if thought_signature and not any(
+        part.thoughtSignature == thought_signature for part in parts
+    ):
+        parts.append(GeminiPartResponse(text="", thoughtSignature=thought_signature))
     if not parts:
         parts.append(GeminiPartResponse(text=""))
     return parts

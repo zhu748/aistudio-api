@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import secrets
@@ -40,8 +41,11 @@ from aistudio_api.application.compat_service import (
     _openai_tool_choice_to_config,
     _openai_tools_to_gemini,
     _parse_data_url,
+    _read_signature,
+    _signature_extra,
     resolve_compat_model,
 )
+from aistudio_api.application.media_session import has_remote_media, media_session
 from aistudio_api.infrastructure.request_context import record_result
 from aistudio_api.infrastructure.utils.logger import get_logger
 
@@ -76,6 +80,12 @@ _FINISH_TO_INCOMPLETE_REASON: dict[str, str] = {
     "IMAGE_OTHER": "content_filter",
     "IMAGE_RECITATION": "content_filter",
     "LANGUAGE": "content_filter",
+    "MALFORMED_FUNCTION_CALL": "content_filter",
+    "UNEXPECTED_TOOL_CALL": "content_filter",
+    "TOO_MANY_TOOL_CALLS": "content_filter",
+    "NO_IMAGE": "content_filter",
+    "MISSING_THOUGHT_SIGNATURE": "content_filter",
+    "FINISH_REASON_UNSPECIFIED": "max_output_tokens",
 }
 
 
@@ -109,6 +119,20 @@ async def _parts_from_input_content(content: object) -> list[GeminiPart]:
         return [GeminiPart(text=content)]
     if not isinstance(content, list):
         return []
+    if len(content) > 1 and has_remote_media(content):
+        parts: list[GeminiPart] = []
+        for offset in range(0, len(content), 4):
+            try:
+                async with asyncio.TaskGroup() as group:
+                    tasks = [
+                        group.create_task(_parts_from_input_content([item]))
+                        for item in content[offset : offset + 4]
+                    ]
+            except* ValueError as exc:
+                raise ValueError(str(exc.exceptions[0])) from exc
+            for task in tasks:
+                parts.extend(task.result())
+        return parts
     parts: list[GeminiPart] = []
     for item in content:
         if not isinstance(item, dict):
@@ -184,12 +208,22 @@ def _tool_output_text(output: object) -> dict[str, object]:
     return {"result": ""}
 
 
+@media_session()
 async def responses_to_gemini_request(
     req: OpenAIResponsesRequest,
 ) -> tuple[GeminiGenerateContentRequest, str]:
     """OpenAI Responses 请求 → (Gemini 请求, 解析后的模型名)。"""
     resolved_model = resolve_compat_model(req.model, channel="openai")
+    if req.previous_response_id:
+        raise ValueError(
+            "previous_response_id is not supported; send the complete conversation in input"
+        )
+    if req.parallel_tool_calls is False:
+        raise ValueError(
+            "parallel_tool_calls=false cannot be enforced by this upstream"
+        )
     contents: list[GeminiContent] = []
+    system_texts: list[str] = [req.instructions] if req.instructions else []
     tool_name_by_call_id: dict[str, str] = {}
 
     # 第一遍：扫 function_call items 建 call_id → 函数名映射（容忍乱序历史）
@@ -218,16 +252,10 @@ async def responses_to_gemini_request(
                 # EasyInputMessage（type 省略时按 message 处理）
                 role = _as_str(item.get("role")).strip().lower()
                 if role in ("system", "developer"):
-                    # system/developer 消息插入为 [SYSTEM] 前缀 user turn
-                    # （保序，语义分层：instructions 走 systemInstruction）。
-                    # content 可为字符串或块数组（input_text 块）
+                    # Preserve instruction priority instead of lowering it to a user turn.
                     text = _content_text(item.get("content"))
                     if text:
-                        contents.append(
-                            GeminiContent(
-                                role="user", parts=[GeminiPart(text=f"[SYSTEM] {text}")]
-                            )
-                        )
+                        system_texts.append(text)
                     continue
                 parts = await _parts_from_input_content(item.get("content"))
                 if role == "assistant":
@@ -259,13 +287,14 @@ async def responses_to_gemini_request(
                         role="model",
                         parts=[
                             GeminiPart(
+                                thoughtSignature=_read_signature(item),
                                 functionCall=GeminiFunctionCall(
                                     name=name,
                                     args=parsed_args
                                     if isinstance(parsed_args, dict)
                                     else {},
                                     id=call_id or None,
-                                )
+                                ),
                             )
                         ],
                     )
@@ -325,8 +354,10 @@ async def responses_to_gemini_request(
     gemini_req = GeminiGenerateContentRequest(
         contents=contents,
         systemInstruction=(
-            GeminiContent(role="user", parts=[GeminiPart(text=req.instructions)])
-            if req.instructions
+            GeminiContent(
+                role="user", parts=[GeminiPart(text="\n\n".join(system_texts))]
+            )
+            if system_texts
             else None
         ),
         tools=_openai_tools_to_gemini(req.tools),
@@ -373,6 +404,7 @@ class _ResponsesOutputBuilder:
         if function_call is not None:
             self.function_calls.append(
                 {
+                    **_signature_extra(getattr(part, "thoughtSignature", None)),
                     "id": _item_id("fc"),
                     "call_id": function_call.id or _call_id(),
                     "name": function_call.name,
@@ -418,6 +450,11 @@ class _ResponsesOutputBuilder:
         for call in self.function_calls:
             output.append(
                 {
+                    **{
+                        key: value
+                        for key, value in call.items()
+                        if key == "extra_content"
+                    },
                     "id": call["id"],
                     "type": "function_call",
                     "status": "completed",
@@ -437,6 +474,7 @@ def _base_response(
     output: list[dict[str, object]],
     usage: dict[str, int] | None,
     incomplete_reason: str | None = None,
+    created_at: int | None = None,
 ) -> dict[str, object]:
     # tools / tool_choice / parallel_tool_calls 为 openai-python 类型模型
     # 必填字段：流式宽松构造不报错，但 model_validate 严格校验的客户端
@@ -444,11 +482,11 @@ def _base_response(
     payload: dict[str, object] = {
         "id": response_id,
         "object": "response",
-        "created_at": int(time.time()),
+        "created_at": created_at if created_at is not None else int(time.time()),
         "status": status,
         "model": requested_model,
         "output": output,
-        "parallel_tool_calls": False,
+        "parallel_tool_calls": True,
         "tool_choice": "auto",
         "tools": [],
     }
@@ -523,6 +561,7 @@ class _ResponsesStreamEmitter:
     def __init__(self, response_id: str, requested_model: str) -> None:
         self.response_id = response_id
         self.requested_model = requested_model
+        self.created_at = int(time.time())
         self.seq = -1  # 首事件自增后为 0，与 SDK 从 0 递增一致
         self.output_index = -1
         # 各 item 记住自己的 output_index：关闭事件与 delta 事件必须报
@@ -539,8 +578,8 @@ class _ResponsesStreamEmitter:
         self.usage: dict[str, int] | None = None
         self.saw_error = False
         # 累积文本（output_text.done / completed 快照需要完整文本）
-        self._text_accumulated: str = ""
-        self._reasoning_accumulated: str = ""
+        self._text_accumulated: list[str] = []
+        self._reasoning_accumulated: list[str] = []
 
     def sse(self, event_type: str, payload: dict[str, object]) -> str:
         self.seq += 1
@@ -565,6 +604,7 @@ class _ResponsesStreamEmitter:
             output=output or [],
             usage=self.usage,
             incomplete_reason=incomplete_reason,
+            created_at=self.created_at,
         )
 
     def created(self) -> str:
@@ -695,7 +735,9 @@ class _ResponsesStreamEmitter:
         )
         return events
 
-    def function_call(self, call_id: str, name: str, args: object) -> list[str]:
+    def function_call(
+        self, call_id: str, name: str, args: object, signature: str = ""
+    ) -> list[str]:
         self.output_index += 1
         fc_index = self.output_index
         item_id = _item_id("fc")
@@ -703,6 +745,7 @@ class _ResponsesStreamEmitter:
             args if isinstance(args, dict) else {}, ensure_ascii=False
         )
         item: dict[str, object] = {
+            **_signature_extra(signature),
             "id": item_id,
             "type": "function_call",
             "status": "completed",
@@ -718,6 +761,7 @@ class _ResponsesStreamEmitter:
                 {
                     "output_index": fc_index,
                     "item": {
+                        **_signature_extra(signature),
                         "id": item_id,
                         "type": "function_call",
                         "status": "in_progress",
@@ -752,13 +796,15 @@ class _ResponsesStreamEmitter:
             ),
         ]
 
-    def _close_reasoning(self, accumulated: str) -> list[str]:
+    def _close_reasoning(
+        self, accumulated: str, status: str = "completed"
+    ) -> list[str]:
         if self.reasoning_item_id is None:
             return []
         final_item = {
             "id": self.reasoning_item_id,
             "type": "reasoning",
-            "status": "completed",
+            "status": status,
             "summary": [{"type": "summary_text", "text": accumulated}],
         }
         self._replace_order_item(self.reasoning_item_id, final_item)
@@ -787,14 +833,14 @@ class _ResponsesStreamEmitter:
             ),
         ]
 
-    def _close_message(self, accumulated: str) -> list[str]:
+    def _close_message(self, accumulated: str, status: str = "completed") -> list[str]:
         if self.message_item_id is None:
             return []
         final_item = {
             "id": self.message_item_id,
             "type": "message",
             "role": "assistant",
-            "status": "completed",
+            "status": status,
             "content": [
                 {"type": "output_text", "text": accumulated, "annotations": []}
             ],
@@ -808,6 +854,7 @@ class _ResponsesStreamEmitter:
                     "output_index": self.message_index,
                     "content_index": 0,
                     "text": accumulated,
+                    "logprobs": [],
                 },
             ),
             self.sse(
@@ -841,8 +888,8 @@ class _ResponsesStreamEmitter:
         # 先收束已打开的 item（以已累积内容 done）：OpenAI 真实行为是
         # 关闭 items 后再发 response.failed，停在 in_progress 的 item
         # 会让 SDK 累积器对账失败
-        events = self._close_reasoning(self._reasoning_accumulated)
-        events += self._close_message(self._text_accumulated)
+        events = self._close_reasoning("".join(self._reasoning_accumulated))
+        events += self._close_message("".join(self._text_accumulated))
         events.append(
             self.sse(
                 "response.failed",
@@ -869,16 +916,14 @@ class _ResponsesStreamEmitter:
         """收束全部打开的 item 并下发终结事件。"""
         if self.saw_error:
             return []
-        events = self._close_reasoning(self._reasoning_accumulated)
-        events += self._close_message(self._text_accumulated)
         incomplete_reason = _FINISH_TO_INCOMPLETE_REASON.get(
             self.finish_reason_raw or ""
         )
         final_status = "incomplete" if incomplete_reason else "completed"
-        # 快照 item 的 status 与终结状态对齐
-        for _, item in self.item_order:
-            if item["type"] in ("reasoning", "message", "function_call"):
-                item["status"] = final_status
+        events = self._close_reasoning(
+            "".join(self._reasoning_accumulated), final_status
+        )
+        events += self._close_message("".join(self._text_accumulated), final_status)
         output = self._ordered_output()
         event_type = (
             "response.incomplete" if incomplete_reason else "response.completed"
@@ -902,10 +947,13 @@ async def responses_stream_adapter(
     source: AsyncIterable[object],
     *,
     requested_model: str,
+    register_failure: Callable[[Callable[[str], list[str]]], None] | None = None,
 ) -> AsyncGenerator[str, None]:
     """Gemini SSE → OpenAI Responses 语义事件流。"""
     response_id = _response_id()
     emitter = _ResponsesStreamEmitter(response_id, requested_model)
+    if register_failure is not None:
+        register_failure(emitter.error)
     yield emitter.created()
     yield emitter.in_progress()
 
@@ -939,7 +987,9 @@ async def responses_stream_adapter(
                     call_id = _as_str(function_call.get("id")) or _call_id()
                     name = _as_str(function_call.get("name")) or "unknown"
                     args = function_call.get("args")
-                    for event in emitter.function_call(call_id, name, args):
+                    for event in emitter.function_call(
+                        call_id, name, args, _as_str(part.get("thoughtSignature"))
+                    ):
                         yield event
                     continue
                 inline = _as_dict(part.get("inlineData"))
@@ -949,7 +999,7 @@ async def responses_stream_adapter(
                     mime = _as_str(inline.get("mimeType")) or "image/png"
                     data = _as_str(inline.get("data"))
                     if data:
-                        emitter._text_accumulated += (
+                        emitter._text_accumulated.append(
                             f"\n\n![image](data:{mime};base64,{data})"
                         )
                         for event in emitter.text_delta(
@@ -964,11 +1014,11 @@ async def responses_stream_adapter(
                     if text.startswith(_ERROR_TEXT_PREFIX):
                         continue
                     if part.get("thought") is True:
-                        emitter._reasoning_accumulated += text
+                        emitter._reasoning_accumulated.append(text)
                         for event in emitter.reasoning_delta(text):
                             yield event
                     else:
-                        emitter._text_accumulated += text
+                        emitter._text_accumulated.append(text)
                         for event in emitter.text_delta(text):
                             yield event
     except Exception as exc:

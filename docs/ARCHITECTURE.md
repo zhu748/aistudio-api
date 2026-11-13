@@ -192,6 +192,27 @@ sequenceDiagram
 1. **内存上下文切换**：触发账号轮换时，`GatewaySession.transition_to_account` 从目标账号的 `auth.json` 与 `meta.json` 加载 Cookie、`auth_user` 与 `tier`，构造新的 `SessionContext`；
 2. **请求上下文绑定**：每个 `PreparedRequest` 在签名时绑定当时的 `SessionContext`，后续 HTTP 传输直接使用该上下文的凭据，避免并发切号期间跨账号串号。
 
+### 4.5 协议转换与资源约束
+
+- Gemini、Chat Completions、Claude Messages 和 Responses 共用模型请求的并发、请求体上限与总超时。并发准入在首次数据库写入前完成，超额请求不会排队争抢历史记录写锁。
+- 兼容路由直接消费 Gemini 管线的结构化帧，仅在最终 HTTP 出口序列化 SSE；原生 Gemini HTTP 输出保持 SSE。外部字符串/字节帧仍支持增量 UTF-8 解码。
+- 工具调用按明确的调用 ID 合并参数分片及累计快照；无 ID 的完整调用保持独立。参数不完整时返回流式错误，异常 finishReason 不会把待完成调用转换为可执行调用。
+- 工具签名通过 `extra_content.google.thought_signature` 扩展字段往返，客户端需保留该字段。Claude thinking 的真实 Gemini 签名封装于 `signature` 中；占位签名不会作为真实签名传给上游。
+- Responses 当前采用无状态的完整历史输入模式。`previous_response_id` 返回 400；system/developer 消息进入 `systemInstruction`。`n != 1` 和无法强制执行的 `parallel_tool_calls=false` 返回明确错误，不静默忽略。
+- Responses 客户端应监听 `response.completed`、`response.incomplete` 和 `response.failed`。OpenAI SDK 3.50.0 的 `get_final_response()` 仅接受 completed；截断与失败需从相应事件读取状态，网关不会为此伪造成功事件。
+- JSON Schema 支持本地 `$ref`、`$defs` 和 JSON Pointer 转义；外部引用、循环引用及过于复杂的展开返回 400。wire Schema 的能力子集仍不等同于完整 JSON Schema/strict 验证。
+- 媒体下载在单次请求内复用连接，最多 4 路并发、64 次远程下载；保持输入顺序，逐项限制 20 MiB，总体积受 `AISTUDIO_MAX_REQUEST_BYTES` 约束。取消或失败时关闭全部下载连接。
+- 代理连接池退役后不接受新租约，等待已有租约释放再关闭；进程关闭时统一回收。增量 JSON 解析按分片缓存并仅在分块闭合时拼接，单块上限 64 MiB、容器深度上限 128。
+- Gemini 的 `candidatesTokenCount` 只计可见输出，`thoughtsTokenCount` 单独计数；Chat/Responses 的输出 token 含思考 token。Claude 的 `input_tokens` 排除另外报告的缓存读取 token。
+
+本地解析基准（不含网络、签名及模型生成时间）：
+
+```bash
+uv run python scripts/benchmark_stream_parser.py --size-mib 1 4 8 --fragment-bytes 1024 --repeat 3
+```
+
+上述契约的回归测试位于 `tests/unit/test_protocol_optimization.py` 与 `tests/unit/test_media_lifetime.py`。
+
 ## 5. 跨平台支持与依赖隔离
 
 | 平台 | 运行模式 | 传输与签名后端 | 内存基准 |

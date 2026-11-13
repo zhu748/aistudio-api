@@ -6,6 +6,7 @@ import contextlib
 import json
 import re
 import time
+from collections.abc import AsyncGenerator
 
 from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
@@ -602,6 +603,11 @@ def _build_gemini_response_from_output(
                         thinking=output.thinking,
                         images=output.images,
                         reasoning_images=output.reasoning_images,
+                        thought_signature=(
+                            output.candidates[0].thought_signature
+                            if output.candidates
+                            else ""
+                        ),
                     ),
                 ),
                 finishReason=to_gemini_finish_reason(
@@ -820,11 +826,35 @@ def format_sse_event(
     thought_signature: str | None = None,
 ) -> str | None:
     """Format a single Gemini streaming event into SSE chunk string."""
+    payload = _event_payload(
+        event_type,
+        text,
+        model_version=model_version,
+        response_id=response_id,
+        thought_signature=thought_signature,
+    )
+    return _encode_sse(payload) if payload is not None else None
+
+
+def _encode_sse(payload: dict[str, object]) -> str:
+    return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+
+
+def _event_payload(
+    event_type: str,
+    text: object,
+    *,
+    model_version: str | None = None,
+    response_id: str | None = None,
+    thought_signature: str | None = None,
+) -> dict[str, object] | None:
     if not text:
         return None
 
     parts: list[dict[str, object]] = []
-    if event_type == "body":
+    if event_type == "signature":
+        parts.append({"thoughtSignature": str(text)})
+    elif event_type == "body":
         p: dict[str, object] = {"text": str(text)}
         if thought_signature:
             p["thoughtSignature"] = thought_signature
@@ -868,7 +898,7 @@ def format_sse_event(
         payload["modelVersion"] = model_version
     if response_id:
         payload["responseId"] = response_id
-    return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+    return payload
 
 
 def format_sse_usage(
@@ -879,6 +909,23 @@ def format_sse_usage(
     response_id: str | None = None,
 ) -> str:
     """Format final completion usage metadata into SSE chunk string."""
+    return _encode_sse(
+        _usage_payload(
+            final_usage,
+            finish_reason=finish_reason,
+            model_version=model_version,
+            response_id=response_id,
+        )
+    )
+
+
+def _usage_payload(
+    final_usage: dict[str, object] | None,
+    *,
+    finish_reason: str = "STOP",
+    model_version: str | None = None,
+    response_id: str | None = None,
+) -> dict[str, object]:
     effective_usage = final_usage or {
         "prompt_tokens": 0,
         "completion_tokens": 0,
@@ -901,26 +948,17 @@ def format_sse_usage(
         payload["modelVersion"] = model_version
     if response_id:
         payload["responseId"] = response_id
-    return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+    return payload
 
 
 def format_sse_error(exc: Exception) -> str:
     """Format exception into standard Gemini SSE error chunk."""
+    return _encode_sse(_error_payload(exc))
+
+
+def _error_payload(exc: Exception) -> dict[str, object]:
     code, msg, status_str = classify_gemini_error_payload(exc)
-    return (
-        "data: "
-        + json.dumps(
-            {
-                "error": {
-                    "code": code,
-                    "message": msg,
-                    "status": status_str,
-                }
-            },
-            ensure_ascii=False,
-        )
-        + "\n\n"
-    )
+    return {"error": {"code": code, "message": msg, "status": status_str}}
 
 
 _ERROR_TEXT_PREFIX = "[aistudio-api 请求失败"
@@ -934,11 +972,36 @@ def format_sse_error_text(exc: Exception) -> str | None:
     导致失败时表现为“空回啥都没有”。此事件把具体错误原因作为正常文本
     part 下发，任何客户端都能看到，避免静默空回。
     """
+    payload = _error_text_payload(exc)
+    return _encode_sse(payload) if payload is not None else None
+
+
+def _error_text_payload(exc: Exception) -> dict[str, object] | None:
     code, msg, status_str = classify_gemini_error_payload(exc)
     if not msg:
         msg = type(exc).__name__
     text = f"{_ERROR_TEXT_PREFIX} {code} {status_str}] {msg}"
-    return format_sse_event("body", text)
+    return _event_payload("body", text)
+
+
+class GeminiStreamResponse(StreamingResponse):
+    """Expose structured frames to adapters; serialize only at the HTTP boundary."""
+
+    def __init__(self, frames: AsyncGenerator[dict[str, object], None]) -> None:
+        self.frames = frames
+
+        async def encode() -> AsyncGenerator[str, None]:
+            try:
+                async for frame in frames:
+                    yield _encode_sse(frame)
+            finally:
+                await frames.aclose()
+
+        super().__init__(
+            encode(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
 
 def _build_gemini_streaming_response(
@@ -949,7 +1012,7 @@ def _build_gemini_streaming_response(
     anti_truncation: bool | None = None,
     force_buffer: bool = False,
 ) -> StreamingResponse:
-    async def stream_response():
+    async def stream_response() -> AsyncGenerator[dict[str, object], None]:
         normalized = None
         stream_start_time = time.perf_counter()
         has_yielded_any = False
@@ -962,7 +1025,6 @@ def _build_gemini_streaming_response(
             final_usage: dict[str, object] | None = None
             final_finish_reason: str = "STOP"
             latest_response_id: str | None = None
-            buffered_thought_sig: str | None = None
             stream_completed = False
             last_stream_error: Exception | None = None
             # 预先初始化，避免循环零次执行时下方引用被判 possibly-unbound
@@ -977,7 +1039,7 @@ def _build_gemini_streaming_response(
                 final_usage = None
                 final_finish_reason = "STOP"
                 latest_response_id = None
-                buffered_thought_sig = None
+                pending_signature: str | None = None
                 await ensure_active_account(stream_attempt, model=model_path)
                 _svc = runtime_state.account_service
                 _acc = _svc.get_active_account() if _svc else None
@@ -1048,16 +1110,7 @@ def _build_gemini_streaming_response(
                                         )
                                     )
                                 )
-                        yield (
-                            "data: "
-                            + json.dumps(
-                                buffered_resp.model_dump(
-                                    mode="json", exclude_none=True
-                                ),
-                                ensure_ascii=False,
-                            )
-                            + "\n\n"
-                        )
+                        yield buffered_resp.model_dump(mode="json", exclude_none=True)
                         stream_completed = True
                         break
                     upstream_events = client.stream_generate_content(
@@ -1098,17 +1151,27 @@ def _build_gemini_streaming_response(
                             elif event_type == "response_id":
                                 latest_response_id = str(text)
                             elif event_type == "thought_signature":
-                                buffered_thought_sig = str(text)
+                                if has_yielded_data:
+                                    signature_frame = _event_payload(
+                                        "signature",
+                                        text,
+                                        model_version=normalized.model,
+                                        response_id=latest_response_id,
+                                    )
+                                    if signature_frame:
+                                        yield signature_frame
+                                else:
+                                    pending_signature = str(text)
                             else:
-                                chunk = format_sse_event(
+                                chunk = _event_payload(
                                     event_type,
                                     text,
                                     model_version=normalized.model,
                                     response_id=latest_response_id,
-                                    thought_signature=buffered_thought_sig,
+                                    thought_signature=pending_signature,
                                 )
-                                buffered_thought_sig = None
                                 if chunk:
+                                    pending_signature = None
                                     record_output_timing(event_type)
                                     if not has_yielded_data:
                                         ttft_ms = (
@@ -1177,7 +1240,7 @@ def _build_gemini_streaming_response(
                     f"(finish={final_finish_reason})。"
                     "可能为账号风控拦截或安全策略，请在面板“运行日志”页查看详情。"
                 )
-                diagnostic_chunk = format_sse_event("body", diagnostic)
+                diagnostic_chunk = _event_payload("body", diagnostic)
                 if diagnostic_chunk:
                     has_yielded_any = True
                     yield diagnostic_chunk
@@ -1214,7 +1277,7 @@ def _build_gemini_streaming_response(
                 pt,
                 ct,
             )
-            yield format_sse_usage(
+            yield _usage_payload(
                 final_usage,
                 finish_reason=final_finish_reason,
                 model_version=target_model,
@@ -1239,16 +1302,12 @@ def _build_gemini_streaming_response(
             # 下发，避免 Chatbox 等客户端只忽略 {"error":...} 事件而表现为空回；
             # 已输出部分内容时不追加，保持正文纯净（仅下发结构化错误事件）。
             if not has_yielded_any:
-                error_text_chunk = format_sse_error_text(exc)
+                error_text_chunk = _error_text_payload(exc)
                 if error_text_chunk:
                     yield error_text_chunk
-            yield format_sse_error(exc)
+            yield _error_payload(exc)
 
-    return StreamingResponse(
-        stream_response(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return GeminiStreamResponse(stream_response())
 
 
 async def handle_gemini_count_tokens(

@@ -418,7 +418,7 @@ def test_build_openai_completion_text_and_reasoning() -> None:
         ],
         usage=GeminiUsageMetadata(
             promptTokenCount=10,
-            candidatesTokenCount=20,
+            candidatesTokenCount=12,
             thoughtsTokenCount=8,
             totalTokenCount=30,
         ),
@@ -527,7 +527,7 @@ async def test_openai_stream_adapter_full_sequence() -> None:
             ],
             "usageMetadata": {
                 "promptTokenCount": 5,
-                "candidatesTokenCount": 7,
+                "candidatesTokenCount": 5,
                 "thoughtsTokenCount": 2,
                 "totalTokenCount": 12,
             },
@@ -692,7 +692,7 @@ async def test_openai_stream_adapter_tolerates_indented_data_lines() -> None:
 
 
 @pytest.mark.asyncio
-async def test_iter_gemini_sse_frames_drops_oversized_buffer() -> None:
+async def test_iter_gemini_sse_frames_rejects_oversized_buffer() -> None:
     """上游持续不发事件边界时，缓冲区必须有上限（否则内存被拖垮）。"""
     from aistudio_api.application import compat_service
 
@@ -701,11 +701,8 @@ async def test_iter_gemini_sse_frames_drops_oversized_buffer() -> None:
         for _ in range(4):
             yield "data: " + ("x" * (8 * 1024 * 1024))
 
-    frames = [
-        frame
-        async for frame in compat_service._iter_gemini_sse_frames(source())  # pyright: ignore[reportPrivateUsage]
-    ]
-    assert frames == []
+    with pytest.raises(ValueError, match="exceeds"):
+        [frame async for frame in compat_service._iter_gemini_sse_frames(source())]
 
 
 def test_openai_finish_reason_safety_beats_tool_calls() -> None:

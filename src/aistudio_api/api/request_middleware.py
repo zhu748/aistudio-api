@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
+from collections.abc import Callable
+from typing import cast
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -42,6 +45,7 @@ class RequestMiddleware:
             await self.app(scope, receive, send)
             return
         path = scope["path"]
+        scope.setdefault("state", {})
         if len(path) > 1 and path.endswith("/"):
             # 规范化优先于 Starlette 的 307 尾斜杠重定向：重定向分支不执行
             # 路由 dependencies，受保护管理端点的尾斜杠变体会未鉴权拿到
@@ -50,7 +54,7 @@ class RequestMiddleware:
             scope = {**scope, "path": path, "raw_path": path.encode("latin-1")}
         model_call = scope["method"] == "POST" and (
             path.startswith("/v1beta/")
-            or path in ("/v1/chat/completions", "/v1/messages")
+            or path in ("/v1/chat/completions", "/v1/messages", "/v1/responses")
         )
         # Management payloads can contain cookies, complete config and credentials.
         dump_enabled = model_call and (
@@ -87,8 +91,31 @@ class RequestMiddleware:
         headers = {k.decode("latin1"): v.decode("latin1") for k, v in scope["headers"]}
         admitted = False
         request_timeout = asyncio.timeout(settings.request_timeout)
+        history_start: asyncio.Task[None] | None = None
 
         async def reply(code: int, message: str) -> None:
+            from aistudio_api.application.compat_service import (
+                claude_error_payload,
+                openai_error_payload,
+            )
+
+            payload = (
+                claude_error_payload(code, message)
+                if context.protocol == "claude"
+                else openai_error_payload(code, message)
+            )
+            if context.protocol == "gemini":
+                payload = {
+                    "error": {
+                        "code": code,
+                        "message": message,
+                        "status": {
+                            413: "INVALID_ARGUMENT",
+                            429: "RESOURCE_EXHAUSTED",
+                            504: "DEADLINE_EXCEEDED",
+                        }.get(code, "INTERNAL"),
+                    }
+                }
             await observed_send(
                 {
                     "type": "http.response.start",
@@ -99,9 +126,7 @@ class RequestMiddleware:
             await observed_send(
                 {
                     "type": "http.response.body",
-                    "body": json.dumps(
-                        {"error": {"message": message, "code": code}}
-                    ).encode(),
+                    "body": json.dumps(payload).encode(),
                 }
             )
 
@@ -191,37 +216,41 @@ class RequestMiddleware:
             await send(message)
 
         try:
+            # Reserve a slot before the first await, including history I/O.
             if model_call:
-                register_request(context)
-                request_event("received", "收到模型调用")
-                logger.info(
-                    "模型请求开始: protocol=%s model=%s",
-                    context.protocol,
-                    context.model or "待解析",
-                )
-                if settings.request_history:
-                    try:
-                        await asyncio.to_thread(
-                            request_history().insert,
-                            request_snapshot(context, running=True),
-                        )
-                    except Exception:
-                        logger.exception("Failed to persist request start")
-            if model_call and self.active >= settings.max_concurrent_requests:
-                context.error = "Concurrent request limit reached"
-                await reply(429, context.error)
-                return
-            if model_call:
+                if self.active >= settings.max_concurrent_requests:
+                    context.error = "Concurrent request limit reached"
+                    await reply(429, context.error)
+                    return
                 self.active += 1
                 admitted = True
-                raw_length = headers.get("content-length", "0")
-                if (
-                    not raw_length.isdigit()
-                    or int(raw_length) > settings.max_request_bytes
-                ):
-                    await reply(413, "Request body exceeds configured limit")
-                    return
+            if model_call:
                 async with request_timeout:
+                    register_request(context)
+                    request_event("received", "收到模型调用")
+                    logger.info(
+                        "模型请求开始: protocol=%s model=%s",
+                        context.protocol,
+                        context.model or "待解析",
+                    )
+                    if settings.request_history:
+                        try:
+                            history_start = asyncio.create_task(
+                                asyncio.to_thread(
+                                    request_history().insert,
+                                    request_snapshot(context, running=True),
+                                )
+                            )
+                            await asyncio.shield(history_start)
+                        except Exception:
+                            logger.exception("Failed to persist request start")
+                    raw_length = headers.get("content-length", "0")
+                    if (
+                        not raw_length.isdigit()
+                        or int(raw_length) > settings.max_request_bytes
+                    ):
+                        await reply(413, "Request body exceeds configured limit")
+                        return
                     await self.app(scope, observed_receive, observed_send)
             else:
                 await self.app(scope, observed_receive, observed_send)
@@ -241,6 +270,18 @@ class RequestMiddleware:
             if not response_started:
                 await reply(504, context.error)
             else:
+                failure = scope.get("state", {}).get("stream_failure")
+                if is_stream and callable(failure):
+                    chunks = cast(Callable[[str], list[str]], failure)(context.error)
+                    for index, chunk in enumerate(chunks):
+                        await observed_send(
+                            {
+                                "type": "http.response.body",
+                                "body": chunk.encode("utf-8"),
+                                "more_body": index < len(chunks) - 1,
+                            }
+                        )
+                    return
                 await observed_send(
                     {
                         "type": "http.response.body",
@@ -273,7 +314,7 @@ class RequestMiddleware:
                 )
             if not completed and context.result == "success":
                 context.result = "cancelled"
-            if model_call:
+            if model_call and admitted:
                 from aistudio_api.api.state import runtime_state
 
                 service = runtime_state.account_service
@@ -322,6 +363,7 @@ class RequestMiddleware:
                         status,
                         elapsed_ms,
                         path,
+                        history_start,
                     )
                 )
                 try:
@@ -348,7 +390,13 @@ class RequestMiddleware:
         status: int,
         elapsed_ms: float,
         path: str,
+        history_start: asyncio.Task[None] | None = None,
     ) -> None:
+        # A cancelled to_thread await does not stop its worker. Order the final
+        # record after the initial insert so a slow worker cannot resurrect 'running'.
+        if history_start is not None:
+            with contextlib.suppress(Exception):
+                await history_start
         if settings.request_history:
             try:
                 safe_record = _mask_json_value(record)

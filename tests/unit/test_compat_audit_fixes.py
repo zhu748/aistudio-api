@@ -654,7 +654,7 @@ async def test_responses_stream_completed_snapshot_ordered() -> None:
     resp_obj = completed["response"]
     assert resp_obj["tools"] == []
     assert resp_obj["tool_choice"] == "auto"
-    assert resp_obj["parallel_tool_calls"] is False
+    assert resp_obj["parallel_tool_calls"] is True
     assert resp_obj["usage"]["input_tokens_details"]["cache_write_tokens"] == 0
 
 
@@ -727,10 +727,9 @@ async def test_responses_request_system_content_array() -> None:
         }
     )
     gemini_req, _ = await responses_to_gemini_request(req)
-    first = gemini_req.contents[0]
-    assert first.role == "user"
-    first_text = first.parts[0].text
-    assert first_text is not None and "You are a calculator." in first_text
+    assert gemini_req.systemInstruction is not None
+    assert gemini_req.systemInstruction.parts[0].text == "You are a calculator."
+    assert gemini_req.contents[0].parts[0].text == "1+1=?"
 
 
 # ---------------------------------------------------------------------------
