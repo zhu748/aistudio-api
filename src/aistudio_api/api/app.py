@@ -627,4 +627,13 @@ def main(argv: list[str] | None = None) -> None:
     import uvicorn
 
     logger.info("启动服务: 监听端口=%d", args.port)
-    uvicorn.run(app, host="0.0.0.0", port=args.port, log_config=None)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=args.port,
+        log_config=None,
+        # 优雅关停：SIGTERM 后先停止收新请求，给在途请求（尤其 SSE 流）
+        # timeout_graceful_shutdown 秒排空；超时才强断连接，避免容器
+        # 编排（Docker/K8s 默认 30s 后 SIGKILL）前在途流挂住整个关停。
+        timeout_graceful_shutdown=25,
+    )

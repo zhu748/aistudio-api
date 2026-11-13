@@ -19,28 +19,50 @@ class RequestHistory:
         self.path = path
         self._lock = threading.Lock()
         self._last_cleanup = 0.0
+        # 进程级一次性 schema 初始化：建表/建索引/PRAGMA/chmod 原先每次
+        # 连接都重复执行（每请求 ≥2 次 insert，DDL 即使 IF NOT EXISTS 也
+        # 需 schema 解析与锁，串行在 self._lock 内放大排队）。
+        self._schema_ready = False
+        self._schema_lock = threading.Lock()
+
+    def _ensure_schema(self, connection: sqlite3.Connection) -> None:
+        if self._schema_ready:
+            return
+        with self._schema_lock:
+            if self._schema_ready:
+                return
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("PRAGMA journal_size_limit=10485760")
+            connection.execute("PRAGMA secure_delete=ON")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS requests ("
+                "request_id TEXT PRIMARY KEY, started_at REAL NOT NULL, "
+                "model TEXT NOT NULL, account_id TEXT NOT NULL, key_id TEXT NOT NULL, "
+                "result TEXT NOT NULL, status_code INTEGER NOT NULL, payload TEXT NOT NULL)"
+            )
+            for column in (
+                "started_at",
+                "model",
+                "account_id",
+                "key_id",
+                "result",
+            ):
+                connection.execute(
+                    f"CREATE INDEX IF NOT EXISTS requests_{column} ON requests({column})"
+                )
+            self.path.chmod(0o600)
+            self._schema_ready = True
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.touch(mode=0o600, exist_ok=True)
-        self.path.chmod(0o600)
         connection = sqlite3.connect(self.path, timeout=10)
-        connection.execute("PRAGMA journal_mode=WAL")
+        # journal_mode 属持久属性，WAL 一次设置后跨连接生效；
+        # synchronous 属连接级属性，逐连接设置开销极小（无磁盘 IO）
         connection.execute("PRAGMA synchronous=NORMAL")
-        connection.execute("PRAGMA journal_size_limit=10485760")
-        connection.execute("PRAGMA secure_delete=ON")
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS requests ("
-            "request_id TEXT PRIMARY KEY, started_at REAL NOT NULL, "
-            "model TEXT NOT NULL, account_id TEXT NOT NULL, key_id TEXT NOT NULL, "
-            "result TEXT NOT NULL, status_code INTEGER NOT NULL, payload TEXT NOT NULL)"
-        )
-        for column in ("started_at", "model", "account_id", "key_id", "result"):
-            connection.execute(
-                f"CREATE INDEX IF NOT EXISTS requests_{column} ON requests({column})"
-            )
-        self.path.chmod(0o600)
+        self._ensure_schema(connection)
         try:
             with connection:
                 yield connection

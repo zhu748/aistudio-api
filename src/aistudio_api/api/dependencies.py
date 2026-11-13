@@ -225,9 +225,7 @@ def require_web_auth(request: Request) -> None:
         )
 
     if web_password:
-        if secrets.compare_digest(
-            token.encode("utf-8"), _encode_secret(web_password)
-        ):
+        if secrets.compare_digest(token.encode("utf-8"), _encode_secret(web_password)):
             _reset_auth_failures(client_ip)
             return
     else:

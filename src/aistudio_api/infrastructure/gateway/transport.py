@@ -349,6 +349,13 @@ class HTTPStreamTransport:
     def __init__(self, proxy_url: str | None = None, timeout: float = 120.0) -> None:
         self.proxy_url = proxy_url or settings.proxy_url
         self.timeout = timeout
+        # 后台 Set-Cookie 持久化任务：流式请求不再在首块前同步等待
+        # 落盘（持锁 stat+fsync 5-15ms，并发排队放大首字延迟数百 ms）
+        self._pending_cookie_tasks: set[asyncio.Task[None]] = set()
+        # 已退役代理池的延迟关闭任务（retire_stale_clients 创建）
+        self._retired_close_tasks: set[asyncio.Task[None]] = set()
+        # 已退役待回收的客户端（close 兜底用；延迟任务正常完成时自清）
+        self._retired_clients: set[httpx.AsyncClient] = set()
         # 按代理地址分池的客户端缓存：key 为代理 URL（空串表示直连）
         self._clients: dict[str, httpx.AsyncClient] = {}
         # 首次并发调用会同时走到建池分支，若不互斥会创建多个客户端并泄漏未关闭的连接池；
@@ -364,15 +371,87 @@ class HTTPStreamTransport:
             self._client_lock_loop = loop
         return self._client_lock
 
+    def _schedule_cookie_persist(
+        self,
+        set_cookies: list[str],
+        auth_file: str | None,
+        cookies: dict[str, str] | None,
+    ) -> None:
+        """把 Set-Cookie 持久化调度为后台任务（失败仅记日志，不影响请求流）。"""
+        task = asyncio.create_task(
+            asyncio.to_thread(_persist_set_cookies, set_cookies, auth_file, cookies)
+        )
+        self._pending_cookie_tasks.add(task)
+        task.add_done_callback(self._pending_cookie_tasks.discard)
+
+    async def _flush_cookie_persist(self) -> None:
+        """关停前排空后台 Cookie 持久化任务，避免滚动凭据丢失。"""
+        if self._pending_cookie_tasks:
+            await asyncio.gather(*self._pending_cookie_tasks, return_exceptions=True)
+
     async def close(self) -> None:
         # 与 _get_client 的建池分支互斥：否则并发建池插入 self._clients
         # 会让这里的迭代抛 "dictionary changed size during iteration"，
         # 且 close 之后新建的客户端将永远不会被关闭（连接泄漏）。
+        await self._flush_cookie_persist()
         async with self._get_client_lock():
             for client in self._clients.values():
                 if not client.is_closed:
                     await client.aclose()
             self._clients.clear()
+        pending = list(self._retired_close_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+            self._retired_close_tasks.clear()
+        # 兜底：任务若在启动帧之前就被取消（retire 后立即 close），
+        # CancelledError 不会经过 except 分支，aclose 从未执行；
+        # 此时 retired 客户端已不在 _clients 中，须显式回收。
+        for client in self._retired_clients:
+            if not client.is_closed:
+                with contextlib.suppress(Exception):
+                    await client.aclose()
+        self._retired_clients.clear()
+
+    async def retire_stale_clients(self, keep_proxy: str | None) -> None:
+        """退役除 keep_proxy 外的所有客户端池（面板切换全局代理时调用）。
+
+        照抄 WaaSigner.reconfigure 的「retired + 延迟关闭」模式：立即从
+        池中摘除、延迟 aclose，让并发在途请求持有的引用能安全跑完，
+        而非滞留到进程退出（反复切代理会累积多个满配连接池）。
+        """
+        keep_key = keep_proxy or ""
+        retired: list[httpx.AsyncClient] = []
+        async with self._get_client_lock():
+            for key in [k for k in self._clients if k != keep_key]:
+                retired.append(self._clients.pop(key))
+        if not retired:
+            return
+
+        self._retired_clients.update(retired)
+
+        async def _delayed_close() -> None:
+            try:
+                # 35s 宽限：足以让在途流式请求（含 SSE 长流）排空
+                await asyncio.sleep(35.0)
+            except asyncio.CancelledError:
+                # 进程关停：宽限期作废，立即回收（cancel 时 sleep 抛出，
+                # finally 统一关闭；重新 raise 让任务以取消态结束）
+                try:
+                    for client in retired:
+                        if not client.is_closed:
+                            await client.aclose()
+                finally:
+                    raise
+            for client in retired:
+                if not client.is_closed:
+                    await client.aclose()
+            self._retired_clients.difference_update(retired)
+
+        task = asyncio.create_task(_delayed_close())
+        self._retired_close_tasks.add(task)
+        task.add_done_callback(self._retired_close_tasks.discard)
 
     async def _get_client(self, proxy_url: str | None = None) -> httpx.AsyncClient:
         """获取（或创建）绑定指定出口代理的客户端；proxy_url=None 时使用全局默认代理。"""
@@ -490,9 +569,9 @@ class HTTPStreamTransport:
             resp = await client.send(req, stream=True)
             set_cookies = resp.headers.get_list("set-cookie")
             if set_cookies:
-                await asyncio.to_thread(
-                    _persist_set_cookies, set_cookies, auth_file, cookies
-                )
+                # 后台落盘：Google 上游普遍带滚动 Set-Cookie，
+                # 同步等待会把持锁磁盘 IO 排队进流式首字关键路径
+                self._schedule_cookie_persist(set_cookies, auth_file, cookies)
             yield ("status", resp.status_code)
 
             if resp.status_code != 200:

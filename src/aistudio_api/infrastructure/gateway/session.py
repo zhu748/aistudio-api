@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import itertools
 import time
@@ -145,6 +146,9 @@ class GatewaySession:
 
     async def set_default_proxy(self, proxy: str | None) -> None:
         self._transport.proxy_url = proxy
+        # 退役旧默认代理的客户端池（延迟关闭，在途请求安全排空），
+        # 否则反复切代理会累积多个满配连接池直至进程退出
+        await self._transport.retire_stale_clients(proxy)
         await self._signer.reconfigure(proxy_url=proxy or "")
 
     async def transition_to_account(
@@ -240,11 +244,11 @@ class GatewaySession:
             model=model,
             upstream_proxy=active_ctx.proxy_url or settings.proxy_url,
         )
-        self._sync_signer_cookies(active_ctx)
+        await self._sync_signer_cookies(active_ctx)
         request_event("signed", "请求签名完成")
         return proof
 
-    def _sync_signer_cookies(self, active_ctx: SessionContext) -> None:
+    async def _sync_signer_cookies(self, active_ctx: SessionContext) -> None:
         """当 WAA 签名服务在内部刷新了滚动 Cookie 时，将其同步回 SessionContext 与 AccountStore。"""
         dyn_headers = getattr(self._signer, "last_headers", None)
         if not isinstance(dyn_headers, dict):
@@ -267,7 +271,10 @@ class GatewaySession:
                     AccountStore,
                 )
 
-                AccountStore().update_account_cookies(
+                # update_account_cookies 含 stat+原子写(fsync)，
+                # 必须经线程池执行，禁止阻塞事件循环（transport 同款约束）
+                await asyncio.to_thread(
+                    AccountStore().update_account_cookies,
                     auth_file=active_ctx.auth_file,
                     new_cookies=active_ctx.cookies,
                 )
