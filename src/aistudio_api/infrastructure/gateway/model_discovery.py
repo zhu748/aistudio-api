@@ -1150,30 +1150,22 @@ class ModelDiscoveryService:
             visit_scope="default",
         )
 
-        async def _resolve_listmodels_proxy(raw: str | None) -> str | None:
-            """传入代理或全局默认 → httpx 可用形态（turn/sstp 转本地 SOCKS5）。"""
-            from aistudio_api.config import settings
-
-            effective = raw or settings.proxy_url
-            if not effective:
-                return None
-            from aistudio_api.infrastructure.proxy_bridge import (
-                resolve_proxy_url_async,
-            )
-
-            return await resolve_proxy_url_async(effective)
-
         url = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ListModels"
         # 复用 transport 层的共享 SSLContext 与 h2 探测：裸建 AsyncClient 会
         # 每次重新枚举系统证书库（Windows 上单次 0.7~1.4s）且丢失 HTTP/2。
+        # 代理经 resolve_effective_proxy_async：传入代理或全局默认 →
+        # httpx 可用形态（turn/sstp 转本地 SOCKS5，fail-closed）。
         from aistudio_api.infrastructure.gateway.transport import (
             _http2_enabled,
             _shared_ssl_context,
         )
+        from aistudio_api.infrastructure.proxy_bridge import (
+            resolve_effective_proxy_async,
+        )
 
         async with httpx.AsyncClient(
             timeout=10.0,
-            proxy=await _resolve_listmodels_proxy(proxy_url),
+            proxy=await resolve_effective_proxy_async(proxy_url),
             trust_env=False,
             http2=_http2_enabled(),
             verify=_shared_ssl_context(),

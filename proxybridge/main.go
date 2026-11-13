@@ -79,10 +79,11 @@ const (
 //
 // ⚠️ Cross-process contract (kept in sync with the Python side): every code
 // reachable during startup (before the ready file is written) must have a
-// matching entry in the `known` map of app/proxy_resolver.py (_launch).
-// Per-connection codes below (turn_*, target_*, socks_*) are diagnostics
-// only and need no Python mapping. Renaming a startup code without updating
-// Python silently degrades it to the generic "startup timeout" message.
+// matching entry in _STARTUP_ERROR_HINTS of
+// src/aistudio_api/infrastructure/proxy_bridge.py. Per-connection codes below
+// (turn_*, target_*, socks_*) are diagnostics only and need no Python mapping.
+// Renaming a startup code without updating Python silently degrades it to the
+// generic "startup timeout" message.
 func diagnostic(message string) {
 	if idx := strings.Index(message, ": "); idx > 0 {
 		message = message[:idx]

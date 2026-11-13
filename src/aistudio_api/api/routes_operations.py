@@ -397,10 +397,12 @@ async def readiness() -> JSONResponse:
             signer_ok = response.is_success
     except httpx.HTTPError:
         pass
-    except Exception:
+    except Exception as exc:
         # 桥接冷启动失败等代理解析错误：就绪探活直接判签名节点不可达，
         # 不影响主体服务的 503 语义（fail-closed，不静默跳过代理）。
-        pass
+        from aistudio_api.infrastructure.utils.logger import get_logger
+
+        get_logger("operations").debug("就绪探活的代理解析失败: %s", exc)
     ready = bool(runtime_state.client and available and signer_ok)
     return JSONResponse(
         {

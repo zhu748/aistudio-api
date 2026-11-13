@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import ctypes
 import hashlib
 import json
 import os
@@ -47,6 +48,8 @@ __all__ = [
     "ProxyBridgeError",
     "bridge_manager",
     "bridge_status",
+    "normalize_proxy_for_go_signer",
+    "resolve_effective_proxy_async",
     "resolve_proxy_url",
     "resolve_proxy_url_async",
     "resolve_proxy_url_cached",
@@ -217,6 +220,42 @@ def _wait_bridge_ready(inst: _BridgeInstance, ready_file: Path, timeout: float) 
     return False
 
 
+def _process_alive(pid: int) -> bool:
+    """探测 pid 是否存活（仅查询，绝不终止目标进程）。
+
+    POSIX 用信号 0 的存在性探测。Windows 的 ``os.kill(pid, 0)`` 不可用：
+    0 是 ``CTRL_C_EVENT``，会先向控制台进程组广播 Ctrl+C，失败后回退
+    ``TerminateProcess`` 直接杀死目标进程（CPython bpo-42962 的既定
+    行为），必须改用 ``OpenProcess`` 的受限查询权限探测。查询被拒
+    （ERROR_ACCESS_DENIED）时保守视为存活，与 POSIX 的 OSError 分支
+    对齐：孤儿文件多留一轮比误删在用文件安全。
+    """
+    if os.name == "nt":
+        process_query_limited_information = 0x1000
+        error_access_denied = 5
+        kernel32 = ctypes.CDLL("kernel32.dll", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        # HANDLE 是指针宽度；默认 c_int 返回值在 Win64 上会截断句柄
+        open_process.restype = ctypes.c_void_p
+        open_process.argtypes = [
+            ctypes.c_uint32,  # dwDesiredAccess
+            ctypes.c_int,  # bInheritHandle (BOOL)
+            ctypes.c_uint32,  # dwProcessId
+        ]
+        handle = open_process(process_query_limited_information, False, pid)
+        if handle:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+            return True
+        return ctypes.get_last_error() == error_access_denied
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # 无法判定（权限等）：保守视为存活
+
+
 def _terminate(inst: _BridgeInstance) -> None:
     """终止子进程（terminate → 3s 后 kill），异常静默（关停路径兜底）。"""
     process = inst.process
@@ -231,6 +270,12 @@ def _terminate(inst: _BridgeInstance) -> None:
             process.wait(timeout=3)
     except Exception:  # 关停兜底：任何异常都不能阻断其余实例回收
         pass
+
+
+def _remove_instance_files(inst: _BridgeInstance) -> None:
+    """回收实例时清理其状态文件（日志；config/ready 在 _launch 已即删）。"""
+    with contextlib.suppress(OSError):
+        inst.log_path.unlink(missing_ok=True)
 
 
 # Go 侧启动期（ready 文件写出前）可达的全部受控错误码 → 中文文案。
@@ -332,13 +377,14 @@ class ProxyBridgeManager:
         return self._cached_local_socks5(uri)
 
     def shutdown_all(self) -> None:
-        """停机：终止全部桥接进程（FastAPI shutdown / atexit 双保险）。"""
+        """停机：终止全部桥接进程并清理状态文件（FastAPI shutdown / atexit 双保险）。"""
         with self._lock:
             self._closed = True
             instances = list(self._instances.values())
             self._instances.clear()
         for inst in instances:
             _terminate(inst)  # 锁外终止：terminate+kill 最多 6s，不阻塞取用
+            _remove_instance_files(inst)
 
     def reopen(self) -> None:
         """停机后重新启用管理器（测试隔离 / 运行时重启场景）。"""
@@ -346,7 +392,12 @@ class ProxyBridgeManager:
             self._closed = False
 
     def reap_idle(self) -> int:
-        """回收空闲实例（已崩溃的死实例不受空闲阈值保护，总是清理）。"""
+        """回收空闲实例（已崩溃的死实例不受空闲阈值保护，总是清理）。
+
+        回收时同步删除实例日志：config/ready 在 ``_launch`` 结束时已删，
+        日志是唯一会滞留的状态文件，不删会在 ``data/proxy-bridge/``
+        随代理轮换无限累积（孤儿清扫只管其它进程的 pid，管不到本进程）。
+        """
         idle_seconds = _idle_minutes() * 60.0
         now = time.time()
         with self._lock:
@@ -367,6 +418,7 @@ class ProxyBridgeManager:
                         continue
                     self._instances.pop(uri)
                 _terminate(inst)
+                _remove_instance_files(inst)
                 removed += 1
             finally:
                 lock.release()
@@ -519,6 +571,10 @@ class ProxyBridgeManager:
                     "",
                 )
                 detail = _STARTUP_ERROR_HINTS.get(code, "启动超时或子进程退出")
+                # 失败即弃：受控错误码已映射进文案，原始日志不再保留（成功
+                # 实例的日志保留供运行期诊断，由回收 / 关停清扫删除）。
+                with contextlib.suppress(OSError):
+                    log_path.unlink(missing_ok=True)
                 raise ProxyBridgeError(
                     f"{str(config['scheme']).upper()} 转换失败：{detail}。"
                     "请检查服务器连通性、账号密码、TLS 证书，以及 TURN RFC6062 / "
@@ -530,6 +586,10 @@ class ProxyBridgeManager:
         except OSError as exc:
             if inst is not None:
                 self._terminate_instance(inst)
+            # 同上：失败即弃，启动失败的日志不滞留（目录创建 / os.open
+            # 失败时文件尚不存在，missing_ok 兼容）。
+            with contextlib.suppress(OSError):
+                log_path.unlink(missing_ok=True)
             raise ProxyBridgeError(
                 f"无法创建或启动 TURN/SSTP 转换器，请检查状态目录权限与可执行文件：{exc}",
             ) from None
@@ -570,13 +630,8 @@ class ProxyBridgeManager:
             pid = int(parts[1])
             if pid == os.getpid():
                 continue
-            try:
-                os.kill(pid, 0)
-                continue  # 属主仍存活（含僵尸）：保留
-            except ProcessLookupError:
-                pass  # 已死：孤儿
-            except OSError:
-                continue  # 无法判定（权限 / 平台差异）：保守保留
+            if _process_alive(pid):
+                continue  # 属主仍存活（含僵尸 / 无法判定）：保守保留
             try:
                 if now - path.stat().st_mtime > 3600:
                     path.unlink(missing_ok=True)
@@ -700,6 +755,33 @@ async def resolve_proxy_url_async(raw: str | None) -> str | None:
     if cached is not None:
         return cached
     return await asyncio.to_thread(resolve_proxy_url, normalized)
+
+
+async def resolve_effective_proxy_async(raw: str | None) -> str | None:
+    """传入代理（缺省回退全局默认）→ httpx 可用形态。
+
+    探活 / Cookie 轮换 / 模型发现等「账号代理为空时走全局」的统一入口
+    （此前同样的回退逻辑散落在 app / cookie_parser / model_discovery 三处
+    各写一份）。解析失败直接上抛（fail-closed，绝不静默降级直连）。
+    """
+    from aistudio_api.config import settings
+
+    effective = raw or settings.proxy_url
+    if not effective:
+        return None
+    return await resolve_proxy_url_async(effective)
+
+
+def normalize_proxy_for_go_signer(resolved: str) -> str:
+    """把已解析的代理 URL 归一为 Go 签名器（waa-signer）可接受的形态。
+
+    Go 侧出站代理的 scheme 白名单只认 http / https / socks5：proxydial
+    虽会把 socks5h 归一为 socks5，但 transport_browser 的校验直接拒收，
+    故统一在 Python 侧归一后再传（``-proxy`` 启动参数与请求级 payload）。
+    """
+    if resolved.startswith("socks5h://"):
+        return "socks5://" + resolved[len("socks5h://") :]
+    return resolved
 
 
 def resolve_proxy_url_cached(raw: str | None) -> str | None:
