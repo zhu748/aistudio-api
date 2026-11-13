@@ -14,6 +14,8 @@ import {
   Info,
   HardDrive,
   Folder,
+  SlidersHorizontal,
+  Terminal,
 } from 'lucide-vue-next'
 
 const props = defineProps<{
@@ -127,7 +129,11 @@ async function handleSave() {
 
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
       <!-- 1. Log Level Configuration -->
-      <div class="p-4 bg-slate-50/70 border border-slate-200/80 rounded-xl space-y-2">
+      <div class="p-4 bg-slate-50/70 border border-slate-200/80 rounded-xl flex flex-col justify-between gap-2.5">
+        <div class="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
+          <SlidersHorizontal class="w-3.5 h-3.5 text-brand-600" />
+          <span>全局日志等级</span>
+        </div>
         <ConfigSelect
           :model-value="logLevel"
           label="日志输出级别"
@@ -137,7 +143,11 @@ async function handleSave() {
       </div>
 
       <!-- 2. Request Dump Toggle -->
-      <div class="p-4 bg-slate-50/70 border border-slate-200/80 rounded-xl space-y-2">
+      <div class="p-4 bg-slate-50/70 border border-slate-200/80 rounded-xl flex flex-col justify-between gap-2.5">
+        <div class="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
+          <Terminal class="w-3.5 h-3.5 text-brand-600" />
+          <span>实时终端调试</span>
+        </div>
         <ConfigSwitch
           :model-value="dumpRequests"
           label="控制台报文转储"
@@ -147,7 +157,7 @@ async function handleSave() {
       </div>
 
       <!-- 3. Dump To File Switch -->
-      <div class="p-4 bg-slate-50/70 border border-slate-200/80 rounded-xl space-y-2">
+      <div class="p-4 bg-slate-50/70 border border-slate-200/80 rounded-xl flex flex-col justify-between gap-2.5">
         <div class="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
           <HardDrive class="w-3.5 h-3.5 text-brand-600" />
           <span>报文持久化落盘</span>
@@ -161,7 +171,7 @@ async function handleSave() {
       </div>
 
       <!-- 4. Dump Directory Input -->
-      <div class="p-4 bg-slate-50/70 border border-slate-200/80 rounded-xl space-y-2">
+      <div class="p-4 bg-slate-50/70 border border-slate-200/80 rounded-xl flex flex-col justify-between gap-2.5">
         <div class="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
           <Folder class="w-3.5 h-3.5 text-brand-600" />
           <span>转储文件存储目录</span>

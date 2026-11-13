@@ -2,33 +2,39 @@
 interface Props {
   label: string
   value: string | number
+  valueTitle?: string
   subValue?: string
   color?: 'default' | 'green' | 'amber' | 'red' | 'blue'
   mono?: boolean
+  compactValue?: boolean
 }
 
 withDefaults(defineProps<Props>(), {
+  valueTitle: '',
   subValue: '',
   color: 'default',
   mono: true,
+  compactValue: false,
 })
 </script>
 
 <template>
-  <div class="bg-white border border-slate-200/90 rounded-xl p-4 shadow-2xs transition-all hover:border-slate-300/90 flex flex-col justify-between gap-2.5">
-    <div class="flex items-center justify-between text-[11px] font-semibold text-slate-500 uppercase tracking-wider">
-      <span>{{ label }}</span>
-      <div class="flex items-center gap-1.5">
+  <div class="bg-white border border-slate-200/90 rounded-xl p-4 shadow-2xs transition-all hover:border-slate-300/90 flex flex-col justify-between gap-2.5 min-w-0">
+    <div class="flex items-center justify-between gap-2 text-[11px] font-semibold text-slate-500 uppercase tracking-wider">
+      <span class="truncate">{{ label }}</span>
+      <div class="flex items-center gap-1.5 shrink-0">
         <slot name="action" />
         <slot name="icon" />
       </div>
     </div>
 
-    <div class="space-y-1">
-      <div class="flex items-baseline justify-between gap-2">
+    <div class="space-y-1 min-w-0">
+      <div class="flex items-baseline justify-between gap-x-2 gap-y-0.5 flex-wrap min-w-0">
         <div
-          class="text-xl font-bold tracking-tight truncate max-w-full"
+          :title="valueTitle || String(value)"
+          class="font-bold tracking-tight min-w-0 max-w-full"
           :class="[
+            compactValue ? 'text-base sm:text-[17px] leading-snug truncate' : 'text-xl leading-tight break-all',
             mono ? 'font-mono tabular-nums' : '',
             {
               'text-slate-900': color === 'default',
@@ -43,7 +49,7 @@ withDefaults(defineProps<Props>(), {
         </div>
         <span
           v-if="subValue"
-          class="text-[11px] text-slate-400 font-medium font-mono tabular-nums shrink-0"
+          class="text-[11px] text-slate-400 font-medium font-mono tabular-nums whitespace-nowrap"
         >{{ subValue }}</span>
       </div>
 
