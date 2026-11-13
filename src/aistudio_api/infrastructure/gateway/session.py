@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import itertools
+import json
+import os
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
@@ -35,6 +37,45 @@ from aistudio_api.infrastructure.utils.redaction import redact_text
 from aistudio_api.infrastructure.waa.signer import WaaSigner
 
 log = get_logger("session")
+
+
+# 真实页面行为：GenerateContent 发出后 ~2.2s，页面向 CountTokens 发一次
+# 当前用户轮次的 token 统计（waa-signer Go pageCountTokensDelay 同源）。
+# 纯行为对齐项（不影响鉴权/内容），可用 AISTUDIO_BROWSER_COUNTTOKENS_FOLLOWUP=0 关闭。
+_BROWSER_COUNTTOKENS_FOLLOWUP = (
+    os.getenv("AISTUDIO_BROWSER_COUNTTOKENS_FOLLOWUP", "1").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
+_PAGE_COUNT_TOKENS_DELAY = 2.2
+
+
+def extract_page_prompt(body: str) -> str:
+    """从 GenerateContent wire 请求体提取当前用户轮次文本（页面提示词）。
+
+    与 Go countTokensBody 的 PagePrompt 语义一致：contents 槽中最后一个
+    user 角色内容的首个文本 part。找不到时返回空串（跳过后续行为）。
+    """
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(parsed, list) or len(parsed) < 2:
+        return ""
+    contents = parsed[1]
+    if not isinstance(contents, list):
+        return ""
+    for raw_content in reversed(contents):
+        if not isinstance(raw_content, list) or len(raw_content) < 2:
+            continue
+        if raw_content[-1] != "user":
+            continue
+        parts = raw_content[0]
+        if not isinstance(parts, list) or not parts:
+            continue
+        part = parts[0]
+        if isinstance(part, list) and len(part) > 1 and isinstance(part[1], str):
+            return part[1]
+    return ""
 
 
 @dataclass
@@ -87,6 +128,8 @@ class GatewaySession:
         self._tier: str | None = None
         self._active_context: SessionContext | None = None
         self._transport = HTTPStreamTransport(proxy_url=settings.proxy_url)
+        # 页面行为后台任务（GenerateContent 后 +2.2s CountTokens 补发）
+        self._background_followups: set[asyncio.Task[None]] = set()
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_active_waa_server,
         )
@@ -299,6 +342,61 @@ class GatewaySession:
         """失效 WAA proof 复用缓存（403 重签路径钩子），返回清除条数。"""
         return self._signer.invalidate_proof_cache()
 
+    def schedule_browser_counttokens_followup(
+        self,
+        ctx: object | None,
+        model: str,
+        page_prompt: str,
+    ) -> None:
+        """像真实页面一样，在 GenerateContent 发出 2.2s 后补一次 CountTokens。
+
+        真实 AI Studio 页面每次生成后 ~2.2s 会对当前用户轮次发一次
+        CountTokens（统计界面 token 用量）；Go 签名器 SendProtected 路径
+        同样携带该行为（pageCountTokensDelay）。主链路在此复刻：
+        fire-and-forget 后台任务，失败仅记日志，绝不影响主请求。
+
+        计时基准为网络发送时刻（Go 同为 SendProtected 入口起算）；
+        梯梯重试的每次实际发送都会各自补一次（Go 同语义）。
+        """
+        if not _BROWSER_COUNTTOKENS_FOLLOWUP or not page_prompt:
+            return
+        normalized_model = (
+            model if model.startswith("models/") else f"models/{model}"
+        )
+        # 与 Go countTokensBody 逐层一致：part = [null, 文本]
+        # （HAR 实测 CountTokens wire 形态：[[[[null,"嘿"]],"user"]]）
+        followup_body = json.dumps(
+            [normalized_model, [[[[None, page_prompt]], "user"]]],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+
+        async def _run_followup() -> None:
+            try:
+                await asyncio.sleep(_PAGE_COUNT_TOKENS_DELAY)
+                status, _raw = await self.send_request(
+                    body=followup_body,
+                    url=COUNT_TOKENS_URL,
+                    ctx=ctx,
+                )
+                if status != 200:
+                    log.debug(
+                        "页面行为 CountTokens 补发返回 HTTP %d（不影响主请求）",
+                        status,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.debug("页面行为 CountTokens 补发失败（不影响主请求）: %s", e)
+
+        try:
+            task = asyncio.create_task(_run_followup())
+        except RuntimeError:
+            # 无事件循环（同步测试路径等）：静默跳过
+            return
+        self._background_followups.add(task)
+        task.add_done_callback(self._background_followups.discard)
+
     async def send_request(
         self,
         *,
@@ -380,6 +478,13 @@ class GatewaySession:
 
     async def close(self) -> None:
         """Close transport, signer, and reset active context."""
+        # 页面行为后台任务：取消后等待退出，避免向已关闭的传输层发请求
+        pending = [t for t in self._background_followups if not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._background_followups.clear()
         await self._transport.close()
         await self._signer.close()
         self._active_context = None

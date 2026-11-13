@@ -581,6 +581,26 @@ class AistudioWireCodec:
 
 _codec = AistudioWireCodec()
 
+_WIRE_SESSION_TOKEN_INDEX = TopLevelIndex.SESSION_TOKEN
+
+
+def attach_session_token(body: str, token: str | None) -> str:
+    """把会话令牌写入请求体 wire 槽 11（真实浏览器回传行为）。
+
+    浏览器每轮 GenerateContent 都把上一轮响应 chunk 槽 7 的 ``v1_...``
+    令牌回传到请求槽 11（同会话恒同值）。缺省（None）时保持原样——
+    编码层尾部 null 裁剪语义不受影响。
+    """
+    if not token:
+        return body
+    parsed = json.loads(body)
+    if not isinstance(parsed, list):
+        return body
+    while len(parsed) <= _WIRE_SESSION_TOKEN_INDEX:
+        parsed.append(None)
+    parsed[_WIRE_SESSION_TOKEN_INDEX] = token
+    return json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
+
 
 def encode_request_body(
     *,
