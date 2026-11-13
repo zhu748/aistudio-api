@@ -324,6 +324,10 @@ class IncrementalJSONStreamParser:
                 or candidate.finish_reason is not None
                 or candidate.finish_message
                 or candidate.safety_ratings
+                # 截断尾块可能只含 function_response / code_output：
+                # 白名单遗漏会把抗截断要保护的内容整块丢弃
+                or getattr(candidate, "function_responses", None)
+                or getattr(candidate, "code_output", None)
             ):
                 yield repaired
 

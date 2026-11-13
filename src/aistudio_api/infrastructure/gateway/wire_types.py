@@ -258,13 +258,14 @@ class AistudioPart:
             wire[PartIndex.THOUGHT_ALT_FLAG] = 1
         if self.thought_signature:
             wire[PartIndex.THOUGHT_SIGNATURE] = self.thought_signature
+        # wire 各槽位正交：同一 part 可同时携带 text 与 inline_data /
+        # function_call（如"图片+图注"）。旧实现的提前 return 会把
+        # self.text 静默丢弃，故所有载荷写入后统一在末尾落 text。
         if self.file_id:
             wire[PartIndex.FILE_DATA] = [self.file_id]
-            return wire.compact()
         if self.inline_data:
             mime, b64 = self.inline_data
             wire[PartIndex.INLINE_DATA] = [mime, b64]
-            return wire.compact()
         if self.function_call:
             name = self.function_call[0]
             args = self.function_call[1] if len(self.function_call) > 1 else {}
@@ -273,7 +274,6 @@ class AistudioPart:
             if call_id:
                 function_call.append(call_id)
             wire[PartIndex.FUNCTION_CALL_ALT] = function_call
-            return wire.compact()
         if self.function_response:
             name = self.function_response[0]
             response = (
@@ -286,7 +286,6 @@ class AistudioPart:
             if call_id:
                 function_response.append(call_id)
             wire[PartIndex.FUNCTION_RESPONSE_ALT] = function_response
-            return wire.compact()
         if self.executable_code:
             lang = self.executable_code[0]
             code = self.executable_code[1] if len(self.executable_code) > 1 else ""
@@ -312,9 +311,8 @@ class AistudioPart:
                 else int(outcome)
             )
             wire[PartIndex.CODE_RESULT] = [outcome_code, output]
-        if self.executable_code or self.code_execution_result:
-            return wire.compact()
-        wire[PartIndex.TEXT] = self.text
+        if self.text is not None:
+            wire[PartIndex.TEXT] = self.text
         return wire.compact()
 
 

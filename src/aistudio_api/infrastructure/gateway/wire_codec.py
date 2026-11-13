@@ -547,12 +547,13 @@ class AistudioWireCodec:
                     str(parsed.code_execution_result[1]),
                 )
 
-        if (
-            not code_part_handled
-            and part.inline_data is None
+        # text 独立判定（与 executable_code 同理）：上游同一 part 可
+        # 同时携带 text 与 inline_data/function_call，elif 链会丢 text
+        if (not code_part_handled and (
+            part.inline_data is None
             and part.executable_code is None
             and part.code_execution_result is None
-        ):
+        )) or (not code_part_handled and part.inline_data is not None):
             part.text = parsed.text
         return part
 

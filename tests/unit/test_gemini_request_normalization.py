@@ -635,7 +635,9 @@ def test_encode_schema_to_wire_lossless_metadata():
     count_wire = props["count"]
     assert isinstance(count_wire, list)
     assert count_wire[0] == 3  # INTEGER
-    assert count_wire[2] == "Number of items"
+    # default 无 wire 槽位（Google Schema Proto 止于 Field 23），
+    # 折叠进 description 保语义，而非静默丢弃
+    assert count_wire[2] == "Number of items (default: 1)"
     assert count_wire[10] == 1  # minimum
     assert count_wire[11] == 100  # maximum
     assert len(count_wire) <= 23  # Google Schema proto strictly terminates at index 22

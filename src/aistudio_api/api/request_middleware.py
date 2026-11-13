@@ -42,6 +42,12 @@ class RequestMiddleware:
             await self.app(scope, receive, send)
             return
         path = scope["path"]
+        if len(path) > 1 and path.endswith("/"):
+            # 规范化优先于 Starlette 的 307 尾斜杠重定向：重定向分支不执行
+            # 路由 dependencies，受保护管理端点的尾斜杠变体会未鉴权拿到
+            # 307 且 Location 原样回显查询串（含一次性票据值，会进反代日志）
+            path = path.rstrip("/") or "/"
+            scope = {**scope, "path": path, "raw_path": path.encode("latin-1")}
         model_call = scope["method"] == "POST" and (
             path.startswith("/v1beta/")
             or path in ("/v1/chat/completions", "/v1/messages")
@@ -125,7 +131,10 @@ class RequestMiddleware:
                                 context.model = context.requested_model
                         except (ValueError, UnicodeDecodeError):
                             pass
-                if model_call and received_bytes > settings.max_request_bytes:
+                # 管理路径同样施加请求体上限（1MB）：写端点无界接收可把
+                # 磁盘与 yaml 解析 CPU 打爆（实测 50MB config 被完整落盘）
+                body_limit = settings.max_request_bytes if model_call else 1_048_576
+                if received_bytes > body_limit:
                     raise HTTPException(413, "Request body exceeds configured limit")
                 if dump_enabled and not request_body_truncated:
                     if len(request_body) + len(body) <= settings.dump_max_bytes:

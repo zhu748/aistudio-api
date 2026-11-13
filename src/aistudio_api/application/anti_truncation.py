@@ -744,6 +744,10 @@ async def _restore_anti_truncation_stream_inner(
     channel: str | None = None  # None | "plain" | "synthetic"
     call_state: _StreamCallState | None = None
     real_calls_seen = False
+    # 暂缓透传的「疑似名称分片」：若流结束时既未被证明是合成名前缀，
+    # 也未等到带参数的完整帧，必须在 done 前冲刷——否则一次真实的
+    # 工具调用（上游恰好只发了名称分片）会被静默吞掉
+    held_prefix_calls: list[dict[str, object]] = []
 
     def handle_synthetic_call(call: dict[str, object]) -> str | None:
         """处理一个合成调用分片，返回待下发的正文增量（可能为空）。"""
@@ -822,9 +826,15 @@ async def _restore_anti_truncation_stream_inner(
                     and "arguments" not in call
                 ):
                     # 名称尚为合成名前缀且未带参数：疑似名称分片，暂缓透传。
+                    # 若后续等到带参数的完整帧（或合成调用胜出），该分片
+                    # 证明是前缀碎片，丢弃即正确；否则在 done 前冲刷。
+                    held_prefix_calls.append(call)
                     continue
                 else:
                     real_calls_seen = True
+                    # 带参数/完整名的真实调用到达：此前暂缓的名称分片
+                    # 确系前缀碎片，安全丢弃
+                    held_prefix_calls.clear()
                     passthrough.append(call)
             if text_delta is not None:
                 if channel == "plain":
@@ -860,6 +870,14 @@ async def _restore_anti_truncation_stream_inner(
             ctx.stream_done = True
             if channel == "synthetic":
                 ctx.restored = True
+            if held_prefix_calls and channel != "synthetic":
+                # 流结束仍未等到证据：按真实调用冲刷，宁透传勿吞调用
+                logger.warning(
+                    "抗截断：流结束时仍有 %d 个未决名称分片，按真实调用透传",
+                    len(held_prefix_calls),
+                )
+                yield "tool_calls", list(held_prefix_calls)
+                held_prefix_calls.clear()
             elif not ctx.synthetic_seen and not ctx.plain_seen and not real_calls_seen:
                 logger.info(
                     "抗截断：模型未使用工具通道且无正文输出 (transport=%s)",

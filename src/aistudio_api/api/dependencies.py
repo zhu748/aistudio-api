@@ -183,8 +183,9 @@ def require_web_auth(request: Request) -> None:
        否则拒绝访问；
     2. 已配置管理密码：仅接受管理密码（API Key 持有者不可越权进入管理端）；
     3. 仅配置了 API Key：接受任意有效 API Key 登录管理端（封堵匿名访问洞，
-       同时不把未设管理密码的运维锁在面板外）；此时 /api-keys 与
-       /config 等敏感只读端点会对 Key 明文脱敏。
+       同时不把未设管理密码的运维锁在面板外）；但 /config* 与 /api-keys*
+       的写操作一律拒绝——写 config.yaml 可自签新 Key 完成权限升级，
+       该能力必须由管理密码会话独占。
 
     管理端凭据只接受 Header 形式（3.11）：?key= 查询参数会残留在反代
     访问日志与浏览器历史中，SSE 票据端点除外。
@@ -197,12 +198,6 @@ def require_web_auth(request: Request) -> None:
 
     client_ip = request.client.host if request.client else "unknown"
 
-    if _register_auth_failure_and_check(client_ip):
-        raise HTTPException(
-            status_code=429,
-            detail="管理端鉴权失败次数过多，请 1 分钟后重试",
-        )
-
     # SSE 端点例外：浏览器 EventSource 无法携带请求头，允许使用一次性票据。
     # 用精确路径比较（容忍尾斜杠），避免 endswith 这类前缀式判断被
     # /api/logs/stream/../accounts 之类的路径绕过或误命中子路径。
@@ -214,17 +209,46 @@ def require_web_auth(request: Request) -> None:
 
     # 管理端不采信 ?key= 查询参数，只接受 Header 凭据
     token = _extract_request_token(request, include_query=False)
-    if token and web_password:
-        if secrets.compare_digest(token.encode("utf-8"), _encode_secret(web_password)):
+    if not token:
+        # 无凭据请求不进入失败计数：反代后所有用户共享同一个 client_ip，
+        # 匿名刷请求会让合法用户的面板被锁定 60 秒（DoS 放大）
+        raise HTTPException(
+            status_code=401,
+            detail="管理控制台鉴权失败，请输入正确的管理密码",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if _register_auth_failure_and_check(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="管理端鉴权失败次数过多，请 1 分钟后重试",
+        )
+
+    if web_password:
+        if secrets.compare_digest(
+            token.encode("utf-8"), _encode_secret(web_password)
+        ):
             _reset_auth_failures(client_ip)
             return
-    elif token and not web_password:
-        # 无管理密码时的对称回退：任意有效 API Key 可进入管理端
+    else:
+        # 无管理密码时的对称回退：任意有效 API Key 可进入管理端（只读）
         token_bytes = token.encode("utf-8")
         if any(
             secrets.compare_digest(token_bytes, candidate)
             for candidate in _encoded_keys(_all_configured_api_keys())
         ):
+            req_method = getattr(request, "method", "GET")
+            if req_method in ("POST", "PUT", "DELETE", "PATCH") and (
+                request.url.path.rstrip("/").startswith("/config")
+                or request.url.path.rstrip("/").startswith("/api-keys")
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "敏感配置写操作需要先设置管理密码"
+                        "（AISTUDIO_WEB_PASSWORD）并使用管理密码会话"
+                    ),
+                )
             _reset_auth_failures(client_ip)
             return
     logger.warning("管理控制台鉴权失败: 客户端=%s", client_ip)

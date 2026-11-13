@@ -140,7 +140,16 @@ class AIStudioClient:
                 headers[str(k)] = str(v)
         dyn_headers = getattr(self._session, "last_signer_headers", None)
         if dyn_headers:
-            headers.update(dyn_headers)
+            # 指纹白名单过滤（与 transport 层同一允许集）：签名服务返回的
+            # 动态头只保留 AI Studio 逆向指纹头名（User-Agent /
+            # X-Goog-Api-Key / X-AIStudio-Visit-Id / X-Goog-Ext-...-bin 等），
+            # 其余一律剥除——签名服务若被配置为回显额外头（代理头、自定义
+            # 头），不得混入上游指纹集。
+            from aistudio_api.infrastructure.gateway.transport import (
+                strip_to_aistudio_fingerprint,
+            )
+
+            headers.update(strip_to_aistudio_fingerprint(dict(dyn_headers)))
         headers["X-Goog-AuthUser"] = ctx.auth_user
         # X-AIStudio-Visit-Id 会话级复用（HAR 实测：真实浏览器对同账号
         # 每次 GenerateContent 均携带，且同页面会话内恒定不变）。

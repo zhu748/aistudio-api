@@ -1,6 +1,7 @@
 """OpenAI / Anthropic(Claude) 兼容层路由。
 
 - ``POST /v1/chat/completions`` — OpenAI Chat Completions（流式 / 非流式）
+- ``POST /v1/responses`` — OpenAI Responses API（流式 / 非流式）
 - ``POST /v1/messages`` — Claude Messages API（流式 / 非流式）
 - ``POST /v1/messages/count_tokens`` — Claude token 数估算
 - ``GET /v1/models`` — 模型列表（按 ``anthropic-version`` 请求头自动区分
@@ -25,6 +26,7 @@ from aistudio_api.api.response_models import GeminiGenerateContentResponse
 from aistudio_api.api.schemas_compat import (
     ClaudeMessagesRequest,
     OpenAIChatCompletionRequest,
+    OpenAIResponsesRequest,
 )
 from aistudio_api.application.api_service_gemini import handle_gemini_generate_content
 from aistudio_api.application.compat_service import (
@@ -35,6 +37,11 @@ from aistudio_api.application.compat_service import (
     is_claude_compat_request,
     openai_stream_adapter,
     openai_to_gemini_request,
+)
+from aistudio_api.application.responses_service import (
+    build_responses_object,
+    responses_stream_adapter,
+    responses_to_gemini_request,
 )
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.request_context import (
@@ -69,11 +76,19 @@ def _shrink_media_payloads(node: object) -> object:
     直接把几十万字符的 base64 计入字符数会让估算虚高三个数量级（Claude
     Code 等客户端会带图调用 count_tokens）；替换为占位符后估算回到
     文本量级，与真实 token 数量级一致。
+
+    命中两类载体：Claude 的 ``source.data``（base64 块）与 ``source.url``
+    / ``image_url`` 下的 data URL（``data:image/png;base64,...`` 形式）。
     """
     if isinstance(node, dict):
         shrunk: dict[str, object] = {}
         for key, value in node.items():
-            if key == "data" and isinstance(value, str) and len(value) > 256:
+            if (key == "data" and isinstance(value, str) and len(value) > 256) or (
+                key == "url"
+                and isinstance(value, str)
+                and value.startswith("data:")
+                and len(value) > 256
+            ):
                 shrunk[key] = f"<base64 media: {len(value)} chars>"
             else:
                 shrunk[key] = _shrink_media_payloads(value)
@@ -181,6 +196,67 @@ async def openai_chat_completions(
     )
 
 
+@router.post("/v1/responses")
+async def openai_responses(
+    req: OpenAIResponsesRequest,
+    http_request: Request,
+    client: AIStudioClient = Depends(get_client),
+):
+    """OpenAI Responses API 兼容端点（openai-python / Codex CLI 等）。"""
+    record_requested_parameters(
+        {
+            "reasoning": req.reasoning,
+            "temperature": req.temperature,
+            "top_p": req.top_p,
+            "max_output_tokens": req.max_output_tokens,
+        }
+    )
+    observation = current_request.get()
+    if observation is not None:
+        observation.requested_model = req.model
+        observation.is_stream = req.stream
+    try:
+        gemini_req, resolved_model = await responses_to_gemini_request(req)
+    except ValueError as exc:
+        raise HTTPException(
+            400, detail={"message": str(exc), "type": "bad_request"}
+        ) from exc
+
+    input_desc = "string" if isinstance(req.input, str) else "items"
+    logger.info(
+        "Responses 兼容请求: model=%s → %s, stream=%s, input=%s",
+        req.model,
+        resolved_model,
+        req.stream,
+        input_desc,
+    )
+    response = await handle_gemini_generate_content(
+        resolved_model,
+        gemini_req,
+        client,
+        stream=req.stream,
+        anti_truncation=_parse_anti_truncation_header(http_request),
+    )
+    if req.stream:
+        if isinstance(response, StreamingResponse):
+            return StreamingResponse(
+                responses_stream_adapter(
+                    response.body_iterator,
+                    requested_model=req.model,
+                ),
+                media_type="text/event-stream",
+                headers=_STREAM_HEADERS,
+            )
+    elif isinstance(response, GeminiGenerateContentResponse):
+        return JSONResponse(
+            content=build_responses_object(response, requested_model=req.model)
+        )
+    raise HTTPException(
+        500,
+        detail={"message": "Unexpected upstream response type", "type": "server_error"},
+    )
+
+
 @router.post("/v1/messages")
 async def claude_messages(
     req: ClaudeMessagesRequest,
@@ -259,6 +335,9 @@ async def claude_count_tokens(req: ClaudeMessagesRequest):
     try:
         payload = {
             "system": _shrink_media_payloads(req.system),
+            # tools 声明同样计入 input_tokens（Claude 官方口径）：Claude
+            # Code 依赖本端点预判上下文余量，漏计会在工具多时系统性低估
+            "tools": _shrink_media_payloads(req.tools),
             "messages": [
                 {"role": m.role, "content": _shrink_media_payloads(m.content)}
                 for m in req.messages

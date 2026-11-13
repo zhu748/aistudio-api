@@ -888,8 +888,11 @@ def get_compat_settings(
                 settings[f"{channel}_default_model"] = default_model.strip()
             raw_mapping = raw_channel.get("model_mapping")
             if isinstance(raw_mapping, dict):
+                # 通配符键 "claude-sonnet-*" 清洗为 "claude-sonnet"（去尾
+                # "*" 及悬挂 "-"）：compat 侧按 key+"-" 前缀匹配，保留尾
+                # 横线会得到 "claude-sonnet--" 双横线永不命中
                 settings[f"{channel}_model_mapping"] = {
-                    str(k).strip().removesuffix("*"): str(v).strip()
+                    str(k).strip().rstrip("*").rstrip("-"): str(v).strip()
                     for k, v in raw_mapping.items()
                     if isinstance(k, str)
                     and k.strip()
@@ -1029,6 +1032,23 @@ def _load_yaml_config(config_path: Path) -> dict[str, object]:
         loaded = {}
     merged: dict[str, object] = _default_config()
     merged.update(loaded)
+    # rotator 部分块深合并：用户只写 rotator.max_retries 时不该把整个
+    # 默认块（cooldowns/tier_weights）吞掉——那会让 record_rate_limited
+    # 直接 KeyError（429 变 500）、选路抛 RuntimeError
+    raw_loaded_rotator = loaded.get("rotator")
+    if isinstance(raw_loaded_rotator, dict):
+        base_rotator = _default_config().get("rotator")
+        if isinstance(base_rotator, dict):
+            merged_rotator = dict(base_rotator)
+            merged_rotator.update(raw_loaded_rotator)
+            for sub_key in ("cooldowns", "tier_weights"):
+                base_sub = base_rotator.get(sub_key)
+                loaded_sub = raw_loaded_rotator.get(sub_key)
+                if isinstance(base_sub, dict) and isinstance(loaded_sub, dict):
+                    merged_sub = dict(base_sub)
+                    merged_sub.update(loaded_sub)
+                    merged_rotator[sub_key] = merged_sub
+            merged["rotator"] = merged_rotator
     raw_merged_defaults = merged.get("model_defaults")
     raw_loaded_defaults = loaded.get("model_defaults")
     if isinstance(raw_merged_defaults, dict) and isinstance(raw_loaded_defaults, dict):

@@ -624,22 +624,30 @@ class AccountStore:
         return meta
 
     def delete_account(self, account_id: str) -> bool:
-        """删除账号，返回是否成功。"""
-        registry = self._load_registry()
-        acc = self._find_registered_account(registry, account_id)
-        if acc is None:
-            return False
-        safe_id = acc.id
-        # 删除目录
-        account_dir = _safe_account_dir(self._accounts_dir, safe_id)
-        if account_dir.is_dir():
-            shutil.rmtree(account_dir, ignore_errors=True)
-        # 从注册表移除
-        del registry.accounts[safe_id]
-        if registry.active_account_id == safe_id:
-            registry.active_account_id = next(iter(registry.accounts), None)
-        self._save_registry(registry)
-        return True
+        """删除账号，返回是否成功。
+
+        全程持锁：del registry.accounts[safe_id] 变更字典大小，而工作
+        线程（Set-Cookie 持久化经 asyncio.to_thread 进入）在
+        _update_account_cookies_locked 里持锁迭代同一字典——无锁删除会
+        触发 RuntimeError 被上层 logger.debug 静默吞掉，该次滚动凭据
+        持久化随之丢失。RLock 可重入，内部 _load/_save_registry 无碍。
+        """
+        with self._lock:
+            registry = self._load_registry()
+            acc = self._find_registered_account(registry, account_id)
+            if acc is None:
+                return False
+            safe_id = acc.id
+            # 删除目录
+            account_dir = _safe_account_dir(self._accounts_dir, safe_id)
+            if account_dir.is_dir():
+                shutil.rmtree(account_dir, ignore_errors=True)
+            # 从注册表移除
+            del registry.accounts[safe_id]
+            if registry.active_account_id == safe_id:
+                registry.active_account_id = next(iter(registry.accounts), None)
+            self._save_registry(registry)
+            return True
 
     def update_account(self, account_id: str, name: str) -> AccountMeta | None:
         """更新账号名称。"""
@@ -741,7 +749,17 @@ class AccountStore:
         for group in groups.values():
             if len(group) <= 1:
                 continue
-            # 按是否存在 __Secure-1PSIDTS 以及最近轮换时间排序（最旧在前，最新在后，后者覆盖前者）
+            # 按是否存在 __Secure-1PSIDTS 以及最近轮换时间排序（最旧在前，最新在后，后者覆盖前者）。
+            # last_rotated_at 为 None 表示「从未后台轮换」——通常是刚导入的新鲜
+            # Cookie；归一为 0.0 会把它排在最旧、被库内陈旧轮换值覆盖并固化。
+            # None 排在「有轮换时间」之前但晚于同为此前从未轮换的账号没有意义，
+            # 用 last_used（ISO 时间串）+ created_at 兜底区分新鲜度。
+            def _freshness_key(meta) -> tuple[float, str, str]:
+                rotated = meta.last_rotated_at
+                # 从未轮换的新导入账号视为"最新"：排在一切已轮换账号之后
+                rotated_key = rotated if rotated is not None else float("inf")
+                return (rotated_key, meta.last_used or "", meta.created_at or "")
+
             group.sort(
                 key=lambda item: (
                     1
@@ -750,8 +768,7 @@ class AccountStore:
                         or item[2].get("__Secure-3PSIDTS")
                     )
                     else 0,
-                    item[0].last_rotated_at or 0.0,
-                    item[0].last_used or "",
+                    *_freshness_key(item[0]),
                 )
             )
             best_cookies: dict[str, str] = {}
