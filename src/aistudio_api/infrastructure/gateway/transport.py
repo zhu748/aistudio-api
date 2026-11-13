@@ -159,6 +159,7 @@ def _firefox_wire_header_list(
         ordered.append((_CANONICAL_HEADER_NAMES.get(name, name), lowered[name]))
     return ordered
 
+
 # httpx 的 HTTP/2 支持是可选依赖（h2 包）。若环境未安装 h2 而仍传
 # http2=True，AsyncClient 在创建时即抛 ImportError（"Using http2=True, but
 # the 'h2' package is not installed"），所有上游请求全部 500——曾在
@@ -714,9 +715,7 @@ class HTTPStreamTransport:
 
         header_names = {str(k).lower() for k in rpc_headers}
         acr_names = sorted(
-            name
-            for name in header_names
-            if name not in _BROWSER_MANAGED_HEADER_NAMES
+            name for name in header_names if name not in _BROWSER_MANAGED_HEADER_NAMES
         )
         acr_value = ",".join(acr_names)
         key = f"POST {url} {acr_value}"

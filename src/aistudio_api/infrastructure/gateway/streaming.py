@@ -82,9 +82,7 @@ class StreamingGateway:
                 self._session, "schedule_browser_counttokens_followup", None
             )
             if callable(scheduler):
-                scheduler(
-                    request.ctx, model, extract_page_prompt(request_body)
-                )
+                scheduler(request.ctx, model, extract_page_prompt(request_body))
         parser = IncrementalJSONStreamParser()
         utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         latest_usage: dict[str, object] | None = None

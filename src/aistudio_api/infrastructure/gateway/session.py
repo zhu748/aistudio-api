@@ -42,10 +42,9 @@ log = get_logger("session")
 # 真实页面行为：GenerateContent 发出后 ~2.2s，页面向 CountTokens 发一次
 # 当前用户轮次的 token 统计（waa-signer Go pageCountTokensDelay 同源）。
 # 纯行为对齐项（不影响鉴权/内容），可用 AISTUDIO_BROWSER_COUNTTOKENS_FOLLOWUP=0 关闭。
-_BROWSER_COUNTTOKENS_FOLLOWUP = (
-    os.getenv("AISTUDIO_BROWSER_COUNTTOKENS_FOLLOWUP", "1").strip().lower()
-    not in {"0", "false", "no", "off"}
-)
+_BROWSER_COUNTTOKENS_FOLLOWUP = os.getenv(
+    "AISTUDIO_BROWSER_COUNTTOKENS_FOLLOWUP", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
 _PAGE_COUNT_TOKENS_DELAY = 2.2
 
 
@@ -360,9 +359,7 @@ class GatewaySession:
         """
         if not _BROWSER_COUNTTOKENS_FOLLOWUP or not page_prompt:
             return
-        normalized_model = (
-            model if model.startswith("models/") else f"models/{model}"
-        )
+        normalized_model = model if model.startswith("models/") else f"models/{model}"
         # 与 Go countTokensBody 逐层一致：part = [null, 文本]
         # （HAR 实测 CountTokens wire 形态：[[[[null,"嘿"]],"user"]]）
         followup_body = json.dumps(
