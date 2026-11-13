@@ -58,26 +58,26 @@ const emit = defineEmits<{
         </div>
 
         <!-- Group Info -->
-        <div class="truncate">
-          <div class="flex items-center gap-2">
+        <div class="min-w-0 flex-1">
+          <div class="flex items-center gap-x-2 gap-y-1 flex-wrap">
             <span class="font-semibold text-slate-900 text-xs tracking-tight">
               {{ group.name }}
             </span>
-            <span class="text-[11px] font-mono text-slate-400 tabular-nums">
+            <span class="text-[11px] font-mono text-slate-400 tabular-nums whitespace-nowrap">
               · {{ group.accounts.length }} 个子账号
             </span>
             <span
               v-if="group.hasActive"
-              class="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-emerald-50 text-emerald-700 border border-emerald-200/70"
+              class="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-emerald-50 text-emerald-700 border border-emerald-200/70 whitespace-nowrap"
             >
               含激活节点
             </span>
           </div>
-          <div class="text-[11px] text-slate-400 font-mono flex items-center gap-2 mt-0.5 tabular-nums">
-            <span>导入: {{ formatDate(group.createdAt) }}</span>
-            <span>·</span>
+          <div class="text-[11px] text-slate-400 font-mono flex items-center flex-wrap gap-x-2 gap-y-0.5 mt-0.5 tabular-nums">
+            <span class="whitespace-nowrap">导入: {{ formatDate(group.createdAt) }}</span>
+            <span class="hidden sm:inline">·</span>
             <span
-              class="truncate max-w-[160px]"
+              class="truncate max-w-[180px] sm:max-w-[220px]"
               :title="group.id"
             >指纹: {{ String(group.id || '').replace(/^cookie_/, '') }}</span>
           </div>

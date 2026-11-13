@@ -194,7 +194,7 @@ async function handleDetectTier() {
           <div class="flex items-center gap-1.5 flex-wrap">
             <button
               class="font-semibold text-slate-900 hover:text-brand-700 text-sm truncate max-w-[260px] cursor-pointer text-left"
-              title="查看账号详情与最近调用"
+              :title="`${account.email || account.name || 'Google Account'} · 查看账号详情与最近调用`"
               @click="emit('details')"
             >
               {{ account.email || account.name || 'Google Account' }}
@@ -275,16 +275,19 @@ async function handleDetectTier() {
             </span>
           </div>
 
-          <div class="text-[11px] text-slate-400 font-mono truncate flex items-center gap-1.5 mt-0.5">
+          <div class="text-[11px] text-slate-400 font-mono flex items-center flex-wrap gap-x-1.5 gap-y-0.5 mt-0.5">
             <span
               v-if="account.email && account.name && account.name !== account.email"
-              class="text-slate-500"
+              class="text-slate-500 truncate max-w-[180px]"
             >{{ account.name }} ·</span>
             <span
               v-else-if="!account.email"
-              class="text-amber-700 bg-amber-50 px-1 py-px rounded text-[10px] border border-amber-200/60"
+              class="text-amber-700 bg-amber-50 px-1 py-px rounded text-[10px] border border-amber-200/60 shrink-0"
             >未记录邮箱</span>
-            <span>ID: {{ account.id }}</span>
+            <span
+              class="truncate max-w-full"
+              :title="account.id"
+            >ID: {{ account.id }}</span>
           </div>
         </div>
       </div>
@@ -350,7 +353,7 @@ async function handleDetectTier() {
         </div>
 
         <!-- Compact Action Cluster -->
-        <div class="flex items-center gap-1 border-l border-slate-100 pl-2">
+        <div class="flex items-center gap-1 lg:border-l lg:border-slate-100 lg:pl-2">
           <button
             v-if="account.session_expired"
             type="button"

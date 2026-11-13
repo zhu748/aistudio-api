@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import type { ModelProfileItem } from './types.ts'
+import type { ModelProfileItem, ThinkingConfig, GenerationConfigDefaults } from './types.ts'
 import {
   TOOL_SUGGESTIONS,
   IMAGE_MODE_OPTIONS,
@@ -84,10 +84,11 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
 </script>
 
 <template>
-  <div class="bg-white border border-slate-200/90 rounded-xl shadow-2xs overflow-hidden transition-all">
+  <div class="bg-white border border-slate-200/90 rounded-xl shadow-2xs transition-all">
     <!-- Header / Toggle -->
     <div
-      class="px-4 py-3 bg-slate-50/70 border-b border-slate-100 flex items-center justify-between gap-3 cursor-pointer select-none hover:bg-slate-100/60 transition-colors"
+      class="px-4 py-3 bg-slate-50/70 flex items-center justify-between gap-3 cursor-pointer select-none hover:bg-slate-100/60 transition-colors"
+      :class="expanded ? 'border-b border-slate-100 rounded-t-xl' : 'rounded-xl'"
       @click="expanded = !expanded"
     >
       <div class="flex items-center gap-2.5 min-w-0">
@@ -162,42 +163,30 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
       class="p-4 space-y-4"
     >
       <!-- Profile Name & Image Model Toggle -->
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div class="space-y-1.5">
-          <div class="flex items-center gap-1.5">
-            <div class="flex-1">
-              <ConfigInput
-                :model-value="profile.name"
-                label="规则分组名称"
-                description="唯一标识"
-                placeholder="例如: image_models"
-                @update:model-value="updateField('name', String($event || ''))"
-              />
-            </div>
-            <FieldHelpTip schema-key="profile.name" />
-          </div>
-        </div>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 items-end">
+        <ConfigInput
+          :model-value="profile.name"
+          label="规则分组名称"
+          description="唯一标识"
+          placeholder="例如: image_models"
+          schema-key="profile.name"
+          @update:model-value="updateField('name', String($event || ''))"
+        />
 
-        <div class="flex items-center gap-1.5">
-          <div class="flex-1">
-            <ConfigSwitch
-              :model-value="Boolean(profile.is_image_model)"
-              label="作为生图模型"
-              description="启用多模态图片编码与生图处理管线"
-              @update:model-value="updateField('is_image_model', $event)"
-            />
-          </div>
-          <FieldHelpTip schema-key="profile.is_image_model" />
-        </div>
+        <ConfigSwitch
+          :model-value="Boolean(profile.is_image_model)"
+          label="作为生图模型"
+          description="启用多模态图片编码与生图处理管线"
+          schema-key="profile.is_image_model"
+          @update:model-value="updateField('is_image_model', $event)"
+        />
       </div>
 
       <!-- Match Conditions -->
       <div class="p-3.5 bg-slate-50/70 border border-slate-200/70 rounded-xl space-y-3">
-        <div class="flex items-center justify-between">
-          <div class="flex items-center gap-2 text-xs font-bold text-slate-800">
-            <Layers class="w-4 h-4 text-brand-600" />
-            <span>模型匹配规则</span>
-          </div>
+        <div class="flex items-center gap-1.5 text-xs font-bold text-slate-800">
+          <Layers class="w-4 h-4 text-brand-600" />
+          <span>模型匹配规则</span>
           <FieldHelpTip schema-key="match.rules" />
         </div>
         <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -229,11 +218,9 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
 
       <!-- Default Tools -->
       <div class="p-3.5 bg-slate-50/70 border border-slate-200/70 rounded-xl space-y-2">
-        <div class="flex items-center justify-between">
-          <div class="flex items-center gap-2 text-xs font-bold text-slate-800">
-            <Wrench class="w-4 h-4 text-brand-600" />
-            <span>默认内置工具</span>
-          </div>
+        <div class="flex items-center gap-1.5 text-xs font-bold text-slate-800">
+          <Wrench class="w-4 h-4 text-brand-600" />
+          <span>默认内置工具</span>
           <FieldHelpTip schema-key="profile.default_tools" />
         </div>
         <ConfigTagList
@@ -247,106 +234,64 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
 
       <!-- Generation Config Defaults -->
       <div class="p-3.5 bg-slate-50/70 border border-slate-200/70 rounded-xl space-y-3">
-        <div class="flex items-center justify-between">
-          <div class="flex items-center gap-2 text-xs font-bold text-slate-800">
-            <Cpu class="w-4 h-4 text-brand-600" />
-            <span>生成参数默认值</span>
-          </div>
+        <div class="flex items-center gap-1.5 text-xs font-bold text-slate-800">
+          <Cpu class="w-4 h-4 text-brand-600" />
+          <span>生成参数默认值</span>
           <FieldHelpTip schema-key="generation.defaults" />
         </div>
         <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
-          <div class="flex items-center gap-1.5">
-            <div class="flex-1">
-              <ConfigSelect
-                :model-value="profile.generation_config_defaults?.image_output_mode"
-                label="图片输出模式"
-                :options="IMAGE_MODE_OPTIONS"
-                @update:model-value="updateGenerationConfig('image_output_mode', $event as string | null)"
-              />
-            </div>
-            <FieldHelpTip
-              schema-key="generation.image_output_mode"
-              class="mt-4 shrink-0"
-            />
-          </div>
+          <ConfigSelect
+            :model-value="profile.generation_config_defaults?.image_output_mode"
+            label="图片输出模式"
+            :options="IMAGE_MODE_OPTIONS"
+            schema-key="generation.image_output_mode"
+            @update:model-value="updateGenerationConfig('image_output_mode', $event as string | null)"
+          />
 
-          <div class="flex items-center gap-1.5">
-            <div class="flex-1">
-              <ConfigSelect
-                :model-value="profile.generation_config_defaults?.thinking_config?.level"
-                label="思考强度等级"
-                :options="THINKING_LEVEL_OPTIONS"
-                @update:model-value="updateThinkingConfig($event as any)"
-              />
-            </div>
-            <FieldHelpTip
-              schema-key="generation.thinking_level"
-              class="mt-4 shrink-0"
-            />
-          </div>
+          <ConfigSelect
+            :model-value="profile.generation_config_defaults?.thinking_config?.level"
+            label="思考强度等级"
+            :options="THINKING_LEVEL_OPTIONS"
+            schema-key="generation.thinking_level"
+            @update:model-value="updateThinkingConfig($event as NonNullable<ThinkingConfig['level']> | null)"
+          />
 
-          <div class="flex items-center gap-1.5">
-            <div class="flex-1">
-              <ConfigSelect
-                :model-value="profile.generation_config_defaults?.media_resolution"
-                label="多模态输入分辨率"
-                :options="MEDIA_RESOLUTION_OPTIONS"
-                @update:model-value="updateGenerationConfig('media_resolution', $event as any)"
-              />
-            </div>
-            <FieldHelpTip
-              schema-key="generation.media_resolution"
-              class="mt-4 shrink-0"
-            />
-          </div>
+          <ConfigSelect
+            :model-value="profile.generation_config_defaults?.media_resolution"
+            label="多模态输入分辨率"
+            :options="MEDIA_RESOLUTION_OPTIONS"
+            schema-key="generation.media_resolution"
+            @update:model-value="updateGenerationConfig('media_resolution', $event as GenerationConfigDefaults['media_resolution'])"
+          />
         </div>
 
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
-          <div class="flex items-center gap-1.5">
-            <div class="flex-1">
-              <ConfigSwitch
-                :model-value="Boolean(profile.drop_unsupported_params)"
-                label="自动过滤不支持的参数"
-                description="自动过滤未知安全类别与不兼容工具，避免报错"
-                @update:model-value="updateField('drop_unsupported_params', $event)"
-              />
-            </div>
-            <FieldHelpTip
-              schema-key="profile.drop_unsupported_params"
-              class="shrink-0"
-            />
-          </div>
+          <ConfigSwitch
+            :model-value="Boolean(profile.drop_unsupported_params)"
+            label="自动过滤不支持的参数"
+            description="自动过滤未知安全类别与不兼容工具，避免报错"
+            schema-key="profile.drop_unsupported_params"
+            @update:model-value="updateField('drop_unsupported_params', $event)"
+          />
 
-          <div class="flex items-center gap-1.5">
-            <div class="flex-1">
-              <ConfigSwitch
-                :model-value="Boolean(profile.disable_safety_settings)"
-                label="完全关闭安全规则"
-                description="生图模型开启以避免误拦截"
-                @update:model-value="updateField('disable_safety_settings', $event)"
-              />
-            </div>
-            <FieldHelpTip
-              schema-key="safety.disable_safety_settings"
-              class="shrink-0"
-            />
-          </div>
+          <ConfigSwitch
+            :model-value="Boolean(profile.disable_safety_settings)"
+            label="完全关闭安全规则"
+            description="生图模型开启以避免误拦截"
+            schema-key="safety.disable_safety_settings"
+            @update:model-value="updateField('disable_safety_settings', $event)"
+          />
         </div>
 
-        <div class="flex items-center gap-1.5 pt-1">
-          <div class="flex-1">
-            <ConfigTagList
-              :model-value="profile.clear_generation_config_indexes || []"
-              label="清空特定字段下标"
-              description="发送前清除的 wire 数组索引 (如 7, 13, 17)"
-              :is-number="true"
-              placeholder="输入数字下标按回车"
-              @update:model-value="updateField('clear_generation_config_indexes', $event as number[])"
-            />
-          </div>
-          <FieldHelpTip
+        <div class="pt-1">
+          <ConfigTagList
+            :model-value="profile.clear_generation_config_indexes || []"
+            label="清空特定字段下标"
+            description="发送前清除的 wire 数组索引 (如 7, 13, 17)"
+            :is-number="true"
+            placeholder="输入数字下标按回车"
             schema-key="generation.clear_indexes"
-            class="mt-4 shrink-0"
+            @update:model-value="updateField('clear_generation_config_indexes', $event as number[])"
           />
         </div>
       </div>
