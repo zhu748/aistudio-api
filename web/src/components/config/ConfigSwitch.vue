@@ -1,14 +1,18 @@
 <script setup lang="ts">
+import FieldHelpTip from './FieldHelpTip.vue'
+
 interface Props {
   modelValue: boolean
   label: string
   description?: string
   disabled?: boolean
+  schemaKey?: string
 }
 
 const props = withDefaults(defineProps<Props>(), {
   description: '',
   disabled: false,
+  schemaKey: '',
 })
 
 const emit = defineEmits<{
@@ -28,9 +32,16 @@ function toggle() {
     :class="{ 'opacity-60 cursor-not-allowed': disabled }"
     @click="toggle"
   >
-    <div class="pr-4">
-      <div class="text-xs font-semibold text-slate-900">
-        {{ label }}
+    <div class="pr-4 min-w-0">
+      <div class="text-xs font-semibold text-slate-900 flex items-center gap-1">
+        <span>{{ label }}</span>
+        <span
+          v-if="schemaKey"
+          class="inline-flex items-center"
+          @click.stop
+        >
+          <FieldHelpTip :schema-key="schemaKey" />
+        </span>
       </div>
       <div
         v-if="description"

@@ -443,11 +443,16 @@ onMounted(() => {
             </button>
 
             <button
-              v-if="!server.is_active"
               type="button"
-              class="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
-              title="删除节点"
-              @click="handleDeleteServer(server)"
+              :disabled="server.is_active"
+              class="p-1.5 rounded-lg transition-colors"
+              :class="
+                server.is_active
+                  ? 'text-slate-200 cursor-not-allowed'
+                  : 'text-slate-400 hover:text-rose-600 hover:bg-rose-50 cursor-pointer'
+              "
+              :title="server.is_active ? '当前激活节点不可删除' : '删除节点'"
+              @click="!server.is_active && handleDeleteServer(server)"
             >
               <Trash2 class="w-3.5 h-3.5" />
             </button>

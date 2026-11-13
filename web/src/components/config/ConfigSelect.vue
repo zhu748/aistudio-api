@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import FieldHelpTip from './FieldHelpTip.vue'
+
 export interface SelectOption {
   value: string | number | null
   label: string
@@ -12,11 +14,13 @@ interface Props {
   description?: string
   options: SelectOption[]
   disabled?: boolean
+  schemaKey?: string
 }
 
 const props = withDefaults(defineProps<Props>(), {
   description: '',
   disabled: false,
+  schemaKey: '',
 })
 
 const emit = defineEmits<{
@@ -47,13 +51,19 @@ function handleChange(e: Event) {
 
 <template>
   <div class="space-y-1.5">
-    <div class="flex items-center justify-between">
-      <label class="block text-xs font-semibold text-slate-700">
-        {{ label }}
-      </label>
+    <div class="flex items-center justify-between gap-2">
+      <div class="flex items-center gap-1 min-w-0">
+        <label class="block text-xs font-semibold text-slate-700 truncate">
+          {{ label }}
+        </label>
+        <FieldHelpTip
+          v-if="schemaKey"
+          :schema-key="schemaKey"
+        />
+      </div>
       <span
         v-if="description"
-        class="text-[11px] text-slate-400"
+        class="text-[11px] text-slate-400 shrink-0"
       >
         {{ description }}
       </span>

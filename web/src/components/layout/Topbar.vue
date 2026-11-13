@@ -57,14 +57,14 @@ const activeNodeLabel = computed(() => {
         v-if="activeNodeLabel"
         to="/accounts"
         class="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-50 hover:bg-slate-100 border border-slate-200/80 text-[11px] font-mono text-slate-700 transition-colors"
-        title="当前激活调度节点，点击前往账号池"
+        :title="`当前激活调度节点: ${activeNodeLabel.label} (${activeNodeLabel.tier})，点击前往账号池`"
       >
         <Radio class="w-3 h-3 text-emerald-500 shrink-0" />
         <span
           v-if="activeNodeLabel.u"
-          class="font-bold text-brand-700"
+          class="font-bold text-brand-700 shrink-0"
         >{{ activeNodeLabel.u }}</span>
-        <span class="truncate max-w-[160px]">{{ activeNodeLabel.label }}</span>
+        <span class="truncate max-w-[200px] xl:max-w-[240px]">{{ activeNodeLabel.label }}</span>
       </router-link>
 
       <!-- Auth State Badge -->

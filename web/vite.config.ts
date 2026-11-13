@@ -17,7 +17,15 @@ export default defineConfig({
       '/api': 'http://localhost:8080',
       '/auth': 'http://localhost:8080',
       '/stats': 'http://localhost:8080',
-      '/accounts': 'http://localhost:8080',
+      '/accounts': {
+        target: 'http://localhost:8080',
+        bypass(req) {
+          // Let browser HTML navigation fall back to Vite SPA instead of proxying /accounts to backend
+          if (req.headers.accept?.includes('text/html')) {
+            return req.url
+          }
+        },
+      },
       '/rotation': 'http://localhost:8080',
       '/config': 'http://localhost:8080',
       '/api-keys': 'http://localhost:8080',

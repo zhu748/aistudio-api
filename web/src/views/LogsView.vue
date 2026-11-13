@@ -600,7 +600,7 @@ onUnmounted(() => {
             >
               {{ entry.request_id.slice(0, 16) }}… ↗
             </router-link>
-            <span class="text-slate-200 whitespace-pre-wrap break-words w-full leading-6 text-[13px]">
+            <span class="text-slate-200 whitespace-pre-wrap break-words [overflow-wrap:anywhere] w-full leading-6 text-[13px]">
               {{ entry.message }}
             </span>
           </div>

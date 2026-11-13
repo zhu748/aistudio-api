@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import FieldHelpTip from './FieldHelpTip.vue'
+
 interface Props {
   modelValue: string | number | null | undefined
   label: string
@@ -6,6 +8,7 @@ interface Props {
   placeholder?: string
   type?: 'text' | 'number'
   disabled?: boolean
+  schemaKey?: string
 }
 
 withDefaults(defineProps<Props>(), {
@@ -13,6 +16,7 @@ withDefaults(defineProps<Props>(), {
   placeholder: '',
   type: 'text',
   disabled: false,
+  schemaKey: '',
 })
 
 const emit = defineEmits<{
@@ -32,13 +36,19 @@ function handleInput(e: Event) {
 
 <template>
   <div class="space-y-1.5">
-    <div class="flex items-center justify-between">
-      <label class="block text-xs font-semibold text-slate-700">
-        {{ label }}
-      </label>
+    <div class="flex items-center justify-between gap-2">
+      <div class="flex items-center gap-1 min-w-0">
+        <label class="block text-xs font-semibold text-slate-700 truncate">
+          {{ label }}
+        </label>
+        <FieldHelpTip
+          v-if="schemaKey"
+          :schema-key="schemaKey"
+        />
+      </div>
       <span
         v-if="description"
-        class="text-[11px] text-slate-400"
+        class="text-[11px] text-slate-400 shrink-0"
       >
         {{ description }}
       </span>

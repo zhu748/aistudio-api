@@ -208,7 +208,7 @@ onMounted(() => {
       </div>
 
       <!-- Model Checkbox List -->
-      <div class="max-h-60 overflow-y-auto bg-white border border-slate-200 rounded-lg divide-y divide-slate-100">
+      <div class="max-h-72 overflow-y-auto bg-white border border-slate-200 rounded-lg divide-y divide-slate-100">
         <div
           v-if="filteredModels.length === 0"
           class="px-3 py-6 text-center text-xs text-slate-400"

@@ -315,6 +315,20 @@ function handleYamlKeydown(e: KeyboardEvent) {
   }
 }
 
+const yamlLineCount = computed(() => {
+  if (!rawYaml.value) return 1
+  return rawYaml.value.split('\n').length
+})
+
+const yamlTextareaRef = ref<HTMLTextAreaElement | null>(null)
+const yamlGutterRef = ref<HTMLDivElement | null>(null)
+
+function syncYamlScroll() {
+  if (yamlGutterRef.value && yamlTextareaRef.value) {
+    yamlGutterRef.value.scrollTop = yamlTextareaRef.value.scrollTop
+  }
+}
+
 const hasUnsavedChanges = computed(() => {
   const current = activeTab.value === 'visual' ? syncStateToYaml() : rawYaml.value
   return Boolean(props.initialYaml && current.trim() !== props.initialYaml.trim())
@@ -441,7 +455,7 @@ onBeforeRouteLeave(async (_to, _from, next) => {
         <div>
           <div class="text-xs font-bold text-slate-900 flex items-center gap-1.5">
             <span>全局自动过滤不支持参数 (drop_unsupported_params)</span>
-            <span class="text-[10px] text-brand-700 bg-brand-50 px-1.5 py-0.5 rounded font-mono border border-brand-200/60 font-semibold">全局默认</span>
+            <span class="text-[10px] text-brand-700 bg-brand-50 px-1.5 py-0.5 rounded font-mono border border-brand-200/60 font-semibold whitespace-nowrap shrink-0">全局默认</span>
             <FieldHelpTip schema-key="system.drop_unsupported_params" />
           </div>
           <p class="text-[11px] text-slate-400 mt-0.5">
@@ -470,25 +484,25 @@ onBeforeRouteLeave(async (_to, _from, next) => {
 
       <!-- Section 1: Model Profiles -->
       <div class="space-y-3.5">
-        <div class="flex items-center justify-between border-b border-slate-100 pb-2.5">
+        <div class="flex flex-wrap items-center justify-between gap-2.5 border-b border-slate-100 pb-2.5">
           <div>
-            <h4 class="text-xs font-bold text-slate-900 flex items-center gap-2">
-              <Layers class="w-4 h-4 text-brand-600" />
+            <h4 class="text-xs font-bold text-slate-900 flex items-center gap-2 flex-wrap">
+              <Layers class="w-4 h-4 text-brand-600 shrink-0" />
               <span>模型分组规则 (Model Profiles)</span>
-              <span class="px-1.5 py-0.5 text-[10px] font-mono bg-slate-100 text-slate-600 rounded tabular-nums">
+              <span class="px-1.5 py-0.5 text-[10px] font-mono bg-slate-100 text-slate-600 rounded tabular-nums whitespace-nowrap shrink-0">
                 {{ filteredProfilesWithIndex.length }} 组
               </span>
             </h4>
           </div>
 
-          <div class="flex items-center gap-2">
+          <div class="flex items-center gap-2 shrink-0">
             <Button
               variant="ghost"
               size="xs"
               @click="toggleAllProfiles"
             >
               <ChevronsUpDown class="w-3.5 h-3.5 text-slate-400" />
-              <span>{{ forceAllProfilesExpanded ? '折叠全部' : '展开全部' }}</span>
+              <span class="whitespace-nowrap">{{ forceAllProfilesExpanded ? '折叠全部' : '展开全部' }}</span>
             </Button>
             <Button
               variant="secondary"
@@ -496,7 +510,7 @@ onBeforeRouteLeave(async (_to, _from, next) => {
               @click="handleAddProfile"
             >
               <Plus class="w-3.5 h-3.5" />
-              <span>添加规则组</span>
+              <span class="whitespace-nowrap">添加规则组</span>
             </Button>
           </div>
         </div>
@@ -542,17 +556,43 @@ onBeforeRouteLeave(async (_to, _from, next) => {
       class="space-y-2"
     >
       <div class="flex items-center justify-between text-xs text-slate-400 font-mono">
-        <span>config.yaml 完整源码</span>
-        <span>保存后自动热重载，无需重启进程</span>
+        <div class="flex items-center gap-2">
+          <span>config.yaml 完整源码</span>
+          <span class="px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 text-[10px] tabular-nums">
+            {{ yamlLineCount }} 行
+          </span>
+        </div>
+        <span class="hidden sm:inline">支持 Tab 缩进 · 保存后自动热重载</span>
       </div>
-      <textarea
-        v-model="rawYaml"
-        rows="24"
-        spellcheck="false"
-        placeholder="正在加载 config.yaml…"
-        class="w-full p-4 font-mono text-xs bg-slate-950 text-slate-100 rounded-xl outline-none focus:ring-2 focus:ring-brand-500 leading-relaxed border border-slate-800"
-        @keydown="handleYamlKeydown"
-      />
+
+      <div class="flex bg-slate-950 rounded-xl border border-slate-800 overflow-hidden focus-within:ring-2 focus-within:ring-brand-500">
+        <!-- Synchronized Line Number Gutter -->
+        <div
+          ref="yamlGutterRef"
+          aria-hidden="true"
+          class="pt-4 pb-8 px-3 bg-slate-900/70 border-r border-slate-800/90 text-right font-mono text-xs leading-[1.625] text-slate-600 select-none overflow-hidden shrink-0 tabular-nums"
+          style="height: 492px"
+        >
+          <div
+            v-for="n in yamlLineCount"
+            :key="n"
+          >
+            {{ n }}
+          </div>
+        </div>
+
+        <textarea
+          ref="yamlTextareaRef"
+          v-model="rawYaml"
+          spellcheck="false"
+          wrap="off"
+          placeholder="正在加载 config.yaml…"
+          class="flex-1 min-w-0 p-4 font-mono text-xs leading-[1.625] bg-transparent text-slate-100 outline-none resize-none overflow-auto whitespace-pre"
+          style="height: 492px"
+          @scroll="syncYamlScroll"
+          @keydown="handleYamlKeydown"
+        />
+      </div>
     </div>
 
     <!-- Schema Specification Dictionary Modal -->

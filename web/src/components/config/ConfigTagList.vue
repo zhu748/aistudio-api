@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { Plus, X } from 'lucide-vue-next'
+import FieldHelpTip from './FieldHelpTip.vue'
 
 interface Props {
   modelValue?: (string | number)[]
@@ -10,6 +11,7 @@ interface Props {
   suggestions?: { label: string; value: string | number; description?: string }[]
   isNumber?: boolean
   disabled?: boolean
+  schemaKey?: string
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -19,6 +21,7 @@ const props = withDefaults(defineProps<Props>(), {
   suggestions: () => [],
   isNumber: false,
   disabled: false,
+  schemaKey: '',
 })
 
 const emit = defineEmits<{
@@ -60,10 +63,16 @@ function handleKeydown(e: KeyboardEvent) {
 
 <template>
   <div class="space-y-1.5">
-    <div class="flex items-center justify-between">
-      <label class="block text-xs font-semibold text-slate-700">
-        {{ label }}
-      </label>
+    <div class="flex items-center justify-between gap-2 flex-wrap">
+      <div class="flex items-center gap-1 min-w-0">
+        <label class="block text-xs font-semibold text-slate-700">
+          {{ label }}
+        </label>
+        <FieldHelpTip
+          v-if="schemaKey"
+          :schema-key="schemaKey"
+        />
+      </div>
       <span
         v-if="description"
         class="text-[11px] text-slate-400"

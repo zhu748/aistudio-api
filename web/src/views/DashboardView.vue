@@ -162,8 +162,10 @@ const rangeQuery = computed(() => ({
       <StatCard
         label="当前调度节点"
         :value="activeAccountDisplay"
+        :value-title="activeAccountDisplay"
         :color="accountsStore.activeAccount ? 'default' : 'amber'"
         :mono="true"
+        :compact-value="true"
       >
         <template #action>
           <button
@@ -218,21 +220,21 @@ const rangeQuery = computed(() => ({
           <Users class="w-4 h-4 text-brand-600" />
         </template>
         <template #footer>
-          <div class="flex items-center gap-2 pt-1 text-[11px] font-mono tabular-nums">
-            <span class="inline-flex items-center gap-1 text-emerald-700">
+          <div class="flex items-center flex-wrap gap-x-2 gap-y-1 pt-1 text-[11px] font-mono tabular-nums">
+            <span class="inline-flex items-center gap-1 text-emerald-700 whitespace-nowrap">
               <span class="w-1.5 h-1.5 rounded-full bg-emerald-500" />
               就绪 {{ poolSummary.ready }}
             </span>
             <span class="text-slate-300">·</span>
             <span
-              class="inline-flex items-center gap-1"
+              class="inline-flex items-center gap-1 whitespace-nowrap"
               :class="poolSummary.limited > 0 ? 'text-amber-700 font-semibold' : 'text-slate-400'"
             >
               <span class="w-1.5 h-1.5 rounded-full bg-amber-500" />
               模型冷却 {{ poolSummary.limited }}
             </span>
             <span class="text-slate-300">·</span>
-            <span class="inline-flex items-center gap-1 text-slate-400">
+            <span class="inline-flex items-center gap-1 text-slate-400 whitespace-nowrap">
               <span class="w-1.5 h-1.5 rounded-full bg-slate-300" />
               停用/失效 {{ poolSummary.disabledOrExpired }}
             </span>
@@ -284,22 +286,28 @@ const rangeQuery = computed(() => ({
       <StatCard
         label="所选时段 Token"
         :value="systemStore.totalTokens.toLocaleString()"
-        :sub-value="`入 ${systemStore.promptTokens.toLocaleString()} / 出 ${systemStore.completionTokens.toLocaleString()}`"
         color="default"
       >
         <template #icon>
           <Cpu class="w-4 h-4 text-brand-600" />
         </template>
         <template #footer>
-          <div class="flex items-center gap-2 pt-1 text-[11px] font-mono tabular-nums">
-            <span class="inline-flex items-center gap-1 text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded">
-              <Brain class="w-3 h-3 text-brand-600" />
-              思考 {{ reasoningTokens.toLocaleString() }}
-            </span>
-            <span class="inline-flex items-center gap-1 text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded">
-              <Database class="w-3 h-3 text-sky-600" />
-              缓存 {{ cachedTokens.toLocaleString() }}
-            </span>
+          <div class="space-y-1.5 pt-1 text-[11px] font-mono tabular-nums">
+            <div class="flex items-center gap-2 text-slate-500">
+              <span>入 {{ systemStore.promptTokens.toLocaleString() }}</span>
+              <span class="text-slate-300">·</span>
+              <span>出 {{ systemStore.completionTokens.toLocaleString() }}</span>
+            </div>
+            <div class="flex items-center gap-2 flex-wrap">
+              <span class="inline-flex items-center gap-1 text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded">
+                <Brain class="w-3 h-3 text-brand-600" />
+                思考 {{ reasoningTokens.toLocaleString() }}
+              </span>
+              <span class="inline-flex items-center gap-1 text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded">
+                <Database class="w-3 h-3 text-sky-600" />
+                缓存 {{ cachedTokens.toLocaleString() }}
+              </span>
+            </div>
           </div>
         </template>
       </StatCard>

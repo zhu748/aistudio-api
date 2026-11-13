@@ -153,13 +153,13 @@ usePageRefresh(loadConfig)
 
     <!-- Section Sub-Navigation Tabs -->
     <div
-      class="bg-white border border-slate-200/90 rounded-xl p-1.5 shadow-2xs flex items-center gap-1 overflow-x-auto"
+      class="bg-white border border-slate-200/90 rounded-xl p-1.5 shadow-2xs grid grid-cols-2 md:flex md:items-center gap-1.5"
     >
       <button
         v-for="tab in tabs"
         :key="tab.key"
         type="button"
-        class="flex-1 min-w-[140px] flex items-center justify-center sm:justify-start gap-2.5 px-3.5 py-2.5 rounded-lg text-left transition-all cursor-pointer"
+        class="min-w-0 md:flex-1 flex items-center justify-start gap-2.5 px-3 py-2.5 rounded-lg text-left transition-all cursor-pointer"
         :class="
           activeTab === tab.key
             ? 'bg-slate-900 text-white shadow-2xs'

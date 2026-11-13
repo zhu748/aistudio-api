@@ -10,11 +10,14 @@ import {
   Terminal,
   Network,
   ListChecks,
+  Copy,
+  Check,
 } from 'lucide-vue-next'
 import { useAuthStore } from '@/stores/auth.ts'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useRouter, useRoute } from 'vue-router'
 import { useSystemHealth } from '@/composables/useSystemHealth.ts'
+import { useClipboard } from '@/composables/useClipboard.ts'
 
 defineProps<{
   open: boolean
@@ -30,6 +33,19 @@ const accountsStore = useAccountsStore()
 const router = useRouter()
 const route = useRoute()
 const { state: healthState, readiness } = useSystemHealth(30000)
+const { copied, copy } = useClipboard()
+
+const protocolEndpoints = [
+  { id: 'gemini', label: 'Gemini', path: '/v1beta', copyPath: '/v1beta' },
+  { id: 'openai', label: 'OpenAI', path: '/v1/chat/*', copyPath: '/v1' },
+  { id: 'claude', label: 'Claude', path: '/v1/messages', copyPath: '' },
+]
+
+function copyEndpoint(item: { id: string; label: string; copyPath: string }) {
+  const origin = typeof window !== 'undefined' && window.location.origin ? window.location.origin : 'http://localhost:8080'
+  const fullUrl = `${origin}${item.copyPath}`
+  void copy(fullUrl, item.id, `已复制 ${item.label} Base URL: ${fullUrl}`)
+}
 
 const accountCountBadge = computed(() => {
   const total = accountsStore.accountRows.length
@@ -155,24 +171,27 @@ function handleLogout() {
           已挂载协议端点
         </div>
         <div class="space-y-1.5 font-mono text-[11px]">
-          <div
-            class="flex items-center justify-between px-2 py-1 rounded-md bg-slate-50 border border-slate-200/60 text-slate-600"
+          <button
+            v-for="ep in protocolEndpoints"
+            :key="ep.id"
+            type="button"
+            class="w-full group flex items-center justify-between px-2 py-1 rounded-md bg-slate-50 hover:bg-slate-100/90 border border-slate-200/60 hover:border-slate-300/80 text-slate-600 transition-colors cursor-pointer text-left"
+            :title="`点击复制 ${ep.label} Base URL`"
+            @click="copyEndpoint(ep)"
           >
-            <span class="text-slate-400">Gemini</span>
-            <span class="text-slate-800 font-medium">/v1beta</span>
-          </div>
-          <div
-            class="flex items-center justify-between px-2 py-1 rounded-md bg-slate-50 border border-slate-200/60 text-slate-600"
-          >
-            <span class="text-slate-400">OpenAI</span>
-            <span class="text-slate-800 font-medium">/v1/chat/*</span>
-          </div>
-          <div
-            class="flex items-center justify-between px-2 py-1 rounded-md bg-slate-50 border border-slate-200/60 text-slate-600"
-          >
-            <span class="text-slate-400">Claude</span>
-            <span class="text-slate-800 font-medium">/v1/messages</span>
-          </div>
+            <span class="text-slate-400">{{ ep.label }}</span>
+            <span class="flex items-center gap-1.5 text-slate-800 font-medium">
+              <span>{{ ep.path }}</span>
+              <Check
+                v-if="copied === ep.id"
+                class="w-3 h-3 text-emerald-500 shrink-0"
+              />
+              <Copy
+                v-else
+                class="w-3 h-3 text-slate-300 group-hover:text-slate-500 transition-colors shrink-0"
+              />
+            </span>
+          </button>
         </div>
       </div>
     </div>

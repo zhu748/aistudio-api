@@ -55,7 +55,7 @@ export const router = createRouter({
 router.beforeEach(async (to, _from, next) => {
   // 设置文档标题
   if (to.meta.title && typeof to.meta.title === 'string') {
-    document.title = `${to.meta.title} - AI Studio Proxy`
+    document.title = `${to.meta.title} - AI Studio Gateway`
   }
 
   const authStore = useAuthStore()

@@ -143,11 +143,12 @@ function updateModelThinkingConfig(modelKey: string, level: string | null) {
       <div
         v-for="(override, modelKey) in models"
         :key="modelKey"
-        class="bg-white border border-slate-200/90 rounded-xl shadow-2xs overflow-hidden"
+        class="bg-white border border-slate-200/90 rounded-xl shadow-2xs"
       >
         <!-- Header -->
         <div
-          class="px-4 py-2.5 bg-slate-50/70 border-b border-slate-100 flex items-center justify-between gap-3 cursor-pointer select-none hover:bg-slate-100/60 transition-colors"
+          class="px-4 py-2.5 bg-slate-50/70 flex items-center justify-between gap-3 cursor-pointer select-none hover:bg-slate-100/60 transition-colors"
+          :class="expandedMap[String(modelKey)] ? 'border-b border-slate-100 rounded-t-xl' : 'rounded-xl'"
           @click="toggleExpand(String(modelKey))"
         >
           <div class="flex items-center gap-2 font-mono text-xs font-bold text-slate-900">
@@ -191,136 +192,85 @@ function updateModelThinkingConfig(modelKey: string, level: string | null) {
           class="p-4 space-y-4"
         >
           <!-- Image Model Switch -->
-          <div class="flex items-center gap-1.5">
-            <div class="flex-1">
-              <ConfigSwitch
-                :model-value="Boolean(override.is_image_model)"
-                label="作为生图模型 (is_image_model)"
-                description="将该模型设为生图模式，启用多模态图片编码与专用处理管线"
-                @update:model-value="updateModelField(String(modelKey), 'is_image_model', $event)"
-              />
-            </div>
-            <FieldHelpTip
-              schema-key="profile.is_image_model"
-              class="shrink-0"
-            />
-          </div>
+          <ConfigSwitch
+            :model-value="Boolean(override.is_image_model)"
+            label="作为生图模型 (is_image_model)"
+            description="将该模型设为生图模式，启用多模态图片编码与专用处理管线"
+            schema-key="profile.is_image_model"
+            @update:model-value="updateModelField(String(modelKey), 'is_image_model', $event)"
+          />
 
           <!-- Generation Config Defaults -->
           <div class="p-3.5 bg-slate-50/70 border border-slate-200/70 rounded-xl space-y-3">
-            <div class="flex items-center justify-between">
-              <div class="flex items-center gap-2 text-xs font-bold text-slate-800">
-                <Cpu class="w-4 h-4 text-brand-600" />
-                <span>生成参数覆盖</span>
-              </div>
+            <div class="flex items-center gap-1.5 text-xs font-bold text-slate-800">
+              <Cpu class="w-4 h-4 text-brand-600" />
+              <span>生成参数覆盖</span>
               <FieldHelpTip schema-key="generation.defaults" />
             </div>
 
             <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
-              <div class="flex items-center gap-1.5">
-                <div class="flex-1">
-                  <ConfigSelect
-                    :model-value="override.generation_config_defaults?.image_output_mode"
-                    label="图片输出模式"
-                    :options="IMAGE_MODE_OPTIONS"
-                    @update:model-value="updateModelGenField(String(modelKey), 'image_output_mode', $event)"
-                  />
-                </div>
-                <FieldHelpTip
-                  schema-key="generation.image_output_mode"
-                  class="mt-4 shrink-0"
-                />
-              </div>
+              <ConfigSelect
+                :model-value="override.generation_config_defaults?.image_output_mode"
+                label="图片输出模式"
+                :options="IMAGE_MODE_OPTIONS"
+                schema-key="generation.image_output_mode"
+                @update:model-value="updateModelGenField(String(modelKey), 'image_output_mode', $event)"
+              />
 
-              <div class="flex items-center gap-1.5">
-                <div class="flex-1">
-                  <ConfigSelect
-                    :model-value="override.generation_config_defaults?.thinking_config?.level"
-                    label="思考强度等级"
-                    :options="THINKING_LEVEL_OPTIONS"
-                    @update:model-value="updateModelThinkingConfig(String(modelKey), $event as string | null)"
-                  />
-                </div>
-                <FieldHelpTip
-                  schema-key="generation.thinking_level"
-                  class="mt-4 shrink-0"
-                />
-              </div>
+              <ConfigSelect
+                :model-value="override.generation_config_defaults?.thinking_config?.level"
+                label="思考强度等级"
+                :options="THINKING_LEVEL_OPTIONS"
+                schema-key="generation.thinking_level"
+                @update:model-value="updateModelThinkingConfig(String(modelKey), $event as string | null)"
+              />
 
-              <div class="flex items-center gap-1.5">
-                <div class="flex-1">
-                  <ConfigSelect
-                    :model-value="override.generation_config_defaults?.media_resolution"
-                    label="多模态输入分辨率"
-                    :options="MEDIA_RESOLUTION_OPTIONS"
-                    @update:model-value="updateModelGenField(String(modelKey), 'media_resolution', $event)"
-                  />
-                </div>
-                <FieldHelpTip
-                  schema-key="generation.media_resolution"
-                  class="mt-4 shrink-0"
-                />
-              </div>
+              <ConfigSelect
+                :model-value="override.generation_config_defaults?.media_resolution"
+                label="多模态输入分辨率"
+                :options="MEDIA_RESOLUTION_OPTIONS"
+                schema-key="generation.media_resolution"
+                @update:model-value="updateModelGenField(String(modelKey), 'media_resolution', $event)"
+              />
             </div>
 
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
-              <div class="flex items-center gap-1.5">
-                <div class="flex-1">
-                  <ConfigSwitch
-                    :model-value="Boolean(override.drop_unsupported_params)"
-                    label="自动过滤不支持的参数"
-                    description="自动过滤未知安全类别与不兼容工具"
-                    @update:model-value="updateModelField(String(modelKey), 'drop_unsupported_params', $event)"
-                  />
-                </div>
-                <FieldHelpTip
-                  schema-key="profile.drop_unsupported_params"
-                  class="shrink-0"
-                />
-              </div>
+              <ConfigSwitch
+                :model-value="Boolean(override.drop_unsupported_params)"
+                label="自动过滤不支持的参数"
+                description="自动过滤未知安全类别与不兼容工具"
+                schema-key="profile.drop_unsupported_params"
+                @update:model-value="updateModelField(String(modelKey), 'drop_unsupported_params', $event)"
+              />
 
-              <div class="flex items-center gap-1.5">
-                <div class="flex-1">
-                  <ConfigSwitch
-                    :model-value="Boolean(override.disable_safety_settings)"
-                    label="完全关闭安全规则"
-                    description="生图模型通常开启此项以避免被安全机制误拦截"
-                    @update:model-value="updateModelField(String(modelKey), 'disable_safety_settings', $event)"
-                  />
-                </div>
-                <FieldHelpTip
-                  schema-key="safety.disable_safety_settings"
-                  class="shrink-0"
-                />
-              </div>
+              <ConfigSwitch
+                :model-value="Boolean(override.disable_safety_settings)"
+                label="完全关闭安全规则"
+                description="生图模型通常开启此项以避免被安全机制误拦截"
+                schema-key="safety.disable_safety_settings"
+                @update:model-value="updateModelField(String(modelKey), 'disable_safety_settings', $event)"
+              />
             </div>
 
             <!-- Clear Indexes -->
-            <div class="flex items-center gap-1.5 pt-1">
-              <div class="flex-1">
-                <ConfigTagList
-                  :model-value="override.clear_generation_config_indexes || []"
-                  label="清空特定字段下标"
-                  description="针对该模型发送前清除的 wire 数组索引 (如 7, 13, 17)"
-                  :is-number="true"
-                  placeholder="输入数字下标按回车"
-                  @update:model-value="updateModelField(String(modelKey), 'clear_generation_config_indexes', $event as number[])"
-                />
-              </div>
-              <FieldHelpTip
+            <div class="pt-1">
+              <ConfigTagList
+                :model-value="override.clear_generation_config_indexes || []"
+                label="清空特定字段下标"
+                description="针对该模型发送前清除的 wire 数组索引 (如 7, 13, 17)"
+                :is-number="true"
+                placeholder="输入数字下标按回车"
                 schema-key="generation.clear_indexes"
-                class="mt-4 shrink-0"
+                @update:model-value="updateModelField(String(modelKey), 'clear_generation_config_indexes', $event as number[])"
               />
             </div>
           </div>
 
           <!-- Tools -->
           <div class="p-3.5 bg-slate-50/70 border border-slate-200/70 rounded-xl space-y-2">
-            <div class="flex items-center justify-between">
-              <div class="flex items-center gap-2 text-xs font-bold text-slate-800">
-                <Wrench class="w-4 h-4 text-brand-600" />
-                <span>模型专用工具</span>
-              </div>
+            <div class="flex items-center gap-1.5 text-xs font-bold text-slate-800">
+              <Wrench class="w-4 h-4 text-brand-600" />
+              <span>模型专用工具</span>
               <FieldHelpTip schema-key="profile.default_tools" />
             </div>
             <ConfigTagList
