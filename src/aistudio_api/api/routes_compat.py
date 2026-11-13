@@ -28,7 +28,10 @@ from aistudio_api.api.schemas_compat import (
     OpenAIChatCompletionRequest,
     OpenAIResponsesRequest,
 )
-from aistudio_api.application.api_service_gemini import handle_gemini_generate_content
+from aistudio_api.application.api_service_gemini import (
+    GeminiStreamResponse,
+    handle_gemini_generate_content,
+)
 from aistudio_api.application.compat_service import (
     build_claude_message,
     build_openai_completion,
@@ -179,9 +182,14 @@ async def openai_chat_completions(
         if isinstance(response, StreamingResponse):
             return StreamingResponse(
                 openai_stream_adapter(
-                    response.body_iterator,
+                    response.frames
+                    if isinstance(response, GeminiStreamResponse)
+                    else response.body_iterator,
                     requested_model=req.model,
                     include_usage=include_usage,
+                    register_failure=lambda handler: setattr(
+                        http_request.state, "stream_failure", handler
+                    ),
                 ),
                 media_type="text/event-stream",
                 headers=_STREAM_HEADERS,
@@ -241,8 +249,13 @@ async def openai_responses(
         if isinstance(response, StreamingResponse):
             return StreamingResponse(
                 responses_stream_adapter(
-                    response.body_iterator,
+                    response.frames
+                    if isinstance(response, GeminiStreamResponse)
+                    else response.body_iterator,
                     requested_model=req.model,
+                    register_failure=lambda handler: setattr(
+                        http_request.state, "stream_failure", handler
+                    ),
                 ),
                 media_type="text/event-stream",
                 headers=_STREAM_HEADERS,
@@ -302,9 +315,14 @@ async def claude_messages(
         if isinstance(response, StreamingResponse):
             return StreamingResponse(
                 claude_stream_adapter(
-                    response.body_iterator,
+                    response.frames
+                    if isinstance(response, GeminiStreamResponse)
+                    else response.body_iterator,
                     requested_model=req.model,
                     stop_sequences=req.stop_sequences,
+                    register_failure=lambda handler: setattr(
+                        http_request.state, "stream_failure", handler
+                    ),
                 ),
                 media_type="text/event-stream",
                 headers=_STREAM_HEADERS,

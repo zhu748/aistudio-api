@@ -20,7 +20,7 @@ XSSI_PREFIX = ")]}'"
 # 跳到下一个结构字符（C 实现），字符串内部无 " 与 \ 时整个 payload
 # 一次扫描越过，图像流解析从 ~190ms/MB 降到亚毫秒级。
 _STRING_SCAN_RE = re.compile(r'["\\]')  # 字符串内部只需关注闭引号与转义
-_STRUCT_SCAN_RE = re.compile(r'["\[\]]')  # 字符串外部只需关注开引号与容器边界
+_STRUCT_SCAN_RE = re.compile(r'["\[\]{}]')
 
 _TRAILING_JUNK = " \t\r\n,"
 _INCOMPLETE_UNICODE_RE = re.compile(r"\\u[0-9a-fA-F]{0,3}$")
@@ -166,18 +166,26 @@ class IncrementalJSONStreamParser:
     """
 
     def __init__(self) -> None:
-        # 缓冲区与游标全部使用「绝对下标」，只在 feed 结束时压缩已消费前缀。
-        # 旧实现每切出一个 chunk 就 self.buffer = self.buffer[pos+1:]，
-        # 在大量小块场景下是 O(n²) 的字符串拷贝（实测 20k 分块耗时数十毫秒）。
-        self.buffer: str = ""
+        # Scan each input fragment once; join only when a wire chunk closes.
+        self._fragments: list[str] = []
+        self._chunk_size = 0
+        self._preamble = ""
         self.depth: int = 0
+        self._nesting = 0
         self.in_string: bool = False
         self.escape: bool = False
         self.chunk_start: int | None = None
         self.preamble_skipped: bool = False
-        self._pos: int = 0
-        # 已消费前缀的长度，用于按需压缩 buffer
-        self._offset: int = 0
+
+    @property
+    def buffer(self) -> str:
+        return self._preamble + "".join(self._fragments)
+
+    def _append(self, fragment: str) -> None:
+        self._chunk_size += len(fragment)
+        if self._chunk_size > 64 * 1024 * 1024:
+            raise ValueError("Upstream JSON chunk exceeds 64 MiB limit")
+        self._fragments.append(fragment)
 
     @staticmethod
     def _parse_chunk(chunk_str: str) -> object | None:
@@ -186,113 +194,84 @@ class IncrementalJSONStreamParser:
         except (TypeError, ValueError):
             return _repair_truncated_json(chunk_str)
 
-    def _compact(self) -> None:
-        """丢弃已消费前缀，避免缓冲区随流长度无限增长。
-
-        只在 feed 末尾调用：此时剩余内容只是尚未形成完整分块的尾部，
-        因此整体复杂度仍是 O(已接收字节数)。
-        """
-        if self._offset == 0:
-            return
-        offset = self._offset
-        self.buffer = self.buffer[offset:]
-        self._pos -= offset
-        if self.chunk_start is not None:
-            self.chunk_start -= offset
-        self._offset = 0
-        if self._pos < 0:
-            self._pos = 0
-
     def feed(self, data: str) -> Generator[list[object], None, None]:
-        self.buffer += data
+        if not self.preamble_skipped:
+            data = (self._preamble + data).lstrip()
+            self._preamble = ""
+            if not data or (
+                len(data) < len(XSSI_PREFIX) and XSSI_PREFIX.startswith(data)
+            ):
+                self._preamble = data
+                return
+            if data.startswith(XSSI_PREFIX):
+                data = data[len(XSSI_PREFIX) :]
+            self.preamble_skipped = True
 
-        while True:
-            if not self.preamble_skipped:
-                rest = self.buffer[self._offset :]
-                if rest.startswith(XSSI_PREFIX):
-                    self._offset += len(XSSI_PREFIX)
-                    # XSSI 前缀后允许任意空白
-                    while (
-                        self._offset < len(self.buffer)
-                        and self.buffer[self._offset] in " \t\r\n"
-                    ):
-                        self._offset += 1
-                    self._pos = max(self._pos, self._offset)
-                elif XSSI_PREFIX.startswith(rest):
-                    break
-                self.preamble_skipped = True
-
-            made_progress = False
-            buf = self.buffer
-            buf_len = len(buf)
-            while self._pos < buf_len:
-                # 跨 feed 边界延续的转义：跳过被转义的首字符
-                if self.escape:
-                    self.escape = False
-                    self._pos += 1
-                    continue
-
-                if self.in_string:
-                    # 字符串内部：一次正则跳到下一个 '"' 或 '\\'（C 速度）。
-                    match = _STRING_SCAN_RE.search(buf, self._pos)
-                    if match is None:
-                        self._pos = buf_len
-                        break
-                    index = match.start()
-                    if buf[index] == '"':
-                        self.in_string = False
-                        self._pos = index + 1
-                        continue
-                    # 反斜杠转义：连同被转义字符一起跳过
-                    if index + 1 < buf_len:
-                        self._pos = index + 2
-                    else:
-                        # 被转义字符在下一批数据里
-                        self.escape = True
-                        self._pos = buf_len
-                    continue
-
-                # 字符串外部：只关心 '"'、'['、']'（其余字符无状态语义）
-                match = _STRUCT_SCAN_RE.search(buf, self._pos)
-                if match is None:
-                    self._pos = buf_len
-                    break
-                index = match.start()
-                ch = buf[index]
-                if ch == '"':
-                    self.in_string = True
-                    self._pos = index + 1
-                elif ch == "[":
-                    self.depth += 1
-                    if self.depth == 3 and self.chunk_start is None:
-                        self.chunk_start = index
-                    self._pos = index + 1
-                elif ch == "]":
-                    self.depth -= 1
-                    self._pos = index + 1
-                    if self.depth == 2 and self.chunk_start is not None:
-                        chunk_str = buf[self.chunk_start : self._pos]
-                        parsed = self._parse_chunk(chunk_str)
-                        self._offset = self._pos
-                        self.chunk_start = None
-                        made_progress = True
-                        if isinstance(parsed, list):
-                            yield parsed
-                        continue
-
-            if not made_progress:
-                self._compact()
+        pos, size = 0, len(data)
+        start = 0 if self.chunk_start is not None else None
+        while pos < size:
+            if self.escape:
+                self.escape = False
+                pos += 1
+                continue
+            regex = _STRING_SCAN_RE if self.in_string else _STRUCT_SCAN_RE
+            match = regex.search(data, pos)
+            if match is None:
                 break
+            index = match.start()
+            ch = data[index]
+            pos = index + 1
+            if not self.in_string:
+                if ch in "[{":
+                    self._nesting += 1
+                    if self._nesting > 128:
+                        raise ValueError("Upstream JSON nesting exceeds 128 levels")
+                elif ch in "]}":
+                    self._nesting -= 1
+                    if self._nesting < 0:
+                        raise ValueError("Unbalanced upstream JSON container")
+            if self.in_string:
+                if ch == '"':
+                    self.in_string = False
+                elif pos < size:
+                    pos += 1
+                else:
+                    self.escape = True
+            elif ch == '"':
+                self.in_string = True
+            elif ch == "[":
+                self.depth += 1
+                if self.depth == 3:
+                    self.chunk_start = 0
+                    start = index
+            elif ch == "]":
+                self.depth -= 1
+                if self.depth < 0:
+                    raise ValueError("Unbalanced upstream JSON array")
+                if self.depth == 2 and start is not None:
+                    self._append(data[start:pos])
+                    chunk = "".join(self._fragments)
+                    self._fragments.clear()
+                    self._chunk_size = 0
+                    self.chunk_start = None
+                    start = None
+                    parsed = self._parse_chunk(chunk)
+                    if isinstance(parsed, list):
+                        yield parsed
+        if start is not None:
+            self._append(data[start:])
 
     def finish(self) -> Generator[list[object], None, None]:
         """流结束：把缓冲区里最后一个不完整的分块修复后交出去，防止丢字/丢finish/丢usage。"""
         fragment = ""
         if self.chunk_start is not None:
             fragment = self.buffer[self.chunk_start :]
-        self.buffer = ""
-        self._pos = 0
+        self._fragments.clear()
+        self._chunk_size = 0
+        self._preamble = ""
         self.chunk_start = None
         self.depth = 0
+        self._nesting = 0
         self.in_string = False
         self.escape = False
 

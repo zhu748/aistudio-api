@@ -11,7 +11,8 @@ import contextlib
 import re
 import ssl
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 
 import httpx
 
@@ -362,6 +363,9 @@ class HTTPStreamTransport:
         self._retired_clients: set[httpx.AsyncClient] = set()
         # 按代理地址分池的客户端缓存：key 为代理 URL（空串表示直连）
         self._clients: dict[str, httpx.AsyncClient] = {}
+        self._active_clients: dict[httpx.AsyncClient, int] = {}
+        self._client_idle: dict[httpx.AsyncClient, asyncio.Event] = {}
+        self._closed = False
         # 首次并发调用会同时走到建池分支，若不互斥会创建多个客户端并泄漏未关闭的连接池；
         # 锁按事件循环惰性创建，避免跨 loop 复用同一个 Lock 对象。
         self._client_lock: asyncio.Lock | None = None
@@ -397,6 +401,7 @@ class HTTPStreamTransport:
         # 与 _get_client 的建池分支互斥：否则并发建池插入 self._clients
         # 会让这里的迭代抛 "dictionary changed size during iteration"，
         # 且 close 之后新建的客户端将永远不会被关闭（连接泄漏）。
+        self._closed = True
         await self._flush_cookie_persist()
         async with self._get_client_lock():
             for client in self._clients.values():
@@ -441,8 +446,12 @@ class HTTPStreamTransport:
 
         async def _delayed_close() -> None:
             try:
-                # 35s 宽限：足以让在途流式请求（含 SSE 长流）排空
-                await asyncio.sleep(35.0)
+                # A generation can run for minutes. Drain actual leases rather
+                # than interrupting long streams after an arbitrary grace period.
+                for client in retired:
+                    idle = self._client_idle.get(client)
+                    if idle is not None:
+                        await idle.wait()
             except asyncio.CancelledError:
                 # 进程关停：宽限期作废，立即回收（cancel 时 sleep 抛出，
                 # finally 统一关闭；重新 raise 让任务以取消态结束）
@@ -461,6 +470,32 @@ class HTTPStreamTransport:
         self._retired_close_tasks.add(task)
         task.add_done_callback(self._retired_close_tasks.discard)
 
+    @asynccontextmanager
+    async def _lease_client(
+        self, proxy_url: str | None
+    ) -> AsyncIterator[httpx.AsyncClient]:
+        while True:
+            client = await self._get_client(proxy_url)
+            async with self._get_client_lock():
+                if self._closed:
+                    raise RuntimeError("Transport is closed")
+                if client in self._retired_clients:
+                    continue
+                self._active_clients[client] = self._active_clients.get(client, 0) + 1
+                idle = self._client_idle.setdefault(client, asyncio.Event())
+                idle.clear()
+                break
+        try:
+            yield client
+        finally:
+            # No await: release remains deterministic during task cancellation.
+            count = self._active_clients[client] - 1
+            if count:
+                self._active_clients[client] = count
+            else:
+                self._active_clients.pop(client)
+                self._client_idle.pop(client).set()
+
     async def _get_client(self, proxy_url: str | None = None) -> httpx.AsyncClient:
         """获取（或创建）绑定指定出口代理的客户端；proxy_url=None 时使用全局默认代理。
 
@@ -468,6 +503,8 @@ class HTTPStreamTransport:
         由 proxy_bridge 托管，首次冷启动放线程池，不阻塞事件循环）；
         客户端池以解析后的地址为键，同一桥接节点复用同一连接池。
         """
+        if self._closed:
+            raise RuntimeError("Transport is closed")
         effective_raw = self.proxy_url if proxy_url is None else (proxy_url or None)
         effective = (
             await resolve_proxy_url_async(effective_raw) if effective_raw else None
@@ -477,6 +514,8 @@ class HTTPStreamTransport:
         if client is not None and not client.is_closed:
             return client
         async with self._get_client_lock():
+            if self._closed:
+                raise RuntimeError("Transport is closed")
             client = self._clients.get(key)
             if client is not None and not client.is_closed:
                 return client
@@ -520,37 +559,37 @@ class HTTPStreamTransport:
         )
 
         effective_proxy = self.proxy_url if proxy_url is None else proxy_url
-        client = await self._get_client(effective_proxy)
-        try:
-            resp = await client.post(
-                url, headers=clean_headers, content=body.encode("utf-8")
-            )
-            # Set-Cookie 回写下放线程池（3.4）：逐账号读盘/写盘的同步 I/O
-            # 若留在事件循环内会拖慢所有并发请求的首字延迟。
-            set_cookies = resp.headers.get_list("set-cookie")
-            if set_cookies:
-                await asyncio.to_thread(
-                    _persist_set_cookies, set_cookies, auth_file, cookies
+        async with self._lease_client(effective_proxy) as client:
+            try:
+                resp = await client.post(
+                    url, headers=clean_headers, content=body.encode("utf-8")
                 )
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-            logger.debug(
-                "请求完成: status=%d, 耗时=%.1fms, 响应长度=%d",
-                resp.status_code,
-                elapsed_ms,
-                len(resp.content),
-            )
-            return resp.status_code, resp.content
-        except Exception as exc:
-            err_detail = (
-                f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
-            )
-            logger.error(
-                "HTTP 请求失败: url=%s, proxy=%s, error=%s",
-                url,
-                _mask_proxy_url(effective_proxy),
-                err_detail,
-            )
-            raise TransportError(f"HTTP request failed: {err_detail}") from exc
+                # Set-Cookie 回写下放线程池（3.4）：逐账号读盘/写盘的同步 I/O
+                # 若留在事件循环内会拖慢所有并发请求的首字延迟。
+                set_cookies = resp.headers.get_list("set-cookie")
+                if set_cookies:
+                    await asyncio.to_thread(
+                        _persist_set_cookies, set_cookies, auth_file, cookies
+                    )
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                logger.debug(
+                    "请求完成: status=%d, 耗时=%.1fms, 响应长度=%d",
+                    resp.status_code,
+                    elapsed_ms,
+                    len(resp.content),
+                )
+                return resp.status_code, resp.content
+            except Exception as exc:
+                err_detail = (
+                    f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+                )
+                logger.error(
+                    "HTTP 请求失败: url=%s, proxy=%s, error=%s",
+                    url,
+                    _mask_proxy_url(effective_proxy),
+                    err_detail,
+                )
+                raise TransportError(f"HTTP request failed: {err_detail}") from exc
 
     async def send_streaming_request(
         self,
@@ -575,41 +614,40 @@ class HTTPStreamTransport:
         logger.debug("建立流式请求: url=%s, u/%s", url, auth_user)
 
         effective_proxy = self.proxy_url if proxy_url is None else proxy_url
-        client = await self._get_client(effective_proxy)
+        async with self._lease_client(effective_proxy) as client:
+            resp = None
+            try:
+                req = client.build_request(
+                    "POST", url, headers=clean_headers, content=body.encode("utf-8")
+                )
+                resp = await client.send(req, stream=True)
+                set_cookies = resp.headers.get_list("set-cookie")
+                if set_cookies:
+                    # 后台落盘：Google 上游普遍带滚动 Set-Cookie，
+                    # 同步等待会把持锁磁盘 IO 排队进流式首字关键路径
+                    self._schedule_cookie_persist(set_cookies, auth_file, cookies)
+                yield ("status", resp.status_code)
 
-        resp = None
-        try:
-            req = client.build_request(
-                "POST", url, headers=clean_headers, content=body.encode("utf-8")
-            )
-            resp = await client.send(req, stream=True)
-            set_cookies = resp.headers.get_list("set-cookie")
-            if set_cookies:
-                # 后台落盘：Google 上游普遍带滚动 Set-Cookie，
-                # 同步等待会把持锁磁盘 IO 排队进流式首字关键路径
-                self._schedule_cookie_persist(set_cookies, auth_file, cookies)
-            yield ("status", resp.status_code)
+                if resp.status_code != 200:
+                    err_body = await resp.aread()
+                    yield ("chunk", err_body)
+                    return
 
-            if resp.status_code != 200:
-                err_body = await resp.aread()
-                yield ("chunk", err_body)
-                return
+                async for chunk in resp.aiter_bytes():
+                    if chunk:
+                        yield ("chunk", chunk)
 
-            async for chunk in resp.aiter_bytes():
-                if chunk:
-                    yield ("chunk", chunk)
-
-        except Exception as exc:
-            err_detail = (
-                f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
-            )
-            logger.warning(
-                "流式传输异常: url=%s, proxy=%s, error=%s",
-                url,
-                _mask_proxy_url(effective_proxy),
-                err_detail,
-            )
-            yield ("error", err_detail)
-        finally:
-            if resp is not None:
-                await resp.aclose()
+            except Exception as exc:
+                err_detail = (
+                    f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+                )
+                logger.warning(
+                    "流式传输异常: url=%s, proxy=%s, error=%s",
+                    url,
+                    _mask_proxy_url(effective_proxy),
+                    err_detail,
+                )
+                yield ("error", err_detail)
+            finally:
+                if resp is not None:
+                    await resp.aclose()

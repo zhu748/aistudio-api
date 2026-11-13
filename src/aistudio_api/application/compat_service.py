@@ -11,7 +11,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import codecs
 import contextlib
 import json
 import re
@@ -39,7 +41,15 @@ from aistudio_api.api.schemas_compat import (
     ClaudeMessagesRequest,
     OpenAIChatCompletionRequest,
 )
-from aistudio_api.config import settings
+from aistudio_api.application.media_session import (
+    current_media,
+    has_remote_media,
+    media_session,
+)
+from aistudio_api.application.stream_utils import (
+    StopSequenceBuffer,
+    coalesce_tool_frames,
+)
 from aistudio_api.infrastructure.gateway.model_defaults import get_compat_settings
 from aistudio_api.infrastructure.request_context import record_result
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -167,6 +177,36 @@ def _as_str(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _signature_extra(signature: object) -> dict[str, object]:
+    """Opaque Gemini metadata which clients can return with tool history."""
+    if isinstance(signature, str) and signature:
+        return {"extra_content": {"google": {"thought_signature": signature}}}
+    return {}
+
+
+def _read_signature(item: dict[str, object]) -> str | None:
+    google = _as_dict(_as_dict(item.get("extra_content")).get("google"))
+    return _as_str(google.get("thought_signature")) or None
+
+
+def _claude_signature(signature: object) -> str:
+    if not isinstance(signature, str) or not signature:
+        return _CLAUDE_DUMMY_SIGNATURE
+    return base64.b64encode(
+        json.dumps({"aistudio_thought_signature": signature}).encode()
+    ).decode("ascii")
+
+
+def _read_claude_signature(signature: object) -> str | None:
+    if not isinstance(signature, str) or not signature:
+        return None
+    try:
+        envelope = json.loads(base64.b64decode(signature, validate=True))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return _as_str(_as_dict(envelope).get("aistudio_thought_signature")) or None
+
+
 def _as_int(value: object) -> int | None:
     if isinstance(value, bool):
         return None
@@ -204,6 +244,9 @@ def _assert_media_size(b64_data: str, *, kind: str) -> None:
             f"{kind} exceeds {_MAX_MEDIA_BYTES} bytes limit "
             f"(estimated {estimated} bytes)"
         )
+    session = current_media.get()
+    if session is not None:
+        session.account_bytes(estimated)
 
 
 def _parse_data_url(url: str) -> tuple[str, str] | None:
@@ -229,21 +272,17 @@ async def _fetch_remote_media(url: str) -> tuple[str, str]:
     """下载远程媒体 → (mime, base64 data)；失败抛 ValueError。"""
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError(f"Unsupported media URL: {url[:128]}")
+    session = current_media.get()
+    if session is None:
+        async with media_session():
+            return await _fetch_remote_media(url)
+    session.downloads += 1
+    if session.downloads > 64:
+        raise ValueError("A request may download at most 64 remote media items")
     try:
-        from aistudio_api.infrastructure.proxy_bridge import resolve_proxy_url_async
-        from aistudio_api.infrastructure.safe_media import PublicMediaTransport
-
         async with (
-            httpx.AsyncClient(
-                timeout=15.0,
-                follow_redirects=True,
-                max_redirects=5,
-                transport=PublicMediaTransport(
-                    proxy=await resolve_proxy_url_async(settings.proxy_url)
-                ),
-                trust_env=False,
-            ) as http,
-            http.stream("GET", url) as response,
+            session.semaphore,
+            (await session.get_client()).stream("GET", url) as response,
         ):
             response.raise_for_status()
             chunks: list[bytes] = []
@@ -252,6 +291,7 @@ async def _fetch_remote_media(url: str) -> tuple[str, str]:
                 size += len(chunk)
                 if size > _MAX_MEDIA_BYTES:
                     raise ValueError("Remote media exceeds configured size limit")
+                session.account_bytes(len(chunk))
                 chunks.append(chunk)
             raw = b"".join(chunks)
             mime = (response.headers.get("content-type") or "").split(";")[0].strip()
@@ -359,6 +399,20 @@ async def _openai_parts_from_content(content: object) -> list[GeminiPart]:
         return [GeminiPart(text=content)]
     if not isinstance(content, list):
         return []
+    if len(content) > 1 and has_remote_media(content):
+        parts: list[GeminiPart] = []
+        for offset in range(0, len(content), 4):
+            try:
+                async with asyncio.TaskGroup() as group:
+                    tasks = [
+                        group.create_task(_openai_parts_from_content([item]))
+                        for item in content[offset : offset + 4]
+                    ]
+            except* ValueError as exc:
+                raise ValueError(str(exc.exceptions[0])) from exc
+            for task in tasks:
+                parts.extend(task.result())
+        return parts
     parts: list[GeminiPart] = []
     for item in content:
         if not isinstance(item, dict):
@@ -470,7 +524,7 @@ def _openai_tools_to_gemini(
             decl["parameters"] = parameters
         declarations.append(decl)
     if not declarations:
-        return None
+        return []
     return [GeminiTool(functionDeclarations=declarations)]
 
 
@@ -529,11 +583,18 @@ def _openai_response_format_to_config(
     return {}
 
 
+@media_session()
 async def openai_to_gemini_request(
     req: OpenAIChatCompletionRequest,
 ) -> tuple[GeminiGenerateContentRequest, str]:
     """OpenAI Chat Completions 请求 → (Gemini 请求, 解析后的模型名)。"""
     resolved_model = resolve_compat_model(req.model, channel="openai")
+    if req.n not in (None, 1):
+        raise ValueError("Only n=1 is supported")
+    if req.parallel_tool_calls is False:
+        raise ValueError(
+            "parallel_tool_calls=false cannot be enforced by this upstream"
+        )
     contents: list[GeminiContent] = []
     system_texts: list[str] = []
     tool_name_by_id: dict[str, str] = {}
@@ -569,9 +630,10 @@ async def openai_to_gemini_request(
                 call_id = _as_str(tool_call.get("id"))
                 parts.append(
                     GeminiPart(
+                        thoughtSignature=_read_signature(tool_call),
                         functionCall=GeminiFunctionCall(
                             name=name, args=args, id=call_id or None
-                        )
+                        ),
                     )
                 )
                 if call_id:
@@ -684,6 +746,24 @@ async def _claude_blocks_to_parts(
         return [GeminiPart(text=content)]
     if not isinstance(content, list):
         return []
+    if len(content) > 1 and has_remote_media(content):
+        parts: list[GeminiPart] = []
+        for offset in range(0, len(content), 4):
+            try:
+                async with asyncio.TaskGroup() as group:
+                    tasks = [
+                        group.create_task(
+                            _claude_blocks_to_parts(
+                                [block], tool_name_by_id=tool_name_by_id
+                            )
+                        )
+                        for block in content[offset : offset + 4]
+                    ]
+            except* ValueError as exc:
+                raise ValueError(str(exc.exceptions[0])) from exc
+            for task in tasks:
+                parts.extend(task.result())
+        return parts
     parts: list[GeminiPart] = []
     for block in content:
         if not isinstance(block, dict):
@@ -692,8 +772,13 @@ async def _claude_blocks_to_parts(
         if block_type == "text":
             parts.append(GeminiPart(text=_as_str(block.get("text"))))
         elif block_type == "thinking":
-            # 回传的 thinking（含占位 signature）→ thought 文本；signature 不透传上游
-            parts.append(GeminiPart(text=_as_str(block.get("thinking")), thought=True))
+            parts.append(
+                GeminiPart(
+                    text=_as_str(block.get("thinking")),
+                    thought=True,
+                    thoughtSignature=_read_claude_signature(block.get("signature")),
+                )
+            )
         elif block_type == "image":
             source = _as_dict(block.get("source"))
             source_type = source.get("type")
@@ -732,11 +817,12 @@ async def _claude_blocks_to_parts(
             tool_input = block.get("input")
             parts.append(
                 GeminiPart(
+                    thoughtSignature=_read_signature(block),
                     functionCall=GeminiFunctionCall(
                         name=name,
                         args=tool_input if tool_input is not None else {},
                         id=_as_str(block.get("id")) or None,
-                    )
+                    ),
                 )
             )
         elif block_type == "tool_result":
@@ -805,8 +891,10 @@ def _claude_system_parts(system: object) -> list[GeminiPart]:
 def _claude_tools_to_gemini(
     tools: list[dict[str, object]] | None,
 ) -> list[GeminiTool] | None:
-    if not tools:
+    if tools is None:
         return None
+    if not tools:
+        return []
     declarations: list[dict[str, object]] = []
     for tool in tools:
         # 只转换客户端自定义工具（无 type 或 type=custom）；
@@ -828,7 +916,7 @@ def _claude_tools_to_gemini(
             decl["parameters"] = input_schema
         declarations.append(decl)
     if not declarations:
-        return None
+        return []
     return [GeminiTool(functionDeclarations=declarations)]
 
 
@@ -877,6 +965,7 @@ def _claude_thinking_to_level(thinking: dict[str, object] | None) -> str | None:
     return "VERY_HIGH"
 
 
+@media_session()
 async def claude_to_gemini_request(
     req: ClaudeMessagesRequest,
 ) -> tuple[GeminiGenerateContentRequest, str]:
@@ -917,6 +1006,8 @@ async def claude_to_gemini_request(
     thinking_level = _claude_thinking_to_level(req.thinking)
     if thinking_level is not None:
         generation_config["thinkingConfig"] = {"thinkingLevel": thinking_level}
+    elif isinstance(req.thinking, dict) and req.thinking.get("type") == "disabled":
+        generation_config["thinkingConfig"] = {"thinkingLevel": "NONE"}
 
     system_parts = _claude_system_parts(req.system)
     gemini_req = GeminiGenerateContentRequest(
@@ -958,11 +1049,11 @@ def _usage_from_gemini(
         return 0
 
     prompt = pick("promptTokenCount")
-    completion = pick("candidatesTokenCount")
+    reasoning = pick("thoughtsTokenCount")
+    completion = pick("candidatesTokenCount") + reasoning
     total = pick("totalTokenCount")
     if total == 0 and (prompt or completion):
         total = prompt + completion
-    reasoning = pick("thoughtsTokenCount")
     cached = pick("cachedContentTokenCount")
     return {
         "prompt": prompt,
@@ -984,7 +1075,7 @@ def _openai_finish_reason(finish_reason: str | None, *, has_tool_calls: bool) ->
         mapped = "length"
     if mapped == "content_filter":
         return "content_filter"
-    if raw == "MAX_TOKENS":
+    if mapped == "length":
         return "length"
     if has_tool_calls:
         return "tool_calls"
@@ -1036,6 +1127,7 @@ def build_openai_completion(
             args = function_call.args if function_call.args is not None else {}
             tool_calls.append(
                 {
+                    **_signature_extra(getattr(part, "thoughtSignature", None)),
                     "id": call_id,
                     "type": "function",
                     "function": {
@@ -1116,15 +1208,9 @@ def _claude_stop_reason(
     full_text: str,
     stop_sequences: list[str] | None,
 ) -> tuple[str, str | None]:
-    stop_seq: str | None = None
-    if stop_sequences and full_text:
-        for sequence in stop_sequences:
-            # contains 判定而非 endswith：上游若未按 Gemini 语义吃掉 stop
-            # 序列（文本中间出现），endswith 永远不成立，stop_reason 会
-            # 误报 end_turn，客户端无法感知提前停止。
-            if sequence and sequence in full_text:
-                stop_seq = sequence
-                break
+    stops = StopSequenceBuffer(stop_sequences)
+    stops.feed(full_text, final=True)
+    stop_seq = stops.hit
     raw = finish_reason or "STOP"
     if stop_seq is not None:
         return "stop_sequence", stop_seq
@@ -1165,7 +1251,9 @@ def build_claude_message(
                     {
                         "type": "thinking",
                         "thinking": text,
-                        "signature": _CLAUDE_DUMMY_SIGNATURE,
+                        "signature": _claude_signature(
+                            getattr(part, "thoughtSignature", None)
+                        ),
                     }
                 )
             else:
@@ -1191,6 +1279,7 @@ def build_claude_message(
             call_id = function_call.id or f"toolu_{secrets.token_hex(12)}"
             blocks.append(
                 {
+                    **_signature_extra(getattr(part, "thoughtSignature", None)),
                     "type": "tool_use",
                     "id": call_id,
                     "name": function_call.name,
@@ -1198,6 +1287,13 @@ def build_claude_message(
                 }
             )
 
+    stops = StopSequenceBuffer(stop_sequences)
+    remaining = len(stops.feed("".join(full_text_parts), final=True))
+    for block in blocks:
+        if block.get("type") == "text":
+            text = _as_str(block.get("text"))
+            block["text"] = text[:remaining]
+            remaining = max(0, remaining - len(text))
     stop_reason, stop_seq = _claude_stop_reason(
         finish_reason_raw,
         has_tool_use=has_tool_use,
@@ -1206,7 +1302,7 @@ def build_claude_message(
     )
     usage = _usage_from_gemini(response.usageMetadata)
     usage_payload: dict[str, object] = {
-        "input_tokens": usage["prompt"],
+        "input_tokens": max(0, usage["prompt"] - usage["cached"]),
         "output_tokens": usage["completion"],
     }
     if usage["cached"]:
@@ -1231,6 +1327,13 @@ def build_claude_message(
 async def _iter_gemini_sse_frames(
     source: AsyncIterable[object],
 ) -> AsyncGenerator[dict[str, object], None]:
+    async for frame in coalesce_tool_frames(_parse_gemini_sse_frames(source)):
+        yield frame
+
+
+async def _parse_gemini_sse_frames(
+    source: AsyncIterable[object],
+) -> AsyncGenerator[dict[str, object], None]:
     """解析内部 Gemini SSE 字符串流 → JSON 帧对象流。
 
     按 SSE 事件边界（空行）缓冲，支持被 TCP/代理拆分的单个事件，以及同一
@@ -1252,15 +1355,18 @@ async def _iter_gemini_sse_frames(
             return None
         try:
             parsed = json.loads(payload)
-        except json.JSONDecodeError:
-            logger.warning("丢弃无法解析的 Gemini SSE 帧: %.120s", payload)
-            return None
+        except json.JSONDecodeError as exc:
+            raise ValueError("Invalid Gemini SSE JSON frame") from exc
         return parsed if isinstance(parsed, dict) else None
 
     buffer = ""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
     async for raw in source:
+        if isinstance(raw, dict):
+            yield raw
+            continue
         if isinstance(raw, (bytes, bytearray)):
-            buffer += bytes(raw).decode("utf-8", errors="replace")
+            buffer += decoder.decode(bytes(raw), final=False)
         elif isinstance(raw, str):
             buffer += raw
         else:
@@ -1272,14 +1378,11 @@ async def _iter_gemini_sse_frames(
             if parsed is not None:
                 yield parsed
         # 防御：上游若持续发送一个不含空行终止符的超大事件，缓冲区会无限增长。
-        # 单帧超过 16MB 说明协议已损坏，直接清空并告警，避免内存被拖垮。
+        # 超限时显式终止，避免把被丢弃的帧伪装成正常完成。
         if len(buffer) > _MAX_SSE_EVENT_BYTES:
-            logger.warning(
-                "Gemini SSE 缓冲区超过 %d 字节仍无事件边界，已丢弃累积内容",
-                _MAX_SSE_EVENT_BYTES,
-            )
-            buffer = ""
+            raise ValueError("Gemini SSE event exceeds configured size limit")
     # 处理流结束时未以空行收尾的最后一个事件
+    buffer += decoder.decode(b"", final=True)
     if buffer.strip():
         parsed = _parse_event(buffer)
         if parsed is not None:
@@ -1329,6 +1432,7 @@ async def openai_stream_adapter(
     *,
     requested_model: str,
     include_usage: bool,
+    register_failure: Callable[[Callable[[str], list[str]]], None] | None = None,
 ) -> AsyncGenerator[str, None]:
     """Gemini SSE → OpenAI chat.completion.chunk SSE 流（含 data: [DONE]）。"""
     completion_id = f"chatcmpl-{secrets.token_hex(14)}"
@@ -1366,6 +1470,13 @@ async def openai_stream_adapter(
         }
         return payload
 
+    if register_failure is not None:
+        register_failure(
+            lambda message: [
+                _sse(_error_chunk(message, "api_error", 504)),
+                "data: [DONE]\n\n",
+            ]
+        )
     yield _sse(_chunk({"role": "assistant", "content": ""}, None))
 
     finish_reason_raw: str | None = None
@@ -1416,6 +1527,9 @@ async def openai_stream_adapter(
                                 {
                                     "tool_calls": [
                                         {
+                                            **_signature_extra(
+                                                part.get("thoughtSignature")
+                                            ),
                                             "index": tool_index,
                                             "id": call_id,
                                             "type": "function",
@@ -1504,15 +1618,7 @@ async def openai_stream_adapter(
 
 
 class _ClaudeStreamEmitter:
-    """Claude SSE 事件发射器：管理 content block 的开闭与索引状态。
-
-    tool_use 块带跨帧拼接状态：上游 wire 层可能以 JSON 字符串形式分片
-    下发同一函数调用的参数（或分片下发函数名、全量重发同一 call），按
-    call_id / name 前缀合并到当前块，块关闭时统一解析下发，避免把分片
-    拆成多个残缺 tool_use 块（input 丢失或重复）。
-    """
-
-    # tool 块按“call_id 相同”或“名称分片前缀”合并跨帧分片（见 tool_use）
+    """Claude SSE block lifecycle; calls are normalized by coalesce_tool_frames."""
 
     def __init__(self, message_id: str, model: str) -> None:
         self.message_id = message_id
@@ -1527,13 +1633,7 @@ class _ClaudeStreamEmitter:
         # stop sequence 命中状态：命中后丢弃后续正文增量（Claude 语义是
         # 在 stop sequence 处截断文本，透传其后内容会让客户端拿到多余文本）
         self.stop_hit: str | None = None
-        # 当前 tool 块状态（_tool_open=False 表示无挂起块；call_id 可能为
-        # 空串——上游部分分片帧不带 id，不能用 None 区分两种状态）
-        self._tool_open = False
-        self._tool_call_id: str = ""
-        self._tool_name: str = ""
-        self._tool_args_buf: str = ""
-        self._tool_dict: dict[str, object] | None = None
+        self.thinking_signature = ""
 
     def sse(self, event: str, payload: dict[str, object]) -> str:
         return (
@@ -1572,7 +1672,7 @@ class _ClaudeStreamEmitter:
                         "index": self.index,
                         "delta": {
                             "type": "signature_delta",
-                            "signature": _CLAUDE_DUMMY_SIGNATURE,
+                            "signature": _claude_signature(self.thinking_signature),
                         },
                     },
                 )
@@ -1588,15 +1688,14 @@ class _ClaudeStreamEmitter:
         return events
 
     def _ensure_block(self, kind: str) -> list[str]:
-        # 挂起的 tool 块先冲刷：若 text/thinking 增量在 tool 分片之后到达，
-        # 不冲刷会让增量混入 tool 块之前的旧块（同 kind 早退路径）
-        events = self._flush_tool_block()
+        events: list[str] = []
         if self.open_kind == kind:
             return events
         events += self._close_events()
         self.index += 1
         block: dict[str, object]
         if kind == "thinking":
+            self.thinking_signature = ""
             block = {"type": "thinking", "thinking": "", "signature": ""}
         else:
             block = {"type": "text", "text": ""}
@@ -1642,33 +1741,10 @@ class _ClaudeStreamEmitter:
         )
         return events
 
-    def _flush_tool_block(self) -> list[str]:
-        """关闭当前累积中的 tool 块：解析合并后的参数并一次性下发。"""
-        if not self._tool_open:
-            return []
-        call_id, name = self._tool_call_id, self._tool_name
-        if self._tool_dict is not None:
-            args: object = self._tool_dict
-        elif self._tool_args_buf.strip():
-            try:
-                parsed = json.loads(self._tool_args_buf)
-            except json.JSONDecodeError:
-                # 分片合并后仍无法解析：保底把原文包成合法对象载荷
-                args = {"input": self._tool_args_buf}
-                logger.warning(
-                    "Claude 流式 tool_use 参数合并后仍非法: name=%s, len=%d",
-                    name,
-                    len(self._tool_args_buf),
-                )
-            else:
-                args = parsed if isinstance(parsed, dict) else {"input": parsed}
-        else:
-            args = {}
-        self._tool_open = False
-        self._tool_call_id = ""
-        self._tool_name = ""
-        self._tool_args_buf = ""
-        self._tool_dict = None
+    def tool_use(
+        self, call_id: str, name: str, args: object, signature: str = ""
+    ) -> list[str]:
+        """Emit a complete call normalized by the shared stream pipeline."""
         events = self._close_events()
         self.index += 1
         self.has_tool_use = True
@@ -1679,6 +1755,7 @@ class _ClaudeStreamEmitter:
                     "type": "content_block_start",
                     "index": self.index,
                     "content_block": {
+                        **_signature_extra(signature),
                         "type": "tool_use",
                         "id": call_id,
                         "name": name,
@@ -1708,49 +1785,8 @@ class _ClaudeStreamEmitter:
         )
         return events
 
-    def tool_use(self, call_id: str, name: str, args: object) -> list[str]:
-        """处理一帧 functionCall：分片并入当前块，完整调用立即冲刷。
-
-        合并判定：
-        - 同 call_id 的后续帧 → 并入（dict 覆盖、字符串追加、name 取更长值）
-        - call_id 为空且新 name 是旧 name 的前缀延续（名称分片）→ 并入
-        - 其余 → 视为新调用，先冲刷上一个块
-        """
-        if args is None:
-            args = {}
-        same_call = self._tool_open and call_id and call_id == self._tool_call_id
-        name_shard = (
-            self._tool_open
-            and not call_id
-            and self._tool_name
-            and self._tool_name.startswith(name)
-        )
-        if same_call or name_shard:
-            if isinstance(args, dict):
-                # 全量 dict 重发覆盖累积的字符串分片（wire 层两种形态混发）
-                self._tool_dict = args
-                self._tool_args_buf = ""
-            elif isinstance(args, str) and args:
-                self._tool_args_buf += args
-            if name and len(name) > len(self._tool_name):
-                self._tool_name = name
-            return []
-        # 新调用：先冲刷上一个块
-        events = self._flush_tool_block()
-        self._tool_open = True
-        self._tool_call_id = call_id
-        self._tool_name = name
-        if isinstance(args, dict):
-            self._tool_dict = args
-            self._tool_args_buf = ""
-        else:
-            self._tool_dict = None
-            self._tool_args_buf = args if isinstance(args, str) else ""
-        return events
-
     def image(self, media_type: str, data: str) -> list[str]:
-        events = self._flush_tool_block()
-        events += self._close_events()
+        events = self._close_events()
         self.index += 1
         events.append(
             self.sse(
@@ -1779,8 +1815,7 @@ class _ClaudeStreamEmitter:
 
     def error(self, status: int, message: str) -> list[str]:
         self.saw_error = True
-        events = self._flush_tool_block()
-        events += self._close_events()
+        events = self._close_events()
         events.append(
             self.sse(
                 "error",
@@ -1796,8 +1831,7 @@ class _ClaudeStreamEmitter:
         return events
 
     def finish(self, stop_sequences: list[str] | None) -> list[str]:
-        events = self._flush_tool_block()
-        events += self._close_events()
+        events = self._close_events()
         if self.saw_error:
             return events
         # stop sequence 已在流中命中：直接用命中值（full_text 已被截断，
@@ -1814,7 +1848,7 @@ class _ClaudeStreamEmitter:
             )
         usage = _usage_from_gemini(self.usage_frame)
         usage_payload: dict[str, object] = {
-            "input_tokens": usage["prompt"],
+            "input_tokens": max(0, usage["prompt"] - usage["cached"]),
             "output_tokens": usage["completion"],
         }
         if usage["cached"]:
@@ -1838,14 +1872,15 @@ async def claude_stream_adapter(
     *,
     requested_model: str,
     stop_sequences: list[str] | None,
+    register_failure: Callable[[Callable[[str], list[str]]], None] | None = None,
 ) -> AsyncGenerator[str, None]:
     """Gemini SSE → Claude Messages SSE 事件流。"""
     emitter = _ClaudeStreamEmitter(f"msg_{secrets.token_hex(12)}", requested_model)
+    stops = StopSequenceBuffer(stop_sequences)
+    if register_failure is not None:
+        register_failure(lambda message: emitter.error(504, message))
     yield emitter.message_start()
     yield emitter.ping()
-    # 分片 functionCall 各帧可能都不带 id：为整个调用生成一个稳定 id，
-    # 避免每帧随机 id 导致合并状态机永远判定为"新调用"
-    pending_tool_id = ""
     # 确定性关闭内层 SSE 生成器（3.6）：自身异常或客户端断连时立即释放上游连接
     source_aclose: Callable[[], Awaitable[None]] | None = getattr(
         source, "aclose", None
@@ -1871,16 +1906,12 @@ async def claude_stream_adapter(
                 if function_call:
                     call_id = _as_str(function_call.get("id"))
                     if not call_id:
-                        # 同名续帧沿用同一 id（名称分片/无 id 全量重发），
-                        # 不同名的新调用换新 id
-                        if not pending_tool_id:
-                            pending_tool_id = f"toolu_{secrets.token_hex(12)}"
-                        call_id = pending_tool_id
-                    else:
-                        pending_tool_id = call_id
+                        call_id = f"toolu_{secrets.token_hex(12)}"
                     name = _as_str(function_call.get("name")) or "unknown"
                     args = function_call.get("args")
-                    for event in emitter.tool_use(call_id, name, args):
+                    for event in emitter.tool_use(
+                        call_id, name, args, _as_str(part.get("thoughtSignature"))
+                    ):
                         yield event
                     continue
                 inline = _as_dict(part.get("inlineData"))
@@ -1896,22 +1927,23 @@ async def claude_stream_adapter(
                     if part.get("thought") is True:
                         for event in emitter.thinking_delta(text):
                             yield event
+                        signature = part.get("thoughtSignature")
+                        if isinstance(signature, str):
+                            emitter.thinking_signature = signature
                     else:
                         # stop sequence 命中后丢弃后续正文（Claude 语义是
                         # 文本在 stop sequence 处截断，不透传其后内容）；
                         # 命中点在本帧中间时，命中点之前的文本仍需下发
-                        if emitter.stop_hit is not None:
-                            continue
-                        if stop_sequences:
-                            for sequence in stop_sequences:
-                                if sequence and sequence in text:
-                                    emitter.stop_hit = sequence
-                                    text = text.split(sequence, 1)[0]
-                                    break
+                        text = stops.feed(text)
+                        emitter.stop_hit = stops.hit
                         if not text:
                             continue
                         for event in emitter.text_delta(text):
                             yield event
+                elif emitter.open_kind == "thinking" and isinstance(
+                    part.get("thoughtSignature"), str
+                ):
+                    emitter.thinking_signature = str(part["thoughtSignature"])
     except Exception as exc:
         logger.warning("Claude 流式转换异常: %s", exc)
         record_result(
@@ -1921,6 +1953,10 @@ async def claude_stream_adapter(
             yield event
         return
     else:
+        tail = stops.feed("", final=True)
+        if tail:
+            for event in emitter.text_delta(tail):
+                yield event
         for event in emitter.finish(stop_sequences):
             yield event
     finally:
