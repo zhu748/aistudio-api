@@ -183,7 +183,9 @@ async def request_payload(request_id: str) -> dict[str, object]:
                     "available": False,
                     "note": "此请求未采集正文，或转储已过保留期。可在日志与调试中为后续请求开启文件转储。",
                 }
-            if target.stat().st_size > settings.dump_max_bytes * 4 + 65536:
+            # JSON escaping can expand body bytes sixfold, and legacy views
+            # coexist with the verbatim client capture in the same file.
+            if target.stat().st_size > settings.dump_max_bytes * 32 + 65536:
                 return {
                     "available": False,
                     "note": "转储超过当前读取上限，请在服务器端查看。",
@@ -191,10 +193,30 @@ async def request_payload(request_id: str) -> dict[str, object]:
             payload = json.loads(target.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {"available": False, "note": "转储文件暂时不可读取。"}
+        client_request = (
+            payload.pop("client_request", None) if isinstance(payload, dict) else None
+        )
+        safe_payload = _mask_json_value(payload)
+        if (
+            isinstance(safe_payload, dict)
+            and isinstance(client_request, dict)
+            and client_request.get("source") == "client"
+        ):
+            # Body is explicitly captured verbatim. Recursive redaction here
+            # would corrupt tool schemas and user messages a second time.
+            body = client_request.pop("body", None)
+            safe_client = _mask_json_value(client_request)
+            if isinstance(safe_client, dict):
+                safe_client["body"] = body
+                safe_payload["client_request"] = safe_client
         return {
             "available": True,
-            "payload": _mask_json_value(payload),
-            "note": "正文已脱敏；流式响应仅保留元数据与执行过程。",
+            "payload": safe_payload,
+            "note": (
+                "客户端请求正文按接收原文保存，未经协议转换或正文脱敏；请求头及查询串中的凭据已打码。流式响应不保存正文。"
+                if client_request is not None
+                else "旧版正文已脱敏并重新序列化，不是逐字原文；后续请求开启文件转储后可保留原文。"
+            ),
         }
 
     return await asyncio.to_thread(read)

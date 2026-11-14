@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import time
@@ -25,6 +26,8 @@ from aistudio_api.infrastructure.request_context import (
 from aistudio_api.infrastructure.request_history import request_history
 from aistudio_api.infrastructure.utils.logger import (
     _mask_json_value,
+    _mask_sensitive_value,
+    _mask_url,
     dump_request_exchange,
     get_logger,
     is_dump_requests_enabled,
@@ -45,6 +48,7 @@ class RequestMiddleware:
             await self.app(scope, receive, send)
             return
         path = scope["path"]
+        original_scope = {**scope, "headers": list(scope["headers"])}
         scope.setdefault("state", {})
         if len(path) > 1 and path.endswith("/"):
             # 规范化优先于 Starlette 的 307 尾斜杠重定向：重定向分支不执行
@@ -86,6 +90,7 @@ class RequestMiddleware:
         request_body = bytearray()
         response_body = bytearray()
         request_body_truncated = False
+        request_body_complete = False
         response_body_truncated = False
         response_headers: dict[str, str] = {}
         headers = {k.decode("latin1"): v.decode("latin1") for k, v in scope["headers"]}
@@ -131,13 +136,14 @@ class RequestMiddleware:
             )
 
         async def observed_receive() -> Message:
-            nonlocal received_bytes, request_body_truncated
+            nonlocal received_bytes, request_body_truncated, request_body_complete
             message = await receive()
             if message["type"] == "http.disconnect" and not completed:
                 context.result = "cancelled"
             elif message["type"] == "http.request":
                 body = message.get("body", b"")
                 received_bytes += len(body)
+                request_body_complete = not message.get("more_body", False)
                 if (
                     model_call
                     and not context.requested_model
@@ -159,14 +165,14 @@ class RequestMiddleware:
                 # 管理路径同样施加请求体上限（1MB）：写端点无界接收可把
                 # 磁盘与 yaml 解析 CPU 打爆（实测 50MB config 被完整落盘）
                 body_limit = settings.max_request_bytes if model_call else 1_048_576
-                if received_bytes > body_limit:
-                    raise HTTPException(413, "Request body exceeds configured limit")
                 if dump_enabled and not request_body_truncated:
                     if len(request_body) + len(body) <= settings.dump_max_bytes:
                         request_body.extend(body)
                     else:
                         request_body.clear()
                         request_body_truncated = True
+                if received_bytes > body_limit:
+                    raise HTTPException(413, "Request body exceeds configured limit")
             return message
 
         async def observed_send(message: Message) -> None:
@@ -367,6 +373,9 @@ class RequestMiddleware:
                             elapsed_ms,
                             path,
                             history_start,
+                            original_scope,
+                            received_bytes,
+                            request_body_complete,
                         )
                     )
                     try:
@@ -395,7 +404,10 @@ class RequestMiddleware:
         status: int,
         elapsed_ms: float,
         path: str,
-        history_start: asyncio.Task[None] | None = None,
+        history_start: asyncio.Task[None] | None,
+        original_scope: Scope,
+        received_bytes: int,
+        request_body_complete: bool,
     ) -> None:
         # A cancelled to_thread await does not stop its worker. Order the final
         # record after the initial insert so a slow worker cannot resurrect 'running'.
@@ -411,6 +423,45 @@ class RequestMiddleware:
                 logger.exception("Failed to persist request history")
         if dump_enabled:
             try:
+                client_request: dict[str, object] | None = None
+                if is_dump_to_file_enabled():
+                    # Keep the ASGI body verbatim, before validation, defaults,
+                    # model mapping or protocol conversion. Only transport
+                    # credentials are masked; tool schemas/prompts are data.
+                    encoding = "utf-8"
+                    try:
+                        body_text = request_body.decode("utf-8")
+                    except UnicodeDecodeError:
+                        body_text = base64.b64encode(request_body).decode("ascii")
+                        encoding = "base64"
+                    raw_path = original_scope.get("raw_path")
+                    target = (
+                        raw_path.decode("latin1")
+                        if raw_path is not None
+                        else original_scope["path"]
+                    )
+                    query = original_scope.get("query_string", b"").decode("latin1")
+                    client_request = {
+                        "source": "client",
+                        "method": original_scope["method"],
+                        "target": _mask_url(target + (f"?{query}" if query else "")),
+                        "http_version": original_scope.get("http_version", ""),
+                        "headers": [
+                            [
+                                key.decode("latin1"),
+                                _mask_sensitive_value(
+                                    key.decode("latin1"), value.decode("latin1")
+                                ),
+                            ]
+                            for key, value in original_scope["headers"]
+                        ],
+                        "body": None if request_body_truncated else body_text,
+                        "body_encoding": encoding,
+                        "body_bytes": received_bytes,
+                        "complete": request_body_complete
+                        and not request_body_truncated,
+                        "truncated": request_body_truncated,
+                    }
                 await asyncio.to_thread(
                     dump_request_exchange,
                     req_id=context.request_id,
@@ -435,6 +486,7 @@ class RequestMiddleware:
                     finish_reason=context.finish_reason,
                     error_detail=context.error,
                     console=is_dump_requests_enabled(),
+                    client_request=client_request,
                 )
             except Exception:
                 logger.exception("Failed to persist request dump")

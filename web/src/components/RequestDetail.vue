@@ -29,6 +29,7 @@ const logsTotal = ref(0)
 const logsPage = ref(1)
 const logsLoading = ref(false)
 const payload = ref<Awaited<ReturnType<typeof operationsApi.payload>> | null>(null)
+const clientRequest = computed(() => payload.value?.payload?.client_request)
 const upstream = ref<Awaited<ReturnType<typeof operationsApi.upstream>> | null>(null)
 const upstreamError = ref('')
 const upstreamDownloading = ref(false)
@@ -242,7 +243,7 @@ async function downloadUpstream() {
             <ExternalLink class="w-3.5 h-3.5" />详情链接
           </Button><Button
             size="xs"
-            @click="downloadJson(record, `${requestId}.json`)"
+            @click="downloadJson({ ...record, client_request: clientRequest }, `${requestId}.json`)"
           >
             <Download class="w-3.5 h-3.5" />导出
           </Button><Button
@@ -465,7 +466,81 @@ async function downloadUpstream() {
         v-else-if="tab === 'payload'"
         class="space-y-4 text-sm"
       >
-        <section class="rounded-xl border border-amber-200 bg-amber-50/50 p-4 space-y-3">
+        <section class="rounded-xl border border-brand-200 bg-brand-50/40 p-4 space-y-3">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h3 class="font-semibold">
+              客户端原始请求（酒馆 → 本程序）
+            </h3>
+            <div
+              v-if="clientRequest"
+              class="flex gap-2"
+            >
+              <Button
+                v-if="clientRequest.body != null"
+                size="xs"
+                @click="copy(clientRequest.body, 'client-body')"
+              >
+                <Copy class="w-3.5 h-3.5" />复制正文
+              </Button>
+              <Button
+                size="xs"
+                @click="downloadJson(clientRequest, `${requestId}.client.json`)"
+              >
+                <Download class="w-3.5 h-3.5" />下载客户端请求
+              </Button>
+            </div>
+          </div>
+          <p
+            v-if="payloadError"
+            class="text-rose-600"
+          >
+            {{ payloadError }}
+          </p>
+          <p class="text-slate-500 text-xs">
+            {{ payload?.note || '正在查询客户端原始请求…' }}
+          </p>
+          <template v-if="clientRequest">
+            <p class="font-mono text-xs break-all">
+              {{ clientRequest.method }} {{ clientRequest.target }} · {{ clientRequest.body_bytes.toLocaleString() }} 字节
+            </p>
+            <details>
+              <summary class="cursor-pointer text-slate-500 text-xs">
+                客户端请求头（鉴权凭据已打码）
+              </summary>
+              <pre class="mt-2 rounded-lg bg-slate-950 text-slate-200 p-3 text-xs overflow-auto max-h-48 whitespace-pre-wrap break-all">{{ JSON.stringify(clientRequest.headers, null, 2) }}</pre>
+            </details>
+            <p
+              v-if="!clientRequest.complete"
+              class="text-amber-700 text-xs"
+            >
+              {{ clientRequest.truncated ? '正文超过采集上限，已省略；请提高 AISTUDIO_DUMP_MAX_BYTES 后重新采集。' : '请求正文未接收完整，以下仅为已收到的内容。' }}
+            </p>
+            <p
+              v-if="clientRequest.body_encoding === 'base64'"
+              class="text-amber-700 text-xs"
+            >
+              正文不是有效 UTF-8，已用 Base64 无损保存。
+            </p>
+            <pre class="rounded-lg bg-slate-950 text-slate-200 p-4 text-xs overflow-auto max-h-96 whitespace-pre-wrap break-all">{{ clientRequest.body ?? '（正文已省略）' }}</pre>
+          </template>
+          <template v-else-if="payload?.available">
+            <p class="text-amber-700 text-xs">
+              此记录只有旧版脱敏正文，没有保留原始格式。
+            </p>
+            <pre class="rounded-lg bg-slate-950 text-slate-200 p-4 text-xs overflow-auto max-h-80 whitespace-pre-wrap break-all">{{ JSON.stringify(payload.payload?.body, null, 2) }}</pre>
+          </template>
+          <router-link
+            v-else
+            to="/settings"
+            class="text-brand-700 hover:underline"
+          >
+            开启「保存客户端原始请求」以采集后续请求
+          </router-link>
+        </section>
+        <details class="rounded-xl border border-amber-200 bg-amber-50/50 p-4 space-y-3">
+          <summary class="cursor-pointer font-semibold text-amber-900">
+            转换后的上游请求快照（本程序 → Google）
+          </summary>
           <div class="flex flex-wrap items-center justify-between gap-2">
             <h3 class="font-semibold text-amber-900">
               上游请求快照
@@ -537,21 +612,11 @@ async function downloadUpstream() {
               >{{ upstream.response?.body || '（空）' }}</pre>
             </div>
           </template>
-        </section>
-        <p
-          v-if="payloadError"
-          class="text-rose-600"
-        >
-          {{ payloadError }}
-        </p>
-        <p class="text-slate-500">
-          {{ payload?.note || '正在查询正文采集状态…' }}
-        </p>
+        </details>
         <template v-if="payload?.available">
           <div
             v-for="(body, label) in {
-              请求正文: payload.payload?.body,
-              响应正文: payload.payload?.response_body,
+              '返回客户端的响应正文（已脱敏）': payload.payload?.response_body,
             }"
             :key="label"
           >
@@ -563,19 +628,12 @@ async function downloadUpstream() {
             >{{ body == null ? '未采集或已省略' : JSON.stringify(body, null, 2) }}</pre>
           </div>
           <p
-            v-if="payload.payload?.request_body_truncated || payload.payload?.response_body_truncated"
+            v-if="payload.payload?.response_body_truncated"
             class="text-amber-700"
           >
-            部分正文超过采集上限，已省略。
+            响应正文超过采集上限，已省略。
           </p>
         </template>
-        <router-link
-          v-else
-          to="/settings"
-          class="text-brand-700 hover:underline"
-        >
-          查看日志与转储设置
-        </router-link>
         <details>
           <summary class="cursor-pointer text-slate-500">
             原始用量元数据

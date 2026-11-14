@@ -10,11 +10,17 @@
 - 客户端指定的思考强度或预算，以及实际发送的思考配置、Temperature、Top P、Top K、输出 Token 上限。
 - 首包、首次思考输出、首段回复和总耗时；输入、输出、思考、缓存和总 Token。
 - 执行时间线、逐次上游尝试及按 Request ID 关联的日志。
-- 按需采集的脱敏请求与响应正文，以及独立详情链接和 JSON 导出。
+- 按需采集的客户端原始请求、脱敏响应，以及独立详情链接和 JSON 导出。
 
 首包指首次向客户端发送响应数据；首段回复指应用首次收到正文、图片或工具调用。思考输出单独计时。非流式和缓冲流式请求需等待完整内容，不能据此推断模型内部开始生成的时刻。上游未返回的用量显示为「—」，旧请求不会补造缺失参数。
 
-请求参数采用白名单采集，无需开启正文转储。完整正文仍由日志设置中的文件转储开关控制，沿用脱敏、大小和保留期限限制；流式响应正文不持久化。
+请求参数采用白名单采集，无需开启正文转储。在「设置 → 日志输出与报文转储」开启「保存客户端原始请求」（`logging.dump_to_file: true` 或 `AISTUDIO_DUMP_TO_FILE=true`）后，后续模型请求的 `client_request` 保存程序在 ASGI 入口收到的原始正文，位于 Pydantic 校验、默认值注入、模型映射和 OpenAI/Claude → Gemini 转换之前。酒馆发来的 system、messages、tools、扩展字段、字段顺序、重复键、空白和转义均保留；正文不做脱敏，包括提示词和工具参数中的 `password` 等键。请求头与 URL 查询串中的鉴权凭据仍打码。
+
+详情页「请求与响应」优先展示客户端原文，可复制正文或下载 `*.client.json`，其中 `body` 是原文字符串，`body_encoding` 为 `utf-8`；非 UTF-8 正文使用 `base64` 无损保存。`headers` 为有序键值对列表，重复头不合并；`target` 保留原始路径（含尾斜杠）与查询串（凭据打码）。这是应用收到的 HTTP 内容，不包含 TLS、HTTP 分块边界等网络封装。
+
+采集沿用 `AISTUDIO_DUMP_MAX_BYTES`（默认每份正文 1 MiB）、文件数量、总大小与保留期限限制；长对话或含图片的请求可提高正文上限。超限正文整份省略并标记 `truncated=true`；提前拒绝或中断导致未读完时 `complete=false`，不会将片段标成完整请求。流式与非流式调用均可保存客户端请求，流式响应正文不持久化。管理接口正文不采集。仅开启控制台转储不会保存原文。
+
+旧记录的 `body` / `raw_body` 是脱敏并重新序列化的兼容视图，无法恢复逐字原文。转换后的上游 wire 请求在独立的「上游请求快照」中展示，不能代替客户端请求。
 
 ## 日志分类
 
@@ -40,7 +46,7 @@
 | `GET /api/requests/active` | 当前进程执行中的调用 |
 | `GET /api/requests/options` | 模型、账号、密钥标识筛选选项 |
 | `GET /api/requests/{request_id}` | 单次调用元数据 |
-| `GET /api/requests/{request_id}/payload` | 脱敏正文与采集状态 |
+| `GET /api/requests/{request_id}/payload` | 客户端原始请求 `payload.client_request`、脱敏响应与采集状态 |
 | `GET /api/logs/stream?category=model` | 模型请求实时日志 |
 | `GET /api/logs/history?category=model&request_id=...&order=asc` | 调用关联归档日志 |
 
