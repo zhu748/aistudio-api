@@ -19,6 +19,7 @@ from aistudio_api.api.dependencies import require_api_key
 from aistudio_api.api.request_middleware import RequestMiddleware
 from aistudio_api.api.state import RuntimeState
 from aistudio_api.config import settings
+from aistudio_api.infrastructure import request_history as history_module
 from aistudio_api.infrastructure.request_context import (
     current_request,
     record_result,
@@ -295,13 +296,32 @@ async def test_body_limit_rejects_before_handler(monkeypatch):
 
 @pytest.mark.parametrize("started", [False, True])
 async def test_timeout_closes_response_and_records_final_state(monkeypatch, started):
-    monkeypatch.setattr(settings, "request_timeout", 0.02)
+    monkeypatch.setattr(settings, "request_timeout", 0.25)
 
-    # 超时窗口内的 history 落库走 asyncio.to_thread（线程池跳变 + SQLite 写），
-    # 慢速 CI runner 上可吃掉整个 20ms 预算，使 response.start 尚未发出
-    # 超时先到 —— [True] 分支因此偶发 504 取代 200（真实 CI 一次复现）。
-    # 将 to_thread 内联后 response.start 前不存在可计时的 yield 点，
-    # 两个分支均与机器负载无关地确定性触发。
+    # 真实 CI 两次复现 [True] 偶发 504!=200，两次根因排查结论：
+    # 1) to_thread 线程池跳变、2) SQLite insert/commit 的阻塞 fsync 都能把
+    #    事件循环卡过超时死线 —— 超时回调在 shield 挂起点取消任务，
+    #    response.start 尚未发出，[True] 分支即退化为 504。
+    # 本用例只验证超时语义（持久化另有专门用例覆盖），history 换内存桩
+    # + to_thread 内联，response.start 前只剩微秒级同步路径；预算放宽到
+    # 0.25s 后即便叠加 VM 级停顿也不足翻车，两分支确定性触发。
+    class _MemHistory:
+        def __init__(self) -> None:
+            self.rows: dict[str, dict[str, object]] = {}
+
+        def insert(self, record: dict[str, object]) -> None:
+            self.rows[str(record.get("request_id"))] = record
+
+        def get(self, request_id: str) -> dict[str, object] | None:
+            return self.rows.get(request_id)
+
+    _stub = _MemHistory()
+
+    def _stub_history_at(_path: object) -> _MemHistory:
+        return _stub
+
+    monkeypatch.setattr(history_module, "_history_at", _stub_history_at)
+
     async def _inline_to_thread(func, /, *args, **kwargs):
         return func(*args, **kwargs)
 
