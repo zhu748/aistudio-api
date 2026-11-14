@@ -29,18 +29,26 @@ class MediaSession:
             raise ValueError("Total media exceeds configured request size limit")
 
     async def get_client(self) -> httpx.AsyncClient:
-        async with self.lock:
-            if self.client is None:
-                self.client = httpx.AsyncClient(
-                    timeout=15.0,
-                    follow_redirects=True,
-                    max_redirects=5,
-                    transport=PublicMediaTransport(
-                        proxy=await resolve_proxy_url_async(settings.proxy_url)
-                    ),
-                    trust_env=False,
-                )
-            return self.client
+        if self.client is None:
+            # 解析在锁外完成：turn/sstp 桥接冷启动是秒级耗时且含真实
+            # await 让出点，夹在锁内会让并发媒体下载首图前全部排队
+            # （同 transport._get_client / signer._get_client 的教训）。
+            proxy = await resolve_proxy_url_async(settings.proxy_url)
+            async with self.lock:
+                if self.client is None:
+                    # SSL 上下文 / h2 / 代理均由 PublicMediaTransport 内部
+                    # 消费（每 origin 的 AsyncHTTPTransport 已用
+                    # _shared_ssl_context）；客户端层再传 verify/http2 会被
+                    # 自定义 transport 短路，属无效参数，不传。
+                    self.client = httpx.AsyncClient(
+                        timeout=15.0,
+                        follow_redirects=True,
+                        max_redirects=5,
+                        transport=PublicMediaTransport(proxy=proxy),
+                        trust_env=False,
+                    )
+                return self.client
+        return self.client
 
 
 current_media: ContextVar[MediaSession | None] = ContextVar(

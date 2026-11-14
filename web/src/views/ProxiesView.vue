@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
-import { Network, RefreshCw, Save } from 'lucide-vue-next'
-import { operationsApi, type ProxyStatus, type ProxyCheck } from '@/api/operations.ts'
+import { computed, onMounted, ref } from 'vue'
+import { Network, RefreshCw, Save, Users } from 'lucide-vue-next'
+import { operationsApi, type ProxyStatus, type ProxyCheck, type ProxyAccount } from '@/api/operations.ts'
 import { useToastStore } from '@/stores/toast.ts'
 import Button from '@/components/ui/Button.vue'
 import ProxyInputField from '@/components/ui/ProxyInputField.vue'
@@ -16,6 +16,54 @@ const testing = ref('')
 const checks = ref<ProxyCheck[]>([])
 const checkedProxy = ref('')
 const error = ref('')
+
+/** 出口分组：同一有效出口（含「直连」）聚合为一行，避免多账号共用
+ * 一条代理时表格里出现大量重复行；enabledCount 供徽标展示，
+ * probeAccountId 取组内首个启用账号用于实际路由诊断。 */
+interface ExitGroup {
+  key: string
+  proxy: string
+  sources: Set<string>
+  accounts: ProxyAccount[]
+  enabledCount: number
+  probeAccountId: string
+}
+
+const exitGroups = computed<ExitGroup[]>(() => {
+  const groups = new Map<string, ExitGroup>()
+  for (const account of status.value.accounts) {
+    const key = account.proxy || '__direct__'
+    let group = groups.get(key)
+    if (!group) {
+      group = {
+        key,
+        proxy: account.proxy,
+        sources: new Set<string>(),
+        accounts: [],
+        enabledCount: 0,
+        probeAccountId: '',
+      }
+      groups.set(key, group)
+    }
+    group.sources.add(account.source)
+    group.accounts.push(account)
+    if (account.enabled) {
+      group.enabledCount += 1
+      if (!group.probeAccountId) group.probeAccountId = account.account_id
+    }
+  }
+  return [...groups.values()]
+})
+
+const totalAccounts = computed(() => status.value.accounts.length)
+
+function sourceLabel(source: string) {
+  return source === 'account' ? '账号独立' : source === 'global' ? '继承全局' : '直连'
+}
+
+function groupSourceLabel(group: ExitGroup) {
+  return [...group.sources].map(sourceLabel).join(' + ')
+}
 
 async function load() {
   loading.value = true
@@ -58,6 +106,28 @@ async function test(accountId = '', draft = false) {
     toast.error(err instanceof Error ? err.message : '诊断失败')
   } finally {
     testing.value = ''
+  }
+}
+
+/** 按出口组诊断：优先用组内启用账号测真实路由；组内全是停用账号时
+ * 回退为按代理地址测试（这些账号不会被调度，仅验证代理本身）。 */
+async function testGroup(group: ExitGroup) {
+  if (group.probeAccountId) {
+    await test(group.probeAccountId)
+  } else {
+    testing.value = group.key
+    checks.value = []
+    try {
+      const result = await operationsApi.testProxy(
+        group.proxy ? { proxy_url: group.proxy } : {},
+      )
+      checks.value = result.checks
+      checkedProxy.value = group.proxy || '直连'
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '诊断失败')
+    } finally {
+      testing.value = ''
+    }
   }
 }
 onMounted(load)
@@ -186,7 +256,7 @@ usePageRefresh(load)
     </div>
     <div class="bg-white border border-slate-200 rounded-xl overflow-hidden">
       <div class="p-4 border-b border-slate-100 flex justify-between text-sm font-semibold">
-        <span>账号出口路由</span><router-link
+        <span>账号出口路由 <span class="text-xs font-normal text-slate-400">按出口聚合</span></span><router-link
           to="/accounts"
           class="text-brand-600 text-xs"
         >
@@ -198,13 +268,13 @@ usePageRefresh(load)
           <thead class="bg-slate-50 text-slate-500">
             <tr>
               <th class="p-3">
-                账号
+                有效出口
               </th>
               <th class="p-3">
                 来源
               </th>
               <th class="p-3">
-                有效出口
+                共用账号
               </th>
               <th class="p-3">
                 诊断
@@ -213,33 +283,31 @@ usePageRefresh(load)
           </thead>
           <tbody class="divide-y divide-slate-100">
             <tr
-              v-for="account in status.accounts"
-              :key="account.account_id"
+              v-for="group in exitGroups"
+              :key="group.key"
             >
-              <td class="p-3">
-                {{ account.name }}
-                <div class="text-slate-400 mt-1 font-mono">
-                  {{ account.account_id }} · {{ account.enabled ? '启用' : '停用' }}
-                </div>
+              <td class="p-3 font-mono break-all max-w-md">
+                {{ group.proxy || '直连' }}
               </td>
               <td class="p-3">
-                {{
-                  account.source === 'account'
-                    ? '账号独立'
-                    : account.source === 'global'
-                      ? '继承全局'
-                      : '直连'
-                }}
+                {{ groupSourceLabel(group) }}
               </td>
-              <td class="p-3 font-mono break-all">
-                {{ account.proxy || '直连' }}
+              <td class="p-3">
+                <span
+                  class="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-medium tabular-nums"
+                  :class="group.accounts.length > 1 ? 'bg-brand-50 text-brand-700' : 'bg-slate-100 text-slate-600'"
+                  :title="group.accounts.map(a => `${a.name}（${a.enabled ? '启用' : '停用'}）`).join('、')"
+                >
+                  <Users class="w-3 h-3 opacity-70" />
+                  {{ group.enabledCount }}/{{ group.accounts.length }}
+                </span>
               </td>
               <td class="p-3">
                 <Button
                   size="xs"
-                  :loading="testing === account.account_id"
-                  :disabled="!!testing"
-                  @click="test(account.account_id)"
+                  :loading="testing === group.key"
+                  :disabled="!!testing && testing !== group.key"
+                  @click="testGroup(group)"
                 >
                   测试出口
                 </Button>
@@ -253,9 +321,23 @@ usePageRefresh(load)
                 导入账号后，可在这里查看每个账号的有效出口。
               </td>
             </tr>
+            <tr v-else-if="!exitGroups.length">
+              <td
+                colspan="4"
+                class="text-center text-slate-400 p-10"
+              >
+                暂无账号出口记录。
+              </td>
+            </tr>
           </tbody>
         </table>
       </div>
+      <p
+        v-if="totalAccounts"
+        class="px-4 py-2.5 border-t border-slate-100 text-[11px] text-slate-400"
+      >
+        共 {{ totalAccounts }} 个账号聚合为 {{ exitGroups.length }} 个出口；「x/y」表示该出口下启用/总账号数。同一出口测试一次即覆盖全部共用账号。
+      </p>
     </div>
   </div>
 </template>

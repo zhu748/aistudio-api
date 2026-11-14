@@ -19,6 +19,30 @@ def test_redact_text_google_cookie_free_text() -> None:
     assert "consider" in redact_text("consider this")
 
 
+def test_redact_text_bridge_proxy_userinfo() -> None:
+    """turn/turns/sstp 桥接 URI 的 userinfo 必须与 http/socks5 一样被遮蔽。
+
+    历史缺陷：_URL_USERINFO 只匹配 https?/socks5h?，导致 TURN/SSTP 凭据
+    原样出现在 /api/proxies 响应与日志里（本项目的核心场景之一）。
+    """
+    from aistudio_api.infrastructure.utils.redaction import redact_text
+
+    cases = [
+        "turn://user:pass@host:3478",
+        "turn:user:pass@host:3478",  # RFC 7065 无斜线形态
+        "turns://user:pass@host:5349?transport=tcp",
+        "sstp://user:pass@vpn.example.com:443",
+    ]
+    for raw in cases:
+        out = redact_text(raw)
+        assert "user:pass" not in out, raw
+        assert "***@" in out, raw
+
+    # 无凭据 / 非代理 URL 不受影响
+    assert redact_text("turns://1.2.3.4:5349") == "turns://1.2.3.4:5349"
+    assert redact_text("https://example.com/path") == "https://example.com/path"
+
+
 def test_mask_yaml_api_keys_structural() -> None:
     from aistudio_api.api.routes_system import _mask_yaml_api_keys
 
