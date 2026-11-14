@@ -116,18 +116,55 @@ thought_signature`、tool 消息、tools 声明）走项目完整转换管线
 **实弹验证**：项目完整栈（含 slot45=1 + 32768 默认）对
 `models/gemini-4-hydrogen` GenerateContent 实发 **200**。
 
-## 四、客户端函数工具的签名语义（与 46f5139 的关系）
+## 四、签名强制校验语义（本地兼容服务 e2e 判别，2026-11-14）
 
-- 上游对**客户端声明函数**（functionDeclarations）的 functionCall
-  回传**宽容**：签名可原样回传（本项目 extra_content 机制）、缺失
-  亦可（不触发 400）。真机捕获证明带签名回传是被接受的形态。
-- 上游对**服务端工具**（`default_api:*` 与内置 grounding 类）的
-  functionCall 回传**强制**校验签名（原始 400 根因）。commit
-  `46f5139` 的防御性剥离因此仅作用于服务端工具，与浏览器自然
-  形态完全兼容：grounding 工具（google_search 等）本来就不产生
-  历史中的 functionCall part。
-- 本轮全部捕获（含记忆开启账号、多轮、多模型）**未出现任何
-  `default_api:` 命名空间调用**；该形态仅在上游主动注入时出现。
+用本地服务（8090，OpenAI 协议）对上游做了四组判别实验，**推翻了
+此前"客户端函数签名宽容"的结论**：
+
+| 实验 | 结果 |
+| --- | --- |
+| 客户端函数 FC 回传带原签名（extra_content 往返） | 200 |
+| 客户端函数 FC 回传**无签名**（hydrogen 与 3.8-flash 均测） | **400** "missing thought_signature ... default_api:get_weather" |
+| 伪签名（随机合法 base64） | **400 "Corrupted thought signature."**（密码学信封校验） |
+| **跨调用交换真实签名**（Tokyo 调用带 Paris 调用的签名） | **200** |
+
+结论：
+
+1. **上游对一切 functionCall 回传强制签名**（客户端函数与服务端工具
+   同规则；错误信息显示上游内部把客户端函数也纳入 `default_api:`
+   命名空间）；
+2. 签名**不可伪造**（Corrupted 校验），但**不绑定具体调用内容**
+   （任何模型真实铸造的签名均可通过）；
+3. 本轮全部浏览器捕获（含记忆开启账号）未出现 `default_api:` 命名空间
+   调用——该形态仅在上游主动注入时出现；grounding 类内置工具本来就不
+   产生历史中的 functionCall part。
+
+### 修复：签名缓存回注
+
+基于结论 2，实现「响应侧缓存、请求侧回注」：
+
+- **响应侧**：`_iter_response_parts`（非流式）与 `_iter_gemini_sse_frames`
+  （流式，覆盖 OpenAI / Claude / Responses 三协议的全部流式适配器）
+  统一挂钩——凡见到 functionCall part 携带有效 thoughtSignature 即按
+  `call_id`（首选）与函数名（兜底）缓存（`domain/tool_signatures.py`
+  的 `ThoughtSignatureCache`，LRU + JSON 持久化 `data/tool_signature_cache.json`，
+  重启不丢）；
+- **请求侧**：三条输入路径（OpenAI tool_calls / Claude tool_use /
+  Gemini 原生 functionCall parts）统一：客户端回传签名缺失或非法时先
+  查缓存回注；仍未命中才剥离该调用及配对 functionResponse（模型会
+  重新发起调用，功能降级但不再 400）；
+- 客户端自身保存了签名（extra_content 机制）时优先用客户端的，缓存
+  仅作丢失兜底。
+
+**e2e 实测矩阵**（gemini-4-hydrogen，全 200）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 非流式：带签名回传 | 200 |
+| 非流式：丢签名（缓存回注） | 200 |
+| 流式：丢签名（缓存回注） | 200 |
+| 服务重启后：丢签名（持久化缓存回注） | 200 |
+| 缓存未命中：剥离（不 400） | 200（调用被剥离） |
 
 ## 五、证据文件
 

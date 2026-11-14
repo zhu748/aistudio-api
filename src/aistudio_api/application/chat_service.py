@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 from aistudio_api.domain.tool_signatures import (
     is_server_side_tool_call as _is_server_side_tool_call,
-    valid_thought_signature as _valid_thought_signature,
+    lookup_function_signature as _lookup_function_signature,
     valid_thought_signature_or_none as _valid_thought_signature_or_none,
 )
 from aistudio_api.infrastructure.gateway.model_defaults import (
@@ -849,19 +849,23 @@ def normalize_gemini_request(
                 continue
             if part.functionCall is not None:
                 fc = part.functionCall
-                # 服务端工具（default_api:* / 内置工具）无有效签名时剥离：
-                # 部分客户端/转译层不保存 thoughtSignature，回传历史缺签名
-                # 会触发上游 400（"Function call is missing a thought_signature
-                # in functionCall parts"）。
-                if _is_server_side_tool_call(fc.name) and not _valid_thought_signature(
-                    part.thoughtSignature
-                ):
+                signature = _valid_thought_signature_or_none(part.thoughtSignature)
+                if signature is None:
+                    # 客户端丢失签名 → 缓存回注（2026-11-14 实测：
+                    # 客户端函数同样强制签名，缺失即 400）
+                    signature = _lookup_function_signature(fc.id, fc.name)
+                if signature is None:
+                    # 回注未命中：任何 functionCall 回传都会被上游拒 400
+                    # （"Function call is missing a thought_signature ..."），
+                    # 剥离调用及配对响应。
                     if fc.id:
                         dropped_server_tool_ids.add(fc.id)
                     logger.info(
-                        "剥离无签名的服务端工具调用: name=%s, call_id=%s",
+                        "剥离无签名的工具调用（缓存未命中）: name=%s, call_id=%s,"
+                        " server_side=%s",
                         fc.name,
                         fc.id or "(无id)",
+                        _is_server_side_tool_call(fc.name),
                     )
                     continue
                 args_payload = fc.args if fc.args is not None else {}
@@ -870,15 +874,13 @@ def normalize_gemini_request(
                         function_call=(fc.name, args_payload, fc.id)
                         if fc.id
                         else (fc.name, args_payload),
-                        thought_signature=_valid_thought_signature_or_none(
-                            part.thoughtSignature
-                        ),
+                        thought_signature=signature,
                     )
                 )
                 continue
             if part.functionResponse is not None:
                 fr = part.functionResponse
-                # 跳过被剥离的服务端工具调用的结果
+                # 跳过被剥离的工具调用的结果
                 if fr.id and fr.id in dropped_server_tool_ids:
                     continue
                 resp_payload = fr.response if fr.response is not None else {}

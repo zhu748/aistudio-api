@@ -53,6 +53,8 @@ from aistudio_api.application.stream_utils import (
 )
 from aistudio_api.domain.tool_signatures import (
     is_server_side_tool_call as _is_server_side_tool_call,
+    lookup_function_signature as _lookup_function_signature,
+    remember_function_signature as _remember_function_signature,
     valid_thought_signature as _valid_thought_signature,
 )
 from aistudio_api.infrastructure.gateway.model_defaults import get_compat_settings
@@ -648,25 +650,26 @@ async def openai_to_gemini_request(
                 args = _openai_tool_arguments(function.get("arguments"))
                 call_id = _as_str(tool_call.get("id"))
                 signature = _read_signature(tool_call)
-                # 服务端工具（default_api:* / 内置工具）无有效签名时剥离：
-                # OpenAI 协议无官方签名字段，客户端回传历史必然丢签名，
-                # 透传会触发上游 400 thought_signature 校验。
-                if _is_server_side_tool_call(name) and not _valid_thought_signature(
-                    signature
-                ):
+                if not _valid_thought_signature(signature):
+                    # 客户端丢失签名（OpenAI 协议无官方字段）→ 缓存回注
+                    # （2026-11-14 实测：客户端函数同样强制签名，缺失即 400）
+                    signature = _lookup_function_signature(call_id or None, name)
+                if not _valid_thought_signature(signature):
+                    # 回注未命中：任何 functionCall 回传都会被上游拒 400
+                    # （服务端工具与客户端函数同规则），剥离调用及配对响应；
+                    # 服务端工具状态已在上游持久化，客户端工具模型会重新
+                    # 发起调用，功能降级但不阻断对话。
                     if call_id:
                         dropped_server_tool_ids.add(call_id)
                     tool_name_by_id.pop(call_id, None)
                     logger.info(
-                        "剥离无签名的服务端工具调用: name=%s, call_id=%s",
+                        "剥离无签名的工具调用（缓存未命中）: name=%s, call_id=%s,"
+                        " server_side=%s",
                         name,
                         call_id or "(无id)",
+                        _is_server_side_tool_call(name),
                     )
                     continue
-                # 普通客户端工具：签名非法 base64 时丢弃签名字段本身
-                # （上游 TYPE_BYTES 解码失败同样 400），调用保留。
-                if signature is not None and not _valid_thought_signature(signature):
-                    signature = None
                 parts.append(
                     GeminiPart(
                         thoughtSignature=signature,
@@ -687,7 +690,7 @@ async def openai_to_gemini_request(
             name = tool_name_by_id.get(
                 message.tool_call_id or "", message.name or "unknown"
             )
-            # 跳过被剥离的服务端工具调用的结果（无对应的 functionCall）
+            # 跳过被剥离的工具调用的结果（无对应的 functionCall）
             if message.tool_call_id and message.tool_call_id in dropped_server_tool_ids:
                 continue
             payload = _openai_tool_content_to_response(message.content)
@@ -864,36 +867,27 @@ async def _claude_blocks_to_parts(
             name = _as_str(block.get("name")) or "unknown"
             tool_input = block.get("input")
             signature = _read_signature(block)
-            # 服务端工具（default_api:* / 内置工具）无有效签名时剥离：
-            # Claude 协议 tool_use 块无官方签名字段，客户端回传历史
-            # 必然丢签名，透传会触发上游 400 thought_signature 校验。
-            if _is_server_side_tool_call(name):
-                if not _valid_thought_signature(signature):
-                    tool_use_id = _as_str(block.get("id"))
-                    if tool_use_id:
-                        dropped_server_tool_ids.add(tool_use_id)
-                    tool_name_by_id.pop(tool_use_id, None)
-                    logger.info(
-                        "剥离无签名的服务端工具调用: name=%s, tool_use_id=%s",
-                        name,
-                        tool_use_id or "(无id)",
-                    )
-                else:
-                    parts.append(
-                        GeminiPart(
-                            thoughtSignature=signature,
-                            functionCall=GeminiFunctionCall(
-                                name=name,
-                                args=tool_input if tool_input is not None else {},
-                                id=_as_str(block.get("id")) or None,
-                            ),
-                        )
-                    )
+            if not _valid_thought_signature(signature):
+                # 客户端丢失签名（Claude 协议 tool_use 无官方字段）→ 缓存回注
+                signature = _lookup_function_signature(
+                    _as_str(block.get("id")) or None, name
+                )
+            if not _valid_thought_signature(signature):
+                # 回注未命中：任何 functionCall 回传都会被上游拒 400
+                # （服务端工具与客户端函数同规则，2026-11-14 实测），
+                # 剥离调用及配对 tool_result。
+                tool_use_id = _as_str(block.get("id"))
+                if tool_use_id:
+                    dropped_server_tool_ids.add(tool_use_id)
+                tool_name_by_id.pop(tool_use_id, None)
+                logger.info(
+                    "剥离无签名的工具调用（缓存未命中）: name=%s, tool_use_id=%s,"
+                    " server_side=%s",
+                    name,
+                    tool_use_id or "(无id)",
+                    _is_server_side_tool_call(name),
+                )
             else:
-                # 普通客户端工具：签名非法 base64 时丢弃签名字段本身
-                # （上游 TYPE_BYTES 解码失败同样 400），调用保留。
-                if signature is not None and not _valid_thought_signature(signature):
-                    signature = None
                 parts.append(
                     GeminiPart(
                         thoughtSignature=signature,
@@ -906,7 +900,7 @@ async def _claude_blocks_to_parts(
                 )
         elif block_type == "tool_result":
             tool_use_id = _as_str(block.get("tool_use_id"))
-            # 跳过被剥离的服务端工具调用的结果（无对应的 functionCall）
+            # 跳过被剥离的工具调用的结果（无对应的 functionCall）
             if tool_use_id and tool_use_id in dropped_server_tool_ids:
                 continue
             name = tool_name_by_id.get(tool_use_id, "unknown")
@@ -1175,7 +1169,20 @@ def _iter_response_parts(
     if not candidates:
         return []
     content = candidates[0].content
-    return list(content.parts) if content else []
+    if not content:
+        return []
+    parts: list[object] = list(content.parts) if content else []
+    # 签名缓存：凡见到 functionCall part 携带有效 thoughtSignature 就缓存
+    # （call_id 首选 + 函数名兜底），供客户端丢失签名的下轮请求回注。
+    for part in parts:
+        function_call = getattr(part, "functionCall", None)
+        if function_call is not None:
+            _remember_function_signature(
+                getattr(function_call, "id", None),
+                getattr(function_call, "name", None),
+                getattr(part, "thoughtSignature", None),
+            )
+    return parts
 
 
 def build_openai_completion(
@@ -1427,7 +1434,21 @@ async def _iter_gemini_sse_frames(
     source: AsyncIterable[object],
 ) -> AsyncGenerator[dict[str, object], None]:
     async for frame in coalesce_tool_frames(_parse_gemini_sse_frames(source)):
+        _remember_frame_tool_signatures(frame)
         yield frame
+
+
+def _remember_frame_tool_signatures(frame: dict[str, object]) -> None:
+    """流式帧签名缓存：functionCall part 携带签名即缓存（同 _iter_response_parts）。"""
+    candidate = _frame_candidate(frame)
+    for part in _frame_parts(candidate):
+        function_call = _as_dict(part.get("functionCall"))
+        if function_call:
+            _remember_function_signature(
+                _as_str(function_call.get("id")) or None,
+                _as_str(function_call.get("name")) or None,
+                part.get("thoughtSignature"),
+            )
 
 
 async def _parse_gemini_sse_frames(

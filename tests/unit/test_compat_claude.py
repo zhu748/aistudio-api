@@ -95,6 +95,14 @@ async def test_claude_request_basic_conversion() -> None:
 
 @pytest.mark.asyncio
 async def test_claude_request_tool_roundtrip() -> None:
+    # 2026-11-14：上游对客户端函数同样强制 thought_signature —— 模拟
+    # 响应侧已缓存该 tool_use 的签名（客户端丢失后由网关回注）。
+    import base64
+
+    from aistudio_api.domain.tool_signatures import remember_function_signature
+
+    cached_sig = base64.b64encode(b"sig-for-toolu-01ABC").decode()
+    remember_function_signature("toolu_01ABC", "get_weather", cached_sig)
     req = ClaudeMessagesRequest.model_validate(
         {
             "model": "gemini-3.8-flash",
@@ -151,7 +159,7 @@ async def test_claude_request_tool_roundtrip() -> None:
     gemini_req, resolved = await claude_to_gemini_request(req)
 
     assert resolved == "gemini-3.8-flash"
-    # assistant: text + tool_use
+    # assistant: text + tool_use（签名由缓存回注）
     assistant_parts = gemini_req.contents[0].parts
     assert assistant_parts[0].text == "I'll check the weather."
     fc = assistant_parts[1].functionCall
@@ -159,6 +167,7 @@ async def test_claude_request_tool_roundtrip() -> None:
     assert fc.name == "get_weather"
     assert fc.args == {"location": "Tokyo"}
     assert fc.id == "toolu_01ABC"
+    assert assistant_parts[1].thoughtSignature == cached_sig
     # user: tool_result（含图片展开）
     user_parts = gemini_req.contents[1].parts
     fr = user_parts[0].functionResponse
