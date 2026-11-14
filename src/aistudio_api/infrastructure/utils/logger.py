@@ -870,7 +870,18 @@ def _prune_dumps(folder: Path) -> None:
             except OSError:
                 return 0
 
-        files = sorted(folder.glob("req_*.json"), key=modified, reverse=True)
+        # 上游交换快照（req_*.upstream[.ok].json）有独立生命周期：成功环
+        # 形淘汰 + 错误不设条数限（仅手动清理），不得被 dump 保留策略
+        # （数量/时长/总量）顺带清扫。
+        files = sorted(
+            (
+                path
+                for path in folder.glob("req_*.json")
+                if not path.name.endswith((".upstream.json", ".upstream.ok.json"))
+            ),
+            key=modified,
+            reverse=True,
+        )
         latest = folder / "latest_request.json"
         all_files = [*files, *([latest] if latest.is_file() else [])]
         for path in all_files:

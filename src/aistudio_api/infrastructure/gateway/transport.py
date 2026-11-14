@@ -33,7 +33,7 @@ from aistudio_api.infrastructure.proxy_bridge import (
 )
 from aistudio_api.infrastructure.utils.logger import get_logger
 from aistudio_api.infrastructure.utils.upstream_dump import (
-    save_failed_upstream_exchange,
+    save_upstream_exchange,
 )
 
 logger = get_logger("transport")
@@ -903,18 +903,20 @@ class HTTPStreamTransport:
                     elapsed_ms,
                     len(resp.content),
                 )
-                if resp.status_code != 200:
-                    # 失败快照：完整 url/头（脱敏）/wire 体/响应，供请求详情页
-                    # 查看与下载（线程池落盘，不阻塞响应路径）
-                    await asyncio.to_thread(
-                        save_failed_upstream_exchange,
-                        url=url,
-                        headers=clean_headers,
-                        body=body,
-                        status=resp.status_code,
-                        response_sample=resp.content,
-                        proxy_url=effective_proxy,
-                    )
+                # 交换快照：成功与失败均采集（函数内部按 RPC 类型与保留策略
+                # 决定落盘形态；httpx 最末请求头 multi_items 保真实线缆顺序）
+                await asyncio.to_thread(
+                    save_upstream_exchange,
+                    url=url,
+                    wire_headers=list(request.headers.multi_items()),
+                    body=body,
+                    status=resp.status_code,
+                    response_sample=resp.content,
+                    response_headers=dict(resp.headers.multi_items()),
+                    response_http_version=resp.http_version,
+                    elapsed_ms=elapsed_ms,
+                    proxy_url=effective_proxy,
+                )
                 return resp.status_code, resp.content
             except Exception as exc:
                 err_detail = (
@@ -941,6 +943,7 @@ class HTTPStreamTransport:
         proxy_url: str | None = None,
     ) -> AsyncGenerator[tuple[str, object], None]:
         """Stream HTTP response chunks directly."""
+        t0 = time.perf_counter()
         clean_headers = _ensure_authorization_header(
             headers,
             auth_user=auth_user,
@@ -985,19 +988,40 @@ class HTTPStreamTransport:
                             if not remaining:
                                 break
                     await asyncio.to_thread(
-                        save_failed_upstream_exchange,
+                        save_upstream_exchange,
                         url=url,
-                        headers=clean_headers,
+                        wire_headers=list(req.headers.multi_items()),
                         body=body,
                         status=resp.status_code,
                         response_sample=bytes(error_sample),
+                        response_headers=dict(resp.headers.multi_items()),
+                        response_http_version=resp.http_version,
+                        elapsed_ms=(time.perf_counter() - t0) * 1000,
                         proxy_url=effective_proxy,
                     )
                     return
 
+                # 成功流：边转发边积累头部样本（仅形态比对用途，硬限 64KiB，
+                # 不缓冲全文），流正常读完后续快照（断连/重试丢弃时不安
+                # 快照——成功现场以完整送达为准）。
+                head_sample = bytearray()
                 async for chunk in resp.aiter_bytes():
                     if chunk:
+                        if len(head_sample) < 65536:
+                            head_sample.extend(chunk[: 65536 - len(head_sample)])
                         yield ("chunk", chunk)
+                await asyncio.to_thread(
+                    save_upstream_exchange,
+                    url=url,
+                    wire_headers=list(req.headers.multi_items()),
+                    body=body,
+                    status=resp.status_code,
+                    response_sample=bytes(head_sample),
+                    response_headers=dict(resp.headers.multi_items()),
+                    response_http_version=resp.http_version,
+                    elapsed_ms=(time.perf_counter() - t0) * 1000,
+                    proxy_url=effective_proxy,
+                )
 
             except Exception as exc:
                 err_detail = (

@@ -21,6 +21,10 @@ from aistudio_api.infrastructure.request_history import request_history
 from aistudio_api.infrastructure.utils.log_files import read_log_history
 from aistudio_api.infrastructure.utils.logger import _mask_json_value, get_dump_dir
 from aistudio_api.infrastructure.utils.redaction import redact_text
+from aistudio_api.infrastructure.utils.upstream_dump import (
+    clear_upstream_snapshots,
+    upstream_snapshot_stats,
+)
 
 router = APIRouter(prefix="/api")
 
@@ -86,6 +90,21 @@ async def export_requests(
         retried=retried,
         min_elapsed_ms=min_elapsed_ms,
     )
+
+
+@router.get("/requests/upstream-snapshots")
+async def upstream_snapshot_inventory() -> dict[str, object]:
+    """上游交换快照库存（成功/错误条数、总字节、保留条数配置）。"""
+    return await asyncio.to_thread(upstream_snapshot_stats)
+
+
+@router.delete("/requests/upstream-snapshots")
+async def clear_upstream_snapshot_files(
+    scope: str = Query("all", pattern="^(all|success)$"),
+) -> dict[str, object]:
+    """手动清理上游交换快照（scope=all 全部 / success 仅成功快照，错误现场保留）。"""
+    removed = await asyncio.to_thread(clear_upstream_snapshots, scope)
+    return {"ok": True, "scope": scope, "removed": removed}
 
 
 @router.get("/requests/active")
@@ -185,10 +204,14 @@ async def request_payload(request_id: str) -> dict[str, object]:
 async def request_upstream_exchange(
     request_id: str, download: bool = Query(False)
 ) -> Response:
-    """上游失败请求的完整交换快照（URL/脱敏头/wire 体/响应样本）。
+    """上游交换快照（URL/脱敏头/wire 体/响应样本与响应头）。
 
-    download=1 时以 attachment 形式返回 JSON 文件（文件名
-    ``<request_id>.upstream.json``），用于离线排查与共享。
+    成功与失败请求均可能存在快照。重试场景下同一 request_id 会同时
+    留下失败现场（``<id>.upstream.json``）与最终成功快照
+    （``<id>.upstream.ok.json``）：按请求记录自身的成败选择优先级，
+    展示「最后一次尝试」的形态。download=1 时以 attachment 形式
+    返回 JSON 文件（文件名 ``<request_id>.upstream.json``），用于
+    离线排查与共享。
     """
     if not re.fullmatch(r"req_[A-Za-z0-9_-]{1,100}", request_id):
         raise HTTPException(400, "请求 ID 格式无效")
@@ -196,22 +219,34 @@ async def request_upstream_exchange(
     if record is None:
         raise HTTPException(404, "请求记录不存在或已过保留期")
 
+    # 最终成功的请求优先展示成功快照；最终失败的优先错误现场。
+    final_status = record.get("status_code")
+    record_success = isinstance(final_status, int) and 200 <= final_status < 300
+    order = (
+        (".upstream.ok.json", ".upstream.json")
+        if record_success
+        else (".upstream.json", ".upstream.ok.json")
+    )
+
     def read() -> dict[str, object]:
-        target = get_dump_dir() / f"{request_id}.upstream.json"
-        try:
-            if not target.is_file():
-                return {
-                    "available": False,
-                    "note": "此请求无上游失败快照（仅上游非 200 响应时采集）。",
-                }
-            if target.stat().st_size > settings.dump_max_bytes * 4 + 65536:
-                return {
-                    "available": False,
-                    "note": "快照超过当前读取上限，请在服务器端查看。",
-                }
-            return json.loads(target.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {"available": False, "note": "快照文件暂时不可读取。"}
+        dump_dir = get_dump_dir()
+        for suffix in order:
+            target = dump_dir / f"{request_id}{suffix}"
+            try:
+                if not target.is_file():
+                    continue
+                if target.stat().st_size > settings.dump_max_bytes * 4 + 65536:
+                    return {
+                        "available": False,
+                        "note": "快照超过当前读取上限，请在服务器端查看。",
+                    }
+                return json.loads(target.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+        return {
+            "available": False,
+            "note": "此请求无上游交换快照（成功快照超保留条数被淘汰，或辅助 RPC 成功形态不采集）。",
+        }
 
     snapshot = await asyncio.to_thread(read)
     content = json.dumps(snapshot, ensure_ascii=False, indent=1)

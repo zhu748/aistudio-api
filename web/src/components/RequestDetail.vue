@@ -490,7 +490,7 @@ async function downloadUpstream() {
             {{ upstreamError }}
           </p>
           <p class="text-slate-500 text-xs">
-            {{ upstream?.note || (upstream?.upstream ? '上游非 200 响应时自动采集：实际发送的 URL、请求头（凭据已脱敏）与完整 wire 请求体。' : '正在查询上游失败快照…') }}
+            {{ upstream?.note || (upstream?.upstream ? '实际发往上游的线缆请求：URL、有序请求头（凭据已脱敏）、wire 请求体与响应样本。成功（含 200）与失败请求均自动采集。' : '正在查询上游交换快照…') }}
           </p>
           <template v-if="upstream?.upstream">
             <dl class="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-xs">
@@ -525,9 +525,16 @@ async function downloadUpstream() {
             </div>
             <div>
               <p class="text-slate-500 mb-1 text-xs">
-                上游响应样本
+                上游响应样本（流式成功请求仅保留前 64 KiB）
               </p>
-              <pre class="rounded-lg bg-slate-950 text-rose-300 p-3 text-xs overflow-auto max-h-48 whitespace-pre-wrap break-all">{{ upstream.response?.body || '（空）' }}</pre>
+              <pre
+                class="rounded-lg bg-slate-950 p-3 text-xs overflow-auto max-h-48 whitespace-pre-wrap break-all"
+                :class="
+                  (upstream.response?.status ?? 0) >= 200 && (upstream.response?.status ?? 0) < 300
+                    ? 'text-emerald-300'
+                    : 'text-rose-300'
+                "
+              >{{ upstream.response?.body || '（空）' }}</pre>
             </div>
           </template>
         </section>

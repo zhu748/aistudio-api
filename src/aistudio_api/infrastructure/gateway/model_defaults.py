@@ -1229,6 +1229,23 @@ def get_configured_api_keys(
     return frozenset(item["key"] for item in items if item.get("key"))
 
 
+# 上游成功快照保留条数：与 infrastructure/utils/upstream_dump.py 的
+# 默认值保持一致（那边是运行时权威，这里仅负责 config.yaml 读写钳位）。
+_SNAPSHOT_KEEP_DEFAULT = 10
+_SNAPSHOT_KEEP_MAX = 1000
+
+
+def _coerce_snapshot_keep(value: object) -> int:
+    """把任意输入安全钳位到 [0, 1000] 的保留条数（非法回退默认 10）。"""
+    if isinstance(value, bool):
+        return _SNAPSHOT_KEEP_DEFAULT
+    if isinstance(value, int):
+        return min(max(value, 0), _SNAPSHOT_KEEP_MAX)
+    if isinstance(value, str) and value.strip().isdigit():
+        return min(max(int(value.strip()), 0), _SNAPSHOT_KEEP_MAX)
+    return _SNAPSHOT_KEEP_DEFAULT
+
+
 def get_configured_logging_settings(
     config_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
@@ -1242,12 +1259,16 @@ def get_configured_logging_settings(
             "dump_requests": bool(raw_logging.get("dump_requests", False)),
             "dump_to_file": bool(raw_logging.get("dump_to_file", False)),
             "dump_dir": str(raw_logging.get("dump_dir") or "").strip(),
+            "upstream_snapshot_keep": _coerce_snapshot_keep(
+                raw_logging.get("upstream_snapshot_keep")
+            ),
         }
     return {
         "level": "INFO",
         "dump_requests": False,
         "dump_to_file": False,
         "dump_dir": "",
+        "upstream_snapshot_keep": _SNAPSHOT_KEEP_DEFAULT,
     }
 
 
@@ -1256,6 +1277,7 @@ def update_configured_logging_settings(
     dump_requests: bool | None = None,
     dump_to_file: bool | None = None,
     dump_dir: str | None = None,
+    upstream_snapshot_keep: int | None = None,
     config_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
     """更新 config.yaml 中的 logging 设置并刷新缓存。"""
@@ -1278,6 +1300,10 @@ def update_configured_logging_settings(
             logging_dict["dump_to_file"] = dump_to_file
         if dump_dir is not None:
             logging_dict["dump_dir"] = dump_dir
+        if upstream_snapshot_keep is not None:
+            logging_dict["upstream_snapshot_keep"] = _coerce_snapshot_keep(
+                upstream_snapshot_keep
+            )
 
         parsed["logging"] = logging_dict
         atomic_write_text(
