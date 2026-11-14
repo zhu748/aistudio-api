@@ -15,6 +15,8 @@ from aistudio_api.infrastructure.utils.common import (
 )
 
 _ROLE_NAMES = frozenset({"model", "user", "system", "assistant"})
+_MAX_REPLAY_BYTES = 4 * 1024 * 1024
+_MAX_REPLAY_PARTS = 16384
 
 # ==============================================================================
 # Google Protobuf-over-JSON Wire Array Specifications (docs/WIRE_SPECIFICATION.md)
@@ -475,6 +477,8 @@ def parse_response_chunk(chunk: list[object]) -> Candidate:
     code_outputs: list[str] = []
 
     for raw_part in raw_parts if isinstance(raw_parts, list) else []:
+        if isinstance(raw_part, list):
+            candidate.raw_parts.append(raw_part)
         part = parse_response_part(raw_part)
         if part.inline_data:
             decoded = decode_base64_images(
@@ -563,6 +567,8 @@ def parse_text_output(raw: str) -> ModelOutput:
     text_parts: list[str] = []
     thinking_parts: list[str] = []
     code_output_parts: list[str] = []
+    retain_parts = True
+    replay_bytes = 0
     for chunk in chunks:
         usage = parse_chunk_usage(chunk)
         if usage:
@@ -572,6 +578,23 @@ def parse_text_output(raw: str) -> ModelOutput:
             if isinstance(raw_rid, str) and raw_rid:
                 output.response_id = raw_rid
         parsed = parse_response_chunk(chunk)
+        if parsed.images or parsed.reasoning_images or parsed.function_responses:
+            retain_parts = False
+            merged.raw_parts.clear()
+        if retain_parts:
+            for wire in parsed.raw_parts:
+                replay_bytes += len(json.dumps(wire, ensure_ascii=False).encode())
+                if (
+                    replay_bytes > _MAX_REPLAY_BYTES
+                    or len(merged.raw_parts) >= _MAX_REPLAY_PARTS
+                ):
+                    merged.raw_parts.clear()
+                    retain_parts = False
+                    break
+                merged.raw_parts.append(wire)
+        if parsed.has_content or parsed.thinking or parsed.reasoning_images:
+            # A previous STOP cannot certify a later unfinished continuation.
+            merged.finish_reason = None
         if parsed.text:
             text_parts.append(parsed.text)
         if parsed.thinking:

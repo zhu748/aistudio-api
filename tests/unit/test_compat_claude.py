@@ -102,7 +102,9 @@ async def test_claude_request_tool_roundtrip() -> None:
     from aistudio_api.domain.tool_signatures import remember_function_signature
 
     cached_sig = base64.b64encode(b"sig-for-toolu-01ABC").decode()
-    remember_function_signature("toolu_01ABC", "get_weather", cached_sig)
+    remember_function_signature(
+        "toolu_01ABC", "get_weather", {"location": "Tokyo"}, cached_sig
+    )
     req = ClaudeMessagesRequest.model_validate(
         {
             "model": "gemini-3.8-flash",

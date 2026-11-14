@@ -275,7 +275,9 @@ async def test_openai_request_tools_and_tool_roundtrip() -> None:
     from aistudio_api.domain.tool_signatures import remember_function_signature
 
     cached_sig = base64.b64encode(b"sig-for-call-abc123").decode()
-    remember_function_signature("call_abc123", "get_weather", cached_sig)
+    remember_function_signature(
+        "call_abc123", "get_weather", {"location": "Beijing"}, cached_sig
+    )
     req = OpenAIChatCompletionRequest.model_validate(
         {
             "model": "gemini-3.8-flash",
@@ -351,8 +353,8 @@ async def test_openai_request_tools_and_tool_roundtrip() -> None:
 
 
 @pytest.mark.asyncio
-async def test_openai_tool_call_without_signature_stripped_on_cache_miss() -> None:
-    """缓存未命中的无签名工具调用 → 剥离调用与配对响应（不再 400）。
+async def test_openai_unsigned_call_keeps_native_history() -> None:
+    """缓存未命中时保留原生调用及结果，并补上跳过签名校验的占位值。
 
     函数名用独特值，避免命中其它用例按名回注的缓存。"""
     req = OpenAIChatCompletionRequest.model_validate(
@@ -394,11 +396,13 @@ async def test_openai_tool_call_without_signature_stripped_on_cache_miss() -> No
         }
     )
     gemini_req, _ = await openai_to_gemini_request(req)
-    # 调用与配对响应全部剥离：仅剩兜底空文本 part
-    assert len(gemini_req.contents) == 1
-    stripped = gemini_req.contents[0]
-    assert stripped.role == "model"
-    assert all(part.functionCall is None for part in stripped.parts)
+    assert [content.role for content in gemini_req.contents] == ["model", "user"]
+    call = gemini_req.contents[0].parts[0]
+    result = gemini_req.contents[1].parts[0]
+    assert call.functionCall is not None and result.functionResponse is not None
+    assert call.functionCall.args == {"location": "Beijing"}
+    assert call.thoughtSignature == "skip_thought_signature_validator"
+    assert result.functionResponse.response == {"temp": 25}
 
 
 @pytest.mark.asyncio

@@ -27,6 +27,7 @@ class Candidate:
     finish_reason: int | None = None
     finish_message: str = ""
     safety_ratings: list[dict[str, object]] = field(default_factory=list)
+    raw_parts: list[list[object]] = field(default_factory=list, repr=False)
 
     @property
     def has_content(self) -> bool:

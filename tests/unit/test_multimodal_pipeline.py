@@ -79,6 +79,19 @@ def test_multimodal_function_response_unpacks_inline_data():
         {
             "contents": [
                 {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "read",
+                                "args": {},
+                                "id": "call_12345",
+                            },
+                            "thoughtSignature": "c2lnMTIz",
+                        }
+                    ],
+                },
+                {
                     "role": "user",
                     "parts": [
                         {
@@ -97,12 +110,12 @@ def test_multimodal_function_response_unpacks_inline_data():
                             }
                         }
                     ],
-                }
+                },
             ]
         }
     )
     normalized = normalize_gemini_request(req, "gemini-3.8-flash")
-    content = normalized.contents[0]
+    content = normalized.contents[-1]
     assert len(content.parts) == 2
 
     part_fr = content.parts[0]

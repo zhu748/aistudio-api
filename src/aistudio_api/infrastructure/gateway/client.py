@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 from dataclasses import dataclass
 
@@ -17,6 +18,10 @@ from aistudio_api.domain.errors import (
 )
 from aistudio_api.domain.models import ModelOutput
 from aistudio_api.infrastructure.account.cookie_parser import get_visit_id
+from aistudio_api.infrastructure.gateway.model_turns import (
+    ModelTurnContext,
+    ModelTurnHistory,
+)
 from aistudio_api.infrastructure.gateway.session import (
     COUNT_TOKENS_URL,
     DEFAULT_UPSTREAM_HEADERS,
@@ -25,17 +30,13 @@ from aistudio_api.infrastructure.gateway.session import (
     SessionContext,
     extract_page_prompt,
 )
-from aistudio_api.infrastructure.gateway.session_token import (
-    account_session_token_scope,
-    get_session_token,
-    record_session_token,
-)
 from aistudio_api.infrastructure.gateway.wire_codec import (
     attach_session_token,
     encode_request_body,
 )
 from aistudio_api.infrastructure.gateway.wire_parser import parse_text_output
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
+from aistudio_api.infrastructure.request_context import current_request
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("client")
@@ -49,6 +50,7 @@ class PreparedRequest:
     model: str = ""
     snapshot: str = ""
     ctx: SessionContext | None = None
+    model_turn: ModelTurnContext | None = None
 
 
 # Per-task storage: AIStudioClient is a process-wide singleton, so a plain
@@ -65,6 +67,7 @@ class AIStudioClient:
 
         self._session = GatewaySession()
         self._streaming_gateway = StreamingGateway(session=self._session)
+        self._model_turns = ModelTurnHistory()
 
     @property
     def last_prepared_request(self) -> PreparedRequest | None:
@@ -92,8 +95,11 @@ class AIStudioClient:
 
     async def close(self) -> None:
         """关闭会话与传输层连接。"""
-        if self._session is not None:
-            await self._session.close()
+        try:
+            if self._session is not None:
+                await self._session.close()
+        finally:
+            self._model_turns.clear()
 
     async def prepare_request(
         self,
@@ -116,6 +122,28 @@ class AIStudioClient:
         effective_contents = contents or [
             AistudioContent.from_user_prompt(prompt=prompt, images=images)
         ]
+        observation = current_request.get()
+        scope = hashlib.sha256(
+            json.dumps(
+                [
+                    observation.key_id if observation else "",
+                    ctx.auth_file,
+                    ctx.auth_user,
+                    model.removeprefix("models/"),
+                    system_instruction_content.to_wire()
+                    if system_instruction_content is not None
+                    else system_instruction,
+                    tools,
+                    tool_config,
+                ],
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest()
+        effective_contents, turn_token, model_turn = self._model_turns.prepare(
+            scope, effective_contents
+        )
         snapshot = await self._session.generate_snapshot(
             effective_contents, ctx=ctx, model=model
         )
@@ -136,12 +164,9 @@ class AIStudioClient:
             generation_config_overrides=generation_config_overrides,
             snapshot=snapshot,
         )
-        # 浏览器行为对齐：回传上一轮响应携带的会话令牌（wire 槽 11）。
-        # 04 号实验实证——在已签名 body 上追加槽 11 不影响 WAA proof
-        # （proof 只绑定 contents 摘要），上游 200 接受。
-        body = attach_session_token(
-            body, get_session_token(account_session_token_scope(ctx.auth_file))
-        )
+        # Only the matched conversation's last model turn supplies slot 11.
+        # Restoration precedes WAA signing, so proof and contents stay aligned.
+        body = attach_session_token(body, turn_token)
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_active_waa_server,
         )
@@ -179,6 +204,7 @@ class AIStudioClient:
             model=model,
             snapshot=snapshot,
             ctx=ctx,
+            model_turn=model_turn,
         )
         logger.debug(
             "请求签名完成: model=%s, proof_len=%d, body_len=%d",
@@ -338,14 +364,10 @@ class AIStudioClient:
                 )
         output = parse_text_output(raw_text)
         output.model = model
-        # 会话令牌（响应槽 7 v1_...）：记录供下一轮请求回传 wire 槽 11
-        if output.response_id:
-            record_session_token(
-                account_session_token_scope(
-                    effective_prep.ctx.auth_file if effective_prep.ctx else None
-                ),
-                output.response_id,
-            )
+        if effective_prep.model_turn is not None and output.candidates:
+            capture = effective_prep.model_turn.capture()
+            capture.add(output.candidates[0].raw_parts, output.response_id)
+            capture.finish(output.candidates[0].finish_reason)
         return output
 
 

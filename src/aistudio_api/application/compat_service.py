@@ -52,7 +52,7 @@ from aistudio_api.application.stream_utils import (
     coalesce_tool_frames,
 )
 from aistudio_api.domain.tool_signatures import (
-    is_server_side_tool_call as _is_server_side_tool_call,
+    SKIP_THOUGHT_SIGNATURE,
     lookup_function_signature as _lookup_function_signature,
     remember_function_signature as _remember_function_signature,
     valid_thought_signature as _valid_thought_signature,
@@ -201,7 +201,13 @@ def _signature_extra(signature: object) -> dict[str, object]:
 
 def _read_signature(item: dict[str, object]) -> str | None:
     google = _as_dict(_as_dict(item.get("extra_content")).get("google"))
-    return _as_str(google.get("thought_signature")) or None
+    return (
+        _as_str(google.get("thought_signature"))
+        or _as_str(google.get("thoughtSignature"))
+        or _as_str(item.get("thought_signature"))
+        or _as_str(item.get("thoughtSignature"))
+        or None
+    )
 
 
 def _claude_signature(signature: object) -> str:
@@ -616,9 +622,6 @@ async def openai_to_gemini_request(
     contents: list[GeminiContent] = []
     system_texts: list[str] = []
     tool_name_by_id: dict[str, str] = {}
-    # 被剥离的服务端工具调用 id 集合：对应的 tool result 也要一并跳过，
-    # 避免孤立 functionResponse 触发上游 MALFORMED_FUNCTION_CALL。
-    dropped_server_tool_ids: set[str] = set()
 
     # 第一遍：先扫全部 assistant 消息建 tool_call_id → 函数名映射。
     # 与 Claude 侧一致的两遍扫描：容忍客户端把 tool 结果放在对应
@@ -651,25 +654,10 @@ async def openai_to_gemini_request(
                 call_id = _as_str(tool_call.get("id"))
                 signature = _read_signature(tool_call)
                 if not _valid_thought_signature(signature):
-                    # 客户端丢失签名（OpenAI 协议无官方字段）→ 缓存回注
-                    # （2026-11-14 实测：客户端函数同样强制签名，缺失即 400）
-                    signature = _lookup_function_signature(call_id or None, name)
+                    # 客户端未回传可用签名时，仅恢复同一次调用的缓存。
+                    signature = _lookup_function_signature(call_id or None, name, args)
                 if not _valid_thought_signature(signature):
-                    # 回注未命中：任何 functionCall 回传都会被上游拒 400
-                    # （服务端工具与客户端函数同规则），剥离调用及配对响应；
-                    # 服务端工具状态已在上游持久化，客户端工具模型会重新
-                    # 发起调用，功能降级但不阻断对话。
-                    if call_id:
-                        dropped_server_tool_ids.add(call_id)
-                    tool_name_by_id.pop(call_id, None)
-                    logger.info(
-                        "剥离无签名的工具调用（缓存未命中）: name=%s, call_id=%s,"
-                        " server_side=%s",
-                        name,
-                        call_id or "(无id)",
-                        _is_server_side_tool_call(name),
-                    )
-                    continue
+                    signature = SKIP_THOUGHT_SIGNATURE
                 parts.append(
                     GeminiPart(
                         thoughtSignature=signature,
@@ -690,9 +678,6 @@ async def openai_to_gemini_request(
             name = tool_name_by_id.get(
                 message.tool_call_id or "", message.name or "unknown"
             )
-            # 跳过被剥离的工具调用的结果（无对应的 functionCall）
-            if message.tool_call_id and message.tool_call_id in dropped_server_tool_ids:
-                continue
             payload = _openai_tool_content_to_response(message.content)
             contents.append(
                 GeminiContent(
@@ -781,16 +766,13 @@ async def _claude_blocks_to_parts(
     content: object,
     *,
     tool_name_by_id: dict[str, str],
-    dropped_server_tool_ids: set[str] | None = None,
 ) -> list[GeminiPart]:
     """Claude content（str 或块数组）→ Gemini parts。
 
     支持 text / thinking / image / document / tool_use / tool_result 块；
     tool_result 中的图片会展开为紧随其后的独立 inlineData parts。
-    无有效签名的服务端工具调用及其结果会被剥离（见 _is_server_side_tool_call）。
+    工具调用无可恢复签名时携带跳过校验的占位值，保留原生结构。
     """
-    if dropped_server_tool_ids is None:
-        dropped_server_tool_ids = set()
     if isinstance(content, str):
         return [GeminiPart(text=content)]
     if not isinstance(content, list):
@@ -805,7 +787,6 @@ async def _claude_blocks_to_parts(
                             _claude_blocks_to_parts(
                                 [block],
                                 tool_name_by_id=tool_name_by_id,
-                                dropped_server_tool_ids=dropped_server_tool_ids,
                             )
                         )
                         for block in content[offset : offset + 4]
@@ -870,39 +851,24 @@ async def _claude_blocks_to_parts(
             if not _valid_thought_signature(signature):
                 # 客户端丢失签名（Claude 协议 tool_use 无官方字段）→ 缓存回注
                 signature = _lookup_function_signature(
-                    _as_str(block.get("id")) or None, name
+                    _as_str(block.get("id")) or None,
+                    name,
+                    tool_input if tool_input is not None else {},
                 )
             if not _valid_thought_signature(signature):
-                # 回注未命中：任何 functionCall 回传都会被上游拒 400
-                # （服务端工具与客户端函数同规则，2026-11-14 实测），
-                # 剥离调用及配对 tool_result。
-                tool_use_id = _as_str(block.get("id"))
-                if tool_use_id:
-                    dropped_server_tool_ids.add(tool_use_id)
-                tool_name_by_id.pop(tool_use_id, None)
-                logger.info(
-                    "剥离无签名的工具调用（缓存未命中）: name=%s, tool_use_id=%s,"
-                    " server_side=%s",
-                    name,
-                    tool_use_id or "(无id)",
-                    _is_server_side_tool_call(name),
+                signature = SKIP_THOUGHT_SIGNATURE
+            parts.append(
+                GeminiPart(
+                    thoughtSignature=signature,
+                    functionCall=GeminiFunctionCall(
+                        name=name,
+                        args=tool_input if tool_input is not None else {},
+                        id=_as_str(block.get("id")) or None,
+                    ),
                 )
-            else:
-                parts.append(
-                    GeminiPart(
-                        thoughtSignature=signature,
-                        functionCall=GeminiFunctionCall(
-                            name=name,
-                            args=tool_input if tool_input is not None else {},
-                            id=_as_str(block.get("id")) or None,
-                        ),
-                    )
-                )
+            )
         elif block_type == "tool_result":
             tool_use_id = _as_str(block.get("tool_use_id"))
-            # 跳过被剥离的工具调用的结果（无对应的 functionCall）
-            if tool_use_id and tool_use_id in dropped_server_tool_ids:
-                continue
             name = tool_name_by_id.get(tool_use_id, "unknown")
             payload: dict[str, object] = {}
             extra_parts: list[GeminiPart] = []
@@ -1049,8 +1015,6 @@ async def claude_to_gemini_request(
     resolved_model = resolve_compat_model(req.model, channel="claude")
     contents: list[GeminiContent] = []
     tool_name_by_id: dict[str, str] = {}
-    # 被剥离的服务端工具调用 id 集合（无有效签名，见 _is_server_side_tool_call）
-    dropped_server_tool_ids: set[str] = set()
 
     # 第一遍：登记 assistant tool_use 的 id → name 映射（tool_result 反查用）
     for message in req.messages:
@@ -1068,7 +1032,6 @@ async def claude_to_gemini_request(
         parts = await _claude_blocks_to_parts(
             message.content,
             tool_name_by_id=tool_name_by_id,
-            dropped_server_tool_ids=dropped_server_tool_ids,
         )
         contents.append(GeminiContent(role=role, parts=parts or [GeminiPart(text="")]))
 
@@ -1180,6 +1143,7 @@ def _iter_response_parts(
             _remember_function_signature(
                 getattr(function_call, "id", None),
                 getattr(function_call, "name", None),
+                getattr(function_call, "args", None),
                 getattr(part, "thoughtSignature", None),
             )
     return parts
@@ -1447,6 +1411,7 @@ def _remember_frame_tool_signatures(frame: dict[str, object]) -> None:
             _remember_function_signature(
                 _as_str(function_call.get("id")) or None,
                 _as_str(function_call.get("name")) or None,
+                function_call.get("args"),
                 part.get("thoughtSignature"),
             )
 

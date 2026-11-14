@@ -471,11 +471,12 @@ class AistudioWireCodec:
             parts = []
             if isinstance(raw_parts, list):
                 for raw_part in raw_parts:
-                    parts.append(self._decode_part(raw_part))
+                    parts.append(self.decode_part(raw_part))
             contents.append(AistudioContent(role=role, parts=parts))
         return contents
 
-    def _decode_part(self, raw_part) -> AistudioPart:
+    def decode_part(self, raw_part: object) -> AistudioPart:
+        """Decode the typed fields needed by signing and history matching."""
         parsed = parse_response_part(raw_part)
         part = AistudioPart(
             thought=parsed.thought,
@@ -575,7 +576,7 @@ class AistudioWireCodec:
             decoded = self._decode_contents([raw_instruction])
             return decoded[0] if decoded else None
         parts = [
-            self._decode_part(raw_part)
+            self.decode_part(raw_part)
             for raw_part in raw_instruction
             if isinstance(raw_part, list)
         ]
@@ -594,12 +595,7 @@ _WIRE_SESSION_TOKEN_INDEX = TopLevelIndex.SESSION_TOKEN
 
 
 def attach_session_token(body: str, token: str | None) -> str:
-    """把会话令牌写入请求体 wire 槽 11（真实浏览器回传行为）。
-
-    浏览器每轮 GenerateContent 都把上一轮响应 chunk 槽 7 的 ``v1_...``
-    令牌回传到请求槽 11（同会话恒同值）。缺省（None）时保持原样——
-    编码层尾部 null 裁剪语义不受影响。
-    """
+    """Write the matched conversation's turn token to request slot 11."""
     if not token:
         return body
     parsed = json.loads(body)

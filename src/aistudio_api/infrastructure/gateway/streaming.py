@@ -19,10 +19,6 @@ from aistudio_api.infrastructure.gateway.session import (
     GatewaySession,
     extract_page_prompt,
 )
-from aistudio_api.infrastructure.gateway.session_token import (
-    account_session_token_scope,
-    record_session_token,
-)
 from aistudio_api.infrastructure.gateway.stream_parser import (
     IncrementalJSONStreamParser,
 )
@@ -71,9 +67,8 @@ class StreamingGateway:
             raise RuntimeError("gateway session is required for streaming")
         request_body = request.body
         logger.debug("开始流式解析: model=%s, body_len=%d", model, len(request_body))
-        # 会话令牌作用域（响应 chunk 槽 7 → 下一轮请求 wire 槽 11，浏览器行为）
-        token_scope = account_session_token_scope(
-            request.ctx.auth_file if request.ctx is not None else None
+        capture = (
+            request.model_turn.capture() if request.model_turn is not None else None
         )
         # 真实页面行为：GenerateContent 发出 2.2s 后补一次 CountTokens
         # （当前用户轮次；Go 签名器 SendProtected 同源行为）
@@ -115,11 +110,10 @@ class StreamingGateway:
                 and parsed_chunk[WIRE_RESPONSE_ID_INDEX]
             ):
                 latest_response_id = str(parsed_chunk[WIRE_RESPONSE_ID_INDEX])
-                # 槽 7 即会话令牌（v1_...，同会话恒同值）：记录供下一轮请求
-                # 回传 wire 槽 11（非法形态被缓存层静默拒绝）
-                record_session_token(token_scope, latest_response_id)
                 events.append(("response_id", latest_response_id))
             candidate = parse_response_chunk(parsed_chunk)
+            if capture is not None:
+                capture.add(candidate.raw_parts, latest_response_id)
             if candidate.thinking:
                 events.append(("thinking", candidate.thinking))
             if candidate.reasoning_images:
@@ -251,6 +245,8 @@ class StreamingGateway:
             raise TransportError(
                 "upstream returned no usable content or finish reason on HTTP 200"
             )
+        if capture is not None:
+            capture.finish(latest_finish_reason)
         if latest_finish_reason is not None:
             yield ("finish_reason", latest_finish_reason)
         elif emitted_any_chunk:
