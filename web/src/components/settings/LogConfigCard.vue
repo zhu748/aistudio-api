@@ -140,7 +140,7 @@ async function handleClearSnapshots(scope: 'all' | 'success') {
             </span>
           </h3>
           <p class="text-[11px] text-slate-400 mt-0.5">
-            控制服务端实时日志级别及上下游原始请求报文的落盘调试策略
+            保存客户端发给本程序的原始请求，并单独查看转换后的上游快照
           </p>
         </div>
       </div>
@@ -194,7 +194,7 @@ async function handleClearSnapshots(scope: 'all' | 'success') {
         <ConfigSwitch
           :model-value="dumpRequests"
           label="控制台报文转储"
-          description="在标准输出中打印完整的上下游请求与响应报文"
+          description="在终端打印脱敏后的客户端请求与响应摘要；不保存原文"
           @update:model-value="dumpRequests = $event"
         />
       </div>
@@ -207,8 +207,8 @@ async function handleClearSnapshots(scope: 'all' | 'success') {
         </div>
         <ConfigSwitch
           :model-value="dumpToFile"
-          label="将报文保存为磁盘文件"
-          description="将每次请求与响应写入独立调试文件，便于排查协议问题"
+          label="保存客户端原始请求"
+          description="原样保存酒馆等客户端的请求正文、未知字段及格式；请求头和查询串中的凭据打码，正文不脱敏"
           @update:model-value="dumpToFile = $event"
         />
       </div>

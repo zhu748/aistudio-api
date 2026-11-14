@@ -11,6 +11,31 @@ export interface Attempt {
   error?: string
 }
 
+export interface ClientRequestCapture {
+  source: 'client'
+  method: string
+  target: string
+  http_version: string
+  headers: [string, string][]
+  body: string | null
+  body_encoding: 'utf-8' | 'base64'
+  body_bytes: number
+  complete: boolean
+  truncated: boolean
+}
+
+export interface RequestPayload {
+  available: boolean
+  note: string
+  payload?: {
+    client_request?: ClientRequestCapture
+    body?: unknown
+    response_body?: unknown
+    request_body_truncated?: boolean
+    response_body_truncated?: boolean
+  }
+}
+
 export interface RequestRecord {
   request_parameters?: Record<string, unknown>
   effective_parameters?: Record<string, unknown>
@@ -107,7 +132,7 @@ export const operationsApi = {
     return request<RequestRecord>(`/api/requests/${encodeURIComponent(id)}`)
   },
   payload(id: string) {
-    return request<{ available: boolean; note: string; payload?: Record<string, unknown> }>(
+    return request<RequestPayload>(
       `/api/requests/${encodeURIComponent(id)}/payload`,
     )
   },

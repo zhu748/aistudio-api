@@ -698,6 +698,7 @@ def dump_request_exchange(
     console: bool = True,
     request_body_truncated: bool = False,
     response_body_truncated: bool = False,
+    client_request: dict[str, object] | None = None,
 ) -> None:
     """转储单次完整请求与响应详细信息。"""
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -762,8 +763,8 @@ def dump_request_exchange(
             clean_id = re.sub(r"[^\w\-.]", "_", req_id)
             dump_file_path = dump_folder / f"{clean_id}.json"
 
-            # 落盘一律写脱敏值：绝不把 Authorization/Cookie/API Key/正文原文
-            # 写入磁盘；控制台同样已脱敏，避免脱敏形同虚设。
+            # Legacy views and console remain redacted. The opt-in client
+            # capture separately preserves the original body for diagnostics.
             def _masked_text(text: str | None, parsed: object | None) -> str | None:
                 if not text:
                     return None
@@ -804,6 +805,8 @@ def dump_request_exchange(
                 "finish_reason": finish_reason,
                 "error_detail": redact_text(error_detail or ""),
             }
+            if client_request is not None:
+                record_data["client_request"] = client_request
             atomic_write_json(dump_file_path, record_data, private=True)
 
             latest_file = dump_folder / "latest_request.json"

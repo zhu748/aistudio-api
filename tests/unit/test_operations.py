@@ -154,7 +154,11 @@ async def test_file_only_dump_and_management_exclusion(monkeypatch, tmp_path):
     assert len(files) == 1
     data = json.loads(files[0].read_text())
     assert data["req_id"] == response.headers["x-request-id"]
-    assert "sensitive" not in files[0].read_text()
+    assert data["body"]["api_key"] == "***"
+    assert json.loads(data["client_request"]["body"]) == {
+        "messages": [],
+        "api_key": "sensitive",
+    }
     assert data["response_body"] == {"reply": "hello"}
 
 
