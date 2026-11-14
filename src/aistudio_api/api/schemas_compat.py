@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 # ---------------------------------------------------------------------------
 # OpenAI Chat Completions (/v1/chat/completions)
@@ -23,6 +23,8 @@ class OpenAIChatMessage(BaseModel):
 
 
 class OpenAIChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
     model: str
     messages: list[OpenAIChatMessage]
     temperature: float | None = None
@@ -59,6 +61,8 @@ class OpenAIResponsesRequest(BaseModel):
     reasoning）；``instructions`` 独立于 system 消息映射。
     """
 
+    model_config = ConfigDict(allow_inf_nan=False)
+
     model: str
     input: str | list[dict[str, object]] | None = None
     instructions: str | None = None
@@ -90,6 +94,8 @@ class ClaudeMessage(BaseModel):
 
 
 class ClaudeMessagesRequest(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
     model: str
     messages: list[ClaudeMessage]
     max_tokens: int | None = None

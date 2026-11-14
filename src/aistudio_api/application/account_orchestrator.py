@@ -282,7 +282,12 @@ def record_rotator_event(
     account: AccountMeta | None = None
     if account_id and account_service and hasattr(account_service, "get_account"):
         account = account_service.get_account(account_id)
-    if account is None and account_service:
+    if account_id:
+        # The original account may have been deleted during an in-flight
+        # request. Never attribute its result to the next active account.
+        if account is None:
+            return
+    elif account_service:
         account = account_service.get_active_account()
     if not rotator or account is None:
         return

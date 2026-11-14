@@ -14,13 +14,18 @@
 from __future__ import annotations
 
 import re
+import threading
+from collections import OrderedDict
 
 # 令牌形态校验：v1_ + base64 变体（实测 48+ 字符），拒绝把响应里其它
 # v1_ 前缀串（如 visit-id 头值若被误传入）当作令牌。
-_SESSION_TOKEN_RE = re.compile(r"^v1_[A-Za-z0-9+/=_-]{16,}$")
+_SESSION_TOKEN_RE = re.compile(r"v1_[A-Za-z0-9+/=_-]{16,}")
 _MIN_TOKEN_LEN = 20
+_MAX_TOKEN_LEN = 4096
+_MAX_SESSION_TOKEN_ENTRIES = 4096
 
-_SESSION_TOKEN_CACHE: dict[str, str] = {}
+_SESSION_TOKEN_CACHE: OrderedDict[str, str] = OrderedDict()
+_session_token_lock = threading.Lock()
 
 
 def _normalize_scope(scope: str | None) -> str:
@@ -30,18 +35,28 @@ def _normalize_scope(scope: str | None) -> str:
 def record_session_token(scope: str | None, token: object) -> bool:
     """记录账号作用域下响应携带的最新会话令牌（非法形态静默拒绝）。"""
     value = token if isinstance(token, str) else ""
-    if len(value) < _MIN_TOKEN_LEN or not _SESSION_TOKEN_RE.match(value):
+    if not _MIN_TOKEN_LEN <= len(
+        value
+    ) <= _MAX_TOKEN_LEN or not _SESSION_TOKEN_RE.fullmatch(value):
         return False
     key = _normalize_scope(scope)
-    if _SESSION_TOKEN_CACHE.get(key) == value:
-        return False
-    _SESSION_TOKEN_CACHE[key] = value
-    return True
+    with _session_token_lock:
+        changed = _SESSION_TOKEN_CACHE.get(key) != value
+        _SESSION_TOKEN_CACHE[key] = value
+        _SESSION_TOKEN_CACHE.move_to_end(key)
+        while len(_SESSION_TOKEN_CACHE) > _MAX_SESSION_TOKEN_ENTRIES:
+            _SESSION_TOKEN_CACHE.popitem(last=False)
+        return changed
 
 
 def get_session_token(scope: str | None) -> str | None:
     """读取账号作用域下最近一次响应携带的会话令牌（无则 None）。"""
-    return _SESSION_TOKEN_CACHE.get(_normalize_scope(scope))
+    key = _normalize_scope(scope)
+    with _session_token_lock:
+        value = _SESSION_TOKEN_CACHE.get(key)
+        if value is not None:
+            _SESSION_TOKEN_CACHE.move_to_end(key)
+        return value
 
 
 def account_session_token_scope(auth_file: str | None) -> str:
@@ -51,9 +66,10 @@ def account_session_token_scope(auth_file: str | None) -> str:
 
 def clear_session_tokens() -> int:
     """清空全部缓存（测试/账号重置用），返回清除条数。"""
-    count = len(_SESSION_TOKEN_CACHE)
-    _SESSION_TOKEN_CACHE.clear()
-    return count
+    with _session_token_lock:
+        count = len(_SESSION_TOKEN_CACHE)
+        _SESSION_TOKEN_CACHE.clear()
+        return count
 
 
 __all__ = [

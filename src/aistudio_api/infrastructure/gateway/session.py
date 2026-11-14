@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import itertools
 import json
@@ -13,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from aistudio_api.config import settings
+from aistudio_api.domain.errors import TransportError
 from aistudio_api.infrastructure.account.cookie_parser import (
     ROTATING_SESSION_COOKIE_NAMES,
     build_makersuite_headers,
@@ -122,6 +124,7 @@ class GatewaySession:
     """Manages authentication state, WAA request signing, and transport routing."""
 
     def __init__(self):
+        self._closed = False
         self._auth_file: str | None = settings.auth_file or None
         self._auth_user: str | None = None
         self._tier: str | None = None
@@ -142,7 +145,15 @@ class GatewaySession:
 
     @property
     def is_ready(self) -> bool:
-        return self._active_context is not None and self._active_context.is_usable()
+        return (
+            not self._closed
+            and self._active_context is not None
+            and self._active_context.is_usable()
+        )
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise TransportError("Gateway session is closed")
 
     @property
     def active_context(self) -> SessionContext | None:
@@ -155,6 +166,7 @@ class GatewaySession:
 
     def set_ready_context(self, context: SessionContext) -> None:
         """Set active ready context (used by transitions and test fixtures)."""
+        self._ensure_open()
         self._auth_file = context.auth_file
         self._auth_user = context.auth_user
         self._tier = context.tier
@@ -178,6 +190,7 @@ class GatewaySession:
 
     async def ensure_ready(self) -> SessionContext:
         """Ensure session context is initialized and ready."""
+        self._ensure_open()
         if self.is_ready and self._active_context is not None:
             return self._active_context
         return await self.transition_to_account(self._auth_file, force_refresh=False)
@@ -187,6 +200,7 @@ class GatewaySession:
         await self.transition_to_account(auth_file, force_refresh=True)
 
     async def set_default_proxy(self, proxy: str | None) -> None:
+        self._ensure_open()
         self._transport.proxy_url = proxy
         # 退役旧默认代理的客户端池（延迟关闭，在途请求安全排空），
         # 否则反复切代理会累积多个满配连接池直至进程退出
@@ -197,6 +211,7 @@ class GatewaySession:
         self, auth_file: str | None, force_refresh: bool = False
     ) -> SessionContext:
         """Execute instantaneous in-memory session transition."""
+        self._ensure_open()
         if (
             not force_refresh
             and self.is_ready
@@ -242,6 +257,7 @@ class GatewaySession:
         model: str = "models/gemini-3.7-flash",
     ) -> str:
         """Generate fresh WAA proof token for request contents."""
+        self._ensure_open()
         active_ctx = ctx or await self.ensure_ready()
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_active_waa_server,
@@ -357,7 +373,12 @@ class GatewaySession:
         计时基准为网络发送时刻（Go 同为 SendProtected 入口起算）；
         梯梯重试的每次实际发送都会各自补一次（Go 同语义）。
         """
-        if not _BROWSER_COUNTTOKENS_FOLLOWUP or not page_prompt:
+        if self._closed or not _BROWSER_COUNTTOKENS_FOLLOWUP or not page_prompt:
+            return
+        # Freeze the account before the delay; a later switch must not send
+        # another account's prompt through the newly active credentials.
+        followup_ctx = ctx if isinstance(ctx, SessionContext) else self._active_context
+        if followup_ctx is None:
             return
         normalized_model = model if model.startswith("models/") else f"models/{model}"
         # 与 Go countTokensBody 逐层一致：part = [null, 文本]
@@ -374,7 +395,7 @@ class GatewaySession:
                 status, _raw = await self.send_request(
                     body=followup_body,
                     url=COUNT_TOKENS_URL,
-                    ctx=ctx,
+                    ctx=followup_ctx,
                 )
                 if status != 200:
                     log.debug(
@@ -387,12 +408,18 @@ class GatewaySession:
                 log.debug("页面行为 CountTokens 补发失败（不影响主请求）: %s", e)
 
         try:
-            task = asyncio.create_task(_run_followup())
+            loop = asyncio.get_running_loop()
         except RuntimeError:
             # 无事件循环（同步测试路径等）：静默跳过
             return
+        # Telemetry must not retain/mutate a completed generation's context,
+        # prepared body, credentials or attempt counters through ContextVars.
+        background_context = contextvars.Context()
+        task = loop.create_task(_run_followup(), context=background_context)
         self._background_followups.add(task)
-        task.add_done_callback(self._background_followups.discard)
+        task.add_done_callback(
+            self._background_followups.discard, context=background_context
+        )
 
     async def send_request(
         self,
@@ -402,6 +429,7 @@ class GatewaySession:
         headers: dict[str, str] | None = None,
         ctx: object | None = None,
     ) -> tuple[int, bytes]:
+        self._ensure_open()
         active_ctx = (
             ctx if isinstance(ctx, SessionContext) else await self.ensure_ready()
         )
@@ -437,6 +465,7 @@ class GatewaySession:
         headers: dict[str, str] | None = None,
         ctx: object | None = None,
     ) -> AsyncGenerator[tuple[str, object], None]:
+        self._ensure_open()
         active_ctx = (
             ctx if isinstance(ctx, SessionContext) else await self.ensure_ready()
         )
@@ -475,16 +504,23 @@ class GatewaySession:
 
     async def close(self) -> None:
         """Close transport, signer, and reset active context."""
+        self._closed = True
         # 页面行为后台任务：取消后等待退出，避免向已关闭的传输层发请求
         pending = [t for t in self._background_followups if not t.done()]
         for task in pending:
             task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        self._background_followups.clear()
-        await self._transport.close()
-        await self._signer.close()
-        self._active_context = None
+        try:
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        finally:
+            self._background_followups.clear()
+            try:
+                await self._transport.close()
+            finally:
+                try:
+                    await self._signer.close()
+                finally:
+                    self._active_context = None
 
 
 __all__ = [

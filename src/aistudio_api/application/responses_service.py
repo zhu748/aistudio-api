@@ -384,14 +384,13 @@ class _ResponsesOutputBuilder:
         self.text_parts: list[str] = []
         self.function_calls: list[dict[str, object]] = []
 
-    def add_part(self, part: object) -> None:
+    def add_part(self, part: object, *, allow_tools: bool = True) -> None:
         text = getattr(part, "text", None)
         if isinstance(text, str) and text:
             if getattr(part, "thought", None) is True:
                 self.reasoning_texts.append(text)
             else:
                 self.text_parts.append(text)
-            return
         inline = getattr(part, "inlineData", None)
         if inline is not None:
             # Responses 协议无原生图片 part：降级为 markdown 占位（与
@@ -399,9 +398,8 @@ class _ResponsesOutputBuilder:
             self.text_parts.append(
                 f"\n\n![image](data:{inline.mimeType};base64,{inline.data})"
             )
-            return
         function_call = getattr(part, "functionCall", None)
-        if function_call is not None:
+        if function_call is not None and allow_tools:
             self.function_calls.append(
                 {
                     **_signature_extra(getattr(part, "thoughtSignature", None)),
@@ -415,7 +413,7 @@ class _ResponsesOutputBuilder:
                 }
             )
 
-    def build_output(self) -> list[dict[str, object]]:
+    def build_output(self, status: str) -> list[dict[str, object]]:
         """产出 Responses output items（reasoning → message → function_call 顺序）。"""
         output: list[dict[str, object]] = []
         if self.reasoning_texts:
@@ -437,7 +435,7 @@ class _ResponsesOutputBuilder:
                     "id": _item_id("msg"),
                     "type": "message",
                     "role": "assistant",
-                    "status": "completed",
+                    "status": status,
                     "content": [
                         {
                             "type": "output_text",
@@ -514,6 +512,12 @@ def _usage_payload_from_gemini(usage_metadata: object) -> dict[str, int]:
     return _usage_from_gemini(usage_metadata)
 
 
+def _incomplete_reason(finish_reason: str | None) -> str | None:
+    if finish_reason in (None, "", "STOP"):
+        return None
+    return _FINISH_TO_INCOMPLETE_REASON.get(finish_reason, "max_output_tokens")
+
+
 def build_responses_object(
     response: GeminiGenerateContentResponse, requested_model: str
 ) -> dict[str, object]:
@@ -525,16 +529,16 @@ def build_responses_object(
 
     builder = _ResponsesOutputBuilder()
     for part in _iter_response_parts(response):
-        builder.add_part(part)
+        builder.add_part(part, allow_tools=finish_reason_raw in (None, "STOP"))
 
-    incomplete_reason = _FINISH_TO_INCOMPLETE_REASON.get(finish_reason_raw or "")
+    incomplete_reason = _incomplete_reason(finish_reason_raw)
     status = "incomplete" if incomplete_reason else "completed"
     usage = _usage_payload_from_gemini(response.usageMetadata)
     return _base_response(
         _response_id(),
         requested_model,
         status=status,
-        output=builder.build_output(),
+        output=builder.build_output(status),
         usage=usage,
         incomplete_reason=incomplete_reason,
     )
@@ -884,12 +888,16 @@ class _ResponsesStreamEmitter:
                 return
 
     def error(self, message: str) -> list[str]:
+        if self.saw_error:
+            return []
         self.saw_error = True
         # 先收束已打开的 item（以已累积内容 done）：OpenAI 真实行为是
         # 关闭 items 后再发 response.failed，停在 in_progress 的 item
         # 会让 SDK 累积器对账失败
-        events = self._close_reasoning("".join(self._reasoning_accumulated))
-        events += self._close_message("".join(self._text_accumulated))
+        events = self._close_reasoning(
+            "".join(self._reasoning_accumulated), "incomplete"
+        )
+        events += self._close_message("".join(self._text_accumulated), "incomplete")
         events.append(
             self.sse(
                 "response.failed",
@@ -916,9 +924,7 @@ class _ResponsesStreamEmitter:
         """收束全部打开的 item 并下发终结事件。"""
         if self.saw_error:
             return []
-        incomplete_reason = _FINISH_TO_INCOMPLETE_REASON.get(
-            self.finish_reason_raw or ""
-        )
+        incomplete_reason = _incomplete_reason(self.finish_reason_raw)
         final_status = "incomplete" if incomplete_reason else "completed"
         events = self._close_reasoning(
             "".join(self._reasoning_accumulated), final_status
@@ -954,13 +960,12 @@ async def responses_stream_adapter(
     emitter = _ResponsesStreamEmitter(response_id, requested_model)
     if register_failure is not None:
         register_failure(emitter.error)
-    yield emitter.created()
-    yield emitter.in_progress()
-
     source_aclose: Callable[[], Awaitable[None]] | None = getattr(
         source, "aclose", None
     )
     try:
+        yield emitter.created()
+        yield emitter.in_progress()
         from aistudio_api.application.compat_service import (
             _frame_candidate,
             _frame_parts,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import time
 from collections import defaultdict
@@ -148,7 +149,16 @@ class RuntimeState:
                 payload = {
                     model: asdict(item) for model, item in self.model_stats.items()
                 }
-                await asyncio.to_thread(self._persist_stats, payload)
+                write = asyncio.create_task(
+                    asyncio.to_thread(self._persist_stats, payload)
+                )
+                try:
+                    await asyncio.shield(write)
+                except asyncio.CancelledError:
+                    # Cancelling to_thread does not stop its worker. Drain it
+                    # before shutdown writes a newer synchronous snapshot.
+                    await write
+                    raise
                 current = {
                     model: asdict(item) for model, item in self.model_stats.items()
                 }
@@ -157,7 +167,7 @@ class RuntimeState:
                 # 新请求在文件写入期间发生时，合并到下一轮快照中。
                 await asyncio.sleep(delay)
 
-        self._save_task = loop.create_task(_flush())
+        self._save_task = loop.create_task(_flush(), context=contextvars.Context())
 
     def record(
         self,

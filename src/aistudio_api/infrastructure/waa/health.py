@@ -35,9 +35,10 @@
 
 from __future__ import annotations
 
+import math
 import os
 import time
-from collections import deque
+from collections import Counter, deque
 from typing import Any
 
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -56,7 +57,8 @@ def _env_int(name: str, default: int) -> int:
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name, "")
     try:
-        return float(raw) if raw else default
+        value = float(raw) if raw else default
+        return value if math.isfinite(value) and value >= 0 else default
     except ValueError:
         return default
 
@@ -89,6 +91,7 @@ class SignerHealthTracker:
         self.cooldown_seconds = cooldown_seconds
         # (monotonic_ts, account_id) —— 只保留拒绝事件；成功事件直接清窗
         self._rejects: deque[tuple[float, str | None]] = deque()
+        self._account_counts: Counter[str] = Counter()
         self._degraded_until: float = 0.0
         self._degraded_at: float | None = None
         self._last_trip_accounts: tuple[int, int] | None = None
@@ -110,15 +113,12 @@ class SignerHealthTracker:
         声明为 dict[str, Any] 以便调用方直接索引嵌套字段。
         """
         now = time.monotonic()
-        recent = [
-            (ts, acc) for ts, acc in self._rejects if now - ts <= self.window_seconds
-        ]
-        accounts = {acc for _, acc in recent if acc}
+        self._prune(now)
         return {
             "degraded": self.is_degraded(),
             "cooldownRemainingSec": round(self.cooldown_remaining(), 1),
-            "recentRejects": len(recent),
-            "recentAccounts": len(accounts),
+            "recentRejects": len(self._rejects),
+            "recentAccounts": len(self._account_counts),
             "tripThreshold": {
                 "rejects": self.min_rejects,
                 "accounts": self.min_accounts,
@@ -148,24 +148,26 @@ class SignerHealthTracker:
         now = time.monotonic()
         self._prune(now)
         self._rejects.append((now, account_id))
+        if account_id:
+            self._account_counts[account_id] += 1
         if self.is_degraded():
             return  # 已在熔断中，无需重复判定
 
-        accounts = {acc for _, acc in self._rejects if acc}
+        account_count = len(self._account_counts)
         if (
             len(self._rejects) >= self.min_rejects
-            and len(accounts) >= self.min_accounts
+            and account_count >= self.min_accounts
         ):
             self._degraded_until = now + self.cooldown_seconds
             self._degraded_at = now
-            self._last_trip_accounts = (len(accounts), len(self._rejects))
+            self._last_trip_accounts = (account_count, len(self._rejects))
             logger.error(
                 "WAA 签名器疑似降级（熔断 %ss）：窗口内 %d 次新铸 proof 被拒，"
                 "涉及 %d 个账号。账号与轻量端点可能仍健康，403 根因大概率在"
                 "签名服务（如远程 VM 挑战过期）。期间跳过重签/切号，成功即解除。",
                 self.cooldown_seconds,
                 len(self._rejects),
-                len(accounts),
+                account_count,
             )
 
     def record_proof_accepted(self, account_id: str | None = None) -> None:
@@ -176,6 +178,7 @@ class SignerHealthTracker:
         """
         was_degraded = self.is_degraded()
         self._rejects.clear()
+        self._account_counts.clear()
         self._degraded_until = 0.0
         if was_degraded:
             logger.info(
@@ -186,7 +189,11 @@ class SignerHealthTracker:
 
     def _prune(self, now: float) -> None:
         while self._rejects and now - self._rejects[0][0] > self.window_seconds:
-            self._rejects.popleft()
+            _, account = self._rejects.popleft()
+            if account:
+                self._account_counts[account] -= 1
+                if not self._account_counts[account]:
+                    del self._account_counts[account]
 
 
 _singleton: SignerHealthTracker | None = None

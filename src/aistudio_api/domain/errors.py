@@ -53,44 +53,40 @@ GRPC_CODE_TO_HTTP: dict[int, int] = {
 
 
 def parse_upstream_grpc_error(raw_response: str) -> tuple[int | None, str]:
-    """Parse Google JSPB/JSON error structures into (grpc_code, message)."""
+    """Parse Google JSPB/JSON errors into (gRPC or HTTP code, message)."""
     if not raw_response:
         return None, ""
     text = raw_response.strip()
 
-    normalized = text
+    normalized = text.removeprefix(")]}'").lstrip()
     if normalized.startswith("[,"):
         normalized = "[null," + normalized[2:]
 
     with contextlib.suppress(Exception):
         data = json.loads(normalized)
-        if isinstance(data, list):
-
-            def _find_grpc(obj: object) -> tuple[int | None, str] | None:
-                if isinstance(obj, list):
-                    if (
-                        len(obj) >= 2
-                        and isinstance(obj[0], int)
-                        and isinstance(obj[1], str)
-                        and obj[1]
-                    ):
-                        return obj[0], obj[1]
-                    for item in obj:
-                        res = _find_grpc(item)
-                        if res is not None:
-                            return res
-                elif isinstance(obj, dict):
-                    err = obj.get("error")
-                    if isinstance(err, dict) and "message" in err:
-                        code = err.get("code")
-                        return (
-                            int(code) if isinstance(code, (int, float)) else None
-                        ), str(err["message"])
-                return None
-
-            found = _find_grpc(data)
-            if found is not None:
-                return found
+        pending = [data]
+        while pending:
+            obj = pending.pop()
+            if isinstance(obj, list):
+                if (
+                    len(obj) >= 2
+                    and isinstance(obj[0], int)
+                    and not isinstance(obj[0], bool)
+                    and isinstance(obj[1], str)
+                    and obj[1]
+                ):
+                    return obj[0], obj[1]
+                pending.extend(reversed(obj))
+            elif isinstance(obj, dict):
+                err = obj.get("error")
+                if isinstance(err, dict) and "message" in err:
+                    code = err.get("code")
+                    parsed_code = None
+                    if isinstance(code, int) and not isinstance(code, bool):
+                        parsed_code = code
+                    elif isinstance(code, float) and code.is_integer():
+                        parsed_code = int(code)
+                    return parsed_code, str(err["message"])
 
     return None, text
 
@@ -121,15 +117,19 @@ def classify_error(
         return SessionExpiredError("登录态已失效: 被重定向至 Google 登录页")
     grpc_code, msg = parse_upstream_grpc_error(body)
     clean_msg = msg or body[:200]
-    if grpc_code == 8 or status == 429:
+    if grpc_code in (8, 429) or status == 429:
         return UsageLimitExceeded(f"配额耗尽: {clean_msg}")
-    if grpc_code == 16 or status == 401:
+    if grpc_code in (16, 401) or status == 401:
         return SessionExpiredError(f"认证失效 (HTTP 401): {clean_msg}")
-    if grpc_code == 7 or status == 403:
+    if grpc_code in (7, 403) or status == 403:
         return AuthError(f"权限被拒绝 (HTTP 403): {clean_msg}")
     if is_html_payload(body, content_type):
         return TransportError(f"上游返回 HTML 错误页 (HTTP {status})")
-    effective_status = GRPC_CODE_TO_HTTP.get(grpc_code, status) if grpc_code else status
+    effective_status = status
+    if grpc_code is not None:
+        effective_status = GRPC_CODE_TO_HTTP.get(
+            grpc_code, grpc_code if 400 <= grpc_code <= 599 else status
+        )
     return RequestError(effective_status, clean_msg)
 
 

@@ -6,6 +6,7 @@ import hashlib
 import secrets
 import threading
 import time
+from collections import OrderedDict, deque
 from functools import lru_cache
 
 from fastapi import HTTPException, Request
@@ -21,36 +22,40 @@ logger = get_logger("auth")
 
 
 # ---------------------------------------------------------------------------
-# 管理端 401 速率限制（3.11）：固定窗口计数器，防止对管理密码的持续爆破。
+# 管理端 401 速率限制（3.11）：滑动窗口计数器，防止对管理密码的持续爆破。
 # 管理端凭据不设上限会配合 0.0.0.0 默认绑定形成爆破面。
 # ---------------------------------------------------------------------------
 _AUTH_FAIL_WINDOW_SECONDS = 60.0
 _AUTH_FAIL_MAX_PER_WINDOW = 10
+_AUTH_FAIL_MAX_CLIENTS = 4096
 
-_auth_fail_counts: dict[str, list[float]] = {}
+_auth_fail_counts: OrderedDict[str, deque[float]] = OrderedDict()
 _auth_fail_lock = threading.Lock()
 
 
 def _register_auth_failure_and_check(client_ip: str) -> bool:
     """记录一次管理端鉴权失败。返回 True 表示该 IP 已超限应被限流。"""
-    now = time.monotonic()
     with _auth_fail_lock:
-        hits = [
-            t
-            for t in _auth_fail_counts.get(client_ip, [])
-            if now - t < _AUTH_FAIL_WINDOW_SECONDS
-        ]
+        now = time.monotonic()
+        # Ordered by the last failure, so expired clients can be pruned from
+        # the front without scanning every live client on each request.
+        while _auth_fail_counts:
+            oldest = next(iter(_auth_fail_counts))
+            if now - _auth_fail_counts[oldest][-1] < _AUTH_FAIL_WINDOW_SECONDS:
+                break
+            _auth_fail_counts.popitem(last=False)
+        hits = _auth_fail_counts.get(client_ip)
+        if hits is None:
+            hits = deque(maxlen=_AUTH_FAIL_MAX_PER_WINDOW + 1)
+            _auth_fail_counts[client_ip] = hits
+        while hits and now - hits[0] >= _AUTH_FAIL_WINDOW_SECONDS:
+            hits.popleft()
+        # Only the latest threshold + 1 failures affect the decision, including
+        # recovery after traffic subsides. Retaining all denied attempts is O(n²).
         hits.append(now)
-        _auth_fail_counts[client_ip] = hits
-        if len(_auth_fail_counts) > 4096:
-            # 防止任意 IP 洪水把计数表撑爆
-            stale = [
-                k
-                for k, v in _auth_fail_counts.items()
-                if not v or now - v[-1] > _AUTH_FAIL_WINDOW_SECONDS
-            ]
-            for k in stale[:1024]:
-                _auth_fail_counts.pop(k, None)
+        _auth_fail_counts.move_to_end(client_ip)
+        while len(_auth_fail_counts) > _AUTH_FAIL_MAX_CLIENTS:
+            _auth_fail_counts.popitem(last=False)
         return len(hits) > _AUTH_FAIL_MAX_PER_WINDOW
 
 

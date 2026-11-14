@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from aistudio_api.config import DEFAULT_TEXT_MODEL
 from aistudio_api.domain.errors import (
+    RequestError,
     SessionExpiredError,
     TransportError,
     classify_error,
@@ -220,12 +221,15 @@ class AIStudioClient:
         if is_login_redirect_payload(raw_text):
             raise SessionExpiredError("登录态已失效: 被重定向至 Google 登录页")
         try:
-            parsed = json.loads(raw_text)
+            parsed = json.loads(raw_text.strip().removeprefix(")]}'").lstrip())
             total = parsed[0] if isinstance(parsed, list) and parsed else None
-            if isinstance(total, int):
+            if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
                 return total
         except json.JSONDecodeError:
             pass
+        error = classify_error(200, raw_text)
+        if not isinstance(error, RequestError) or error.status != 200:
+            raise error
         raise TransportError(
             f"upstream CountTokens returned malformed body: {raw_text[:200]}"
         )

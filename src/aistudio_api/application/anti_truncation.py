@@ -675,27 +675,38 @@ class _StreamCallState:
     """单个合成调用的累积状态（自适应"全量重发 / 增量追加"两种上游行为）。"""
 
     call_id: str | None = None
-    accumulated: str = ""
+    fragments: list[str] = field(default_factory=list)
+    size: int = 0
     decoder: ContentDecoder = field(default_factory=ContentDecoder)
     signature_emitted: bool = False
     # 上游一旦下发过可完整解析的 dict 参数，后续字符串分片视为冗余重发。
     dict_seen: bool = False
 
+    @property
+    def complete(self) -> bool:
+        return self.dict_seen or self.decoder.valid
+
+    def append(self, text: str) -> None:
+        if text:
+            self.fragments.append(text)
+            self.size += len(text)
+
 
 def _merge_content(state: _StreamCallState, new: str) -> str:
     """合并新到的 content 片段，返回应作为正文增量下发的新文本。"""
-    prev = state.accumulated
+    prev = "".join(state.fragments)
     if not prev:
-        state.accumulated = new
+        state.append(new)
         return new
     if new.startswith(prev) and len(new) > len(prev):
         # 上游重发了"到目前为止的全量"：只补发后缀。
-        state.accumulated = new
+        state.fragments = [new]
+        state.size = len(new)
         return new[len(prev) :]
     if new == prev:
         return ""
     # 增量追加模式。
-    state.accumulated = prev + new
+    state.append(new)
     return new
 
 
@@ -743,6 +754,7 @@ async def _restore_anti_truncation_stream_inner(
 
     channel: str | None = None  # None | "plain" | "synthetic"
     call_state: _StreamCallState | None = None
+    prior_calls_complete = True
     real_calls_seen = False
     # 暂缓透传的「疑似名称分片」：若流结束时既未被证明是合成名前缀，
     # 也未等到带参数的完整帧，必须在 done 前冲刷——否则一次真实的
@@ -751,7 +763,7 @@ async def _restore_anti_truncation_stream_inner(
 
     def handle_synthetic_call(call: dict[str, object]) -> str | None:
         """处理一个合成调用分片，返回待下发的正文增量（可能为空）。"""
-        nonlocal call_state
+        nonlocal call_state, prior_calls_complete
 
         ctx.synthetic_seen = True
         call_id = call.get("call_id") or call.get("id")
@@ -761,8 +773,10 @@ async def _restore_anti_truncation_stream_inner(
             and call_state.call_id is not None
             and call_state.call_id != call_id_str
         ):
-            if call_state is not None and call_state.accumulated:
-                ctx.multiple_calls = True
+            if call_state is not None:
+                prior_calls_complete = prior_calls_complete and call_state.complete
+                if call_state.size:
+                    ctx.multiple_calls = True
             call_state = _StreamCallState(call_id=call_id_str)
         elif call_state.call_id is None and call_id_str is not None:
             call_state.call_id = call_id_str
@@ -770,8 +784,8 @@ async def _restore_anti_truncation_stream_inner(
         delta: str
         args = call.get("args")
         if isinstance(args, dict):
-            call_state.dict_seen = True
             content = args.get("content")
+            call_state.dict_seen = isinstance(content, str)
             delta = _merge_content(
                 call_state, content if isinstance(content, str) else ""
             )
@@ -791,7 +805,7 @@ async def _restore_anti_truncation_stream_inner(
                 if delta:
                     # 与 dict 路径共享累积状态：若上游随后补发完整
                     # dict 参数帧，_merge_content 可据此去重。
-                    call_state.accumulated += delta
+                    call_state.append(delta)
         return delta if delta else None
 
     async for event_type, payload in events:
@@ -857,10 +871,13 @@ async def _restore_anti_truncation_stream_inner(
             if (
                 channel == "synthetic"
                 and not real_calls_seen
+                and prior_calls_complete
+                and call_state is not None
+                and call_state.complete
                 and isinstance(payload, int)
                 and payload in (10, 12, 13)
             ):
-                # 参数已被成功解码：MALFORMED / UNEXPECTED / TOO_MANY 属于
+                # 仅当参数完整且合法时，MALFORMED / UNEXPECTED / TOO_MANY 属于
                 # 工具协议视角的收尾码，对正文通道应归一为 STOP。
                 payload = 1
             yield event_type, payload

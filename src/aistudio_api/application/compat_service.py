@@ -47,6 +47,7 @@ from aistudio_api.application.media_session import (
     media_session,
 )
 from aistudio_api.application.stream_utils import (
+    SSEEventBuffer,
     StopSequenceBuffer,
     coalesce_tool_frames,
 )
@@ -108,7 +109,7 @@ _GEMINI_TO_OPENAI_FINISH: dict[str, str] = {
     # 映射 "stop" 会让 SDK 把残缺回答当完整答案；"length" 语义是"输出因
     # 上限提前终止"，客户端可据此提示用户重试，与截断的实际表现一致。
     "OTHER": "length",
-    "FINISH_REASON_UNSPECIFIED": "stop",
+    "FINISH_REASON_UNSPECIFIED": "length",
 }
 
 # 视为内容安全拦截的 Gemini finishReason（Claude 侧映射为 refusal）
@@ -128,6 +129,8 @@ _CLAUDE_REFUSAL_FINISH = frozenset(
         "MALFORMED_FUNCTION_CALL",
         "UNEXPECTED_TOOL_CALL",
         "TOO_MANY_TOOL_CALLS",
+        "NO_IMAGE",
+        "MISSING_THOUGHT_SIGNATURE",
     }
 )
 
@@ -238,7 +241,8 @@ def _assert_media_size(b64_data: str, *, kind: str) -> None:
     内联 base64 与远程 URL 走同一套 ``_MAX_MEDIA_BYTES`` 限额，避免超大
     媒体直透上游被拒后白白占用带宽与账号额度。
     """
-    estimated = len(b64_data) * 3 // 4
+    padding = 2 if b64_data.endswith("==") else int(b64_data.endswith("="))
+    estimated = max(0, len(b64_data) * 3 // 4 - padding)
     if estimated > _MAX_MEDIA_BYTES:
         raise ValueError(
             f"{kind} exceeds {_MAX_MEDIA_BYTES} bytes limit "
@@ -261,8 +265,10 @@ def _parse_data_url(url: str) -> tuple[str, str] | None:
     _assert_media_size(data, kind="data URL media")
     if not mime:
         try:
-            decoded = base64.b64decode(data, validate=False)
-        except Exception:
+            # Magic sniffers need at most twelve bytes. Avoid decoding the
+            # entire image merely to infer its MIME type.
+            decoded = base64.b64decode(data[:32], validate=False)
+        except ValueError:
             decoded = b""
         mime = _sniff_mime(decoded) or "application/octet-stream"
     return mime, data
@@ -1113,15 +1119,13 @@ def build_openai_completion(
                 reasoning_parts.append(text)
             else:
                 text_parts.append(text)
-            continue
         inline = getattr(part, "inlineData", None)
         if inline is not None:
             text_parts.append(
                 f"\n\n![image](data:{inline.mimeType};base64,{inline.data})"
             )
-            continue
         function_call = getattr(part, "functionCall", None)
-        if function_call is not None:
+        if function_call is not None and finish_reason_raw in (None, "STOP"):
             has_tool_calls = True
             call_id = function_call.id or f"call_{secrets.token_hex(12)}"
             args = function_call.args if function_call.args is not None else {}
@@ -1221,7 +1225,7 @@ def _claude_stop_reason(
         return "max_tokens", None
     # OTHER = 上游流被截断（streaming.py 无 finishReason 时下发 OTHER），
     # 伪装成 end_turn 会让客户端把残缺回答当完整答案继续跑。
-    if raw in ("OTHER", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"):
+    if raw != "STOP":
         return "max_tokens", None
     if has_tool_use:
         return "tool_use", None
@@ -1240,7 +1244,6 @@ def build_claude_message(
         finish_reason_raw = candidates[0].finishReason
 
     blocks: list[dict[str, object]] = []
-    full_text_parts: list[str] = []
     has_tool_use = False
 
     for part in _iter_response_parts(response):
@@ -1258,8 +1261,6 @@ def build_claude_message(
                 )
             else:
                 blocks.append({"type": "text", "text": text})
-                full_text_parts.append(text)
-            continue
         inline = getattr(part, "inlineData", None)
         if inline is not None:
             blocks.append(
@@ -1272,9 +1273,8 @@ def build_claude_message(
                     },
                 }
             )
-            continue
         function_call = getattr(part, "functionCall", None)
-        if function_call is not None:
+        if function_call is not None and finish_reason_raw in (None, "STOP"):
             has_tool_use = True
             call_id = function_call.id or f"toolu_{secrets.token_hex(12)}"
             blocks.append(
@@ -1288,18 +1288,37 @@ def build_claude_message(
             )
 
     stops = StopSequenceBuffer(stop_sequences)
-    remaining = len(stops.feed("".join(full_text_parts), final=True))
+    filtered: list[dict[str, object]] = []
+
+    def flush_pending() -> None:
+        tail = stops.feed("", final=True)
+        if tail:
+            if filtered and filtered[-1].get("type") == "text":
+                filtered[-1]["text"] = _as_str(filtered[-1].get("text")) + tail
+            else:
+                filtered.append({"type": "text", "text": tail})
+
     for block in blocks:
+        if stops.hit is not None:
+            break
         if block.get("type") == "text":
-            text = _as_str(block.get("text"))
-            block["text"] = text[:remaining]
-            remaining = max(0, remaining - len(text))
-    stop_reason, stop_seq = _claude_stop_reason(
-        finish_reason_raw,
-        has_tool_use=has_tool_use,
-        full_text="".join(full_text_parts),
-        stop_sequences=stop_sequences,
-    )
+            text = stops.feed(_as_str(block.get("text")))
+            if text:
+                filtered.append({**block, "text": text})
+        else:
+            flush_pending()
+            filtered.append(block)
+    flush_pending()
+    blocks = filtered
+    if stops.hit is not None:
+        stop_reason, stop_seq = "stop_sequence", stops.hit
+    else:
+        stop_reason, stop_seq = _claude_stop_reason(
+            finish_reason_raw,
+            has_tool_use=has_tool_use,
+            full_text="",
+            stop_sequences=None,
+        )
     usage = _usage_from_gemini(response.usageMetadata)
     usage_payload: dict[str, object] = {
         "input_tokens": max(0, usage["prompt"] - usage["cached"]),
@@ -1342,7 +1361,10 @@ async def _parse_gemini_sse_frames(
 
     def _parse_event(event: str) -> dict[str, object] | None:
         data_lines = []
-        for line in event.splitlines():
+        # SSEEventBuffer has normalized only the protocol's CR/LF endings.
+        # str.splitlines() also splits valid JSON string characters such as
+        # U+2028, U+2029 and U+0085, corrupting otherwise valid text payloads.
+        for line in event.split("\n"):
             stripped = line.strip()
             # 先 strip 再切 "data:"：SSE 允许行首有空白，直接 line[5:] 会在
             # 前置空白时切错位置（把 payload 首字符一起吃掉）。
@@ -1359,32 +1381,30 @@ async def _parse_gemini_sse_frames(
             raise ValueError("Invalid Gemini SSE JSON frame") from exc
         return parsed if isinstance(parsed, dict) else None
 
-    buffer = ""
+    buffer = SSEEventBuffer(_MAX_SSE_EVENT_BYTES)
     decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
     async for raw in source:
         if isinstance(raw, dict):
             yield raw
             continue
         if isinstance(raw, (bytes, bytearray)):
-            buffer += decoder.decode(bytes(raw), final=False)
+            text = decoder.decode(bytes(raw), final=False)
         elif isinstance(raw, str):
-            buffer += raw
+            text = raw
         else:
             continue
-        buffer = buffer.replace("\r\n", "\n")
-        while "\n\n" in buffer:
-            event, buffer = buffer.split("\n\n", 1)
+        for event in buffer.feed(text):
             parsed = _parse_event(event)
             if parsed is not None:
                 yield parsed
-        # 防御：上游若持续发送一个不含空行终止符的超大事件，缓冲区会无限增长。
-        # 超限时显式终止，避免把被丢弃的帧伪装成正常完成。
-        if len(buffer) > _MAX_SSE_EVENT_BYTES:
-            raise ValueError("Gemini SSE event exceeds configured size limit")
     # 处理流结束时未以空行收尾的最后一个事件
-    buffer += decoder.decode(b"", final=True)
-    if buffer.strip():
-        parsed = _parse_event(buffer)
+    for event in buffer.feed(decoder.decode(b"", final=True)):
+        parsed = _parse_event(event)
+        if parsed is not None:
+            yield parsed
+    tail = buffer.finish()
+    if tail.strip():
+        parsed = _parse_event(tail)
         if parsed is not None:
             yield parsed
 
@@ -1477,8 +1497,6 @@ async def openai_stream_adapter(
                 "data: [DONE]\n\n",
             ]
         )
-    yield _sse(_chunk({"role": "assistant", "content": ""}, None))
-
     finish_reason_raw: str | None = None
     usage_frame: dict[str, object] | None = None
     tool_index = 0
@@ -1491,6 +1509,7 @@ async def openai_stream_adapter(
         source, "aclose", None
     )
     try:
+        yield _sse(_chunk({"role": "assistant", "content": ""}, None))
         try:
             async for frame in _iter_gemini_sse_frames(source):
                 error_obj = frame.get("error")
@@ -1625,7 +1644,6 @@ class _ClaudeStreamEmitter:
         self.model = model
         self.index = -1
         self.open_kind: str | None = None
-        self.text_parts: list[str] = []
         self.has_tool_use = False
         self.finish_reason_raw: str | None = None
         self.usage_frame: dict[str, object] | None = None
@@ -1728,7 +1746,6 @@ class _ClaudeStreamEmitter:
 
     def text_delta(self, text: str) -> list[str]:
         events = self._ensure_block("text")
-        self.text_parts.append(text)
         events.append(
             self.sse(
                 "content_block_delta",
@@ -1830,7 +1847,7 @@ class _ClaudeStreamEmitter:
         )
         return events
 
-    def finish(self, stop_sequences: list[str] | None) -> list[str]:
+    def finish(self) -> list[str]:
         events = self._close_events()
         if self.saw_error:
             return events
@@ -1843,8 +1860,8 @@ class _ClaudeStreamEmitter:
             stop_reason, stop_seq = _claude_stop_reason(
                 self.finish_reason_raw,
                 has_tool_use=self.has_tool_use,
-                full_text="".join(self.text_parts),
-                stop_sequences=stop_sequences,
+                full_text="",
+                stop_sequences=None,
             )
         usage = _usage_from_gemini(self.usage_frame)
         usage_payload: dict[str, object] = {
@@ -1879,13 +1896,13 @@ async def claude_stream_adapter(
     stops = StopSequenceBuffer(stop_sequences)
     if register_failure is not None:
         register_failure(lambda message: emitter.error(504, message))
-    yield emitter.message_start()
-    yield emitter.ping()
     # 确定性关闭内层 SSE 生成器（3.6）：自身异常或客户端断连时立即释放上游连接
     source_aclose: Callable[[], Awaitable[None]] | None = getattr(
         source, "aclose", None
     )
     try:
+        yield emitter.message_start()
+        yield emitter.ping()
         async for frame in _iter_gemini_sse_frames(source):
             error_obj = frame.get("error")
             if isinstance(error_obj, dict):
@@ -1902,6 +1919,18 @@ async def claude_stream_adapter(
             if isinstance(usage_metadata, dict):
                 emitter.usage_frame = usage_metadata
             for part in _frame_parts(candidate):
+                if stops.hit is not None:
+                    continue
+                if (
+                    part.get("functionCall")
+                    or part.get("inlineData")
+                    or part.get("thought") is True
+                ):
+                    # A retained text prefix belongs before this next block.
+                    tail = stops.feed("", final=True)
+                    if tail:
+                        for event in emitter.text_delta(tail):
+                            yield event
                 function_call = _as_dict(part.get("functionCall"))
                 if function_call:
                     call_id = _as_str(function_call.get("id"))
@@ -1957,7 +1986,7 @@ async def claude_stream_adapter(
         if tail:
             for event in emitter.text_delta(tail):
                 yield event
-        for event in emitter.finish(stop_sequences):
+        for event in emitter.finish():
             yield event
     finally:
         if callable(source_aclose):

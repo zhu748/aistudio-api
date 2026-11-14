@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
 class GeminiInlineData(BaseModel):
@@ -123,6 +123,8 @@ class GeminiTool(BaseModel):
 
 
 class GeminiGenerationConfig(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
     stopSequences: list[str] | None = Field(
         default=None, validation_alias=AliasChoices("stopSequences", "stop_sequences")
     )

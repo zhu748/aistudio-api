@@ -84,7 +84,7 @@ class StreamingGateway:
             if callable(scheduler):
                 scheduler(request.ctx, model, extract_page_prompt(request_body))
         parser = IncrementalJSONStreamParser()
-        utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
         latest_usage: dict[str, object] | None = None
         latest_finish_reason: int | None = None
         latest_response_id: str | None = None
@@ -102,7 +102,8 @@ class StreamingGateway:
         def emit_parsed_chunk(
             parsed_chunk: list[object],
         ) -> list[tuple[str, object | None]]:
-            nonlocal latest_usage, latest_finish_reason, latest_response_id
+            nonlocal latest_usage, latest_finish_reason
+            nonlocal latest_response_id, emitted_any_chunk
             events: list[tuple[str, object | None]] = []
             usage = parse_chunk_usage(parsed_chunk)
             if usage:
@@ -119,11 +120,6 @@ class StreamingGateway:
                 record_session_token(token_scope, latest_response_id)
                 events.append(("response_id", latest_response_id))
             candidate = parse_response_chunk(parsed_chunk)
-            if candidate.finish_reason is not None and candidate.finish_reason not in (
-                0,
-                WIRE_FINISH_REASON_CONTINUING,
-            ):
-                latest_finish_reason = candidate.finish_reason
             if candidate.thinking:
                 events.append(("thinking", candidate.thinking))
             if candidate.reasoning_images:
@@ -141,6 +137,18 @@ class StreamingGateway:
                 events.append(("body", candidate.text))
             if candidate.thought_signature:
                 events.append(("thought_signature", candidate.thought_signature))
+            if any(
+                kind not in {"response_id", "thought_signature"} for kind, _ in events
+            ):
+                emitted_any_chunk = True
+                # New output needs its own terminal reason; an earlier STOP
+                # cannot certify a later truncated continuation.
+                latest_finish_reason = None
+            if candidate.finish_reason is not None and candidate.finish_reason not in (
+                0,
+                WIRE_FINISH_REASON_CONTINUING,
+            ):
+                latest_finish_reason = candidate.finish_reason
             return events
 
         # aclosing：客户端断连/上层重试丢弃本生成器时，async for 不会自动
@@ -166,7 +174,11 @@ class StreamingGateway:
                 elif event_type == "chunk" and payload:
                     has_received_chunks = True
                     if isinstance(payload, bytes):
-                        text_payload = utf8_decoder.decode(payload, final=False)
+                        text_payload = (
+                            utf8_decoder.decode(payload, final=False)
+                            if status_code == 200
+                            else payload.decode("utf-8", errors="replace")
+                        )
                     else:
                         text_payload = str(payload)
                     if not text_payload:
@@ -187,27 +199,24 @@ class StreamingGateway:
                         # 下发为事件）；错误分类走末尾的 raw_response 路径。
                         for parsed_chunk in parser.feed(text_payload):
                             for event in emit_parsed_chunk(parsed_chunk):
-                                emitted_any_chunk = True
                                 yield event
+        except ValueError as exc:
+            raise TransportError(f"Invalid upstream stream: {exc}") from exc
         finally:
             # 正常结束 / 异常 / 客户端断连（GeneratorExit）都走这里：
             # 确定性关闭 transport 生成器，触发其 finally 的 resp.aclose()。
             await upstream.aclose()
-        trailing_text = utf8_decoder.decode(b"", final=True)
-        if trailing_text:
-            if status_code != 200 and raw_parts_total < 65536:
-                raw_parts.append(trailing_text)
-                raw_parts_total += len(trailing_text)
-            if status_code == 200:
+        try:
+            trailing_text = utf8_decoder.decode(b"", final=True)
+            if trailing_text and status_code == 200:
                 for parsed_chunk in parser.feed(trailing_text):
                     for event in emit_parsed_chunk(parsed_chunk):
-                        emitted_any_chunk = True
                         yield event
-
-        for parsed_chunk in parser.finish():
-            for event in emit_parsed_chunk(parsed_chunk):
-                emitted_any_chunk = True
-                yield event
+            for parsed_chunk in parser.finish():
+                for event in emit_parsed_chunk(parsed_chunk):
+                    yield event
+        except ValueError as exc:
+            raise TransportError(f"Invalid upstream stream: {exc}") from exc
         logger.debug("流式读取结束: model=%s, 收到分块=%s", model, has_received_chunks)
         raw_response = "".join(raw_parts)
         if status_code == 0:
@@ -235,6 +244,13 @@ class StreamingGateway:
                 raise SessionExpiredError("登录态已失效: 被重定向至 Google 登录页")
             if is_html_payload(head_sample):
                 raise TransportError("upstream returned HTML error page on HTTP 200")
+        if not emitted_any_chunk and latest_finish_reason is None:
+            error = classify_error(200, head_sample)
+            if not isinstance(error, RequestError) or error.status != 200:
+                raise error
+            raise TransportError(
+                "upstream returned no usable content or finish reason on HTTP 200"
+            )
         if latest_finish_reason is not None:
             yield ("finish_reason", latest_finish_reason)
         elif emitted_any_chunk:
@@ -250,10 +266,5 @@ class StreamingGateway:
                 head_sample[:120],
             )
             yield ("finish_reason", 5)
-        else:
-            logger.warning(
-                "流式响应结束但未收到上游 finish_reason（无内容输出）: model=%s", model
-            )
-            yield ("finish_reason", 1)
         yield ("usage", latest_usage)
         yield ("done", None)
