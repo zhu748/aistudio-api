@@ -29,7 +29,9 @@ async def test_proxy_resolution_runs_outside_lock(
         if len(resolve_calls) == 1:
             started.set()
             await asyncio.sleep(0.2)
-        resolved_at[asyncio.current_task()] = asyncio.get_event_loop().time()
+        task = asyncio.current_task()
+        assert task is not None  # 协程内 current_task 不会为 None（pyright 收窄）
+        resolved_at[task] = asyncio.get_event_loop().time()
         return "socks5://127.0.0.1:14000"
 
     monkeypatch.setattr(ms, "resolve_proxy_url_async", fake_resolve)
