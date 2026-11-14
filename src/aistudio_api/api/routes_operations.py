@@ -10,7 +10,7 @@ import time
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from aistudio_api.api.state import runtime_state
@@ -179,6 +179,53 @@ async def request_payload(request_id: str) -> dict[str, object]:
         }
 
     return await asyncio.to_thread(read)
+
+
+@router.get("/requests/{request_id}/upstream")
+async def request_upstream_exchange(
+    request_id: str, download: bool = Query(False)
+) -> Response:
+    """上游失败请求的完整交换快照（URL/脱敏头/wire 体/响应样本）。
+
+    download=1 时以 attachment 形式返回 JSON 文件（文件名
+    ``<request_id>.upstream.json``），用于离线排查与共享。
+    """
+    if not re.fullmatch(r"req_[A-Za-z0-9_-]{1,100}", request_id):
+        raise HTTPException(400, "请求 ID 格式无效")
+    record = await asyncio.to_thread(request_history().get, request_id)
+    if record is None:
+        raise HTTPException(404, "请求记录不存在或已过保留期")
+
+    def read() -> dict[str, object]:
+        target = get_dump_dir() / f"{request_id}.upstream.json"
+        try:
+            if not target.is_file():
+                return {
+                    "available": False,
+                    "note": "此请求无上游失败快照（仅上游非 200 响应时采集）。",
+                }
+            if target.stat().st_size > settings.dump_max_bytes * 4 + 65536:
+                return {
+                    "available": False,
+                    "note": "快照超过当前读取上限，请在服务器端查看。",
+                }
+            return json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"available": False, "note": "快照文件暂时不可读取。"}
+
+    snapshot = await asyncio.to_thread(read)
+    content = json.dumps(snapshot, ensure_ascii=False, indent=1)
+    if download:
+        return Response(
+            content=content,
+            media_type="application/json",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{request_id}.upstream.json"'
+                )
+            },
+        )
+    return Response(content=content, media_type="application/json")
 
 
 @router.get("/requests/{request_id}")

@@ -1,4 +1,4 @@
-import { request } from './client.ts'
+import { authHeaders, request } from './client.ts'
 import type { LogEntry } from '@/types'
 import type { RequestMetricsResponse } from '@/types/stats.ts'
 
@@ -110,6 +110,30 @@ export const operationsApi = {
     return request<{ available: boolean; note: string; payload?: Record<string, unknown> }>(
       `/api/requests/${encodeURIComponent(id)}/payload`,
     )
+  },
+  upstream(id: string) {
+    return request<{
+      available?: boolean
+      note?: string
+      captured_at?: string
+      upstream?: {
+        url: string
+        method: string
+        headers: Record<string, string>
+        wire_body: unknown
+        body_bytes: number
+      }
+      proxy?: string | null
+      response?: { status: number; body: string }
+    }>(`/api/requests/${encodeURIComponent(id)}/upstream`)
+  },
+  async upstreamBlob(id: string) {
+    const response = await fetch(
+      `/api/requests/${encodeURIComponent(id)}/upstream?download=1`,
+      { headers: await authHeaders() },
+    )
+    if (!response.ok) throw new Error(`下载失败 (HTTP ${response.status})`)
+    return response.blob()
   },
   requests(params: URLSearchParams) {
     return request<Page<RequestRecord>>(`/api/requests?${params}`)

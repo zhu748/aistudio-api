@@ -29,6 +29,9 @@ const logsTotal = ref(0)
 const logsPage = ref(1)
 const logsLoading = ref(false)
 const payload = ref<Awaited<ReturnType<typeof operationsApi.payload>> | null>(null)
+const upstream = ref<Awaited<ReturnType<typeof operationsApi.upstream>> | null>(null)
+const upstreamError = ref('')
+const upstreamDownloading = ref(false)
 const tab = ref('overview')
 const detailUrl = computed(
   () => `${window.location.origin}/requests?request_id=${encodeURIComponent(props.requestId)}`,
@@ -115,6 +118,17 @@ async function load() {
       .catch((err) => {
         if (current === sequence) payloadError.value = err instanceof Error ? err.message : '正文加载失败'
       }),
+    operationsApi
+      .upstream(id)
+      .then((value) => {
+        if (current === sequence) {
+          upstream.value = value
+          upstreamError.value = ''
+        }
+      })
+      .catch((err) => {
+        if (current === sequence) upstreamError.value = err instanceof Error ? err.message : '上游快照加载失败'
+      }),
     loadLogs(),
   ])
   if (current === sequence) loading.value = false
@@ -126,10 +140,12 @@ watch(
     sequence++
     record.value = null
     payload.value = null
+    upstream.value = null
     logs.value = []
     error.value = ''
     logsError.value = ''
     payloadError.value = ''
+    upstreamError.value = ''
     logsPage.value = 1
     tab.value = 'overview'
     if (props.requestId) void load()
@@ -160,6 +176,22 @@ function value(number: unknown) {
 async function turnLogs(delta: number) {
   logsPage.value += delta
   await loadLogs()
+}
+async function downloadUpstream() {
+  upstreamDownloading.value = true
+  try {
+    const blob = await operationsApi.upstreamBlob(props.requestId)
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `${props.requestId}.upstream.json`
+    anchor.click()
+    URL.revokeObjectURL(url)
+  } catch (err) {
+    upstreamError.value = err instanceof Error ? err.message : '下载失败'
+  } finally {
+    upstreamDownloading.value = false
+  }
 }
 </script>
 
@@ -433,6 +465,72 @@ async function turnLogs(delta: number) {
         v-else-if="tab === 'payload'"
         class="space-y-4 text-sm"
       >
+        <section class="rounded-xl border border-amber-200 bg-amber-50/50 p-4 space-y-3">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h3 class="font-semibold text-amber-900">
+              上游请求快照
+              <span
+                v-if="upstream?.captured_at"
+                class="ml-2 text-xs font-normal text-amber-700"
+              >{{ upstream.captured_at }}</span>
+            </h3>
+            <Button
+              v-if="upstream?.upstream"
+              size="xs"
+              :loading="upstreamDownloading"
+              @click="downloadUpstream"
+            >
+              <Download class="w-3.5 h-3.5" />下载快照
+            </Button>
+          </div>
+          <p
+            v-if="upstreamError"
+            class="text-rose-600"
+          >
+            {{ upstreamError }}
+          </p>
+          <p class="text-slate-500 text-xs">
+            {{ upstream?.note || (upstream?.upstream ? '上游非 200 响应时自动采集：实际发送的 URL、请求头（凭据已脱敏）与完整 wire 请求体。' : '正在查询上游失败快照…') }}
+          </p>
+          <template v-if="upstream?.upstream">
+            <dl class="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-xs">
+              <div>
+                <dt class="text-slate-500 mb-0.5">
+                  上游端点
+                </dt>
+                <dd class="font-mono break-all">
+                  {{ upstream.upstream.url }}
+                </dd>
+              </div>
+              <div>
+                <dt class="text-slate-500 mb-0.5">
+                  响应状态 / 代理出口
+                </dt>
+                <dd class="font-mono break-all">
+                  HTTP {{ upstream.response?.status }} / {{ upstream.proxy || '直连' }}
+                </dd>
+              </div>
+            </dl>
+            <div>
+              <p class="text-slate-500 mb-1 text-xs">
+                请求头（{{ Object.keys(upstream.upstream.headers).length }} 个，凭据仅保留长度）
+              </p>
+              <pre class="rounded-lg bg-slate-950 text-slate-200 p-3 text-xs overflow-auto max-h-48 whitespace-pre-wrap break-all">{{ JSON.stringify(upstream.upstream.headers, null, 2) }}</pre>
+            </div>
+            <div>
+              <p class="text-slate-500 mb-1 text-xs">
+                wire 请求体（{{ upstream.upstream.body_bytes.toLocaleString() }} 字节，WAA proof 已截断）
+              </p>
+              <pre class="rounded-lg bg-slate-950 text-slate-200 p-3 text-xs overflow-auto max-h-96 whitespace-pre-wrap break-all">{{ JSON.stringify(upstream.upstream.wire_body, null, 1) }}</pre>
+            </div>
+            <div>
+              <p class="text-slate-500 mb-1 text-xs">
+                上游响应样本
+              </p>
+              <pre class="rounded-lg bg-slate-950 text-rose-300 p-3 text-xs overflow-auto max-h-48 whitespace-pre-wrap break-all">{{ upstream.response?.body || '（空）' }}</pre>
+            </div>
+          </template>
+        </section>
         <p
           v-if="payloadError"
           class="text-rose-600"

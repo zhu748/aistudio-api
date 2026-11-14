@@ -72,6 +72,12 @@ export function setUnauthorizedHandler(handler: UnauthorizedHandler | null): voi
   onUnauthorizedHandler = handler
 }
 
+/** 构造带管理令牌的请求头（供 request 之外的裸 fetch 使用，如 blob 下载）。 */
+export async function authHeaders(): Promise<Record<string, string>> {
+  const token = getToken()
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}
+
 // 默认请求超时：fetch 本身没有超时，后端卡住时前端会无限等待
 const DEFAULT_TIMEOUT_MS = 30000
 

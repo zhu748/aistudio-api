@@ -355,10 +355,51 @@ def test_normalize_keeps_signature_only_part():
             ),
         ]
     )
-    # 末尾空文本签名轮保留（有签名载荷，非空轮）
-    assert normalized.contents[-1].parts[0].thought_signature == (
+    # 末尾空文本签名轮保留（有签名载荷，非空轮）；
+    # model 结尾追加单空格 user 占位（真机实测 200，见 2026-11-14 判别）
+    assert normalized.contents[-2].parts[0].thought_signature == (
         "dmFsaWRfc2lnXzEyMw=="
     )
+    assert normalized.contents[-1].role == "user"
+    assert normalized.contents[-1].parts[0].text == " "
+
+
+def test_normalize_tail_model_text_gets_space_user_sentinel():
+    """尾部 model 文本轮（prefill/混合轮剥离残留）→ 追加单空格 user 占位。
+
+    真机五形态判别（2026-11-14）：model 结尾 400；空文本 user 占位无效
+    （上游不认空文本轮）；单空格 user 占位 200。
+    """
+    from aistudio_api.api.schemas import (
+        GeminiContent,
+        GeminiFunctionCall,
+        GeminiPart,
+    )
+
+    # 混合轮：文本 + 伪造工具调用（剥离后文本保留，轮次以 model 收尾）
+    normalized = _norm(
+        [
+            GeminiContent(role="user", parts=[GeminiPart(text="Hello.")]),
+            GeminiContent(
+                role="model",
+                parts=[
+                    GeminiPart(text="Let me reply in style."),
+                    GeminiPart(
+                        functionCall=GeminiFunctionCall(
+                            name="context", args={}, id="call_tail"
+                        )
+                    ),
+                ],
+            ),
+        ]
+    )
+    assert [c.role for c in normalized.contents] == ["user", "model", "user"]
+    assert normalized.contents[0].parts[0].text == "Hello."
+    assert normalized.contents[1].parts[0].text == "Let me reply in style."
+    assert all(p.function_call is None for p in normalized.contents[1].parts)
+    sentinel = normalized.contents[-1]
+    assert sentinel.role == "user"
+    assert sentinel.parts[0].text == " "
 
 
 def test_normalize_all_hollow_falls_back_to_single_user_turn():
