@@ -123,6 +123,7 @@ Google AI Studio 在 Web 端（`alkalimakersuite-pa.clients6.google.com`）与�
 | **`17`** | `media_resolution` | `int \| null` | 多模态输入分辨率：`1`=LOW, `2`=MEDIUM, `3`=HIGH |
 | **`18`** | `seed` | `int \| null` | 随机种子（Field 19） |
 | **`26`** | `output_resolution` | `list[str] \| null` | 生图分辨率配置，如 `["1:1", "1K"]` |
+| **`45`** | `unknown_flag_45` | `int \| null` | 未知开关：**与模型家族相关**（2026-11-14 hybrid 多模型判别，目录槽位 `[85]` 非空的 gemini-4 三兄弟 hydrogen/carbon/argon 恒携 `1`；3.8-flash（新代但 `[85]=null`）与 3.5-flash-lite 不带 —— 与 `unknown_flag_13`（[83]）正交；同标记家族的浏览器默认 maxOutputTokens 恒 32768，即使 hydrogen 目录输出上限为 65536） |
 
 ---
 
@@ -213,6 +214,13 @@ Google AI Studio 在 Web 端（`alkalimakersuite-pa.clients6.google.com`）与�
 > **Schema 字段边界说明**：
 > 根据 AI Studio 前端 Bundle 逆向提取的 Schema Proto 字段集（`_.mhb = new Set(...)`），定义范围截止于 Field 23（`propertyOrdering`，数组下标 22）。早期推测的 `title` (Field 24) 与 `default` (Field 25) 并不存在于 Google Schema Proto 中；向数组注入下标 23 或 24 会被服务端识别为未知字段并返回 `HTTP 400: Request contains an invalid argument`。
 
+> [!IMPORTANT]
+> **propertyOrdering 缺省推导（2026-11-14 hybrid6 真机抓包）**：
+> 前端对 object 类型且含属性的 schema **恒**在槽位 22 携带
+> `propertyOrdering`（= `properties` 的键序快照），即使客户端未显式
+> 声明。网关侧已同构推导（`_encode_schema_to_wire`）：object 且
+> `properties` 非空时按键序生成，其余类型不带。
+
 ### 6.4 工具控制模式 (ToolConfig)
 
 MakerSuite 协议无独立顶层工具控制字段，Gemini API 的 `toolConfig` 在网关层按语义映射：
@@ -249,6 +257,39 @@ MakerSuite 协议无独立顶层工具控制字段，Gemini API 的 `toolConfig`
 | **`NONE`** | 禁用工具调用，强制纯文本输出 | 置空 `tools` 为 `null` |
 | **`ANY`** | 强制执行工具调用 | 若配置 `allowedFunctionNames`，在网关层过滤候选工具列表 |
 | **`VALIDATED`** | 受限解码验证 | 保持 `tools` 原样下发 |
+
+### 6.5 函数调用往返编码（2026-11-14 hybrid6 真机抓包）
+
+客户端声明函数（functionDeclarations）的完整往返形态：
+
+**响应侧 functionCall part**（模型输出，单 part 同时携带调用与签名）：
+
+```json
+[null×10, [name, args_wire, call_id], null, null, null, thought_signature]
+```
+
+- `call_id`（`call_<19位数字>`）由**上游生成**；前端/网关原样回传；
+- **签名挂在本 part 槽位 14**（非独立尾 part —— 纯文本轮才是尾 part 形态）。
+
+**回传侧**（下一轮请求的历史）：
+
+```json
+model: [null×10, [name, args_wire, call_id], null, null, null, 同签名]
+user:  [null×11, [name, response_wire, call_id]]
+```
+
+- functionCall 三元素 + 签名**原样回传**；
+- functionResponse 为 user 角色，槽位 11 = `[name, response, call_id]`，
+  **call_id 与对应 FC 一致**（配对键）；
+- response 载荷 wire：`[[[key, value_wire], …]]`（int→`[null,18]`、
+  str→`[null,null,"…"]`，同结构体编码规范）；
+- 模型 FC 轮无额外尾签名 part；后继文本轮恢复常规形态（思考摘要
+  (槽位 12=1) + 文本 + 尾部空文本签名 part）。
+
+> [!NOTE]
+> **签名宽容度差异**：上游对客户端声明函数的 FC 回传**宽容**（签名可带可缺）；
+> 对服务端工具（`default_api:*` 与内置 grounding 类）的 FC 回传**强制**校验
+> 签名（见 6.4 节 IMPORTANT）。
 
 ## 7. 响应报文解析与 Token 使用量 (Response & Usage)
 
@@ -369,25 +410,30 @@ POST /$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/C
 - 鉴权链与 GenerateContent 完全一致（API Key + SAPISIDHASH + Cookie + Origin）；
 - 网关层对应暴露 `POST /v1beta/{model}:countTokens`（Gemini 协议兼容）。
 
-## 7.6 浏览器恒定默认形态（2026-11 全量 9 条 GenerateContent 抓包逆向）
+## 7.6 浏览器恒定默认形态（2026-11 全量抓包逆向，11-14 hybrid 多模型判别修订）
 
-真机抓包中所有 GenerateContent 请求（gemini-3.8-flash 与 gemini-3.5-flash-lite
-两类模型、多轮/工具/结构化输出场景全覆盖）呈现恒定默认 `generation_config`：
+真机抓包中所有 GenerateContent 请求（gemini-3.8-flash / gemini-3.5-flash-lite /
+gemini-4-hydrogen 三类模型、多轮/工具/结构化输出场景全覆盖）呈现恒定默认
+`generation_config`（按模型家族两档）：
 
 ```
-[null, null, null, 65536, 1, 0.95, 64, ...null..., <13?>, null, null, [1, null, null, <level>]]
+非 gemini-4 系: [null,null,null, 65536, 1, 0.95, 64, ...null..., <13?>, null,null, [1,null,null,<level>]]
+gemini-4 系:    [null,null,null, 32768, 1, 0.95, 64, ...null..., 1,      null,null, [1,null,null,<level>],
+                 ...null..., 45:1]
 ```
 
 | 项 | 值 | 说明 |
 |---|---|---|
-| `maxOutputTokens` | `65536` | AI Studio UI 层硬编码默认（flash 模型输出上限恰为 65536） |
+| `maxOutputTokens` | `65536` / **gemini-4 系 `32768`** | AI Studio UI 层硬编码默认；gemini-4 系（目录 `[85]` 非空）恒 32768 —— hydrogen 目录输出上限虽为 65536，真机请求实测仍 32768（2026-11-14 hybrid7/7b 判别） |
 | `temperature` / `topP` / `topK` | `1` / `0.95` / `64` | 与服务端默认一致，无行为变化 |
-| `thinking_config` | `[1, null, null, <level>]` | 档位取 **ListModels 元数据默认档**（目录槽位 `[71][5]`）：3.5-flash-lite 默认 `4`(MINIMAL)，3.8-flash / carbon / argon 默认 `2`(MEDIUM) |
+| `thinking_config` | `[1, null, null, <level>]` | 档位取 **ListModels 元数据默认档**（目录槽位 `[71][5]`）：3.5-flash-lite 默认 `4`(MINIMAL)，3.8-flash / carbon / argon 默认 `2`(MEDIUM)，hydrogen 默认 `3`(HIGH) |
 | `unknown_flag_13` | 目录 `[83]=1` 时为 `1` | 模型相关：3.8-flash / carbon / argon / 新代图像与 TTS 模型恒为 `1`，3.5-flash-lite 等为 null |
+| `unknown_flag_45` | 目录 `[85]` 非空时为 `1` | 家族相关（2026-11-14 判别）：gemini-4 三兄弟恒 `1`；3.8-flash（新代但 `[85]=null`）不带 —— 与 flag_13 正交 |
 
 - 项目落地：`model_defaults` 的 `gemini_models` 预设注入上述默认值，
   `wire_codec.build_request` 在用户未显式指定时按 ListModels 元数据自适应
-  （默认思考档位 / flag13 自动推导 / 65536 按模型输出上限钳制如 carbon 32768）；
+  （默认思考档位 / flag13 与 flag45 自动推导 / maxOutputTokens 按家族与
+  输出上限钳制：gemini-4 系 32768，其余 65536 或输出上限）；
 - 特殊输出模型（图像 / 视频 / 语音 / TTS / Live）通过 `aux_output_models`
   预设清除文本默认值（槽位 3/4/5/6/13/16），避免携带越界参数；
 - 用户显式传入的任何参数优先于浏览器形态默认值。

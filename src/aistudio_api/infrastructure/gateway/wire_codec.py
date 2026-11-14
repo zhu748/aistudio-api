@@ -13,6 +13,7 @@ from .model_defaults import (
     browser_default_max_tokens,
     browser_default_thinking_wire,
     model_unknown_flag_13,
+    model_unknown_flag_45,
     resolve_model_defaults,
     snap_thinking_wire_to_model,
 )
@@ -344,6 +345,14 @@ class AistudioWireCodec:
             flag13 = model_unknown_flag_13(model)
             if flag13 is not None:
                 gc.unknown_flag_13 = flag13
+        # 2026-11-14 hybrid 判别：目录 [85] 非空的 gemini-4 系恒携 [45]=1
+        if gc.unknown_flag_45 is None and (
+            GenerationConfigIndex.UNKNOWN_FLAG_45
+            not in model_defaults.clear_generation_config_indexes
+        ):
+            flag45 = model_unknown_flag_45(model)
+            if flag45 is not None:
+                gc.unknown_flag_45 = flag45
         if not user_specified_max_tokens and gc.max_tokens is not None:
             capped = browser_default_max_tokens(model)
             if isinstance(gc.max_tokens, (int, float)) and capped < gc.max_tokens:

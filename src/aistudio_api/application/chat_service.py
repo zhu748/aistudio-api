@@ -21,7 +21,6 @@ from aistudio_api.infrastructure.gateway.model_defaults import (
 )
 from aistudio_api.infrastructure.gateway.wire_codec import build_tools_from_names
 from aistudio_api.infrastructure.gateway.wire_spec import JspbArray, SchemaIndex
-from aistudio_api.infrastructure.utils.logger import get_logger
 from aistudio_api.infrastructure.gateway.wire_types import (
     AistudioContent,
     AistudioImageOutputMode,
@@ -29,6 +28,7 @@ from aistudio_api.infrastructure.gateway.wire_types import (
     AistudioThinkingConfig,
     ThinkingLevel,
 )
+from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("chat")
 
@@ -394,6 +394,19 @@ def _encode_schema_to_wire(
     property_ordering = schema.get("propertyOrdering") or schema.get(
         "property_ordering"
     )
+    if not isinstance(property_ordering, list):
+        # 2026-11 AI Studio 真机抓包（hybrid6 函数调用实验）：前端对
+        # object schema 恒在槽位 22 携带 propertyOrdering（= properties
+        # 的键序快照），即使客户端未显式声明。缺省时按键序推导对齐
+        # 浏览器线缆形态；仅 object 且有属性时推导。
+        if schema_type == "object" and isinstance(properties, dict) and properties:
+            property_ordering = [
+                str(name)
+                for name, prop in properties.items()
+                if isinstance(prop, dict) or prop is True
+            ]
+        else:
+            property_ordering = None
     if isinstance(property_ordering, list):
         wire[SchemaIndex.PROPERTY_ORDERING] = list(property_ordering)
 
@@ -1029,9 +1042,7 @@ def normalize_gemini_request(
         for t in tools:
             if isinstance(t, list) and len(t) > 1 and isinstance(t[1], list):
                 filtered_decls = [
-                    d
-                    for d in t[1]
-                    if isinstance(d, list) and d and d[0] in allowed_set
+                    d for d in t[1] if isinstance(d, list) and d and d[0] in allowed_set
                 ]
                 if filtered_decls:
                     filtered_tools.append([t[0], filtered_decls])

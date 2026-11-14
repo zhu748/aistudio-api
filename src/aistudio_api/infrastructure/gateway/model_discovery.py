@@ -195,6 +195,7 @@ _FALLBACK_MODELS = [
         "inputTokenLimit": 1048576,
         "outputTokenLimit": 32768,
         "unknownFlag13": 1,
+        "unknownFlag45": 1,
         "defaultThinkingLevel": 2,
         "thinkingLevels": [1, 2, 3],
         "paid": True,
@@ -211,6 +212,7 @@ _FALLBACK_MODELS = [
         "inputTokenLimit": 1048576,
         "outputTokenLimit": 32768,
         "unknownFlag13": 1,
+        "unknownFlag45": 1,
         "defaultThinkingLevel": 2,
         "thinkingLevels": [1, 2, 3],
         "paid": True,
@@ -235,6 +237,7 @@ _FALLBACK_MODELS = [
         "inputTokenLimit": 1048576,
         "outputTokenLimit": 65536,
         "unknownFlag13": 1,
+        "unknownFlag45": 1,
         "defaultThinkingLevel": 3,
         "thinkingLevels": [1, 2, 3, 5],
         "aliases": [],
@@ -1276,6 +1279,12 @@ class ModelDiscoveryService:
                 and not isinstance(item[83], bool)
             ):
                 unknown_flag_13 = item[83]
+            # 2026-11-14 hybrid 多模型判别：目录槽位 [85] 非空（gemini-4
+            # 三兄弟的 1M 上下文标记）与 generation_config[45]=1 严格对应；
+            # 3.8-flash / 3.5-flash-lite 等不带。与 [83] 正交。
+            unknown_flag_45: int | None = None
+            if len(item) > 85 and item[85] is not None:
+                unknown_flag_45 = 1
             paid = bool(len(item) > 77 and item[77] == 2)
             # accessModes 主槽位 [82]，镜像槽位 [87]（实测两者恒等：carbon
             # [1,4] / argon [1,3]）；主槽缺失时用镜像兜底。模式语义：
@@ -1339,6 +1348,7 @@ class ModelDiscoveryService:
                     "defaultThinkingLevel": default_thinking_level,
                     "thinkingLevels": thinking_levels,
                     "unknownFlag13": unknown_flag_13,
+                    "unknownFlag45": unknown_flag_45,
                     "paid": paid,
                     "accessModes": access_modes,
                     "is_image_model": is_image,

@@ -73,6 +73,12 @@ class GenerationConfigIndex(IntEnum):
     MEDIA_RESOLUTION = 17
     SEED = 18
     OUTPUT_RESOLUTION = 26
+    # 2026-11-14 hybrid 混合捕获实验（多模型判别）：目录槽位 [85] 非空的
+    # 模型（gemini-4 三兄弟 hydrogen/carbon/argon，1M 上下文标记）请求恒携
+    # generation_config[45]=1；3.8-flash（[83]=1 但 [85]=null）与
+    # 3.5-flash-lite 均不带 —— 与 flag_13 正交。语义待逆向；定义常量
+    # 以便透传保真，构造时由 model_defaults.model_unknown_flag_45 自动推导。
+    UNKNOWN_FLAG_45 = 45
 
 
 class SchemaIndex(IntEnum):

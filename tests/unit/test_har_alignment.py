@@ -28,6 +28,7 @@ from aistudio_api.infrastructure.gateway.model_defaults import (
     effective_generation_config_overrides,
     model_output_token_limit,
     model_unknown_flag_13,
+    model_unknown_flag_45,
     resolve_model_defaults,
     snap_thinking_level_to_supported,
     snap_thinking_wire_to_model,
@@ -352,12 +353,20 @@ def test_model_metadata_helpers():
     assert model_unknown_flag_13("gemini-3.8-flash") == 1
     assert model_unknown_flag_13("gemini-3.5-flash-lite") is None
     assert model_unknown_flag_13("gemini-4-hydrogen") == 1
+    # 2026-11-14 hybrid 判别：目录 [85] 非空的 gemini-4 系才携 [45]=1，
+    # 3.8-flash（新代但 [85]=null）不带 —— 与 flag_13 正交。
+    assert model_unknown_flag_45("gemini-4-hydrogen") == 1
+    assert model_unknown_flag_45("gemini-4-carbon") == 1
+    assert model_unknown_flag_45("gemini-4-argon") == 1
+    assert model_unknown_flag_45("gemini-3.8-flash") is None
+    assert model_unknown_flag_45("gemini-3.5-flash-lite") is None
     assert model_output_token_limit("gemini-4-carbon") == 32768
     assert browser_default_max_tokens("gemini-4-carbon") == 32768
     assert browser_default_max_tokens("gemini-3.8-flash") == 65536
-    # hydrogen 输出上限 65536：默认值不被钳制（高于碳的 32768）
+    # hybrid7/7b 浏览器判别实验：gemini-4 系（目录 [85] 非空）浏览器默认
+    # 恒 32768 —— hydrogen 目录输出上限虽为 65536，真机请求实测仍 32768。
     assert model_output_token_limit("gemini-4-hydrogen") == 65536
-    assert browser_default_max_tokens("gemini-4-hydrogen") == 65536
+    assert browser_default_max_tokens("gemini-4-hydrogen") == 32768
 
 
 def test_effective_generation_config_overrides_applies_clear_semantics():

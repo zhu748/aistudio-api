@@ -184,4 +184,5 @@ page.route(/$rpc.*GenerateContent/)          ← 拦截点
 - hybrid4 的目的是**观察**真实线缆结构，不是生产通路；生产通路仍是
   项目自身的签名栈（其 200 已由判别实验证明）。
 - 本轮捕获未含客户端自定义函数（function calling）的调用往返——
-  仅覆盖 grounding 类服务端工具；函数工具往返形态见下一轮捕获文档。
+  仅覆盖 grounding 类服务端工具；函数工具往返形态与对齐结论见
+  `FUNCTION_CALL_ROUNDTRIP_2026-11-14.md`（hybrid6 实验）。

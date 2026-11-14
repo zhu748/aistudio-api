@@ -211,7 +211,9 @@ def test_chat_service_does_not_convert_signed_text_into_thought():
             GeminiContent(
                 role="model",
                 parts=[
-                    GeminiPart(text="Normal answer", thoughtSignature="dmFsaWRfc2lnXzEyMw=="),
+                    GeminiPart(
+                        text="Normal answer", thoughtSignature="dmFsaWRfc2lnXzEyMw=="
+                    ),
                 ],
             )
         ]

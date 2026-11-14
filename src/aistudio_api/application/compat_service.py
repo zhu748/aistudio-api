@@ -651,17 +651,18 @@ async def openai_to_gemini_request(
                 # 服务端工具（default_api:* / 内置工具）无有效签名时剥离：
                 # OpenAI 协议无官方签名字段，客户端回传历史必然丢签名，
                 # 透传会触发上游 400 thought_signature 校验。
-                if _is_server_side_tool_call(name):
-                    if not _valid_thought_signature(signature):
-                        if call_id:
-                            dropped_server_tool_ids.add(call_id)
-                        tool_name_by_id.pop(call_id, None)
-                        logger.info(
-                            "剥离无签名的服务端工具调用: name=%s, call_id=%s",
-                            name,
-                            call_id or "(无id)",
-                        )
-                        continue
+                if _is_server_side_tool_call(name) and not _valid_thought_signature(
+                    signature
+                ):
+                    if call_id:
+                        dropped_server_tool_ids.add(call_id)
+                    tool_name_by_id.pop(call_id, None)
+                    logger.info(
+                        "剥离无签名的服务端工具调用: name=%s, call_id=%s",
+                        name,
+                        call_id or "(无id)",
+                    )
+                    continue
                 # 普通客户端工具：签名非法 base64 时丢弃签名字段本身
                 # （上游 TYPE_BYTES 解码失败同样 400），调用保留。
                 if signature is not None and not _valid_thought_signature(signature):
