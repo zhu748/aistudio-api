@@ -297,6 +297,16 @@ async def test_body_limit_rejects_before_handler(monkeypatch):
 async def test_timeout_closes_response_and_records_final_state(monkeypatch, started):
     monkeypatch.setattr(settings, "request_timeout", 0.02)
 
+    # 超时窗口内的 history 落库走 asyncio.to_thread（线程池跳变 + SQLite 写），
+    # 慢速 CI runner 上可吃掉整个 20ms 预算，使 response.start 尚未发出
+    # 超时先到 —— [True] 分支因此偶发 504 取代 200（真实 CI 一次复现）。
+    # 将 to_thread 内联后 response.start 前不存在可计时的 yield 点，
+    # 两个分支均与机器负载无关地确定性触发。
+    async def _inline_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _inline_to_thread)
+
     async def slow_app(scope, receive, send):
         if started:
             await send(
