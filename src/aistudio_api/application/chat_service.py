@@ -804,6 +804,60 @@ def _normalize_gemini_safety_settings(
     return normalized
 
 
+def _is_hollow_part(part: AistudioPart) -> bool:
+    """part 无任何有效载荷（纯空文本、无签名/调用/媒体/代码）。"""
+    if part.thought_signature:
+        # 纯签名 part（纯文本轮的尾部签名信封）是有效载荷，不可丢弃
+        return False
+    if (
+        part.function_call
+        or part.function_response
+        or part.inline_data
+        or part.file_id
+        or part.executable_code
+        or part.code_execution_result
+    ):
+        return False
+    return not part.text
+
+
+def _is_hollow_content(content: AistudioContent) -> bool:
+    """整轮无任何载荷：剥离残留或空占位（前端从不产生此形态）。"""
+    return not content.parts or all(_is_hollow_part(p) for p in content.parts)
+
+
+def _drop_hollow_and_merge_same_role(
+    contents: list[AistudioContent],
+) -> list[AistudioContent]:
+    """丢弃全空轮并合并相邻同角色轮（前端同构形态）。
+
+    2026-11-14 双错误实测（同一有毒历史，剥离后残留）：
+
+    - 原生 Gemini 路径剥离 functionCall/functionResponse 后残留
+      ``[[], role]`` 全空轮 → 上游 WAA 层 403 "The caller does not
+      have permission"（同账号同签名器，纯净请求同窗口 200；
+      重放 + 重签 + 换账号 6 连 403，确定性拒绝）；
+    - 兼容路径空壳 ``[\"\"]`` model 轮结尾 → 过 WAA 后 RPC 400
+      "Requests ending with a model turn are not supported"。
+
+    两种形态 AI Studio 前端均不产生。丢弃全空轮 + 合并相邻同角色轮后，
+    剥离残留彻底消失；清理不改变 proof 摘要（空轮对 ``" ".join``
+    无贡献，合并不改变 part 平铺顺序），铸造与线缆编码天然一致。
+    全部轮被清空时回退单个空文本 user 轮（保持「以 user 轮收尾」）。
+    """
+    cleaned: list[AistudioContent] = []
+    for content in contents:
+        if _is_hollow_content(content):
+            continue
+        if cleaned and cleaned[-1].role == content.role:
+            cleaned[-1].parts.extend(content.parts)
+        else:
+            cleaned.append(content)
+    if not cleaned:
+        return [AistudioContent(role="user", parts=[AistudioPart(text="")])]
+    return cleaned
+
+
 def normalize_gemini_request(
     req: GeminiGenerateContentRequest, requested_model: str
 ) -> NormalizedGeminiRequest:
@@ -930,6 +984,9 @@ def normalize_gemini_request(
             if part.thoughtSignature:
                 parts.append(AistudioPart(thought_signature=part.thoughtSignature))
         contents.append(AistudioContent(role=role, parts=parts))
+    # 剥离残留清理：丢弃全空轮（WAA 403）并合并相邻同角色轮
+    # （消除空壳 model 轮结尾的 400 model-turn），详见函数 docstring。
+    contents = _drop_hollow_and_merge_same_role(contents)
     system_instruction = None
     if req.systemInstruction is not None:
         system_instruction = AistudioContent(
