@@ -367,6 +367,10 @@ async def get_system_config(request: Request) -> dict[str, object]:
     )
 
     active_waa = get_active_waa_server()
+    from aistudio_api.infrastructure.utils.upstream_dump import (
+        upstream_snapshot_keep,
+    )
+
     return {
         "port": settings.port,
         "proof_server_url": str(active_waa.get("url") or settings.proof_server_url),
@@ -379,6 +383,7 @@ async def get_system_config(request: Request) -> dict[str, object]:
         "debug_env_active": is_debug_env_active(),
         "dump_to_file": is_dump_to_file_enabled(),
         "dump_dir": str(get_dump_dir()),
+        "upstream_snapshot_keep": upstream_snapshot_keep(),
     }
 
 
@@ -1113,6 +1118,7 @@ class LoggingConfigRequest(BaseModel):
     dump_requests: bool | None = None
     dump_to_file: bool | None = None
     dump_dir: str | None = None
+    upstream_snapshot_keep: int | None = None
 
 
 @protected_router.put("/config/logging")
@@ -1132,6 +1138,15 @@ async def update_logging_config(req: LoggingConfigRequest) -> dict[str, object]:
         set_dump_to_file,
         set_log_level,
     )
+    from aistudio_api.infrastructure.utils.upstream_dump import (
+        prune_upstream_snapshots,
+        upstream_snapshot_keep,
+    )
+
+    if req.upstream_snapshot_keep is not None and not (
+        0 <= req.upstream_snapshot_keep <= 1000
+    ):
+        raise HTTPException(400, "上游成功快照保留条数必须在 0-1000 之间")
 
     if req.level is not None:
         set_log_level(req.level)
@@ -1147,13 +1162,18 @@ async def update_logging_config(req: LoggingConfigRequest) -> dict[str, object]:
         dump_requests=req.dump_requests,
         dump_to_file=req.dump_to_file,
         dump_dir=req.dump_dir,
+        upstream_snapshot_keep=req.upstream_snapshot_keep,
     )
+    # 保留条数调低（或置 0）后立即收缩成功环，不等下一次成功写盘。
+    if req.upstream_snapshot_keep is not None:
+        await asyncio.to_thread(prune_upstream_snapshots)
     logger.info(
-        "日志配置已更新: 级别=%s, 请求转储=%s, 文件转储=%s, 目录=%s",
+        "日志配置已更新: 级别=%s, 请求转储=%s, 文件转储=%s, 目录=%s, 成功快照保留=%s",
         req.level,
         req.dump_requests,
         req.dump_to_file,
         req.dump_dir,
+        req.upstream_snapshot_keep,
     )
 
     return {
@@ -1163,6 +1183,7 @@ async def update_logging_config(req: LoggingConfigRequest) -> dict[str, object]:
         "debug_env_active": is_debug_env_active(),
         "dump_to_file": is_dump_to_file_enabled(),
         "dump_dir": str(get_dump_dir()),
+        "upstream_snapshot_keep": upstream_snapshot_keep(),
     }
 
 

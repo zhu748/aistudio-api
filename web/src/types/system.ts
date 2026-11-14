@@ -9,12 +9,14 @@ export interface SystemConfig {
   debug_env_active?: boolean
   dump_to_file?: boolean
   dump_dir?: string
+  upstream_snapshot_keep?: number
 }
 export interface UpdateLoggingConfigRequest {
   level?: string
   dump_requests?: boolean
   dump_to_file?: boolean
   dump_dir?: string
+  upstream_snapshot_keep?: number
 }
 export interface UpdateLoggingConfigResponse {
   ok: boolean
@@ -23,6 +25,7 @@ export interface UpdateLoggingConfigResponse {
   debug_env_active: boolean
   dump_to_file: boolean
   dump_dir: string
+  upstream_snapshot_keep: number
 }
 
 export interface HealthCheckResponse {

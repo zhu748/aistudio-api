@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import { systemApi } from '@/api/system.ts'
+import { operationsApi } from '@/api/operations.ts'
 import { useToastStore } from '@/stores/toast.ts'
 import type { SystemConfig } from '@/types/system.ts'
 import Button from '@/components/ui/Button.vue'
@@ -16,6 +17,8 @@ import {
   Folder,
   SlidersHorizontal,
   Terminal,
+  Camera,
+  Trash2,
 } from 'lucide-vue-next'
 
 const props = defineProps<{
@@ -33,6 +36,9 @@ const dumpRequests = ref(Boolean(props.initialConfig.dump_requests))
 const dumpToFile = ref(Boolean(props.initialConfig.dump_to_file))
 const dumpDir = ref(props.initialConfig.dump_dir || 'dumps')
 const debugEnvActive = ref(Boolean(props.initialConfig.debug_env_active))
+const snapshotKeep = ref(String(props.initialConfig.upstream_snapshot_keep ?? 10))
+const snapshotStats = ref<{ success: number; error: number; bytes: number } | null>(null)
+const snapshotClearing = ref('')
 const saving = ref(false)
 
 watch(
@@ -43,9 +49,22 @@ watch(
     dumpToFile.value = Boolean(cfg.dump_to_file)
     dumpDir.value = cfg.dump_dir || 'dumps'
     debugEnvActive.value = Boolean(cfg.debug_env_active)
+    snapshotKeep.value = String(cfg.upstream_snapshot_keep ?? 10)
   },
   { deep: true },
 )
+
+async function loadSnapshotStats() {
+  try {
+    snapshotStats.value = await operationsApi.upstreamSnapshotStats()
+  } catch {
+    snapshotStats.value = null
+  }
+}
+
+onMounted(() => {
+  void loadSnapshotStats()
+})
 
 const logLevels = [
   { value: 'DEBUG', label: '调试 (DEBUG)', description: '输出详细底层跟踪日志' },
@@ -57,24 +76,48 @@ const logLevels = [
 async function handleSave() {
   saving.value = true
   try {
+    const keep = Number.parseInt(snapshotKeep.value, 10)
+    if (Number.isNaN(keep) || keep < 0 || keep > 1000) {
+      toast.error('上游快照保留条数必须是 0-1000 之间的整数')
+      return
+    }
     const res = await systemApi.updateLoggingConfig({
       level: logLevel.value,
       dump_requests: dumpRequests.value,
       dump_to_file: dumpToFile.value,
       dump_dir: dumpDir.value,
+      upstream_snapshot_keep: keep,
     })
     logLevel.value = res.log_level
     dumpRequests.value = res.dump_requests
     dumpToFile.value = res.dump_to_file
     dumpDir.value = res.dump_dir
     debugEnvActive.value = res.debug_env_active
+    snapshotKeep.value = String(res.upstream_snapshot_keep)
     toast.success('日志与转储配置已更新')
     emit('saved')
+    void loadSnapshotStats()
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : '保存配置失败'
     toast.error(msg)
   } finally {
     saving.value = false
+  }
+}
+
+async function handleClearSnapshots(scope: 'all' | 'success') {
+  snapshotClearing.value = scope
+  try {
+    const res = await operationsApi.clearUpstreamSnapshots(scope)
+    toast.success(
+      `已清理快照：成功 ${res.removed.success} 条${scope === 'all' ? `，错误 ${res.removed.error} 条` : ''}`,
+    )
+    void loadSnapshotStats()
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : '清理快照失败'
+    toast.error(msg)
+  } finally {
+    snapshotClearing.value = ''
   }
 }
 </script>
@@ -183,6 +226,59 @@ async function handleSave() {
           @update:model-value="dumpDir = String($event || 'dumps')"
         />
       </div>
+    </div>
+
+    <!-- 5. Upstream Exchange Snapshots -->
+    <div class="p-4 bg-slate-50/70 border border-slate-200/80 rounded-xl space-y-3">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <div class="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
+          <Camera class="w-3.5 h-3.5 text-brand-600" />
+          <span>上游交换快照（含 200 成功请求）</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <Button
+            size="xs"
+            variant="ghost"
+            :loading="snapshotClearing === 'success'"
+            :disabled="!snapshotStats?.success"
+            @click="handleClearSnapshots('success')"
+          >
+            <Trash2 class="w-3.5 h-3.5" />仅清成功
+          </Button>
+          <Button
+            size="xs"
+            variant="ghost"
+            :loading="snapshotClearing === 'all'"
+            :disabled="!snapshotStats || (!snapshotStats.success && !snapshotStats.error)"
+            @click="handleClearSnapshots('all')"
+          >
+            <Trash2 class="w-3.5 h-3.5" />全部清理
+          </Button>
+        </div>
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <ConfigInput
+          :model-value="snapshotKeep"
+          type="number"
+          label="成功快照保留条数（随保存日志配置生效）"
+          placeholder="10"
+          description="0 = 不采集成功快照；错误快照不受此限制"
+          @update:model-value="snapshotKeep = String($event ?? '10')"
+        />
+        <div class="text-[11px] text-slate-400 leading-relaxed self-end">
+          <template v-if="snapshotStats">
+            当前库存：成功 {{ snapshotStats.success }} 条 · 错误 {{ snapshotStats.error }} 条（不受条数限制）· 占用
+            {{ (snapshotStats.bytes / 1024).toFixed(1) }} KiB
+          </template>
+          <template v-else>
+            正在获取快照库存…
+          </template>
+        </div>
+      </div>
+      <p class="text-[11px] text-slate-400 leading-relaxed">
+        每次模型调用的实际线缆请求（URL、有序请求头、wire 请求体、响应头与响应样本）均落盘为快照，
+        成功与失败都可在请求详情页查看/下载；凭据头仅保留长度，WAA proof 截断存储。
+      </p>
     </div>
   </div>
 </template>

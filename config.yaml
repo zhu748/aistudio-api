@@ -38,6 +38,8 @@ logging:
   dump_requests: false
   dump_to_file: false
   dump_dir: dumps
+  # 上游交换快照：成功请求保留条数（0=关闭成功采集）；错误快照不受此限制
+  upstream_snapshot_keep: 10
 rotator:
   max_retries: 5
   strategy: sticky

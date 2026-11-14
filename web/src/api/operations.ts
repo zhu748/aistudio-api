@@ -135,6 +135,21 @@ export const operationsApi = {
     if (!response.ok) throw new Error(`下载失败 (HTTP ${response.status})`)
     return response.blob()
   },
+  upstreamSnapshotStats() {
+    return request<{
+      success: number
+      error: number
+      bytes: number
+      keep: number
+    }>('/api/requests/upstream-snapshots')
+  },
+  clearUpstreamSnapshots(scope: 'all' | 'success') {
+    return request<{
+      ok: boolean
+      scope: string
+      removed: { success: number; error: number }
+    }>(`/api/requests/upstream-snapshots?scope=${scope}`, { method: 'DELETE' })
+  },
   requests(params: URLSearchParams) {
     return request<Page<RequestRecord>>(`/api/requests?${params}`)
   },
