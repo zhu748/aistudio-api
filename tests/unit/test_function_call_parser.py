@@ -244,14 +244,8 @@ def _norm(contents, model="gemini-3.8-flash", **kwargs):
     )
 
 
-def test_normalize_drops_hollow_turns_and_merges_same_role():
-    """剥离后的全空轮必须彻底消失（WAA 403 / model-turn 400 双修）。
-
-    有毒历史（预设伪造工具调用，缓存未命中被剥离）：
-    [user text, model FC(剥离), user FR(丢弃), model FC(剥离),
-     user FR(丢弃)+text, model FC(剥离), user FR(丢弃)]
-    → 清理后仅剩单个 user 轮（两段 text 合并），以 user 收尾。
-    """
+def test_normalize_keeps_unsigned_tool_history_instead_of_creating_hollow_turns():
+    """无签名工具消息含上下文，不能当成全空轮清理。"""
     from aistudio_api.api.schemas import (
         GeminiContent,
         GeminiFunctionCall,
@@ -327,11 +321,11 @@ def test_normalize_drops_hollow_turns_and_merges_same_role():
             ),
         ]
     )
-    # 全部空轮被丢弃，两段 user 文本合并为单轮
-    assert len(normalized.contents) == 1
-    merged = normalized.contents[0]
-    assert merged.role == "user"
-    assert [p.text for p in merged.parts] == ["Hello.", "Continue."]
+    assert len(normalized.contents) == 7
+    assert normalized.contents[0].parts[0].text == "Hello."
+    assert normalized.contents[4].parts[-1].text == "Continue."
+    assert normalized.contents[-1].role == "user"
+    assert normalized.contents[-1].parts[0].function_response is not None
     # wire 形态：无 [[], role] 空轮（WAA 403 触发形态），以 user 收尾
     for content in normalized.contents:
         assert content.parts, "空轮残留"
@@ -365,7 +359,7 @@ def test_normalize_keeps_signature_only_part():
 
 
 def test_normalize_tail_model_text_gets_space_user_sentinel():
-    """尾部 model 文本轮（prefill/混合轮剥离残留）→ 追加单空格 user 占位。
+    """真正以 model 收尾时仍追加单空格 user 占位，避免 model-turn 400。
 
     真机五形态判别（2026-11-14）：model 结尾 400；空文本 user 占位无效
     （上游不认空文本轮）；单空格 user 占位 200。
@@ -376,7 +370,7 @@ def test_normalize_tail_model_text_gets_space_user_sentinel():
         GeminiPart,
     )
 
-    # 混合轮：文本 + 伪造工具调用（剥离后文本保留，轮次以 model 收尾）
+    # 混合轮：文本与无签名的原生工具调用均保留。
     normalized = _norm(
         [
             GeminiContent(role="user", parts=[GeminiPart(text="Hello.")]),
@@ -396,7 +390,9 @@ def test_normalize_tail_model_text_gets_space_user_sentinel():
     assert [c.role for c in normalized.contents] == ["user", "model", "user"]
     assert normalized.contents[0].parts[0].text == "Hello."
     assert normalized.contents[1].parts[0].text == "Let me reply in style."
-    assert all(p.function_call is None for p in normalized.contents[1].parts)
+    call = normalized.contents[1].parts[1]
+    assert call.function_call is not None
+    assert call.thought_signature == "skip_thought_signature_validator"
     sentinel = normalized.contents[-1]
     assert sentinel.role == "user"
     assert sentinel.parts[0].text == " "
@@ -406,8 +402,6 @@ def test_normalize_all_hollow_falls_back_to_single_user_turn():
     """全部轮被清空时回退单个空文本 user 轮（保持 user 收尾语义）。"""
     from aistudio_api.api.schemas import (
         GeminiContent,
-        GeminiFunctionCall,
-        GeminiFunctionResponse,
         GeminiPart,
     )
 
@@ -415,23 +409,11 @@ def test_normalize_all_hollow_falls_back_to_single_user_turn():
         [
             GeminiContent(
                 role="model",
-                parts=[
-                    GeminiPart(
-                        functionCall=GeminiFunctionCall(
-                            name="context", args={}, id="call_x"
-                        )
-                    )
-                ],
+                parts=[GeminiPart(text="")],
             ),
             GeminiContent(
                 role="user",
-                parts=[
-                    GeminiPart(
-                        functionResponse=GeminiFunctionResponse(
-                            name="context", response={}, id="call_x"
-                        )
-                    )
-                ],
+                parts=[],
             ),
         ]
     )
@@ -463,38 +445,25 @@ def test_normalize_digest_unaffected_by_cleanup():
     """清理不改变 proof 摘要输入（空轮无贡献，合并保持平铺顺序）。"""
     from aistudio_api.api.schemas import (
         GeminiContent,
-        GeminiFunctionCall,
-        GeminiFunctionResponse,
         GeminiPart,
     )
     from aistudio_api.infrastructure.waa.signer import extract_content_digest
 
-    poisoned = [
+    with_empty_turns = [
         GeminiContent(role="user", parts=[GeminiPart(text="Hello.")]),
         GeminiContent(
             role="model",
-            parts=[
-                GeminiPart(
-                    functionCall=GeminiFunctionCall(
-                        name="context", args={}, id="call_c1"
-                    )
-                )
-            ],
+            parts=[GeminiPart(text="")],
         ),
         GeminiContent(
             role="user",
             parts=[
-                GeminiPart(
-                    functionResponse=GeminiFunctionResponse(
-                        name="context", response={}, id="call_c1"
-                    )
-                ),
                 GeminiPart(text="Continue."),
             ],
         ),
     ]
-    normalized = _norm(poisoned)
-    # 与「无工具轮的等价历史」摘要一致：剥离 + 清理后内容语义不变
+    normalized = _norm(with_empty_turns)
+    # 仅清理确实无载荷的空轮，不删除工具上下文。
     equivalent = _norm(
         [
             GeminiContent(role="user", parts=[GeminiPart(text="Hello.")]),

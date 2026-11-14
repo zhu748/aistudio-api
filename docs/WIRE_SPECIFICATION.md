@@ -238,19 +238,16 @@ MakerSuite 协议无独立顶层工具控制字段，Gemini API 的 `toolConfig`
 > 不主动混发该组合（客户端显式声明 tools 时不自动注入内置工具）。
 
 > [!IMPORTANT]
-> **服务端工具调用的 thought_signature 强制校验（2026-11 实测；
-> 2026-11-14 判别补充：客户端声明函数同样强制，见 6.5 节）**：
-> 上游对服务端执行的工具（`default_api:*` 命名空间，如
-> `default_api:context` = Saved Info 记忆保存调用；以及
-> google_search / url_context / code_execution / google_maps 内置工具）
-> 的 functionCall 回传强制要求携带有效 thoughtSignature：缺失或非法
-> base64（字段类型 TYPE_BYTES）直接 400 INVALID_ARGUMENT
-> （"Function call is missing a thought_signature in functionCall parts"）。
-> 由于 OpenAI / Claude 兼容协议无官方工具签名字段，客户端回传历史
-> 必然丢签名，网关在三条输入路径（OpenAI / Claude / Gemini 原生）
-> 统一剥离无有效签名的服务端工具调用及配对的 functionResponse
-> （`domain/tool_signatures.py`）。客户端声明的普通工具
-> （functionDeclarations）缺失签名上游宽容，不受影响。
+> **函数历史的签名兼容（2026-11-14 修订）**：缺少签名可能触发
+> "Function call is missing a thought_signature in functionCall parts"。
+> 报错中的 `default_api:` 不能用来判断函数是内置工具，客户端声明的
+> `context` 同样可能出现此前缀。不得据此删除调用或工具结果。
+> 网关保留客户端签名；缺失时仅恢复调用 ID、函数名和参数均匹配的缓存。
+> 未命中则在 Part 槽位 14 写入特殊字面量
+> `skip_thought_signature_validator`，保留原生 functionCall/functionResponse。
+> 此值沿用 AIStudio2API 的 MakerSuite 编码方式，不进行 Base64 编码，
+> 也不被普通 Base64 校验规则过滤。参考与验证边界见
+> `TOOL_HISTORY_LOSS_2026-11-14.md`。
 
 | 模式 (Mode) | 语义说明 | 网关处理策略 |
 |---|---|---|
@@ -292,10 +289,9 @@ user:  [null×11, [name, response_wire, call_id]]
 > 上游对**一切 functionCall 回传强制 thoughtSignature**——客户端声明函数
 > 与服务端工具同规则（缺失 → 400 "missing thought_signature ...
 > default_api:<函数名>"；伪签名 → 400 "Corrupted thought signature."，
-> 密码学信封校验不可伪造）。但校验**不绑定签名与具体调用内容**（跨调用
-> 交换真实签名实测 200）。网关对策：响应侧按 call_id/函数名缓存真实签名，
-> 请求侧客户端丢签名时回注，未命中才剥离（`domain/tool_signatures.py`
-> 的 `ThoughtSignatureCache`，详见 `FUNCTION_CALL_ROUNDTRIP_2026-11-14.md`）。
+> 普通签名存在信封校验）。旧实验中的“跨调用交换签名返回 200”不能证明
+> 不同调用的推理状态等价。当前缓存只按 ID、函数名、规范化参数精确匹配；
+> 缺签名时使用协议兼容占位值，不借用同名函数的其他签名，也不剥离工具历史。
 
 ## 7. 响应报文解析与 Token 使用量 (Response & Usage)
 

@@ -73,6 +73,14 @@ def _go(_build_dir: Path) -> str:
         pytest.skip(
             "未找到 Go 工具链（需要 go >= 1.27 编译 TURN fixture），跳过跨进程 E2E"
         )
+    try:
+        version = subprocess.run(
+            [go, "version"], capture_output=True, text=True, timeout=10, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pytest.skip("Go 工具链不可用，跳过跨进程 E2E")
+    if version.returncode != 0 or not version.stdout.startswith("go version "):
+        pytest.skip("PATH 中的 go 不是 Go 编译工具链，跳过跨进程 E2E")
     if not _FIXTURE_GO.is_file():
         pytest.skip("TURN fixture 源码缺失：proxybridge/testdata/turnfixture.go")
     # testdata 目录不参与 go build .，须显式编译为独立 fixture 二进制

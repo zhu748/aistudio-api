@@ -10,8 +10,9 @@ if TYPE_CHECKING:
 from dataclasses import dataclass
 
 from aistudio_api.domain.tool_signatures import (
-    is_server_side_tool_call as _is_server_side_tool_call,
+    SKIP_THOUGHT_SIGNATURE,
     lookup_function_signature as _lookup_function_signature,
+    tool_history_text,
     valid_thought_signature_or_none as _valid_thought_signature_or_none,
 )
 from aistudio_api.infrastructure.gateway.model_defaults import (
@@ -862,7 +863,8 @@ def _drop_hollow_and_merge_same_role(
         # 轮当有效 user turn；**追加单空格 user 轮实测 200**）。
         # 触发场景：尾部 assistant 轮文本+伪造工具调用混合，工具剥离后
         # 文本保留、轮次仍以 model 收尾；或客户端 prefill hack。
-        # 单空格占位保留 prefill 语义（model 尾部文本原样续写）。
+        # 保留 model 尾部历史，并满足上游要求的 user 收尾；占位本身
+        # 不保证原生 assistant prefill 的逐字续写语义。
         cleaned.append(AistudioContent(role="user", parts=[AistudioPart(text=" ")]))
     return cleaned
 
@@ -879,12 +881,14 @@ def normalize_gemini_request(
         else f"models/{requested_model}"
     )
     contents: list[AistudioContent] = []
-    # 被剥离的服务端工具调用 id（无有效签名，见 _is_server_side_tool_call）：
-    # 对应的 functionResponse 一并跳过，避免孤立工具结果触发上游报错。
-    dropped_server_tool_ids: set[str] = set()
+    # Only orphan/reordered results need a transcript. Unsigned calls retain
+    # their native structure using the explicit skip-signature literal.
+    pending_calls: list[tuple[str | None, str]] = []
 
     for content in req.contents:
         role = content.role or "user"
+        if role == "user" and not any(p.functionResponse for p in content.parts):
+            pending_calls.clear()
         parts: list[AistudioPart] = []
         for part in content.parts:
             if part.text is not None:
@@ -912,26 +916,13 @@ def normalize_gemini_request(
                 continue
             if part.functionCall is not None:
                 fc = part.functionCall
-                signature = _valid_thought_signature_or_none(part.thoughtSignature)
-                if signature is None:
-                    # 客户端丢失签名 → 缓存回注（2026-11-14 实测：
-                    # 客户端函数同样强制签名，缺失即 400）
-                    signature = _lookup_function_signature(fc.id, fc.name)
-                if signature is None:
-                    # 回注未命中：任何 functionCall 回传都会被上游拒 400
-                    # （"Function call is missing a thought_signature ..."），
-                    # 剥离调用及配对响应。
-                    if fc.id:
-                        dropped_server_tool_ids.add(fc.id)
-                    logger.info(
-                        "剥离无签名的工具调用（缓存未命中）: name=%s, call_id=%s,"
-                        " server_side=%s",
-                        fc.name,
-                        fc.id or "(无id)",
-                        _is_server_side_tool_call(fc.name),
-                    )
-                    continue
                 args_payload = fc.args if fc.args is not None else {}
+                signature = (
+                    _valid_thought_signature_or_none(part.thoughtSignature)
+                    or _lookup_function_signature(fc.id, fc.name, args_payload)
+                    or SKIP_THOUGHT_SIGNATURE
+                )
+                pending_calls.append((fc.id, fc.name))
                 parts.append(
                     AistudioPart(
                         function_call=(fc.name, args_payload, fc.id)
@@ -943,17 +934,48 @@ def normalize_gemini_request(
                 continue
             if part.functionResponse is not None:
                 fr = part.functionResponse
-                # 跳过被剥离的工具调用的结果
-                if fr.id and fr.id in dropped_server_tool_ids:
-                    continue
                 resp_payload = fr.response if fr.response is not None else {}
-                parts.append(
-                    AistudioPart(
-                        function_response=(fr.name, resp_payload, fr.id)
-                        if fr.id
-                        else (fr.name, resp_payload),
-                    )
+                # IDs identify parallel calls. When an endpoint omits IDs,
+                # use the only pending call or the next matching name.
+                matched = next(
+                    (
+                        i
+                        for i, (call_id, _) in enumerate(pending_calls)
+                        if fr.id and call_id == fr.id
+                    ),
+                    None,
                 )
+                if matched is None:
+                    matched = next(
+                        (
+                            i
+                            for i, (call_id, name) in enumerate(pending_calls)
+                            if not (fr.id and call_id)
+                            and (
+                                fr.name == name
+                                or (not fr.name and len(pending_calls) == 1)
+                            )
+                        ),
+                        None,
+                    )
+                if matched is None:
+                    parts.append(
+                        AistudioPart(
+                            text=tool_history_text(
+                                "tool_result", fr.name, fr.id, resp_payload
+                            )
+                        )
+                    )
+                else:
+                    call_id, name = pending_calls.pop(matched)
+                    result_id = fr.id or call_id
+                    parts.append(
+                        AistudioPart(
+                            function_response=(name, resp_payload, result_id)
+                            if result_id
+                            else (name, resp_payload),
+                        )
+                    )
                 if fr.parts:
                     for subpart in fr.parts:
                         if subpart.inlineData is not None:

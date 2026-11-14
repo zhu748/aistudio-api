@@ -166,7 +166,7 @@ def test_decode_part_keeps_text_alongside_payload() -> None:
     from aistudio_api.infrastructure.gateway.wire_codec import AistudioWireCodec
 
     codec = AistudioWireCodec()
-    part = codec._decode_part([None, "look at this", ["image/png", "aGVsbG8="]])
+    part = codec.decode_part([None, "look at this", ["image/png", "aGVsbG8="]])
     assert part.text == "look at this"
     assert part.inline_data == ("image/png", "aGVsbG8=")
 

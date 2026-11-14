@@ -26,7 +26,7 @@ class GeminiFunctionCall(BaseModel):
 
 
 class GeminiFunctionResponse(BaseModel):
-    name: str
+    name: str = ""
     response: dict[str, object] | list[object] | object | None = Field(
         default=None,
         validation_alias=AliasChoices("response", "content", "output"),

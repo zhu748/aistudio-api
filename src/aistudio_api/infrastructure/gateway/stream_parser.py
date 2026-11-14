@@ -15,12 +15,9 @@ from aistudio_api.infrastructure.gateway.wire_parser import (
 XSSI_PREFIX = ")]}'"
 _MAX_JSON_CHUNK_BYTES = 64 * 1024 * 1024
 
-# 结构字符跳扫：feed 的热路径不再逐字符走 Python 字节码。
-# 旧实现对每个字符执行一次循环体（含分支判断），inline_data 的 base64
-# 图像分块（常见 1.5MB）实测阻塞事件循环 200ms+；改为用编译正则一次
-# 跳到下一个结构字符（C 实现），字符串内部无 " 与 \ 时整个 payload
-# 一次扫描越过，图像流解析从 ~190ms/MB 降到亚毫秒级。
-_STRING_SCAN_RE = re.compile(r'["\\]')  # 字符串内部只需关注闭引号与转义
+# Skip strings with C-level substring searches. A regex character class still
+# tests every base64 character; str.find uses the optimized substring scanner.
+# Only the next quote/backslash matters while inside a string.
 _STRUCT_SCAN_RE = re.compile(r'["\[\]{}]')
 
 _TRAILING_JUNK = " \t\r\n,"
@@ -204,17 +201,30 @@ class IncrementalJSONStreamParser:
             self.preamble_skipped = True
 
         pos, size = 0, len(data)
+        next_quote = -1
         start = 0 if self.chunk_start is not None else None
         while pos < size:
             if self.escape:
                 self.escape = False
                 pos += 1
                 continue
-            regex = _STRING_SCAN_RE if self.in_string else _STRUCT_SCAN_RE
-            match = regex.search(data, pos)
-            if match is None:
-                break
-            index = match.start()
+            if self.in_string:
+                # Reuse the next quote across escapes. Repeatedly searching
+                # the remaining tail would be quadratic for escape-heavy JSON.
+                if next_quote < pos:
+                    next_quote = data.find('"', pos)
+                    if next_quote < 0:
+                        next_quote = size
+                index = data.find("\\", pos, next_quote)
+                if index < 0:
+                    if next_quote == size:
+                        break
+                    index = next_quote
+            else:
+                match = _STRUCT_SCAN_RE.search(data, pos)
+                if match is None:
+                    break
+                index = match.start()
             ch = data[index]
             pos = index + 1
             if not self.in_string:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from enum import IntEnum
 
@@ -261,8 +262,11 @@ class AistudioPart:
     code_execution_result: tuple[str, str] | None = None
     thought_signature: str | None = None
     thought: bool = False
+    raw_wire: list[object] | None = field(default=None, repr=False)
 
     def to_wire(self) -> list[object]:
+        if self.raw_wire is not None:
+            return copy.deepcopy(self.raw_wire)
         wire = JspbArray()
         if self.thought:
             wire[PartIndex.THOUGHT_ALT_FLAG] = 1

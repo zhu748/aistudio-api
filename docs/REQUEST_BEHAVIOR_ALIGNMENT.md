@@ -203,10 +203,12 @@ OAuth 客户端流程、纯凭 Cookie 铸造账号级 OAuth 令牌。本项目�
    形态（含 `priority: u=4`、ACR headers 按字母序）；按
    `Access-Control-Max-Age`（实测 3600s，Firefox 上限 24h）缓存；失败仅告警
    不阻断。**真实上游活体 200 验证通过。**
-6. **会话令牌传播**（`session_token.py` + `attach_session_token`）：
-   响应 chunk 槽 7 的 `v1_...` 令牌按账号作用域缓存，下一轮 GenerateContent
-   请求注入 wire 槽 11（活体两轮 200 验证：Turn2 slot11 = Turn1 令牌）；
-   在已签名 body 上注入不影响 proof（04 号实验：proof 只绑定 contents 摘要）。
+6. **对话轮次令牌传播**（`model_turns.py` + `attach_session_token`）：
+   响应 chunk 槽 7 的 `v1_...` 令牌与完整模型轮一起保存；下一轮仅在对应
+   历史匹配时注入 wire 槽 11。2026-11-14 对照 AIStudio2API 后移除了原来的
+   账号级“最后一个令牌”缓存，避免同账号的并发对话串用。恢复范围还包含
+   客户端、模型、系统指令和工具；恢复发生在 WAA 签名前。
+   早前两轮 200 实验只验证令牌能回传，不足以证明按账号共享状态正确。
 7. **页面 CountTokens 补发**（`schedule_browser_counttokens_followup`）：
    GenerateContent 发出 2.2s 后对当前用户轮次补发一次 CountTokens
    （body `[model,[[[null,"用户文本"]],"user"]]`，与 Go countTokensBody 逐层
