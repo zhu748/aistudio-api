@@ -328,6 +328,23 @@ def model_unknown_flag_13(model: str) -> int | None:
     return None
 
 
+def model_unknown_flag_45(model: str) -> int | None:
+    """读取模型元数据中的 generation_config[45] 开关（2026-11-14 逆向结论）。
+
+    hybrid 多模型判别实验：ListModels 槽位 [85] 非空的模型
+    （gemini-4 hydrogen/carbon/argon，1M 上下文标记）请求恒携
+    generation_config[45]=1；3.8-flash（[83]=1 但 [85]=null）与
+    3.5-flash-lite 均不带 —— 与 flag_13（[83]）正交。
+    """
+    info = _cached_model_info_for(model)
+    if not info:
+        return None
+    raw = info.get("unknownFlag45")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return int(raw)
+    return None
+
+
 def model_output_token_limit(model: str) -> int | None:
     """读取模型元数据输出上限（浏览器形态默认 max_tokens 的安全钳制用）。"""
     info = _cached_model_info_for(model)
@@ -339,13 +356,20 @@ def model_output_token_limit(model: str) -> int | None:
     return None
 
 
-# 浏览器恒定默认 maxOutputTokens（2026-11 全量 9 条 GenerateContent 抓包实测；
-# 目录 flash 模型输出上限恰为 65536，旗舰为 32768 —— 构造时按元数据钳制）。
+# 浏览器恒定默认 maxOutputTokens（2026-11 全量 GenerateContent 抓包实测；
+# hybrid7/7b 多模型判别补充：gemini-4 系（目录 [85] 非空）恒 32768 ——
+# hydrogen 目录输出上限虽为 65536，浏览器仍默认 32768；其余模型按
+# 输出上限钳制在 65536）。
 _BROWSER_DEFAULT_MAX_TOKENS = 65536
+_BROWSER_GEMINI4_DEFAULT_MAX_TOKENS = 32768
 
 
 def browser_default_max_tokens(model: str) -> int:
-    """浏览器形态默认 max_tokens，按模型输出上限钳制（cap 仅作用于默认值）。"""
+    """浏览器形态默认 max_tokens，按模型家族与输出上限钳制（仅作用于默认值）。"""
+    # gemini-4 系（目录 [85] 非空，与 generation_config[45] 同源标记）：
+    # 浏览器默认恒 32768（carbon/argon 输出上限亦为 32768，一致）。
+    if model_unknown_flag_45(model) is not None:
+        return _BROWSER_GEMINI4_DEFAULT_MAX_TOKENS
     limit = model_output_token_limit(model)
     if isinstance(limit, int) and 0 < limit < _BROWSER_DEFAULT_MAX_TOKENS:
         return limit
@@ -365,6 +389,7 @@ _GENERATION_CONFIG_INDEX_BY_ATTR: dict[str, int] = {
     "response_logprobs": 11,
     "logprobs": 12,
     "unknown_flag_13": 13,
+    "unknown_flag_45": 45,
     "image_output_mode": 14,
     "thinking_config": 16,
     "media_resolution": 17,

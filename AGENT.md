@@ -224,7 +224,8 @@ aistudio-api/
 │   ├── BOTGUARD_VERIFICATION_CHAIN.md # BotGuard 验证交互链路规范
 │   ├── WAA_VM_ARCHITECTURE.md     # WAA 字节码虚拟机 ISA、密钥派生、打分蜜罐与 TLV 签名协议规范
 │   ├── WIRE_SPECIFICATION.md      # Protobuf-over-JSON (JSPB) 数组索引规范
-│   └── BROWSER_HYBRID_403_2026-11-14.md # 浏览器侧 403 根因判别与混合拦截捕获方案
+│   ├── BROWSER_HYBRID_403_2026-11-14.md # 浏览器侧 403 根因判别与混合拦截捕获方案
+│   └── FUNCTION_CALL_ROUNDTRIP_2026-11-14.md # 函数调用往返线缆对齐 (hybrid6)
 ├── config.yaml                    # 模型规则与工具默认行为配置 (支持在线热重载)
 ├── main.py                        # 本地统一启动入口
 └── tests/                         # 单元测试套件
