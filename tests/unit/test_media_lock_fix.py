@@ -14,7 +14,9 @@ import pytest
 from aistudio_api.application import media_session as ms
 
 
-async def test_proxy_resolution_runs_outside_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_proxy_resolution_runs_outside_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """锁内不得出现 await 解析：并发首调应并行解析。"""
     resolve_calls: list[float] = []
     resolved_at: dict[asyncio.Task, float] = {}
