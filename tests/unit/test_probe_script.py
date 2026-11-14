@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import sys
@@ -28,6 +29,9 @@ probe = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = probe
 SPEC.loader.exec_module(probe)
 SECRET = "private-cookie-proof-api-key-must-not-appear-in-report"
+# 上游 thought_signature 字段为 TYPE_BYTES（JSON 表示恒为 base64）；
+# 签名往返探测使用 base64 形态的假签名，与真实上游行为一致。
+SECRET_SIG = base64.b64encode(SECRET.encode()).decode()
 
 
 async def test_full_probe_through_real_adapters(monkeypatch, capsys):
@@ -48,7 +52,7 @@ async def test_full_probe_through_real_adapters(monkeypatch, capsys):
                     "name": "probe_sum",
                     "args": {"a": 2, "b": 5},
                     "call_id": "c",
-                    "thought_signature": SECRET,
+                    "thought_signature": SECRET_SIG,
                 }
             ]
             text = ""
@@ -88,7 +92,7 @@ async def test_full_probe_through_real_adapters(monkeypatch, capsys):
         app.dependency_overrides.clear()
         app.dependency_overrides.update(previous)
     assert report["summary"] == {"passed": 25, "failed": 0, "skipped": 0}
-    assert returned_signatures == [SECRET] * 4
+    assert returned_signatures == [SECRET_SIG] * 4
     assert SECRET not in json.dumps(report)
     assert SECRET not in capsys.readouterr().out
 

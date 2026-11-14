@@ -51,6 +51,10 @@ from aistudio_api.application.stream_utils import (
     StopSequenceBuffer,
     coalesce_tool_frames,
 )
+from aistudio_api.domain.tool_signatures import (
+    is_server_side_tool_call as _is_server_side_tool_call,
+    valid_thought_signature as _valid_thought_signature,
+)
 from aistudio_api.infrastructure.gateway.model_defaults import get_compat_settings
 from aistudio_api.infrastructure.request_context import record_result
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -165,6 +169,12 @@ _CLAUDE_ERROR_TYPE: dict[int, str] = {
 _CLAUDE_DUMMY_SIGNATURE = base64.b64encode(b"aistudio-api-compat-thinking").decode(
     "ascii"
 )
+
+# ---------------------------------------------------------------------------
+# 服务端工具调用防护（thought_signature 400 修复）：判定与校验函数统一由
+# domain/tool_signatures.py 提供，此处保留别名供本模块各转换路径使用。
+# 背景与修复策略详见该模块文档字符串。
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +614,9 @@ async def openai_to_gemini_request(
     contents: list[GeminiContent] = []
     system_texts: list[str] = []
     tool_name_by_id: dict[str, str] = {}
+    # 被剥离的服务端工具调用 id 集合：对应的 tool result 也要一并跳过，
+    # 避免孤立 functionResponse 触发上游 MALFORMED_FUNCTION_CALL。
+    dropped_server_tool_ids: set[str] = set()
 
     # 第一遍：先扫全部 assistant 消息建 tool_call_id → 函数名映射。
     # 与 Claude 侧一致的两遍扫描：容忍客户端把 tool 结果放在对应
@@ -634,9 +647,28 @@ async def openai_to_gemini_request(
                 name = _as_str(function.get("name")) or "unknown"
                 args = _openai_tool_arguments(function.get("arguments"))
                 call_id = _as_str(tool_call.get("id"))
+                signature = _read_signature(tool_call)
+                # 服务端工具（default_api:* / 内置工具）无有效签名时剥离：
+                # OpenAI 协议无官方签名字段，客户端回传历史必然丢签名，
+                # 透传会触发上游 400 thought_signature 校验。
+                if _is_server_side_tool_call(name):
+                    if not _valid_thought_signature(signature):
+                        if call_id:
+                            dropped_server_tool_ids.add(call_id)
+                        tool_name_by_id.pop(call_id, None)
+                        logger.info(
+                            "剥离无签名的服务端工具调用: name=%s, call_id=%s",
+                            name,
+                            call_id or "(无id)",
+                        )
+                        continue
+                # 普通客户端工具：签名非法 base64 时丢弃签名字段本身
+                # （上游 TYPE_BYTES 解码失败同样 400），调用保留。
+                if signature is not None and not _valid_thought_signature(signature):
+                    signature = None
                 parts.append(
                     GeminiPart(
-                        thoughtSignature=_read_signature(tool_call),
+                        thoughtSignature=signature,
                         functionCall=GeminiFunctionCall(
                             name=name, args=args, id=call_id or None
                         ),
@@ -654,6 +686,9 @@ async def openai_to_gemini_request(
             name = tool_name_by_id.get(
                 message.tool_call_id or "", message.name or "unknown"
             )
+            # 跳过被剥离的服务端工具调用的结果（无对应的 functionCall）
+            if message.tool_call_id and message.tool_call_id in dropped_server_tool_ids:
+                continue
             payload = _openai_tool_content_to_response(message.content)
             contents.append(
                 GeminiContent(
@@ -742,12 +777,16 @@ async def _claude_blocks_to_parts(
     content: object,
     *,
     tool_name_by_id: dict[str, str],
+    dropped_server_tool_ids: set[str] | None = None,
 ) -> list[GeminiPart]:
     """Claude content（str 或块数组）→ Gemini parts。
 
     支持 text / thinking / image / document / tool_use / tool_result 块；
     tool_result 中的图片会展开为紧随其后的独立 inlineData parts。
+    无有效签名的服务端工具调用及其结果会被剥离（见 _is_server_side_tool_call）。
     """
+    if dropped_server_tool_ids is None:
+        dropped_server_tool_ids = set()
     if isinstance(content, str):
         return [GeminiPart(text=content)]
     if not isinstance(content, list):
@@ -760,7 +799,9 @@ async def _claude_blocks_to_parts(
                     tasks = [
                         group.create_task(
                             _claude_blocks_to_parts(
-                                [block], tool_name_by_id=tool_name_by_id
+                                [block],
+                                tool_name_by_id=tool_name_by_id,
+                                dropped_server_tool_ids=dropped_server_tool_ids,
                             )
                         )
                         for block in content[offset : offset + 4]
@@ -821,18 +862,52 @@ async def _claude_blocks_to_parts(
         elif block_type == "tool_use":
             name = _as_str(block.get("name")) or "unknown"
             tool_input = block.get("input")
-            parts.append(
-                GeminiPart(
-                    thoughtSignature=_read_signature(block),
-                    functionCall=GeminiFunctionCall(
-                        name=name,
-                        args=tool_input if tool_input is not None else {},
-                        id=_as_str(block.get("id")) or None,
-                    ),
+            signature = _read_signature(block)
+            # 服务端工具（default_api:* / 内置工具）无有效签名时剥离：
+            # Claude 协议 tool_use 块无官方签名字段，客户端回传历史
+            # 必然丢签名，透传会触发上游 400 thought_signature 校验。
+            if _is_server_side_tool_call(name):
+                if not _valid_thought_signature(signature):
+                    tool_use_id = _as_str(block.get("id"))
+                    if tool_use_id:
+                        dropped_server_tool_ids.add(tool_use_id)
+                    tool_name_by_id.pop(tool_use_id, None)
+                    logger.info(
+                        "剥离无签名的服务端工具调用: name=%s, tool_use_id=%s",
+                        name,
+                        tool_use_id or "(无id)",
+                    )
+                else:
+                    parts.append(
+                        GeminiPart(
+                            thoughtSignature=signature,
+                            functionCall=GeminiFunctionCall(
+                                name=name,
+                                args=tool_input if tool_input is not None else {},
+                                id=_as_str(block.get("id")) or None,
+                            ),
+                        )
+                    )
+            else:
+                # 普通客户端工具：签名非法 base64 时丢弃签名字段本身
+                # （上游 TYPE_BYTES 解码失败同样 400），调用保留。
+                if signature is not None and not _valid_thought_signature(signature):
+                    signature = None
+                parts.append(
+                    GeminiPart(
+                        thoughtSignature=signature,
+                        functionCall=GeminiFunctionCall(
+                            name=name,
+                            args=tool_input if tool_input is not None else {},
+                            id=_as_str(block.get("id")) or None,
+                        ),
+                    )
                 )
-            )
         elif block_type == "tool_result":
             tool_use_id = _as_str(block.get("tool_use_id"))
+            # 跳过被剥离的服务端工具调用的结果（无对应的 functionCall）
+            if tool_use_id and tool_use_id in dropped_server_tool_ids:
+                continue
             name = tool_name_by_id.get(tool_use_id, "unknown")
             payload: dict[str, object] = {}
             extra_parts: list[GeminiPart] = []
@@ -979,6 +1054,8 @@ async def claude_to_gemini_request(
     resolved_model = resolve_compat_model(req.model, channel="claude")
     contents: list[GeminiContent] = []
     tool_name_by_id: dict[str, str] = {}
+    # 被剥离的服务端工具调用 id 集合（无有效签名，见 _is_server_side_tool_call）
+    dropped_server_tool_ids: set[str] = set()
 
     # 第一遍：登记 assistant tool_use 的 id → name 映射（tool_result 反查用）
     for message in req.messages:
@@ -994,7 +1071,9 @@ async def claude_to_gemini_request(
     for message in req.messages:
         role = "model" if message.role.strip().lower() == "assistant" else "user"
         parts = await _claude_blocks_to_parts(
-            message.content, tool_name_by_id=tool_name_by_id
+            message.content,
+            tool_name_by_id=tool_name_by_id,
+            dropped_server_tool_ids=dropped_server_tool_ids,
         )
         contents.append(GeminiContent(role=role, parts=parts or [GeminiPart(text="")]))
 

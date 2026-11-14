@@ -9,6 +9,11 @@ if TYPE_CHECKING:
 
 from dataclasses import dataclass
 
+from aistudio_api.domain.tool_signatures import (
+    is_server_side_tool_call as _is_server_side_tool_call,
+    valid_thought_signature as _valid_thought_signature,
+    valid_thought_signature_or_none as _valid_thought_signature_or_none,
+)
 from aistudio_api.infrastructure.gateway.model_defaults import (
     resolve_model_defaults,
     snap_thinking_level_to_supported as _snap_thinking_level_to_supported,
@@ -16,6 +21,7 @@ from aistudio_api.infrastructure.gateway.model_defaults import (
 )
 from aistudio_api.infrastructure.gateway.wire_codec import build_tools_from_names
 from aistudio_api.infrastructure.gateway.wire_spec import JspbArray, SchemaIndex
+from aistudio_api.infrastructure.utils.logger import get_logger
 from aistudio_api.infrastructure.gateway.wire_types import (
     AistudioContent,
     AistudioImageOutputMode,
@@ -23,6 +29,8 @@ from aistudio_api.infrastructure.gateway.wire_types import (
     AistudioThinkingConfig,
     ThinkingLevel,
 )
+
+logger = get_logger("chat")
 
 
 @dataclass
@@ -605,6 +613,22 @@ def _normalize_gemini_image_config(
 
 
 def _normalize_gemini_tool_config(value: object) -> list[object] | None:
+    """toolConfig → fcc wire（语义解析用，MakerSuite wire 无 tool_config 槽位）。
+
+    2026-11 前端 bundle 逆向结论（boq-makersuite jspb 类 _.Rv 全字段）：
+    MakerSuite GenerateContentRequest 顶层字段为 1=model, 2=contents,
+    3=safety, 4=generation_config, 5=snapshot, 6=system_instruction,
+    7=tools, 12=session_token, 13=conversation_tracking_mode,
+    14=request_context, 15=api_key, 16=preamble_config —— **不存在
+    tool_config 字段**。上游 "Please enable
+    tool_config.include_server_side_tool_invocations" 400 是其后端内部
+    校验（内置工具与 Function calling 组合的限制），前端 wire 层无法
+    控制该开关；本网关的对策是不主动混发该组合（见 tools 注入逻辑）。
+
+    本函数产出 fcc wire 形态供 build_request 的语义过滤（NONE 置空
+    tools / allowedNames 过滤）使用；NONE 与 allowedNames 的处理也同步
+    在 normalize_gemini_request 中前置执行。
+    """
     if value is None:
         return None
     if isinstance(value, list):
@@ -637,6 +661,8 @@ def _normalize_gemini_tool_config(value: object) -> list[object] | None:
     if isinstance(allowed_names, list) and allowed_names:
         fcc_wire.append(list(allowed_names))
 
+    # includeServerSideToolInvocations 在 MakerSuite wire 协议中无槽位可
+    # 编码（见函数 docstring），仅保留在语义层供观察/后续上游支持。
     include_invocations = value.get("includeServerSideToolInvocations") or value.get(
         "include_server_side_tool_invocations"
     )
@@ -777,6 +803,9 @@ def normalize_gemini_request(
         else f"models/{requested_model}"
     )
     contents: list[AistudioContent] = []
+    # 被剥离的服务端工具调用 id（无有效签名，见 _is_server_side_tool_call）：
+    # 对应的 functionResponse 一并跳过，避免孤立工具结果触发上游报错。
+    dropped_server_tool_ids: set[str] = set()
 
     for content in req.contents:
         role = content.role or "user"
@@ -788,7 +817,9 @@ def normalize_gemini_request(
                     AistudioPart(
                         text=part.text,
                         thought=is_thought,
-                        thought_signature=part.thoughtSignature,
+                        thought_signature=_valid_thought_signature_or_none(
+                            part.thoughtSignature
+                        ),
                     )
                 )
                 continue
@@ -797,24 +828,46 @@ def normalize_gemini_request(
                 parts.append(
                     AistudioPart(
                         inline_data=img_data,
-                        thought_signature=part.thoughtSignature,
+                        thought_signature=_valid_thought_signature_or_none(
+                            part.thoughtSignature
+                        ),
                     )
                 )
                 continue
             if part.functionCall is not None:
                 fc = part.functionCall
+                # 服务端工具（default_api:* / 内置工具）无有效签名时剥离：
+                # 部分客户端/转译层不保存 thoughtSignature，回传历史缺签名
+                # 会触发上游 400（"Function call is missing a thought_signature
+                # in functionCall parts"）。
+                if _is_server_side_tool_call(fc.name) and not _valid_thought_signature(
+                    part.thoughtSignature
+                ):
+                    if fc.id:
+                        dropped_server_tool_ids.add(fc.id)
+                    logger.info(
+                        "剥离无签名的服务端工具调用: name=%s, call_id=%s",
+                        fc.name,
+                        fc.id or "(无id)",
+                    )
+                    continue
                 args_payload = fc.args if fc.args is not None else {}
                 parts.append(
                     AistudioPart(
                         function_call=(fc.name, args_payload, fc.id)
                         if fc.id
                         else (fc.name, args_payload),
-                        thought_signature=part.thoughtSignature,
+                        thought_signature=_valid_thought_signature_or_none(
+                            part.thoughtSignature
+                        ),
                     )
                 )
                 continue
             if part.functionResponse is not None:
                 fr = part.functionResponse
+                # 跳过被剥离的服务端工具调用的结果
+                if fr.id and fr.id in dropped_server_tool_ids:
+                    continue
                 resp_payload = fr.response if fr.response is not None else {}
                 parts.append(
                     AistudioPart(
@@ -948,7 +1001,9 @@ def normalize_gemini_request(
     tool_config = _normalize_gemini_tool_config(raw_tool_config)
 
     # 检查工具调用模式。若为 NONE，显式置空 tools 与 tool_config，确保模型仅输出纯文本且不调用任何工具。
+    # allowedFunctionNames（tool_choice 指定具体函数）在网关层过滤候选工具列表。
     is_mode_none = False
+    allowed_names: list[str] | None = None
     if isinstance(raw_tool_config, dict):
         fcc = raw_tool_config.get("functionCallingConfig") or raw_tool_config.get(
             "function_calling_config"
@@ -957,20 +1012,32 @@ def normalize_gemini_request(
             m_val = fcc.get("mode")
             if m_val in (3, "NONE", "none"):
                 is_mode_none = True
-    elif (
-        (
-            isinstance(tool_config, list)
-            and len(tool_config) > 1
-            and isinstance(tool_config[1], list)
-        )
-        and tool_config[1]
-        and tool_config[1][0] == 3
-    ):
-        is_mode_none = True
+            raw_allowed = fcc.get("allowedFunctionNames") or fcc.get(
+                "allowed_function_names"
+            )
+            if isinstance(raw_allowed, list) and raw_allowed:
+                allowed_names = [str(x) for x in raw_allowed]
 
     if is_mode_none:
         tools = None
         tool_config = None
+    elif allowed_names is not None and tools:
+        # 与旧 wire 层过滤逻辑对齐：仅保留声明名在 allowed 集合内的
+        # functionDeclarations 工具容器；内置工具容器不受影响。
+        allowed_set = set(allowed_names)
+        filtered_tools: list[list[object]] = []
+        for t in tools:
+            if isinstance(t, list) and len(t) > 1 and isinstance(t[1], list):
+                filtered_decls = [
+                    d
+                    for d in t[1]
+                    if isinstance(d, list) and d and d[0] in allowed_set
+                ]
+                if filtered_decls:
+                    filtered_tools.append([t[0], filtered_decls])
+            else:
+                filtered_tools.append(t)
+        tools = filtered_tools or None
     generation_config = req.generationConfig
     # 只透传用户显式指定的生成参数：profile 的浏览器形态默认值
     # （max_tokens/temperature/top_p/top_k/thinking/…）由 wire_codec.build_request
