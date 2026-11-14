@@ -19,16 +19,16 @@ GET /health -> {"ok": true}
 
 原理见 docs/BROWSER_HYBRID_403_2026-11-14.md。
 """
+
 import asyncio
 import json
 import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
-_REPO_SRC = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "src"
-)
+_REPO_SRC = str(Path(__file__).resolve().parents[2] / "src")
 sys.path.insert(0, _REPO_SRC)
 
 from aistudio_api.infrastructure.waa.signer import RemoteProofSigner  # noqa: E402
@@ -42,8 +42,7 @@ LISTEN = os.environ.get("HYBRID_LISTEN", "127.0.0.1:8765")
 if not AUTH_PATH or not PROXY:
     raise SystemExit("missing HYBRID_AUTH_FILE / HYBRID_PROXY env")
 
-with open(AUTH_PATH) as f:
-    _auth = json.load(f)
+_auth = json.loads(Path(AUTH_PATH).read_text())
 COOKIES = {c["name"]: c["value"] for c in _auth["cookies"]}
 
 # --- 单一后台事件循环 (连接池 / 签名器复用) ---
@@ -117,14 +116,24 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             if self.path == "/mint":
                 proof, headers = run_async(
-                    mint_proof(payload.get("model", "models/gemini-4-hydrogen"),
-                               payload.get("wireContents") or []))
+                    mint_proof(
+                        payload.get("model", "models/gemini-4-hydrogen"),
+                        payload.get("wireContents") or [],
+                    )
+                )
                 print(f"[mint] ok proof_len={len(proof)}", flush=True)
                 self._json(200, {"ok": True, "proof": proof, "headers": headers})
             elif self.path == "/send":
                 status, resp_headers, body = run_async(_send(payload), timeout=150)
-                self._json(200, {"ok": True, "status": status,
-                                 "headers": resp_headers, "body": body})
+                self._json(
+                    200,
+                    {
+                        "ok": True,
+                        "status": status,
+                        "headers": resp_headers,
+                        "body": body,
+                    },
+                )
             else:
                 self._json(404, {"ok": False, "error": "not found"})
         except Exception as exc:
@@ -187,11 +196,16 @@ async def _send(payload: dict) -> tuple[int, dict, str]:
             # 重签: 解析 body, 换新 proof
             try:
                 arr = json.loads(current_body)
-                model = arr[0] if isinstance(arr[0], str) else "models/gemini-4-hydrogen"
+                model = (
+                    arr[0] if isinstance(arr[0], str) else "models/gemini-4-hydrogen"
+                )
                 proof, _ = await mint_proof(model, arr[1])
                 arr[4] = proof
                 current_body = json.dumps(arr, separators=(",", ":"))
-                print(f"[send] 403 -> re-minted proof ({len(proof)}B), retrying", flush=True)
+                print(
+                    f"[send] 403 -> re-minted proof ({len(proof)}B), retrying",
+                    flush=True,
+                )
             except Exception as exc:
                 print(f"[send] re-mint failed: {exc}", flush=True)
                 break
