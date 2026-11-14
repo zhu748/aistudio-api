@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import re
 
-_URL_USERINFO = re.compile(r"(https?|socks5h?)://[^\s/@]+@", re.IGNORECASE)
+# turn/turns/sstp 桥接 URI（含 RFC 7065 无斜线形态）同样会携带
+# user:pass@host userinfo，此处与 http/socks5 一并遮蔽，避免 TURN
+# 凭据在管理面板与日志里明文展示。
+_URL_USERINFO = re.compile(
+    r"(https?|socks5h?|turns?|sstp):(//)?[^\s/?@]+@", re.IGNORECASE
+)
 _KEY_PATH = re.compile(r"(/api-keys/)[^\s?\"'<>]+", re.IGNORECASE)
 _QUERY_SECRET = re.compile(
     r"([?&](?:key|api[_-]?key|token|ticket|password|secret|auth)=)[^&\s\"'<>]+",
