@@ -238,7 +238,8 @@ MakerSuite 协议无独立顶层工具控制字段，Gemini API 的 `toolConfig`
 > 不主动混发该组合（客户端显式声明 tools 时不自动注入内置工具）。
 
 > [!IMPORTANT]
-> **服务端工具调用的 thought_signature 强制校验（2026-11 实测）**：
+> **服务端工具调用的 thought_signature 强制校验（2026-11 实测；
+> 2026-11-14 判别补充：客户端声明函数同样强制，见 6.5 节）**：
 > 上游对服务端执行的工具（`default_api:*` 命名空间，如
 > `default_api:context` = Saved Info 记忆保存调用；以及
 > google_search / url_context / code_execution / google_maps 内置工具）
@@ -286,10 +287,15 @@ user:  [null×11, [name, response_wire, call_id]]
 - 模型 FC 轮无额外尾签名 part；后继文本轮恢复常规形态（思考摘要
   (槽位 12=1) + 文本 + 尾部空文本签名 part）。
 
-> [!NOTE]
-> **签名宽容度差异**：上游对客户端声明函数的 FC 回传**宽容**（签名可带可缺）；
-> 对服务端工具（`default_api:*` 与内置 grounding 类）的 FC 回传**强制**校验
-> 签名（见 6.4 节 IMPORTANT）。
+> [!IMPORTANT]
+> **签名强制校验（2026-11-14 本地服务 e2e 判别，修正早前"客户端函数宽容"结论）**：
+> 上游对**一切 functionCall 回传强制 thoughtSignature**——客户端声明函数
+> 与服务端工具同规则（缺失 → 400 "missing thought_signature ...
+> default_api:<函数名>"；伪签名 → 400 "Corrupted thought signature."，
+> 密码学信封校验不可伪造）。但校验**不绑定签名与具体调用内容**（跨调用
+> 交换真实签名实测 200）。网关对策：响应侧按 call_id/函数名缓存真实签名，
+> 请求侧客户端丢签名时回注，未命中才剥离（`domain/tool_signatures.py`
+> 的 `ThoughtSignatureCache`，详见 `FUNCTION_CALL_ROUNDTRIP_2026-11-14.md`）。
 
 ## 7. 响应报文解析与 Token 使用量 (Response & Usage)
 

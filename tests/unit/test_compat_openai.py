@@ -267,6 +267,15 @@ async def test_openai_reasoning_effort_xhigh_passthrough_and_snap() -> None:
 
 @pytest.mark.asyncio
 async def test_openai_request_tools_and_tool_roundtrip() -> None:
+    # 2026-11-14 实测：上游对客户端函数的 functionCall 回传同样强制
+    # thought_signature —— 模拟响应侧已缓存该调用的签名（客户端丢失后
+    # 由网关回注），验证往返仍完整保留。
+    import base64
+
+    from aistudio_api.domain.tool_signatures import remember_function_signature
+
+    cached_sig = base64.b64encode(b"sig-for-call-abc123").decode()
+    remember_function_signature("call_abc123", "get_weather", cached_sig)
     req = OpenAIChatCompletionRequest.model_validate(
         {
             "model": "gemini-3.8-flash",
@@ -313,7 +322,8 @@ async def test_openai_request_tools_and_tool_roundtrip() -> None:
     gemini_req, resolved = await openai_to_gemini_request(req)
 
     assert resolved == "gemini-3.8-flash"
-    # assistant tool_calls → functionCall parts（保留 id 供回传）
+    # assistant tool_calls → functionCall parts（保留 id 供回传；
+    # 客户端丢失的签名由缓存回注）
     model_content = gemini_req.contents[0]
     assert model_content.role == "model"
     fc_part = model_content.parts[0]
@@ -321,6 +331,7 @@ async def test_openai_request_tools_and_tool_roundtrip() -> None:
     assert fc_part.functionCall.name == "get_weather"
     assert fc_part.functionCall.args == {"location": "Beijing"}
     assert fc_part.functionCall.id == "call_abc123"
+    assert fc_part.thoughtSignature == cached_sig
     # tool 消息 → functionResponse（name 由 tool_call_id 反查）
     tool_content = gemini_req.contents[1]
     assert tool_content.role == "user"
@@ -337,6 +348,57 @@ async def test_openai_request_tools_and_tool_roundtrip() -> None:
     assert gemini_req.toolConfig == {"functionCallingConfig": {"mode": "AUTO"}}
     assert gemini_req.generationConfig is not None
     assert gemini_req.generationConfig.responseMimeType == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_openai_tool_call_without_signature_stripped_on_cache_miss() -> None:
+    """缓存未命中的无签名工具调用 → 剥离调用与配对响应（不再 400）。
+
+    函数名用独特值，避免命中其它用例按名回注的缓存。"""
+    req = OpenAIChatCompletionRequest.model_validate(
+        {
+            "model": "gemini-3.8-flash",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_never_seen",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup_unique_cache_miss_probe",
+                                "arguments": '{"location": "Beijing"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_never_seen",
+                    "content": '{"temp": 25}',
+                },
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_unique_cache_miss_probe",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+        }
+    )
+    gemini_req, _ = await openai_to_gemini_request(req)
+    # 调用与配对响应全部剥离：仅剩兜底空文本 part
+    assert len(gemini_req.contents) == 1
+    stripped = gemini_req.contents[0]
+    assert stripped.role == "model"
+    assert all(part.functionCall is None for part in stripped.parts)
 
 
 @pytest.mark.asyncio
