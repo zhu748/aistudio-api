@@ -32,6 +32,9 @@ from aistudio_api.infrastructure.proxy_bridge import (
     resolve_proxy_url_cached,
 )
 from aistudio_api.infrastructure.utils.logger import get_logger
+from aistudio_api.infrastructure.utils.upstream_dump import (
+    save_failed_upstream_exchange,
+)
 
 logger = get_logger("transport")
 
@@ -900,6 +903,18 @@ class HTTPStreamTransport:
                     elapsed_ms,
                     len(resp.content),
                 )
+                if resp.status_code != 200:
+                    # 失败快照：完整 url/头（脱敏）/wire 体/响应，供请求详情页
+                    # 查看与下载（线程池落盘，不阻塞响应路径）
+                    await asyncio.to_thread(
+                        save_failed_upstream_exchange,
+                        url=url,
+                        headers=clean_headers,
+                        body=body,
+                        status=resp.status_code,
+                        response_sample=resp.content,
+                        proxy_url=effective_proxy,
+                    )
                 return resp.status_code, resp.content
             except Exception as exc:
                 err_detail = (
@@ -960,13 +975,24 @@ class HTTPStreamTransport:
                     # not buffer an unbounded HTML/error stream before the
                     # gateway's own diagnostic limit can take effect.
                     remaining = 65536
+                    error_sample = bytearray()
                     async for chunk in resp.aiter_bytes():
                         if chunk:
                             sample = chunk[:remaining]
                             yield ("chunk", sample)
+                            error_sample.extend(sample)
                             remaining -= len(sample)
                             if not remaining:
                                 break
+                    await asyncio.to_thread(
+                        save_failed_upstream_exchange,
+                        url=url,
+                        headers=clean_headers,
+                        body=body,
+                        status=resp.status_code,
+                        response_sample=bytes(error_sample),
+                        proxy_url=effective_proxy,
+                    )
                     return
 
                 async for chunk in resp.aiter_bytes():

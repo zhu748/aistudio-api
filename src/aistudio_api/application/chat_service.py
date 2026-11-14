@@ -855,6 +855,15 @@ def _drop_hollow_and_merge_same_role(
             cleaned.append(content)
     if not cleaned:
         return [AistudioContent(role="user", parts=[AistudioPart(text="")])]
+    if cleaned[-1].role == "model":
+        # 上游不接受 model 结尾（2026-11-14 真机五形态判别：model 结尾
+        # 无论空壳/有文本均 400 "Requests ending with a model turn are
+        # not supported"；追加空文本 user 轮同样 400——上游不把空文本
+        # 轮当有效 user turn；**追加单空格 user 轮实测 200**）。
+        # 触发场景：尾部 assistant 轮文本+伪造工具调用混合，工具剥离后
+        # 文本保留、轮次仍以 model 收尾；或客户端 prefill hack。
+        # 单空格占位保留 prefill 语义（model 尾部文本原样续写）。
+        cleaned.append(AistudioContent(role="user", parts=[AistudioPart(text=" ")]))
     return cleaned
 
 
