@@ -217,6 +217,32 @@ Google AI Studio 在 Web 端（`alkalimakersuite-pa.clients6.google.com`）与�
 
 MakerSuite 协议无独立顶层工具控制字段，Gemini API 的 `toolConfig` 在网关层按语义映射：
 
+> [!IMPORTANT]
+> **2026-11 前端 bundle 逆向补充（jspb 类 `_.Rv` 全字段还原）**：
+> MakerSuite GenerateContentRequest 顶层字段全集为 `1`=model,
+> `2`=contents, `3`=safety_settings, `4`=generation_config, `5`=snapshot,
+> `6`=system_instruction, `7`=tools, `12`=session_token,
+> `13`=conversation_tracking_mode, `14`=request_context, `15`=api_key,
+> `16`=preamble_config —— **不存在 `tool_config` 字段**。上游报错
+> "Please enable tool_config.include_server_side_tool_invocations to use
+> Built-in tools with Function calling" 属其后端内部校验（内置工具与
+> Function calling 组合的限制），wire 层无法携带该开关；网关对策为
+> 不主动混发该组合（客户端显式声明 tools 时不自动注入内置工具）。
+
+> [!IMPORTANT]
+> **服务端工具调用的 thought_signature 强制校验（2026-11 实测）**：
+> 上游对服务端执行的工具（`default_api:*` 命名空间，如
+> `default_api:context` = Saved Info 记忆保存调用；以及
+> google_search / url_context / code_execution / google_maps 内置工具）
+> 的 functionCall 回传强制要求携带有效 thoughtSignature：缺失或非法
+> base64（字段类型 TYPE_BYTES）直接 400 INVALID_ARGUMENT
+> （"Function call is missing a thought_signature in functionCall parts"）。
+> 由于 OpenAI / Claude 兼容协议无官方工具签名字段，客户端回传历史
+> 必然丢签名，网关在三条输入路径（OpenAI / Claude / Gemini 原生）
+> 统一剥离无有效签名的服务端工具调用及配对的 functionResponse
+> （`domain/tool_signatures.py`）。客户端声明的普通工具
+> （functionDeclarations）缺失签名上游宽容，不受影响。
+
 | 模式 (Mode) | 语义说明 | 网关处理策略 |
 |---|---|---|
 | **`AUTO`** | 模型自主决定文本或工具调用 | 保持 `tools` 原样下发 |

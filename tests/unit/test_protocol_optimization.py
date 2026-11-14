@@ -267,7 +267,7 @@ async def test_tool_signature_survives_full_history_roundtrip(protocol):
                                     "args": {},
                                     "id": "c",
                                 },
-                                "thoughtSignature": "opaque_signature",
+                                "thoughtSignature": "b3BhcXVlX3NpZ25hdHVyZQ==",
                             }
                         ]
                     },
@@ -300,7 +300,7 @@ async def test_tool_signature_survives_full_history_roundtrip(protocol):
                 {"model": "test", "input": result["output"]}
             )
         )
-    assert request.contents[0].parts[0].thoughtSignature == "opaque_signature"
+    assert request.contents[0].parts[0].thoughtSignature == "b3BhcXVlX3NpZ25hdHVyZQ=="
     events = await convert(
         protocol,
         [
@@ -308,7 +308,7 @@ async def test_tool_signature_survives_full_history_roundtrip(protocol):
                 [
                     {
                         "functionCall": {"id": "c", "name": "weather", "args": {}},
-                        "thoughtSignature": "opaque_signature",
+                        "thoughtSignature": "b3BhcXVlX3NpZ25hdHVyZQ==",
                     }
                 ],
                 "STOP",
@@ -317,7 +317,7 @@ async def test_tool_signature_survives_full_history_roundtrip(protocol):
     )
     assert (
         calls_from(protocol, events)[0]["extra_content"]["google"]["thought_signature"]
-        == "opaque_signature"
+        == "b3BhcXVlX3NpZ25hdHVyZQ=="
     )
 
 

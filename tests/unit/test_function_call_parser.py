@@ -211,7 +211,7 @@ def test_chat_service_does_not_convert_signed_text_into_thought():
             GeminiContent(
                 role="model",
                 parts=[
-                    GeminiPart(text="Normal answer", thoughtSignature="valid_sig_123"),
+                    GeminiPart(text="Normal answer", thoughtSignature="dmFsaWRfc2lnXzEyMw=="),
                 ],
             )
         ]
@@ -220,11 +220,11 @@ def test_chat_service_does_not_convert_signed_text_into_thought():
     part = normalized.contents[0].parts[0]
     assert part.text == "Normal answer"
     assert part.thought is False
-    assert part.thought_signature == "valid_sig_123"
+    assert part.thought_signature == "dmFsaWRfc2lnXzEyMw=="
 
     # Wire serialization must not have thought flag at index 12
     wire = part.to_wire()
     assert wire[1] == "Normal answer"
     assert len(wire) > 14
-    assert wire[14] == "valid_sig_123"
+    assert wire[14] == "dmFsaWRfc2lnXzEyMw=="
     assert wire[12] is None
