@@ -10,12 +10,12 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import hashlib
+import json
 import os
 import re
 import threading
 import time
 from collections import OrderedDict
-from contextlib import suppress
 from typing import Any
 
 import httpx
@@ -119,6 +119,7 @@ class RemoteProofSigner:
         self.proxy_url = proxy_url or None
         self.timeout = timeout
         self._client: httpx.AsyncClient | None = None
+        self._closed = False
         # 惰性建池互斥：进程级单例被首批并发签名请求共享，
         # 无锁并发首调会各建一个 AsyncClient、后赋值者胜出，
         # 其余实例失去引用泄漏连接池（同 transport._get_client 的教训）。
@@ -135,6 +136,8 @@ class RemoteProofSigner:
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or lazily initialize shared HTTP client with connection pooling."""
+        if self._closed:
+            raise TransportError("Proof signer is closed")
         if self._client is not None and not self._client.is_closed:
             return self._client
         # 解析在锁外完成：turn/sstp 全局代理需惰性启动桥接子进程（可能
@@ -149,11 +152,18 @@ class RemoteProofSigner:
         # httpx.AsyncClient 的构造不触网，同步临界区即可，无需 await；
         # 双重检查防并发首调重复建池。
         with self._client_lock:
+            if self._closed:
+                raise TransportError("Proof signer is closed")
             if self._client is None or self._client.is_closed:
+                from aistudio_api.infrastructure.gateway.transport import (
+                    _shared_ssl_context,
+                )
+
                 self._client = httpx.AsyncClient(
                     timeout=self.timeout,
                     proxy=effective_proxy,
                     trust_env=False,
+                    verify=_shared_ssl_context(),
                     limits=httpx.Limits(
                         max_keepalive_connections=20, max_connections=50
                     ),
@@ -162,9 +172,12 @@ class RemoteProofSigner:
 
     async def close(self) -> None:
         """Close shared HTTP client."""
-        if self._client is not None and not self._client.is_closed:
-            await self._client.aclose()
+        with self._client_lock:
+            self._closed = True
+            client = self._client
             self._client = None
+        if client is not None and not client.is_closed:
+            await client.aclose()
 
     def _masked_proxy(self) -> str:
         """脱敏代理地址中的账号密码，用于日志输出。"""
@@ -355,11 +368,12 @@ class WaaSigner:
         self._reconfigure_lock_guard = threading.Lock()
         self._delayed_close_tasks: set[asyncio.Task[None]] = set()
         self._retired_signers: set[RemoteProofSigner] = set()
-        # proof 复用缓存：key=(content_hash, auth_user, tier, model, cookie_anchor)
-        # value=(monotonic_ts, proof, dynamic_headers)。cookie_anchor 取
-        # SAPISID 前 16 位，Cookie 轮换后锚点变化，天然隔离新旧会话。
+        self._active_signers: dict[RemoteProofSigner, int] = {}
+        self._signer_idle: dict[RemoteProofSigner, asyncio.Event] = {}
+        self._closed = False
+        # Bind proofs to the complete credential fingerprint and upstream route.
         self._proof_cache: OrderedDict[
-            tuple[str, str, str, str, str],
+            tuple[str, str, str, str, str, str],
             tuple[float, str, dict[str, str]],
         ] = OrderedDict()
 
@@ -369,7 +383,7 @@ class WaaSigner:
         403 重签路径调用（Auth403RetryManager 第 3 次重试）：此时缓存
         proof 可能已失效或被风控标记，必须强制重新走签名服务。
         带摘要失效时清除该 content_hash 下全部条目（跨账号/模型/层级：
-        缓存键为五元组，同一摘要可存在多条）。
+        缓存键同时包含凭据和出口，同一摘要可存在多条）。
         """
         if content_hash is None:
             removed = len(self._proof_cache)
@@ -389,14 +403,20 @@ class WaaSigner:
         auth_user: str,
         tier: str,
         model: str,
-    ) -> tuple[str, str, str, str, str]:
-        anchor = (
-            cookies.get("SAPISID")
-            or cookies.get("__Secure-3PAPISID")
-            or cookies.get("APISID")
-            or ""
-        )[:16]
-        return (content_hash, str(auth_user), str(tier), str(model), anchor)
+        upstream_proxy: str | None,
+    ) -> tuple[str, str, str, str, str, str]:
+        credentials = json.dumps(
+            filter_minimal_cookies(cookies), sort_keys=True, separators=(",", ":")
+        )
+        anchor = hashlib.sha256(credentials.encode("utf-8")).hexdigest()
+        return (
+            content_hash,
+            str(auth_user),
+            str(tier),
+            str(model),
+            anchor,
+            upstream_proxy or "",
+        )
 
     def _get_reconfigure_lock(self) -> asyncio.Lock:
         """惰性创建切换锁（避免 import 时无事件循环可用）。
@@ -421,9 +441,11 @@ class WaaSigner:
         旧实现直接改写 remote.server_url 并 close 共享连接池：正在途中的
         并发签名请求会因连接池被关闭而失败，检查与赋值之间的 await 间隙
         还存在双重进入竞态。改为整实例原子替换：新请求立即走新实例，
-        旧实例延迟一个宽限期（覆盖在途请求的最大超时）后关闭。
+        旧实例等待在途签名完成后关闭。
         """
         lock = self._get_reconfigure_lock()
+        if self._closed:
+            raise TransportError("Proof signer is closed")
         current = self._remote_signer
         target_url = (server_url or current.server_url).rstrip("/")
         target_proxy = (
@@ -433,7 +455,15 @@ class WaaSigner:
             return  # 快路径：目标未变，不进入切换序列
 
         async with lock:
+            if self._closed:
+                raise TransportError("Proof signer is closed")
             current = self._remote_signer
+            # Unspecified fields must inherit the latest state after waiting
+            # for another concurrent configuration change.
+            target_url = (server_url or current.server_url).rstrip("/")
+            target_proxy = (
+                (proxy_url or None) if proxy_url is not None else current.proxy_url
+            )
             if current.server_url == target_url and current.proxy_url == target_proxy:
                 return  # 双重检查：并发切换已由先到者完成
             new_signer = RemoteProofSigner(
@@ -441,6 +471,7 @@ class WaaSigner:
             )
             # 原子替换：后续新请求立即使用新实例，在途请求仍持有旧实例引用
             self._remote_signer = new_signer
+            self.invalidate_proof_cache()
             self._retired_signers.add(current)
             logger.info(
                 "签名节点已切换: %s -> %s",
@@ -448,16 +479,20 @@ class WaaSigner:
                 target_url,
             )
 
-        # 旧实例延迟关闭：给在途请求一个宽限期（其超时上限为 30s）
+        # A mint may include two 30s attempts and backoff. Drain real leases
+        # instead of interrupting its second attempt after a fixed 35s timer.
         async def _delayed_close() -> None:
-            with suppress(asyncio.CancelledError):
-                await asyncio.sleep(35.0)
+            idle = self._signer_idle.get(current)
             try:
-                await current.close()
-            except Exception as e:
-                logger.debug("延迟关闭旧签名器失败: %s", e)
+                if idle is not None:
+                    await idle.wait()
             finally:
-                self._retired_signers.discard(current)
+                try:
+                    await current.close()
+                except Exception as e:
+                    logger.debug("延迟关闭旧签名器失败: %s", e)
+                finally:
+                    self._retired_signers.discard(current)
 
         try:
             task = asyncio.create_task(_delayed_close())
@@ -469,6 +504,8 @@ class WaaSigner:
 
     async def close(self) -> None:
         """Close underlying remote signer resources."""
+        self._closed = True
+        self.invalidate_proof_cache()
         tasks = list(self._delayed_close_tasks)
         for task in tasks:
             task.cancel()
@@ -520,8 +557,9 @@ class WaaSigner:
         upstream_proxy: str | None = None,
     ) -> str:
         """Compute content hash and generate WAA proof token (with reuse cache)."""
+        if self._closed:
+            raise TransportError("Proof signer is closed")
         prompt, content_hash = extract_content_digest(contents)
-        wire_contents = [c.to_wire() for c in contents]
         logger.debug(
             "计算请求摘要: hash=%s, prompt_len=%d, u/%s",
             content_hash[:8],
@@ -532,15 +570,20 @@ class WaaSigner:
         # 1) 缓存命中路径：命中时同时恢复动态头（签名服务返回的 UA/头
         # 需要与 proof 成对使用，避免 proof 与指纹头错配）。
         ttl = self._proof_cache_ttl()
-        key = self._cache_key(content_hash, cookies, auth_user, tier, model)
-        if ttl > 0:
+        key = (
+            self._cache_key(
+                content_hash, cookies, auth_user, tier, model, upstream_proxy
+            )
+            if ttl > 0
+            else None
+        )
+        if key is not None:
             cached = self._proof_cache.get(key)
             if cached is not None:
                 ts, proof, cached_headers = cached
                 if time.monotonic() - ts < ttl:
                     self._proof_cache.move_to_end(key)
-                    if cached_headers:
-                        self._remote_signer.last_headers = dict(cached_headers)
+                    self._remote_signer.last_headers = dict(cached_headers)
                     logger.debug(
                         "WAA proof 缓存命中: hash=%s, age=%.0fs, u/%s",
                         content_hash[:8],
@@ -551,18 +594,35 @@ class WaaSigner:
                 self._proof_cache.pop(key, None)
 
         # 2) 未命中：走远程签名服务。
-        proof = await self._remote_signer.mint_proof(
-            cookies=cookies,
-            auth_user=auth_user,
-            tier=tier,
-            model=model,
-            prompt=prompt,
-            wire_contents=wire_contents,
-            upstream_proxy=upstream_proxy,
-        )
+        remote = self._remote_signer
+        self._active_signers[remote] = self._active_signers.get(remote, 0) + 1
+        idle = self._signer_idle.setdefault(remote, asyncio.Event())
+        idle.clear()
+        try:
+            proof = await remote.mint_proof(
+                cookies=cookies,
+                auth_user=auth_user,
+                tier=tier,
+                model=model,
+                prompt=prompt,
+                wire_contents=[c.to_wire() for c in contents],
+                upstream_proxy=upstream_proxy,
+            )
+        finally:
+            count = self._active_signers[remote] - 1
+            if count:
+                self._active_signers[remote] = count
+            else:
+                self._active_signers.pop(remote)
+                self._signer_idle.pop(remote).set()
 
         # 3) 回填缓存（LRU 容量淘汰）。失败不回填；mint_proof 内部已重试。
-        if ttl > 0 and proof:
+        if (
+            key is not None
+            and proof
+            and remote is self._remote_signer
+            and not self._closed
+        ):
             self._proof_cache[key] = (
                 time.monotonic(),
                 proof,

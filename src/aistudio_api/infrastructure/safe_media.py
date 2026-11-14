@@ -24,21 +24,38 @@ async def resolve_public_address(host: str, port: int) -> str:
 class PublicMediaTransport(httpx.AsyncBaseTransport):
     def __init__(self, proxy: str | None = None) -> None:
         self.proxy = proxy
+        self._closed = False
         self._origins: dict[tuple[str, str, int | None], httpx.AsyncHTTPTransport] = {}
 
     async def aclose(self) -> None:
-        await asyncio.gather(
-            *(transport.aclose() for transport in self._origins.values())
-        )
+        self._closed = True
+        transports = tuple(self._origins.values())
         self._origins.clear()
+        await asyncio.gather(*(transport.aclose() for transport in transports))
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if self._closed:
+            raise RuntimeError("Media transport is closed")
         url = request.url
         if url.scheme not in ("http", "https") or url.username or url.password:
             raise ValueError("Unsupported media URL")
-        address = await resolve_public_address(
-            url.host, url.port or (443 if url.scheme == "https" else 80)
-        )
+        timeout = request.extensions.get("timeout", {})
+        connect_timeout = timeout.get("connect") if isinstance(timeout, dict) else None
+        try:
+            async with asyncio.timeout(connect_timeout):
+                address = await resolve_public_address(
+                    url.host, url.port or (443 if url.scheme == "https" else 80)
+                )
+        except TimeoutError as exc:
+            raise httpx.ConnectTimeout(
+                "Media DNS resolution timed out", request=request
+            ) from exc
+        except socket.gaierror as exc:
+            raise httpx.ConnectError(
+                "Media DNS resolution failed", request=request
+            ) from exc
+        if self._closed:
+            raise RuntimeError("Media transport is closed")
         # Pin the checked IP so a second DNS lookup cannot rebind to a private host.
         pinned = httpx.Request(
             request.method,

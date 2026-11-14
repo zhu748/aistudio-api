@@ -179,6 +179,8 @@ async def test_streaming_set_cookie_persist_off_critical_path() -> None:
     """status 事件不等落盘；close 前冲刷保证持久化执行。"""
     from unittest.mock import patch
 
+    import httpx
+
     from aistudio_api.infrastructure.gateway import transport as tr
 
     class FakeHeaders:
@@ -197,7 +199,7 @@ async def test_streaming_set_cookie_persist_off_critical_path() -> None:
 
     class FakeClient:
         def build_request(self, *a, **k):
-            return None
+            return httpx.Request(*a, **k)
 
         async def send(self, *a, **k):
             return FakeResp()

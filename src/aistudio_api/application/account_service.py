@@ -169,12 +169,17 @@ class AccountService:
                 rotated_at=now_ts,
             )
             if session is not None and session.active_context is not None:
-                active_file = session.active_context.auth_file
-                if active_file and (
-                    str(auth_path) == str(active_file)
-                    or any(uid in str(active_file) for uid in updated_ids)
-                ):
-                    session.active_context.cookies.update(cookies)
+                active = session.active_context
+                if active.auth_file:
+                    active_path = Path(active.auth_file).resolve()
+                    updated_paths = (
+                        self._store.get_auth_path(uid) for uid in updated_ids
+                    )
+                    if active_path == auth_path.resolve() or any(
+                        path is not None and path.resolve() == active_path
+                        for path in updated_paths
+                    ):
+                        active.cookies.update(cookies)
             updated_names = result.get("updated")
             if isinstance(updated_names, list) and updated_names:
                 logger.debug(

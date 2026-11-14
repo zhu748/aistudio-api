@@ -303,76 +303,81 @@ class RequestMiddleware:
         finally:
             if admitted:
                 self.active -= 1
-            elapsed_ms = (time.perf_counter() - started) * 1000
-            if not context.result:
-                context.result = (
-                    "rate_limited"
-                    if status == 429
-                    else "success"
-                    if completed and status < 400
-                    else "error"
-                )
-            if not completed and context.result == "success":
-                context.result = "cancelled"
-            if model_call and admitted:
-                from aistudio_api.api.state import runtime_state
+            try:
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                if not context.result:
+                    context.result = (
+                        "rate_limited"
+                        if status == 429
+                        else "success"
+                        if completed and status < 400
+                        else "error"
+                    )
+                if not completed and context.result == "success":
+                    context.result = "cancelled"
+                if model_call and admitted:
+                    from aistudio_api.api.state import runtime_state
 
-                service = runtime_state.account_service
-                account = (
-                    service.get_account(context.account_id)
-                    if service and context.account_id
-                    else None
-                )
-                if account:
-                    context.account_name = account.email or account.name or account.id
-                request_event(
-                    "finished",
-                    f"调用结束 · {context.result}"
-                    + (f" · {context.error}" if context.error else ""),
-                )
-                record = {
-                    **request_snapshot(context),
-                    "started_at": started_at,
-                    "method": scope["method"],
-                    "path": redact_text(path),
-                    "status_code": status,
-                    "is_stream": is_stream,
-                    "elapsed_ms": round(elapsed_ms, 2),
-                    "finished_at": time.time(),
-                    "generation_ms": round(
-                        max(0, elapsed_ms - context.first_content_ms), 2
+                    service = runtime_state.account_service
+                    account = (
+                        service.get_account(context.account_id)
+                        if service and context.account_id
+                        else None
                     )
-                    if context.first_content_ms is not None
-                    else None,
-                    "first_byte_ms": first_byte_ms,
-                }
-                # Cancellation must not interrupt final bookkeeping after a client disconnect.
-                task = asyncio.create_task(
-                    self._persist(
-                        record,
-                        dump_enabled,
-                        context,
-                        headers,
-                        request_body,
-                        response_headers,
-                        response_body,
-                        request_body_truncated,
-                        response_body_truncated,
-                        is_stream,
-                        completed,
-                        status,
-                        elapsed_ms,
-                        path,
-                        history_start,
+                    if account:
+                        context.account_name = (
+                            account.email or account.name or account.id
+                        )
+                    request_event(
+                        "finished",
+                        f"调用结束 · {context.result}"
+                        + (f" · {context.error}" if context.error else ""),
                     )
-                )
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    await task
-                finally:
+                    record = {
+                        **request_snapshot(context),
+                        "started_at": started_at,
+                        "method": scope["method"],
+                        "path": redact_text(path),
+                        "status_code": status,
+                        "is_stream": is_stream,
+                        "elapsed_ms": round(elapsed_ms, 2),
+                        "finished_at": time.time(),
+                        "generation_ms": round(
+                            max(0, elapsed_ms - context.first_content_ms), 2
+                        )
+                        if context.first_content_ms is not None
+                        else None,
+                        "first_byte_ms": first_byte_ms,
+                    }
+                    # Drain bookkeeping, then preserve cancellation semantics.
+                    task = asyncio.create_task(
+                        self._persist(
+                            record,
+                            dump_enabled,
+                            context,
+                            headers,
+                            request_body,
+                            response_headers,
+                            response_body,
+                            request_body_truncated,
+                            response_body_truncated,
+                            is_stream,
+                            completed,
+                            status,
+                            elapsed_ms,
+                            path,
+                            history_start,
+                        )
+                    )
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        await task
+                        raise
+            finally:
+                if model_call and admitted:
                     unregister_request(context.request_id)
-            current_request.reset(token)
+                current_request.reset(token)
 
     @staticmethod
     async def _persist(

@@ -919,20 +919,16 @@ class ModelDiscoveryService:
                     logger.warning(
                         "拉取上游模型列表失败，将使用本地缓存/内置列表: %s", e
                     )
-                    # 有旧缓存但拉取失败时也写短 TTL 负缓存：否则 _last_fetched_at
-                    # 不更新，后续每次 get_models 都会重新拿锁、对已挂掉的上游
-                    # 发 10s 超时请求并在锁上串行堆积，拖慢所有 /models 请求。
-                    if self._cached_models:
-                        self._last_fetched_at = time.time() - self._cache_ttl + 60.0
             # 3. 保底返回本地默认模型列表（含本地补充模型）
             if not self._cached_models:
                 self._cached_models = _merge_extra_models(
                     [dict(m) for m in _FALLBACK_MODELS]
                 )
-                # 上游拉取失败且无缓存时只给短 TTL，避免启动时一次瞬时网络故障
-                # 导致 10 分钟内不再尝试上游（L1）。
-                self._last_fetched_at = time.time() - self._cache_ttl + 60.0
-
+            # Empty/unparseable responses and missing credentials need the same
+            # backoff as exceptions, including when an expired catalog exists.
+            # Otherwise every queued caller repeats an unusable upstream fetch.
+            retry_ttl = min(60.0, max(0.0, self._cache_ttl))
+            self._last_fetched_at = time.time() - self._cache_ttl + retry_ttl
             return self._cached_models
 
     async def get_model_by_id(

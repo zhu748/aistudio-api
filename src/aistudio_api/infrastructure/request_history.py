@@ -51,6 +51,10 @@ class RequestHistory:
                 connection.execute(
                     f"CREATE INDEX IF NOT EXISTS requests_{column} ON requests({column})"
                 )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS requests_finished_order ON requests("
+                "started_at DESC, request_id DESC) WHERE result != 'running'"
+            )
             self.path.chmod(0o600)
             self._schema_ready = True
 
@@ -59,11 +63,11 @@ class RequestHistory:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.touch(mode=0o600, exist_ok=True)
         connection = sqlite3.connect(self.path, timeout=10)
-        # journal_mode 属持久属性，WAL 一次设置后跨连接生效；
-        # synchronous 属连接级属性，逐连接设置开销极小（无磁盘 IO）
-        connection.execute("PRAGMA synchronous=NORMAL")
-        self._ensure_schema(connection)
         try:
+            # journal_mode is persistent; these settings are per connection.
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("PRAGMA secure_delete=ON")
+            self._ensure_schema(connection)
             with connection:
                 yield connection
         finally:
@@ -87,12 +91,13 @@ class RequestHistory:
             now = time.time()
             if now - self._last_cleanup > 60:
                 connection.execute(
-                    "DELETE FROM requests WHERE started_at < ?",
+                    "DELETE FROM requests WHERE result != 'running' AND started_at < ?",
                     (now - settings.history_days * 86400,),
                 )
                 connection.execute(
                     "DELETE FROM requests WHERE request_id IN ("
-                    "SELECT request_id FROM requests ORDER BY started_at DESC LIMIT -1 OFFSET ?)",
+                    "SELECT request_id FROM requests WHERE result != 'running' "
+                    "ORDER BY started_at DESC, request_id DESC LIMIT -1 OFFSET ?)",
                     (settings.history_max_rows,),
                 )
                 self._last_cleanup = now
@@ -239,7 +244,10 @@ class RequestHistory:
         if account_id:
             clauses.append("account_id = ?")
             params.append(account_id)
-        with self._lock, self._connect() as connection:
+        # A separate WAL reader can aggregate without blocking request inserts
+        # behind the process-wide write lock. Consume rows lazily, preserving
+        # exact percentile samples without materializing two full row lists.
+        with self._connect() as connection:
             connection.row_factory = sqlite3.Row
             rows = connection.execute(
                 "SELECT model, account_id, key_id, result, started_at, "
@@ -247,8 +255,8 @@ class RequestHistory:
                 + ", json_array_length(payload, '$.attempts') AS attempts FROM requests WHERE "
                 + " AND ".join(clauses),
                 params,
-            ).fetchall()
-        return summarize([dict(row) for row in rows], since=since, until=until)
+            )
+            return summarize((dict(row) for row in rows), since=since, until=until)
 
     def options(self) -> dict[str, object]:
         with self._lock, self._connect() as connection:

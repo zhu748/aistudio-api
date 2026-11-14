@@ -529,6 +529,7 @@ def parse_response_chunk(chunk: list[object]) -> Candidate:
         raw_candidate[WIRE_CANDIDATE_FINISH_REASON]
         if len(raw_candidate) > WIRE_CANDIDATE_FINISH_REASON
         and isinstance(raw_candidate[WIRE_CANDIDATE_FINISH_REASON], int)
+        and not isinstance(raw_candidate[WIRE_CANDIDATE_FINISH_REASON], bool)
         else None
     )
     candidate.finish_message = (

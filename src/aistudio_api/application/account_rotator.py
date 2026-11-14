@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import time
 from dataclasses import asdict, dataclass, field
@@ -83,17 +84,22 @@ def get_pacific_date_key(ts: float | None = None) -> str:
 
 def get_seconds_until_pacific_midnight() -> float:
     """获取距离下一次美西太平洋时间午夜 00:00 的秒数。"""
+    now = time.time()
     zone = _pacific_zone()
     if zone is not None:
-        now_dt = datetime.now(zone)
+        now_dt = datetime.fromtimestamp(now, tz=zone)
         tomorrow_dt = (now_dt + timedelta(days=1)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
-        return max(0.0, (tomorrow_dt - now_dt).total_seconds())
-    # 保底计算：按当地时间整点取余（偏移已含 DST 修正）
-    now = time.time()
-    local = now + _pacific_offset_seconds(now)
-    return float(86400 - (local % 86400))
+        # Subtract UTC timestamps: same-zone datetime subtraction counts wall
+        # hours and is off by one hour on Pacific DST transition days.
+        return max(0.0, tomorrow_dt.timestamp() - now)
+    offset = _pacific_offset_seconds(now)
+    local = now + offset
+    next_local_midnight = (local // 86400 + 1) * 86400
+    approximate_utc = next_local_midnight - offset
+    midnight = next_local_midnight - _pacific_offset_seconds(approximate_utc)
+    return max(0.0, midnight - now)
 
 
 def normalize_model_key(model: str | None) -> str | None:
@@ -606,11 +612,24 @@ class AccountRotator:
         if self._save_task is not None and not self._save_task.done():
             return
 
-        async def _offload() -> None:
-            payload = self._snapshot_state()
-            await asyncio.to_thread(self._persist_state, payload)
+        self._save_task = loop.create_task(
+            self._flush_latest_state(), context=contextvars.Context()
+        )
 
-        self._save_task = loop.create_task(_offload())
+    async def _flush_latest_state(self) -> None:
+        while True:
+            payload = self._snapshot_state()
+            write = asyncio.create_task(asyncio.to_thread(self._persist_state, payload))
+            try:
+                await asyncio.shield(write)
+            except asyncio.CancelledError:
+                await write
+                raise
+            if payload == self._snapshot_state():
+                return
+            # Coalesce updates arriving during disk I/O without dropping the
+            # last one or writing continuously under sustained traffic.
+            await asyncio.sleep(2.0)
 
     def _schedule_debounced_save(self, delay: float = 2.0) -> None:
         if not settings.persist_rotator:
@@ -634,10 +653,9 @@ class AccountRotator:
         async def _delayed():
             await asyncio.sleep(delay)
             # 快照在事件循环线程做，仅文件写入入线程池（save_state 同理）
-            payload = self._snapshot_state()
-            await asyncio.to_thread(self._persist_state, payload)
+            await self._flush_latest_state()
 
-        self._save_task = loop.create_task(_delayed())
+        self._save_task = loop.create_task(_delayed(), context=contextvars.Context())
 
     def get_account_stats(self, account_id: str) -> AccountStats | None:
         """获取指定账号的统计对象。"""

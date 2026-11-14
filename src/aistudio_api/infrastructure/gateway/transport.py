@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import re
 import ssl
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -217,9 +219,9 @@ _EMPTY_COOKIE_TTL = 5.0
 def _get_auth_cookies(auth_file: str | None = None) -> dict[str, str] | None:
     """Read credentials from the bound auth_file or active account."""
     if auth_file:
-        cookies = load_cookies_from_auth_file(auth_file)
-        if cookies:
-            return cookies
+        # A bound request must never borrow the globally active account if
+        # its own credential file has disappeared or become unreadable.
+        return load_cookies_from_auth_file(auth_file) or None
     cache_key = auth_file or ""
     now = time.monotonic()
     cached = _empty_cookie_cache.get(cache_key)
@@ -450,7 +452,7 @@ def _ensure_authorization_header(
     if tier_header:
         clean_headers["x-aistudio-g1-tier"] = tier_header
 
-    raw_cookie_dict = cookies or _get_auth_cookies(auth_file)
+    raw_cookie_dict = cookies if cookies is not None else _get_auth_cookies(auth_file)
     cookie_dict = filter_minimal_cookies(raw_cookie_dict) if raw_cookie_dict else None
 
     if cookie_dict:
@@ -484,6 +486,29 @@ def _is_browser_rpc_target(url: str) -> bool:
     return match.group(1).lower().endswith(".clients6.google.com")
 
 
+def _build_rpc_request(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: list[tuple[str, str]],
+    body: bytes,
+) -> httpx.Request:
+    request = client.build_request("POST", url, headers=headers, content=body)
+    if not any(name.lower() == "cookie" for name, _ in headers):
+        # Pools are shared across accounts. Only explicit request credentials
+        # are authoritative; httpx's cookie jar is not an account fallback.
+        request.headers.pop("cookie", None)
+    return request
+
+
+_PreflightKey = tuple[httpx.AsyncClient, str, str, str]
+
+
+@dataclass
+class _PreflightLock:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
 class HTTPStreamTransport:
     """Direct HTTP streaming and non-streaming transport layer."""
 
@@ -508,9 +533,9 @@ class HTTPStreamTransport:
         self._retired_clients: set[httpx.AsyncClient] = set()
         # 按代理地址分池的客户端缓存：key 为代理 URL（空串表示直连）
         self._clients: dict[str, httpx.AsyncClient] = {}
-        # CORS 预检结果缓存：key = "POST <url> <acr-headers>"，值为到期时刻
-        # （time.monotonic 基准；浏览器同源预检缓存语义）
-        self._preflight_cache: dict[str, float] = {}
+        # Cache/serialize per connection pool, URL, origin and header names.
+        self._preflight_cache: dict[_PreflightKey, float] = {}
+        self._preflight_locks: dict[_PreflightKey, _PreflightLock] = {}
         self._active_clients: dict[httpx.AsyncClient, int] = {}
         self._client_idle: dict[httpx.AsyncClient, asyncio.Event] = {}
         self._closed = False
@@ -588,6 +613,11 @@ class HTTPStreamTransport:
         async with self._get_client_lock():
             for key in [k for k in self._clients if k != keep_key]:
                 retired.append(self._clients.pop(key))
+            self._preflight_cache = {
+                key: expiry
+                for key, expiry in self._preflight_cache.items()
+                if key[0] not in retired
+            }
         if not retired:
             return
 
@@ -718,13 +748,49 @@ class HTTPStreamTransport:
             name for name in header_names if name not in _BROWSER_MANAGED_HEADER_NAMES
         )
         acr_value = ",".join(acr_names)
-        key = f"POST {url} {acr_value}"
+        lowered = {str(k).lower(): str(v) for k, v in rpc_headers.items()}
+        key = (client, url, lowered.get("origin", ""), acr_value)
         now = time.monotonic()
         expiry = self._preflight_cache.get(key)
         if expiry is not None and now < expiry:
             return
 
-        lowered = {str(k).lower(): str(v) for k, v in rpc_headers.items()}
+        if self._closed:
+            raise RuntimeError("Transport is closed")
+        state = self._preflight_locks.setdefault(key, _PreflightLock())
+        state.users += 1
+        try:
+            async with state.lock:
+                if self._closed:
+                    raise RuntimeError("Transport is closed")
+                if time.monotonic() < self._preflight_cache.get(key, 0):
+                    return
+                max_age = await self._send_cors_preflight(
+                    url, lowered, acr_value, client
+                )
+                if client not in self._retired_clients and not self._closed:
+                    now = time.monotonic()
+                    if len(self._preflight_cache) >= 256:
+                        self._preflight_cache = {
+                            item: expiry
+                            for item, expiry in self._preflight_cache.items()
+                            if expiry > now
+                        }
+                        if len(self._preflight_cache) >= 256:
+                            self._preflight_cache.pop(next(iter(self._preflight_cache)))
+                    self._preflight_cache[key] = now + max_age
+        finally:
+            state.users -= 1
+            if not state.users:
+                self._preflight_locks.pop(key, None)
+
+    async def _send_cors_preflight(
+        self,
+        url: str,
+        lowered: dict[str, str],
+        acr_value: str,
+        client: httpx.AsyncClient,
+    ) -> float:
         preflight_headers: list[tuple[str, str]] = [
             ("User-Agent", lowered.get("user-agent") or ""),
             ("Accept", "*/*"),
@@ -746,7 +812,12 @@ class HTTPStreamTransport:
 
         max_age = self._PREFLIGHT_FALLBACK_MAX_AGE
         try:
-            resp = await client.options(url, headers=preflight_headers)
+            request = client.build_request("OPTIONS", url, headers=preflight_headers)
+            # httpx automatically merges its cookie jar/default auth into
+            # requests. Browser preflights must always be anonymous.
+            request.headers.pop("cookie", None)
+            request.headers.pop("authorization", None)
+            resp = await client.send(request, auth=None)
             if not 200 <= resp.status_code < 300:
                 logger.warning(
                     "CORS 预检返回 HTTP %d（不阻断主请求）: url=%s",
@@ -759,8 +830,8 @@ class HTTPStreamTransport:
                     parsed_age = float(raw_age) if raw_age else None
                 except ValueError:
                     parsed_age = None
-                if parsed_age is not None:
-                    max_age = min(parsed_age, self._PREFLIGHT_MAX_AGE_CAP)
+                if parsed_age is not None and math.isfinite(parsed_age):
+                    max_age = max(0, min(parsed_age, self._PREFLIGHT_MAX_AGE_CAP))
                 logger.debug(
                     "CORS 预检完成: url=%s, status=%d, max_age=%.0fs",
                     url,
@@ -773,7 +844,7 @@ class HTTPStreamTransport:
                 url,
                 e,
             )
-        self._preflight_cache[key] = time.monotonic() + max_age
+        return max_age
 
     async def send_request(
         self,
@@ -813,7 +884,8 @@ class HTTPStreamTransport:
                 url=url, rpc_headers=clean_headers, client=client
             )
             try:
-                resp = await client.post(url, headers=wire_headers, content=body_bytes)
+                request = _build_rpc_request(client, url, wire_headers, body_bytes)
+                resp = await client.send(request, auth=None)
                 # Set-Cookie 回写下放线程池（3.4）：逐账号读盘/写盘的同步 I/O
                 # 若留在事件循环内会拖慢所有并发请求的首字延迟。
                 set_cookies = resp.headers.get_list("set-cookie")
@@ -874,10 +946,8 @@ class HTTPStreamTransport:
             )
             resp = None
             try:
-                req = client.build_request(
-                    "POST", url, headers=wire_headers, content=body_bytes
-                )
-                resp = await client.send(req, stream=True)
+                req = _build_rpc_request(client, url, wire_headers, body_bytes)
+                resp = await client.send(req, stream=True, auth=None)
                 set_cookies = resp.headers.get_list("set-cookie")
                 if set_cookies:
                     # 后台落盘：Google 上游普遍带滚动 Set-Cookie，
@@ -886,8 +956,17 @@ class HTTPStreamTransport:
                 yield ("status", resp.status_code)
 
                 if resp.status_code != 200:
-                    err_body = await resp.aread()
-                    yield ("chunk", err_body)
+                    # Error classification needs only a small body sample. Do
+                    # not buffer an unbounded HTML/error stream before the
+                    # gateway's own diagnostic limit can take effect.
+                    remaining = 65536
+                    async for chunk in resp.aiter_bytes():
+                        if chunk:
+                            sample = chunk[:remaining]
+                            yield ("chunk", sample)
+                            remaining -= len(sample)
+                            if not remaining:
+                                break
                     return
 
                 async for chunk in resp.aiter_bytes():

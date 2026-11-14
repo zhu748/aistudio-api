@@ -13,6 +13,7 @@ from aistudio_api.infrastructure.gateway.wire_parser import (
 )
 
 XSSI_PREFIX = ")]}'"
+_MAX_JSON_CHUNK_BYTES = 64 * 1024 * 1024
 
 # 结构字符跳扫：feed 的热路径不再逐字符走 Python 字节码。
 # 旧实现对每个字符执行一次循环体（含分支判断），inline_data 的 base64
@@ -171,7 +172,7 @@ class IncrementalJSONStreamParser:
         self._chunk_size = 0
         self._preamble = ""
         self.depth: int = 0
-        self._nesting = 0
+        self._containers: list[str] = []
         self.in_string: bool = False
         self.escape: bool = False
         self.chunk_start: int | None = None
@@ -182,17 +183,12 @@ class IncrementalJSONStreamParser:
         return self._preamble + "".join(self._fragments)
 
     def _append(self, fragment: str) -> None:
-        self._chunk_size += len(fragment)
-        if self._chunk_size > 64 * 1024 * 1024:
+        self._chunk_size += (
+            len(fragment) if fragment.isascii() else len(fragment.encode("utf-8"))
+        )
+        if self._chunk_size > _MAX_JSON_CHUNK_BYTES:
             raise ValueError("Upstream JSON chunk exceeds 64 MiB limit")
         self._fragments.append(fragment)
-
-    @staticmethod
-    def _parse_chunk(chunk_str: str) -> object | None:
-        try:
-            return json.loads(chunk_str)
-        except (TypeError, ValueError):
-            return _repair_truncated_json(chunk_str)
 
     def feed(self, data: str) -> Generator[list[object], None, None]:
         if not self.preamble_skipped:
@@ -223,12 +219,12 @@ class IncrementalJSONStreamParser:
             pos = index + 1
             if not self.in_string:
                 if ch in "[{":
-                    self._nesting += 1
-                    if self._nesting > 128:
+                    self._containers.append(ch)
+                    if len(self._containers) > 128:
                         raise ValueError("Upstream JSON nesting exceeds 128 levels")
                 elif ch in "]}":
-                    self._nesting -= 1
-                    if self._nesting < 0:
+                    expected = "[" if ch == "]" else "{"
+                    if not self._containers or self._containers.pop() != expected:
                         raise ValueError("Unbalanced upstream JSON container")
             if self.in_string:
                 if ch == '"':
@@ -255,7 +251,9 @@ class IncrementalJSONStreamParser:
                     self._chunk_size = 0
                     self.chunk_start = None
                     start = None
-                    parsed = self._parse_chunk(chunk)
+                    # A structurally closed chunk must already be valid JSON.
+                    # Only finish() may repair an actual EOF-truncated fragment.
+                    parsed = json.loads(chunk)
                     if isinstance(parsed, list):
                         yield parsed
         if start is not None:
@@ -271,7 +269,7 @@ class IncrementalJSONStreamParser:
         self._preamble = ""
         self.chunk_start = None
         self.depth = 0
-        self._nesting = 0
+        self._containers.clear()
         self.in_string = False
         self.escape = False
 

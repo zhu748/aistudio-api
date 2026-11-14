@@ -201,7 +201,7 @@ class Auth403RetryManager:
                     and hasattr(account_svc, "get_account")
                 ):
                     target_acc = account_svc.get_account(self.serving_account_id)
-                if target_acc is None and account_svc:
+                if not self.serving_account_id and account_svc:
                     target_acc = account_svc.get_active_account()
                 if (
                     account_svc is not None

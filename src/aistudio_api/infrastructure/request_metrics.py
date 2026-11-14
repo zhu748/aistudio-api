@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -13,16 +15,14 @@ def _number(value: object) -> float:
     )
 
 
-def _percentile(values: list[float], fraction: float) -> float | None:
+def _sorted_percentile(values: list[float], fraction: float) -> float | None:
+    """Interpolate an already sorted sample without allocating another copy."""
     if not values:
         return None
-    ordered = sorted(values)
-    index = (len(ordered) - 1) * fraction
+    index = (len(values) - 1) * fraction
     lower = math.floor(index)
     upper = math.ceil(index)
-    return round(
-        ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower), 2
-    )
+    return round(values[lower] + (values[upper] - values[lower]) * (index - lower), 2)
 
 
 @dataclass
@@ -74,6 +74,8 @@ class Metrics:
         self.last_used = max(self.last_used, _number(row.get("started_at")))
 
     def export(self) -> dict[str, object]:
+        self.latency.sort()
+        self.first_byte.sort()
         return {
             "requests": self.requests,
             "success": self.success,
@@ -87,10 +89,10 @@ class Metrics:
             "retry_rate": round(self.retried / self.requests * 100, 2)
             if self.requests
             else None,
-            "latency_p50_ms": _percentile(self.latency, 0.5),
-            "latency_p95_ms": _percentile(self.latency, 0.95),
-            "first_byte_p50_ms": _percentile(self.first_byte, 0.5),
-            "first_byte_p95_ms": _percentile(self.first_byte, 0.95),
+            "latency_p50_ms": _sorted_percentile(self.latency, 0.5),
+            "latency_p95_ms": _sorted_percentile(self.latency, 0.95),
+            "first_byte_p50_ms": _sorted_percentile(self.first_byte, 0.5),
+            "first_byte_p95_ms": _sorted_percentile(self.first_byte, 0.95),
             **{
                 key: self.tokens.get(key, 0)
                 for key in (
@@ -110,28 +112,30 @@ class Metrics:
 
 
 def summarize(
-    rows: list[dict[str, object]], *, since: float, until: float
+    rows: Iterable[dict[str, object]], *, since: float, until: float
 ) -> dict[str, object]:
     totals = Metrics()
-    models: dict[str, Metrics] = {}
-    accounts: dict[str, Metrics] = {}
-    keys: dict[str, Metrics] = {}
-    model_accounts: dict[str, dict[str, Metrics]] = {}
+    models: defaultdict[str, Metrics] = defaultdict(Metrics)
+    accounts: defaultdict[str, Metrics] = defaultdict(Metrics)
+    keys: defaultdict[str, Metrics] = defaultdict(Metrics)
+    model_accounts: defaultdict[str, defaultdict[str, Metrics]] = defaultdict(
+        lambda: defaultdict(Metrics)
+    )
     names: dict[str, str] = {}
     interval = 3600 if until - since <= 2 * 86400 else 86400
-    series: dict[int, Metrics] = {}
+    series: defaultdict[int, Metrics] = defaultdict(Metrics)
     for row in rows:
         totals.add(row)
         model = str(row.get("model") or "未识别模型").removeprefix("models/")
         account = str(row.get("account_id") or "未调度")
         key = str(row.get("key_id") or "匿名")
         names[account] = str(row.get("account_name") or names.get(account) or account)
-        models.setdefault(model, Metrics()).add(row)
-        model_accounts.setdefault(model, {}).setdefault(account, Metrics()).add(row)
-        accounts.setdefault(account, Metrics()).add(row)
-        keys.setdefault(key, Metrics()).add(row)
+        models[model].add(row)
+        model_accounts[model][account].add(row)
+        accounts[account].add(row)
+        keys[key].add(row)
         bucket = int(_number(row.get("started_at")) // interval) * interval
-        series.setdefault(bucket, Metrics()).add(row)
+        series[bucket].add(row)
     # Include empty buckets so idle periods remain visible.
     for bucket in range(
         int(since // interval) * interval,

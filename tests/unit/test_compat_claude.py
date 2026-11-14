@@ -292,10 +292,8 @@ def test_build_claude_message_tool_use_and_stop_sequence() -> None:
     message = cast(dict[str, Any], build_claude_message(response, "m", ["DONE"]))
     assert message["stop_reason"] == "stop_sequence"
     assert message["stop_sequence"] == "DONE"
-    tool_block = message["content"][-1]
-    assert tool_block["type"] == "tool_use"
-    assert tool_block["id"] == "toolu_01XYZ"
-    assert tool_block["input"] == {"x": 1}
+    # The stop sequence ends the response, including subsequent tool actions.
+    assert message["content"] == [{"type": "text", "text": "Result: "}]
 
 
 def test_build_claude_message_image_and_refusal() -> None:
