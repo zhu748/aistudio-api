@@ -230,3 +230,236 @@ def test_chat_service_does_not_convert_signed_text_into_thought():
     assert len(wire) > 14
     assert wire[14] == "dmFsaWRfc2lnXzEyMw=="
     assert wire[12] is None
+
+
+# ---------- 剥离残留清理（2026-11-14 双 400/403 修复） ----------
+
+
+def _norm(contents, model="gemini-3.8-flash", **kwargs):
+    from aistudio_api.api.schemas import GeminiGenerateContentRequest
+    from aistudio_api.application.chat_service import normalize_gemini_request
+
+    return normalize_gemini_request(
+        GeminiGenerateContentRequest(contents=contents, **kwargs), model
+    )
+
+
+def test_normalize_drops_hollow_turns_and_merges_same_role():
+    """剥离后的全空轮必须彻底消失（WAA 403 / model-turn 400 双修）。
+
+    有毒历史（预设伪造工具调用，缓存未命中被剥离）：
+    [user text, model FC(剥离), user FR(丢弃), model FC(剥离),
+     user FR(丢弃)+text, model FC(剥离), user FR(丢弃)]
+    → 清理后仅剩单个 user 轮（两段 text 合并），以 user 收尾。
+    """
+    from aistudio_api.api.schemas import (
+        GeminiContent,
+        GeminiFunctionCall,
+        GeminiFunctionResponse,
+        GeminiPart,
+    )
+
+    normalized = _norm(
+        [
+            GeminiContent(role="user", parts=[GeminiPart(text="Hello.")]),
+            GeminiContent(
+                role="model",
+                parts=[
+                    GeminiPart(
+                        functionCall=GeminiFunctionCall(
+                            name="context", args={}, id="call_init_context_00"
+                        )
+                    )
+                ],
+            ),
+            GeminiContent(
+                role="user",
+                parts=[
+                    GeminiPart(
+                        functionResponse=GeminiFunctionResponse(
+                            name="context", response={}, id="call_init_context_00"
+                        )
+                    )
+                ],
+            ),
+            GeminiContent(
+                role="model",
+                parts=[
+                    GeminiPart(
+                        functionCall=GeminiFunctionCall(
+                            name="soliumbra_reply",
+                            args={},
+                            id="call_hist_01",
+                        )
+                    )
+                ],
+            ),
+            GeminiContent(
+                role="user",
+                parts=[
+                    GeminiPart(
+                        functionResponse=GeminiFunctionResponse(
+                            name="soliumbra_reply", response={}, id="call_hist_01"
+                        )
+                    ),
+                    GeminiPart(text="Continue."),
+                ],
+            ),
+            GeminiContent(
+                role="model",
+                parts=[
+                    GeminiPart(
+                        functionCall=GeminiFunctionCall(
+                            name="context", args={}, id="call_sync_final"
+                        )
+                    )
+                ],
+            ),
+            GeminiContent(
+                role="user",
+                parts=[
+                    GeminiPart(
+                        functionResponse=GeminiFunctionResponse(
+                            name="context", response={}, id="call_sync_final"
+                        )
+                    )
+                ],
+            ),
+        ]
+    )
+    # 全部空轮被丢弃，两段 user 文本合并为单轮
+    assert len(normalized.contents) == 1
+    merged = normalized.contents[0]
+    assert merged.role == "user"
+    assert [p.text for p in merged.parts] == ["Hello.", "Continue."]
+    # wire 形态：无 [[], role] 空轮（WAA 403 触发形态），以 user 收尾
+    for content in normalized.contents:
+        assert content.parts, "空轮残留"
+        assert all(
+            p.text or p.function_call or p.function_response or p.thought_signature
+            for p in content.parts
+        ), "无载荷 part 残留"
+
+
+def test_normalize_keeps_signature_only_part():
+    """纯签名 part（文本轮尾部信封）是有效载荷，不可被清理丢弃。"""
+    from aistudio_api.api.schemas import GeminiContent, GeminiPart
+
+    normalized = _norm(
+        [
+            GeminiContent(role="model", parts=[GeminiPart(text="Answer.")]),
+            GeminiContent(role="user", parts=[GeminiPart(text="Next.")]),
+            GeminiContent(
+                role="model",
+                parts=[GeminiPart(text="", thoughtSignature="dmFsaWRfc2lnXzEyMw==")],
+            ),
+        ]
+    )
+    # 末尾空文本签名轮保留（有签名载荷，非空轮）
+    assert normalized.contents[-1].parts[0].thought_signature == (
+        "dmFsaWRfc2lnXzEyMw=="
+    )
+
+
+def test_normalize_all_hollow_falls_back_to_single_user_turn():
+    """全部轮被清空时回退单个空文本 user 轮（保持 user 收尾语义）。"""
+    from aistudio_api.api.schemas import (
+        GeminiContent,
+        GeminiFunctionCall,
+        GeminiFunctionResponse,
+        GeminiPart,
+    )
+
+    normalized = _norm(
+        [
+            GeminiContent(
+                role="model",
+                parts=[
+                    GeminiPart(
+                        functionCall=GeminiFunctionCall(
+                            name="context", args={}, id="call_x"
+                        )
+                    )
+                ],
+            ),
+            GeminiContent(
+                role="user",
+                parts=[
+                    GeminiPart(
+                        functionResponse=GeminiFunctionResponse(
+                            name="context", response={}, id="call_x"
+                        )
+                    )
+                ],
+            ),
+        ]
+    )
+    assert len(normalized.contents) == 1
+    assert normalized.contents[0].role == "user"
+    assert normalized.contents[0].parts[0].text == ""
+
+
+def test_normalize_merges_consecutive_same_role_turns():
+    """相邻同角色轮合并（前端同构形态），part 顺序保持。"""
+    from aistudio_api.api.schemas import GeminiContent, GeminiPart
+
+    normalized = _norm(
+        [
+            GeminiContent(role="user", parts=[GeminiPart(text="A.")]),
+            GeminiContent(role="user", parts=[GeminiPart(text="B.")]),
+            GeminiContent(role="model", parts=[GeminiPart(text="C.")]),
+            GeminiContent(role="user", parts=[GeminiPart(text="D.")]),
+        ]
+    )
+    assert [(c.role, [p.text for p in c.parts]) for c in normalized.contents] == [
+        ("user", ["A.", "B."]),
+        ("model", ["C."]),
+        ("user", ["D."]),
+    ]
+
+
+def test_normalize_digest_unaffected_by_cleanup():
+    """清理不改变 proof 摘要输入（空轮无贡献，合并保持平铺顺序）。"""
+    from aistudio_api.api.schemas import (
+        GeminiContent,
+        GeminiFunctionCall,
+        GeminiFunctionResponse,
+        GeminiPart,
+    )
+    from aistudio_api.infrastructure.waa.signer import extract_content_digest
+
+    poisoned = [
+        GeminiContent(role="user", parts=[GeminiPart(text="Hello.")]),
+        GeminiContent(
+            role="model",
+            parts=[
+                GeminiPart(
+                    functionCall=GeminiFunctionCall(
+                        name="context", args={}, id="call_c1"
+                    )
+                )
+            ],
+        ),
+        GeminiContent(
+            role="user",
+            parts=[
+                GeminiPart(
+                    functionResponse=GeminiFunctionResponse(
+                        name="context", response={}, id="call_c1"
+                    )
+                ),
+                GeminiPart(text="Continue."),
+            ],
+        ),
+    ]
+    normalized = _norm(poisoned)
+    # 与「无工具轮的等价历史」摘要一致：剥离 + 清理后内容语义不变
+    equivalent = _norm(
+        [
+            GeminiContent(role="user", parts=[GeminiPart(text="Hello.")]),
+            GeminiContent(role="user", parts=[GeminiPart(text="Continue.")]),
+        ]
+    )
+    assert extract_content_digest(normalized.contents) == extract_content_digest(
+        equivalent.contents
+    )
