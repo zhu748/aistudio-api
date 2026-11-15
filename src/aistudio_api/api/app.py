@@ -23,6 +23,7 @@ from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.model_defaults import (
     get_configured_logging_settings,
 )
+from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 from aistudio_api.infrastructure.utils.logger import (
     get_logger,
     setup_logging,
@@ -331,6 +332,14 @@ async def lifespan(_app: FastAPI):
     tier_task = asyncio.create_task(_auto_refresh_tiers())
     rotate_task = asyncio.create_task(_cookie_rotation_loop())
 
+    # 模型目录（含思考档位/付费状态元数据）后台周期刷新：启动即预热，
+    # 此后每 60s 唤醒一次（真实拉网频率由 get_models 内部 600s TTL 控制，
+    # 失败按内部退避 ≤60s 在下一 tick 重试）。此前刷新是"被动周期"——
+    # 仅当 /v1beta/models、/v1/models 或管理端模型列表被请求时触发，
+    # 从不访问模型列表端点的客户端（模型名写死）会让聊天路径长期读到
+    # 静态保底快照，目录档位迁移（如 2026-11-15 hydrogen 5→6）随之漏过。
+    model_discovery.start_background_refresh()
+
     # 新注入的环境变量账号：后台探活多登子账号 (u/1..u/N)
     env_probe_task = None
     if env_report.created_ids:
@@ -356,6 +365,8 @@ async def lifespan(_app: FastAPI):
     # 等待取消真正落地，避免残留 pending task 在事件循环关闭时告警
     if bg_tasks:
         await asyncio.gather(*bg_tasks, return_exceptions=True)
+    # 停止模型目录后台刷新（跨循环调用时仅清理句柄，内部已防挂死）
+    await model_discovery.stop_background_refresh()
     if client:
         try:
             await client.close()
