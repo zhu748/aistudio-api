@@ -64,10 +64,13 @@ class ThinkingLevel(IntEnum):
     MEDIUM = 2
     HIGH = 3
     MINIMAL = 4
-    # 2026-11 上游 ListModels 目录实测新档：gemini-4-hydrogen 的
-    # thinkingLevels=[1,2,3,5]（槽位 [71][6]）含 5，默认档仍为 3(HIGH)，
-    # 强度序在 HIGH 之上（仅旗舰 4 系开放，carbon/argon 仍 [1,2,3]）。
+    # 2026-11 上游 ListModels 目录曾实测 gemini-4-hydrogen thinkingLevels=
+    # [1,2,3,5]（默认档 3）。2026-11-15 Reqable 真机抓包（双样本 200）：
+    # UI「Extra High」档现发送 [1,null,null,6]，同日对 5 档上游报 400
+    # "Thinking level EXTRA_HIGH is not supported"——目录最高档已上移至 6，
+    # 5 不再受支持。VERY_HIGH(5) 仅为数值直传与吸附排序保留。
     VERY_HIGH = 5
+    EXTRA_HIGH = 6
 
 
 class MediaResolution(IntEnum):

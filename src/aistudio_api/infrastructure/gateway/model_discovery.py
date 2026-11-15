@@ -229,7 +229,10 @@ _FALLBACK_MODELS = [
     {
         # 2026-11-12 线上目录实测收录：免费 4 系列模型（paid[77]=None /
         # accessModes[82]=None，Free 号可用）；输出上限 65536 高于 carbon，
-        # 思考档 [1,2,3,5] 默认 HIGH(3)，[83]=1。
+        # [83]=1。思考档 2026-11-15 Reqable 真机抓包复核：UI「Extra High」
+        # 档发送 [1,null,null,6] → 200（双样本），对 5 上游报 400
+        # "EXTRA_HIGH is not supported"——最高档已由 5 上移至 6，
+        # 默认 HIGH(3) 不变。
         "id": "gemini-4-hydrogen",
         "displayName": "Gemini 4 Hydrogen",
         "description": "Gemini 4 Hydrogen",
@@ -239,7 +242,7 @@ _FALLBACK_MODELS = [
         "unknownFlag13": 1,
         "unknownFlag45": 1,
         "defaultThinkingLevel": 3,
-        "thinkingLevels": [1, 2, 3, 5],
+        "thinkingLevels": [1, 2, 3, 6],
         "aliases": [],
         "paid": False,
         "supportedGenerationMethods": [

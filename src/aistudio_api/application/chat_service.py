@@ -809,13 +809,20 @@ _REASONING_EFFORT_TO_LEVEL: dict[str, ThinkingLevel] = {
     "LOW": ThinkingLevel.LOW,
     "MEDIUM": ThinkingLevel.MEDIUM,
     "HIGH": ThinkingLevel.HIGH,
-    # 2026-11 目录实测新档（gemini-4-hydrogen thinkingLevels=[1,2,3,5]）；
-    # openai/claude 兼容层透传 very_high 文本，此处按 upper 后带下划线命中。
-    "VERY_HIGH": ThinkingLevel.VERY_HIGH,
+    # 目录最高思考档：2026-11 曾为 5(VERY_HIGH)，2026-11-15 真机抓包确认
+    # 上移至 6(EXTRA_HIGH)——UI Extra High 档发送 [1,null,null,6] → 200，
+    # 5 → 400 "Thinking level EXTRA_HIGH is not supported"。very_high /
+    # xhigh 文本标签（openai/claude 兼容层透传，按 upper 后带下划线命中）
+    # 一律指向 6 档，避免落到已被上游移除的 5；数值直传 5 仍解析为
+    # VERY_HIGH 枚举，交由档位吸附按目录元数据纠正。
+    "VERY_HIGH": ThinkingLevel.EXTRA_HIGH,
     # xhigh：较新 openai 客户端 effort 词汇（GPT-5.1-codex-max 系选择器），
-    # 与 VERY_HIGH(5) 同档；分隔符变体（X-HIGH/X_HIGH/XHIGH）由下方
+    # 与目录最高档同档；分隔符变体（X-HIGH/X_HIGH/XHIGH）由下方
     # compact 匹配统一命中。
-    "XHIGH": ThinkingLevel.VERY_HIGH,
+    "XHIGH": ThinkingLevel.EXTRA_HIGH,
+    # max：Gemini 原生路径直接传入的顶格词汇（compat 层已归一化为
+    # xhigh，此处兜底直传场景），同样指向目录最高档。
+    "MAX": ThinkingLevel.EXTRA_HIGH,
 }
 
 
@@ -824,8 +831,14 @@ def _parse_thinking_level(raw_level: object) -> ThinkingLevel | None:
         return None
     if isinstance(raw_level, ThinkingLevel):
         return raw_level
-    if isinstance(raw_level, int) and not isinstance(raw_level, bool):
-        return ThinkingLevel(raw_level)
+    # 合法 JSON 数字可能是 2.0 形式的浮点档位：整数值等价对待，
+    # 非整浮点（2.5）落入下方标签路径抛 ValueError（400）。
+    if (
+        isinstance(raw_level, (int, float))
+        and not isinstance(raw_level, bool)
+        and (not isinstance(raw_level, float) or raw_level.is_integer())
+    ):
+        return ThinkingLevel(int(raw_level))
     label = str(raw_level).strip().upper()
     if not label or label in ("NONE", "OFF", "DISABLE", "DISABLED", "0"):
         return None
@@ -883,6 +896,24 @@ def _user_explicitly_disabled_thinking(value: object) -> bool:
     )
 
 
+def _coerce_json_int(value: object, field: str) -> int:
+    """容错整数解析：合法 JSON 数字可能是 8192.0 形式的 float，
+    ``int(str(...))`` 会把它当非法字面量抛 ValueError（合法请求被 400）。"""
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        raise ValueError(f"{field} must be an integer, got {value}")
+    text = str(value).strip()
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an integer, got {value!r}") from exc
+
+
 def _normalize_gemini_thinking_config(
     value: object,
 ) -> list[object] | None:
@@ -920,7 +951,7 @@ def _normalize_gemini_thinking_config(
     level = _parse_thinking_level(raw_level)
     budget: int | None = None
     if raw_budget is not None and not isinstance(raw_budget, bool):
-        budget = int(str(raw_budget))
+        budget = _coerce_json_int(raw_budget, "thinkingConfig.thinkingBudget")
         if budget == 0 and level is None and raw_mode is None:
             return None
 
@@ -928,7 +959,7 @@ def _normalize_gemini_thinking_config(
         return None
 
     mode = (
-        int(str(raw_mode))
+        _coerce_json_int(raw_mode, "thinkingConfig.mode")
         if raw_mode is not None and not isinstance(raw_mode, bool)
         else 1
     )
