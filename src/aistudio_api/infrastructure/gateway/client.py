@@ -61,6 +61,25 @@ _LAST_PREPARED_REQUEST: contextvars.ContextVar[PreparedRequest | None] = (
 )
 
 
+def _apply_function_name_restore(
+    calls: object,
+    mapping: dict[str, str] | None,
+) -> None:
+    """把上游回传的截短函数名换回客户端声明原名（原地修改）。
+
+    AIStudio2API restoreFunctionNames 移植：映射仅含本请求内超长截短
+    过的声明，普通名不命中、零开销。session 快照（raw_parts）保存的是
+    上游原始 wire 形态，不经过本函数，恢复后回放仍与声明侧截短名一致。
+    """
+    if not mapping or not isinstance(calls, list):
+        return
+    for call in calls:
+        if isinstance(call, dict):
+            original = mapping.get(str(call.get("name") or ""))
+            if original is not None:
+                call["name"] = original
+
+
 class AIStudioClient:
     def __init__(self):
         from aistudio_api.infrastructure.gateway.streaming import StreamingGateway
@@ -275,6 +294,7 @@ class AIStudioClient:
         max_tokens: int | None = None,
         generation_config_overrides: dict | None = None,
         prepared: PreparedRequest | None = None,
+        function_name_restore: dict[str, str] | None = None,
     ):
         effective_prep = prepared or await self.prepare_request(
             model=model,
@@ -297,6 +317,8 @@ class AIStudioClient:
         )
         try:
             async for event in gateway_stream:
+                if function_name_restore and event[0] == "tool_calls":
+                    _apply_function_name_restore(event[1], function_name_restore)
                 yield event
         finally:
             await gateway_stream.aclose()
@@ -316,6 +338,7 @@ class AIStudioClient:
         max_tokens: int | None = None,
         generation_config_overrides: dict | None = None,
         prepared: PreparedRequest | None = None,
+        function_name_restore: dict[str, str] | None = None,
     ) -> ModelOutput:
         if prepared is not None:
             effective_prep = prepared
@@ -364,6 +387,13 @@ class AIStudioClient:
                 )
         output = parse_text_output(raw_text)
         output.model = model
+        if function_name_restore:
+            # 换回截短前的原名：签名缓存 remember/下游协议层全部以客户端
+            # 声明名为键，raw_parts（session 快照）保持上游原始形态
+            for candidate in output.candidates:
+                _apply_function_name_restore(
+                    candidate.function_calls, function_name_restore
+                )
         if effective_prep.model_turn is not None and output.candidates:
             capture = effective_prep.model_turn.capture()
             capture.add(output.candidates[0].raw_parts, output.response_id)

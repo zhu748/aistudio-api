@@ -344,7 +344,9 @@ def test_encode_request_body_handles_tool_config_semantically_and_preserves_ever
     )
     body = json.loads(rewritten)
     # Index 7 is evergreen_model_uri (null or string), never corrupted with a list!
-    assert body[7] is None
+    # 2026-11-15 抓包对齐：纯自定义 FC 工具不带槽13时区，尾部裁剪到
+    # tools 槽(6)即止——body[7] 可能整体不存在。
+    assert len(body) <= 7 or body[7] is None
     # Tools are filtered to allowed_function_names
     assert body[6] == [[None, [["get_weather", "desc", None]]]]
 
@@ -449,3 +451,43 @@ def test_part_to_wire_emits_both_code_and_result():
     encoded = part.to_wire()
     assert encoded[8] == [1, "print(1)"]
     assert encoded[9] == [1, "1"]
+
+
+def test_inline_data_filename_roundtrip():
+    """inlineData 槽位 5 文件名：编码对齐真机抓包、往返保真、缺省兼容。
+
+    2026-11 AI Studio 真机抓包（hybrid 函数调用实验，多轮上传截图）：
+    上传 part 的 inlineData 为 [mime, b64, null, null, null, filename]。
+    OpenAI file.filename / Responses input_file.filename 透传至此。
+    """
+    from aistudio_api.infrastructure.gateway.wire_types import (
+        AistudioPart,
+        _wire_inline_filename,
+    )
+
+    capture = ["image/jpeg", "/9j/4QFc", None, None, None, "shot.jpg"]
+    part = AistudioPart(
+        inline_data=("image/jpeg", "/9j/4QFc"), inline_filename="shot.jpg"
+    )
+    assert part.to_wire()[2] == capture
+
+    # 缺省文件名保持旧二元素形态（向后兼容，不放大请求体）
+    legacy = AistudioPart(inline_data=("image/jpeg", "/9j/4QFc"))
+    assert legacy.to_wire()[2] == ["image/jpeg", "/9j/4QFc"]
+
+    # decode→encode 往返保真
+    codec = AistudioWireCodec()
+    decoded = codec.decode_part([None, None, capture])
+    assert decoded.inline_filename == "shot.jpg"
+    decoded.raw_wire = None
+    assert decoded.to_wire()[2] == capture
+
+    # 旧 wire 解码不带文件名
+    old = codec.decode_part([None, None, ["image/png", "AAA"]])
+    assert old.inline_filename is None
+
+    # 清洗：控制字符剔除、空白归一、超长截断、非 str 归 None
+    assert _wire_inline_filename("  a\x00b\tc\n ") == "abc"
+    assert _wire_inline_filename("   ") is None
+    assert _wire_inline_filename(123) is None
+    assert len(_wire_inline_filename("x" * 1000) or "") == 255

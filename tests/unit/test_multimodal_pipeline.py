@@ -37,6 +37,7 @@ def test_chat_service_does_not_guess_thought_for_multi_parts():
     """Verify model multi-part messages do not force thought=True."""
     req = GeminiGenerateContentRequest(
         contents=[
+            GeminiContent(role="user", parts=[GeminiPart(text="hi")]),
             GeminiContent(
                 role="model",
                 parts=[
@@ -44,16 +45,19 @@ def test_chat_service_does_not_guess_thought_for_multi_parts():
                     GeminiPart(text="Paragraph 2"),
                     GeminiPart(text="Paragraph 3"),
                 ],
-            )
+            ),
+            # 以 user 轮收尾：model 多 part 轮不被续写改写剥离
+            GeminiContent(role="user", parts=[GeminiPart(text="go on")]),
         ]
     )
     normalized = normalize_gemini_request(req, "gemini-3.5-flash")
-    model_content = normalized.contents[0]
+    model_content = normalized.contents[1]
     assert len(model_content.parts) == 3
     assert not any(p.thought for p in model_content.parts)
 
     req_with_thought = GeminiGenerateContentRequest(
         contents=[
+            GeminiContent(role="user", parts=[GeminiPart(text="hi")]),
             GeminiContent(
                 role="model",
                 parts=[
@@ -61,14 +65,15 @@ def test_chat_service_does_not_guess_thought_for_multi_parts():
                     GeminiPart(text="Answer with sig", thoughtSignature="c2lnMTIz"),
                     GeminiPart(text="Normal answer"),
                 ],
-            )
+            ),
+            GeminiContent(role="user", parts=[GeminiPart(text="go on")]),
         ]
     )
     norm_thought = normalize_gemini_request(req_with_thought, "gemini-3.5-flash")
-    assert norm_thought.contents[0].parts[0].thought is True
-    assert norm_thought.contents[0].parts[1].thought is False
-    assert norm_thought.contents[0].parts[1].thought_signature == "c2lnMTIz"
-    assert norm_thought.contents[0].parts[2].thought is False
+    assert norm_thought.contents[1].parts[0].thought is True
+    assert norm_thought.contents[1].parts[1].thought is False
+    assert norm_thought.contents[1].parts[1].thought_signature == "c2lnMTIz"
+    assert norm_thought.contents[1].parts[2].thought is False
 
 
 def test_multimodal_function_response_unpacks_inline_data():

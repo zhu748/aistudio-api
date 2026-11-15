@@ -266,6 +266,177 @@ async def test_openai_reasoning_effort_xhigh_passthrough_and_snap() -> None:
 
 
 @pytest.mark.asyncio
+async def test_openai_reasoning_effort_variants_normalized() -> None:
+    """各生态客户端的思考强度参数形态统一归一化为 reasoningEffort。
+
+    2026-11 修复：reasoning.effort（OpenRouter）/ thinking（智谱 GLM）/
+    enable_thinking（Qwen）/ chat_template_kwargs.thinking（vLLM）此前被
+    pydantic 静默丢弃（"思考强度传不过去"），现全部收进宽松字段并归一化。
+    """
+    cases: list[tuple[dict[str, object], str | None]] = [
+        # OpenAI 官方顶层
+        ({"reasoning_effort": "high"}, "high"),
+        # OpenRouter / 新版网关
+        ({"reasoning": {"effort": "high"}}, "high"),
+        ({"reasoning": {"effort": "low", "exclude": True}}, "low"),
+        ({"reasoning": {"enabled": True}}, "medium"),
+        ({"reasoning": {"enabled": False}}, "none"),
+        # 智谱 GLM
+        ({"thinking": {"type": "enabled"}}, "medium"),
+        ({"thinking": {"type": "disabled"}}, "none"),
+        ({"thinking": {"type": "enabled", "budget_tokens": 1024}}, "low"),
+        ({"thinking": {"type": "enabled", "budget_tokens": 4096}}, "medium"),
+        ({"thinking": {"type": "enabled", "budget_tokens": 16384}}, "high"),
+        ({"thinking": {"type": "custom", "max_budget_tokens": 60000}}, "xhigh"),
+        # Qwen / DashScope
+        ({"enable_thinking": True}, "medium"),
+        ({"enable_thinking": False}, "none"),
+        # vLLM
+        ({"chat_template_kwargs": {"thinking": True}}, "medium"),
+        ({"chat_template_kwargs": {"thinking": False}}, "none"),
+        ({"chat_template_kwargs": {"thinking": "high"}}, "high"),
+        # 大小写 / 分隔符 / 别名容错
+        ({"reasoning_effort": "HIGH"}, "high"),
+        ({"reasoning_effort": "very-high"}, "very_high"),
+        ({"reasoning_effort": "VERYHIGH"}, "very_high"),
+        ({"reasoning_effort": "max"}, "xhigh"),
+        ({"reasoning_effort": "off"}, "none"),
+        ({"reasoning_effort": "disabled"}, "none"),
+        # 无效词按未指定处理（宽松容错，不 400）
+        ({"reasoning_effort": "turbo"}, None),
+        # 未传任何思考参数
+        ({}, None),
+    ]
+    for extra, expected in cases:
+        req = OpenAIChatCompletionRequest.model_validate(
+            {
+                "model": "gemini-3.8-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+                **extra,
+            }
+        )
+        gemini_req, _ = await openai_to_gemini_request(req)
+        effort = (
+            gemini_req.generationConfig.reasoningEffort
+            if gemini_req.generationConfig
+            else None
+        )
+        assert effort == expected, f"{extra} → {effort!r}, 期望 {expected!r}"
+
+
+@pytest.mark.asyncio
+async def test_openai_reasoning_effort_priority() -> None:
+    """多形态并存时按 reasoning_effort > reasoning.effort > thinking >
+    enable_thinking > chat_template_kwargs 的优先级取值。"""
+    req = OpenAIChatCompletionRequest.model_validate(
+        {
+            "model": "gemini-3.8-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "low",
+            "reasoning": {"effort": "high"},
+            "thinking": {"type": "enabled"},
+            "enable_thinking": False,
+        }
+    )
+    gemini_req, _ = await openai_to_gemini_request(req)
+    assert gemini_req.generationConfig is not None
+    assert gemini_req.generationConfig.reasoningEffort == "low"
+
+    req2 = OpenAIChatCompletionRequest.model_validate(
+        {
+            "model": "gemini-3.8-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning": {"effort": "high"},
+            "thinking": {"type": "disabled"},
+        }
+    )
+    gemini_req2, _ = await openai_to_gemini_request(req2)
+    assert gemini_req2.generationConfig is not None
+    assert gemini_req2.generationConfig.reasoningEffort == "high"
+
+
+@pytest.mark.asyncio
+async def test_openai_reasoning_variants_reach_wire() -> None:
+    """端到端：各形态归一化后必须落到上游 wire 的 thinking_config 槽位 16。
+
+    显式关闭（none）必须把 thinking_config 置空以抑制 profile 注入的
+    浏览器默认档；开启形态必须生成 [1, null, null, <档位>] wire。
+    """
+    from aistudio_api.application.chat_service import normalize_gemini_request
+    from aistudio_api.infrastructure.gateway.wire_codec import _codec as codec
+
+    cases: list[tuple[dict[str, object], object]] = [
+        ({"reasoning": {"effort": "high"}}, [1, None, None, 3]),
+        ({"thinking": {"type": "enabled", "budget_tokens": 4096}}, [1, None, None, 2]),
+        ({"enable_thinking": False}, None),
+        ({"thinking": {"type": "disabled"}}, None),
+        ({"chat_template_kwargs": {"thinking": True}}, [1, None, None, 2]),
+    ]
+    for extra, expected_wire in cases:
+        req = OpenAIChatCompletionRequest.model_validate(
+            {
+                "model": "gemini-3.8-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+                **extra,
+            }
+        )
+        gemini_req, resolved = await openai_to_gemini_request(req)
+        normalized = normalize_gemini_request(gemini_req, resolved)
+        aistudio_req = codec.build_request(
+            model=normalized.model,
+            contents=normalized.contents,
+            system_instruction_content=normalized.system_instruction,
+            tools=normalized.tools,
+            temperature=normalized.temperature,
+            top_p=normalized.top_p,
+            top_k=normalized.top_k,
+            max_tokens=normalized.max_tokens,
+            generation_config_overrides=normalized.generation_config_overrides,
+        )
+        wire = aistudio_req.generation_config.thinking_config
+        assert wire == expected_wire, f"{extra} → wire {wire!r}, 期望 {expected_wire!r}"
+
+
+@pytest.mark.asyncio
+async def test_openai_reasoning_effort_http_passthrough(
+    mock_client: MagicMock, http_client: httpx.AsyncClient
+) -> None:
+    """HTTP 层端到端：OpenRouter 形态 reasoning.effort 必须透传到上游。
+
+    完整链路：路由 → openai_to_gemini_request（归一化）→
+    handle_gemini_generate_content → client.generate_content 的
+    generation_config_overrides（wire thinking_config 槽位 16 的来源）。
+    """
+    captured: dict[str, object] = {}
+
+    async def fake_generate_content(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return ModelOutput(
+            candidates=[Candidate(text="ok", finish_reason=1)],  # wire STOP=1
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        )
+
+    mock_client.generate_content = fake_generate_content
+    app.dependency_overrides[get_client] = lambda: mock_client
+    try:
+        response = await http_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gemini-3.8-flash",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "reasoning": {"effort": "high"},
+            },
+        )
+        assert response.status_code == 200
+        overrides = captured.get("generation_config_overrides")
+        assert isinstance(overrides, dict)
+        # high → VERY_HIGH 前 3 档中的 HIGH(3)：[mode=1, null, null, level=3]
+        assert overrides.get("thinking_config") == [1, None, None, 3]
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
 async def test_openai_request_tools_and_tool_roundtrip() -> None:
     # 2026-11-14 实测：上游对客户端函数的 functionCall 回传同样强制
     # thought_signature —— 模拟响应侧已缓存该调用的签名（客户端丢失后

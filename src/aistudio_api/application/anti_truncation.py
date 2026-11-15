@@ -36,6 +36,7 @@ from aistudio_api.infrastructure.gateway.model_defaults import (
 from aistudio_api.infrastructure.gateway.wire_types import (
     AistudioContent,
     AistudioPart,
+    wire_function_name,
 )
 from aistudio_api.infrastructure.utils.logger import get_logger
 
@@ -326,6 +327,14 @@ def prepare_anti_truncation(
     tool_name = configured_name or DEFAULT_TOOL_NAME
     if any(name.startswith(tool_name) for name in declared_names):
         tool_name = _random_tool_name()
+
+    # 配置的合成名超长时同样会被 wire_function_name 截短；注册进恢复
+    # 映射，保证流式还原的 tool_name 前缀匹配不受截短影响
+    synthetic_wire_name = wire_function_name(tool_name)
+    if synthetic_wire_name != tool_name:
+        restore = dict(normalized.function_name_restore or {})
+        restore[synthetic_wire_name] = tool_name
+        normalized.function_name_restore = restore
 
     # 注入合成函数声明。
     synthetic_decl = _build_synthetic_declaration(tool_name)

@@ -33,6 +33,7 @@ from aistudio_api.application.api_service_gemini import (
     handle_gemini_generate_content,
 )
 from aistudio_api.application.compat_service import (
+    _openai_reasoning_effort,
     build_claude_message,
     build_openai_completion,
     claude_stream_adapter,
@@ -140,9 +141,13 @@ async def openai_chat_completions(
     client: AIStudioClient = Depends(get_client),
 ):
     """OpenAI Chat Completions 兼容端点。"""
+    # 思考强度统一归一化后记录（优先），同时保留客户端原始形态便于面板排查
     record_requested_parameters(
         {
-            "reasoning_effort": req.reasoning_effort,
+            "reasoning_effort": _openai_reasoning_effort(req) or req.reasoning_effort,
+            "reasoning": req.reasoning,
+            "thinking": req.thinking,
+            "enable_thinking": req.enable_thinking,
             "temperature": req.temperature,
             "top_p": req.top_p,
             "max_tokens": req.max_tokens,

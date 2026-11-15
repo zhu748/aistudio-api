@@ -413,6 +413,17 @@ curl http://localhost:8080/v1/chat/completions \
 - Enter a Gemini model name in `model` directly; family names like `gpt-4o` are mapped to `compat.openai.default_model` in `config.yaml`;
 - Streaming emits standard `chat.completion.chunk` sequences (including `data: [DONE]`); reasoning chains stream through the `reasoning_content` delta field;
 - Tool calling (`tools` / `tool_choice`), `response_format` (JSON mode), `reasoning_effort`, and image inputs (data URLs or remote URLs) are supported.
+- Thinking-effort parameters from all major client ecosystems are accepted and normalized to the upstream thinking level (auto-snapped to the nearest level the model supports). Equivalent forms:
+
+| Parameter shape | Ecosystem | Example |
+| --- | --- | --- |
+| `reasoning_effort` | OpenAI official | `"reasoning_effort": "high"` |
+| `reasoning.effort` | OpenRouter / newer gateways | `"reasoning": {"effort": "high"}` |
+| `thinking.type` / `thinking.budget_tokens` | Zhipu GLM | `"thinking": {"type": "enabled", "budget_tokens": 4096}` |
+| `enable_thinking` | Qwen / DashScope | `"enable_thinking": true` |
+| `chat_template_kwargs.thinking` | vLLM | `"chat_template_kwargs": {"thinking": true}` |
+
+  Level words: `minimal` / `low` / `medium` / `high` / `very_high` (aliases `xhigh` / `max`); `none` / `off` / `disabled` explicitly disables thinking; `budget_tokens` maps by token budget (≤2048 low / ≤8192 medium / ≤32768 high / larger xhigh). `reasoning.effort` on `/v1/responses` is supported as well.
 </details>
 
 <details>

@@ -465,7 +465,7 @@ async def test_late_native_signature_survives_and_can_be_returned_in_history(
 
     async def generate(**kwargs):
         yield "body", "answer"
-        yield "thought_signature", "late-signature"
+        yield "thought_signature", "bGF0ZS1zaWduYXR1cmU="
         yield "finish_reason", 1
         yield "usage", None
 
@@ -485,13 +485,21 @@ async def test_late_native_signature_survives_and_can_be_returned_in_history(
         for c in cast(list[dict], f.get("candidates", []))
         for p in c["content"]["parts"]
     ]
-    assert any(p.get("thoughtSignature") == "late-signature" for p in parts)
+    assert any(p.get("thoughtSignature") == "bGF0ZS1zaWduYXR1cmU=" for p in parts)
     request = GeminiGenerateContentRequest.model_validate(
-        {"contents": [{"role": "model", "parts": parts}]}
+        {
+            "contents": [
+                {"role": "model", "parts": parts},
+                # 历史回传后接新 user 输入（真实续聊形态）：model 轮
+                # 不被续写改写剥离，签名得以保留在历史中
+                {"role": "user", "parts": [{"text": "go on"}]},
+            ]
+        }
     )
     normalized = normalize_gemini_request(request, "test")
     assert any(
-        p.thought_signature == "late-signature" for p in normalized.contents[0].parts
+        p.thought_signature == "bGF0ZS1zaWduYXR1cmU="
+        for p in normalized.contents[0].parts
     )
 
 

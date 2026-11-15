@@ -52,6 +52,9 @@ from aistudio_api.domain.errors import (
     parse_upstream_grpc_error,
 )
 from aistudio_api.domain.models import ModelOutput
+from aistudio_api.domain.tool_signatures import (
+    remember_function_signature as _remember_function_signature,
+)
 from aistudio_api.infrastructure.gateway.client import (
     AIStudioClient,
     PreparedRequest,
@@ -583,6 +586,19 @@ def _build_gemini_response_from_output(
 ) -> GeminiGenerateContentResponse:
     """把缓冲完成的 ModelOutput 组装为 Gemini 完整响应（非流式 JSON 与
     缓冲变体的单条 SSE 事件共用）。"""
+    # 签名缓存回填：原生路径的 lookup 挂在 normalize_gemini_request，
+    # 此前却只在 compat 层 remember（只取不存）——纯原生 /v1beta 用户
+    # 丢签名后永远只能走 SKIP 字面量。
+    for call in output.function_calls:
+        if isinstance(call, dict):
+            raw_call_id = call.get("call_id") or call.get("id")
+            raw_name = call.get("name")
+            _remember_function_signature(
+                raw_call_id if isinstance(raw_call_id, str) else None,
+                raw_name if isinstance(raw_name, str) else None,
+                call.get("args"),
+                call.get("thought_signature"),
+            )
     if output.thinking or output.reasoning_images:
         record_output_timing("thinking")
     if (
@@ -711,6 +727,7 @@ async def handle_gemini_generate_content(
                 max_tokens=normalized.max_tokens,
                 generation_config_overrides=normalized.generation_config_overrides,
                 prepared=auth_manager.current_prepared,
+                function_name_restore=normalized.function_name_restore,
             )
             auth_manager.current_prepared = None
             restore_anti_truncation_output(output, at_ctx)
@@ -1011,7 +1028,9 @@ def _build_gemini_streaming_response(
     model_path: str,
     anti_truncation: bool | None = None,
     force_buffer: bool = False,
-) -> StreamingResponse:
+) -> GeminiStreamResponse:
+    """构建 Gemini 流式响应（暴露结构化 frames 供适配层消费）。"""
+
     async def stream_response() -> AsyncGenerator[dict[str, object], None]:
         normalized = None
         stream_start_time = time.perf_counter()
@@ -1064,6 +1083,7 @@ def _build_gemini_streaming_response(
                             max_tokens=normalized.max_tokens,
                             generation_config_overrides=normalized.generation_config_overrides,
                             prepared=auth_manager.current_prepared,
+                            function_name_restore=normalized.function_name_restore,
                         )
                         auth_manager.current_prepared = None
                         restore_anti_truncation_output(output, at_ctx)
@@ -1126,6 +1146,7 @@ def _build_gemini_streaming_response(
                         max_tokens=normalized.max_tokens,
                         generation_config_overrides=normalized.generation_config_overrides,
                         prepared=auth_manager.current_prepared,
+                        function_name_restore=normalized.function_name_restore,
                     )
                     # 重试 continue / 客户端断连时，async for 不会自动关闭被迭代
                     # 的异步生成器，只能等 GC 的 asyncgen finalizer 释放上游连接；
@@ -1171,6 +1192,30 @@ def _build_gemini_streaming_response(
                                     thought_signature=pending_signature,
                                 )
                                 if chunk:
+                                    # 签名缓存回填（原生流式路径，与
+                                    # _build_gemini_response_from_output
+                                    # 同标准）：tool_calls 事件载荷是
+                                    # function_call dict 列表，签名内嵌在
+                                    # dict 或前置 pending_signature 中。
+                                    if event_type == "tool_calls" and isinstance(
+                                        text, list
+                                    ):
+                                        for call_index, call in enumerate(text):
+                                            if not isinstance(call, dict):
+                                                continue
+                                            signature = call.get(
+                                                "thought_signature"
+                                            ) or (
+                                                pending_signature
+                                                if call_index == 0
+                                                else None
+                                            )
+                                            _remember_function_signature(
+                                                call.get("call_id") or call.get("id"),
+                                                call.get("name"),
+                                                call.get("args"),
+                                                signature,
+                                            )
                                     pending_signature = None
                                     record_output_timing(event_type)
                                     if not has_yielded_data:

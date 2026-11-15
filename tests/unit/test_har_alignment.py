@@ -14,6 +14,8 @@ import re
 import time
 import uuid
 
+import pytest
+
 from aistudio_api.config import settings
 from aistudio_api.infrastructure.account.cookie_parser import (
     MINIMAL_COOKIE_WHITELIST,
@@ -284,7 +286,7 @@ def test_encode_request_body_drops_thinking_for_models_without_capability():
 
 
 def test_encode_request_body_request_context_single_element_with_tools():
-    """抓包实证：带工具时 request_context 恒为单元素 [[null,null,时区]]。"""
+    """抓包实证：google_search 族工具时 request_context 恒为单元素 [[null,null,时区]]。"""
     tools = [[None, None, None, [None, [[]]]]]  # google_search 模板
     body = json.loads(
         encode_request_body(model="models/gemini-3.8-flash", prompt="hi", tools=tools)
@@ -297,6 +299,57 @@ def test_encode_request_body_request_context_single_element_with_tools():
     assert rc[0][0] is None
     assert rc[0][1] is None
     assert rc[0][2] == settings.timezone
+
+
+def test_encode_request_body_no_request_context_with_custom_fc_tools():
+    """2026-11-15 getWeather 往返抓包（gc12/gc32）实证：纯自定义函数声明
+    不携带 request_context(槽13时区)——该槽仅随 google_search 族出现；
+    尾部裁剪到 tools 槽(6)，请求体形态 len=7 与真机一致。"""
+    tools = [
+        [
+            None,
+            [
+                [
+                    "getWeather",
+                    "获取指定城市的实时天气情况",
+                    [
+                        6,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        [["city", [1, None, "城市名称，例如北京、上海"]]],
+                        ["city"],
+                    ],
+                ]
+            ],
+        ]
+    ]
+    body = json.loads(
+        encode_request_body(model="models/gemini-3.8-flash", prompt="hi", tools=tools)
+    )
+    assert len(body) == 7  # gc32 真机形态：止于 tools 槽
+    assert body[6] == tools
+    assert not (len(body) > 13 and body[13] is not None)
+
+
+def test_encode_request_body_no_request_context_with_maps_or_url_context():
+    """maps / url_context / code_execution 容器槽位不在 t[3]，同样不带时区槽。"""
+    from aistudio_api.infrastructure.gateway.wire_codec import (
+        TOOLS_TEMPLATES,
+        _has_search_grounding_tools,
+    )
+
+    assert _has_search_grounding_tools([TOOLS_TEMPLATES["google_search"]])
+    assert _has_search_grounding_tools(
+        [[None, None, None, [None, [[], []]]]]
+    )  # search+image
+    assert not _has_search_grounding_tools([TOOLS_TEMPLATES["google_maps"]])
+    assert not _has_search_grounding_tools([TOOLS_TEMPLATES["url_context"]])
+    assert not _has_search_grounding_tools([TOOLS_TEMPLATES["code_execution"]])
+    assert not _has_search_grounding_tools(None)
 
 
 def test_encode_request_body_trims_tail_without_tools():
@@ -584,3 +637,175 @@ def test_xhigh_snap_chain_per_model_catalog():
     assert (
         snap_thinking_level_to_supported("gemini-4-carbon", level) is ThinkingLevel.HIGH
     )
+
+
+# ─────────────────── 第三轮：工具调用全链路黄金样本 ───────────────────
+# 2026-11-15 真机抓包（Reqable HAR，Android Chrome 130，51 条
+# MakerSuiteService RPC）：getWeather 函数调用实验，用户声明 → FC(带
+# thought_signature) → FR(map 编码) → 二轮续写，四个环节 wire 逐字节采录。
+
+
+def test_har_golden_function_declaration_wire():
+    """抓包 req_12 槽 6 工具声明：我们的编码与其逐字节一致。"""
+    from aistudio_api.application.chat_service import (
+        encode_function_declaration_to_wire,
+    )
+
+    golden = [
+        "getWeather",
+        "获取指定城市的实时天气情况",
+        [
+            6,
+            None,
+            None,
+            None,
+            None,
+            None,
+            [["city", [1, None, "城市名称，例如北京、上海"]]],
+            ["city"],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ["city"],
+        ],
+    ]
+    wire = encode_function_declaration_to_wire(
+        {
+            "name": "getWeather",
+            "description": "获取指定城市的实时天气情况",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string",
+                        "description": "城市名称，例如北京、上海",
+                    }
+                },
+                "required": ["city"],
+            },
+        }
+    )
+    assert wire == golden
+    # propertyOrdering 未显式声明时按键序推导（抓包：浏览器恒携带）
+
+
+def test_har_golden_function_call_part_with_signature():
+    """抓包 FC part：槽 10 三元组 + 槽 14 签名，11-13 恒空。"""
+    from aistudio_api.infrastructure.gateway.wire_types import AistudioPart
+
+    sig = "Eo0CCooCAWkUfRO0lhH0949y"
+    part = AistudioPart(
+        function_call=("getWeather", {"city": "上海"}, "call_12531810613605977258"),
+        thought_signature=sig,
+    )
+    wire = part.to_wire()
+    assert wire[10] == [
+        "getWeather",
+        [[["city", [None, None, "上海"]]]],
+        "call_12531810613605977258",
+    ]
+    assert wire[14] == sig
+    assert wire[11] is None and wire[12] is None and wire[13] is None
+
+
+def test_har_golden_function_response_part_map_encoding():
+    """抓包 FR part：槽 11 三元组，response 为 [[key,[null,null,val]]] map 编码。"""
+    from aistudio_api.infrastructure.gateway.wire_types import AistudioPart
+
+    part = AistudioPart(
+        function_response=(
+            "getWeather",
+            {"weather": "中雨", "temperature": "18°C", "humidity": "85%"},
+            "call_12531810613605977258",
+        )
+    )
+    wire = part.to_wire()
+    assert wire[11] == [
+        "getWeather",
+        [
+            [
+                ["weather", [None, None, "中雨"]],
+                ["temperature", [None, None, "18°C"]],
+                ["humidity", [None, None, "85%"]],
+            ]
+        ],
+        "call_12531810613605977258",
+    ]
+
+
+def test_har_golden_usage_reasoning_tokens_slot9():
+    """抓包 usage：[prompt, visible, total, cached, promptDetails, ..., reasoning@9]。
+
+    实测样本 [106,24,179,null,[[1,106]],null,null,null,null,49]：
+    total(179) = prompt(106) + visible(24) + reasoning(49)。
+    """
+    from aistudio_api.infrastructure.gateway.wire_parser import parse_usage_metadata
+
+    usage = parse_usage_metadata(
+        [106, 24, 179, None, [[1, 106]], None, None, None, None, 49]
+    )
+    assert usage["prompt_tokens"] == 106
+    assert usage["completion_tokens"] == 24 + 49
+    assert usage["total_tokens"] == 179
+    details = usage["completion_tokens_details"]
+    assert isinstance(details, dict)
+    assert details["reasoning_tokens"] == 49
+
+
+def test_har_session_token_v1_shape():
+    """抓包：响应槽 7 的 v1_ 会话 token 下轮请求写回槽 11（SESSION_TOKEN）。"""
+    token = "v1_ChcyaXo1YXF1R0s2Zl8wX3dQbWVLbDhRWRIXMml6NWF1V0tNNjJob19VUHphcXdtQUk"
+    assert token.startswith("v1_")
+    from aistudio_api.infrastructure.gateway.model_turns import _TOKEN_RE
+
+    assert _TOKEN_RE.fullmatch(token)
+
+
+@pytest.mark.asyncio
+async def test_har_openai_file_block_carries_filename_to_inline_slot5():
+    """抓包 idx 88：上传截图 inlineData = [mime, b64, null, null, null, 文件名]。
+
+    OpenAI file.filename 透传链路：compat 入口 → GeminiInlineData →
+    AistudioPart.inline_filename → wire 槽 5。
+    """
+    from aistudio_api.application.compat_service import _openai_parts_from_content
+
+    parts = await _openai_parts_from_content(
+        [
+            {
+                "type": "file",
+                "file": {
+                    "file_data": "data:image/jpeg;base64,/9j/4QFc",
+                    "filename": "Screenshot_20261115_115206.jpg",
+                },
+            }
+        ]
+    )
+    assert parts[0].inlineData is not None
+    assert parts[0].inlineData.filename == "Screenshot_20261115_115206.jpg"
+
+    from aistudio_api.infrastructure.gateway.wire_types import AistudioPart
+
+    wire = AistudioPart(
+        inline_data=("image/jpeg", "/9j/4QFc"),
+        inline_filename=parts[0].inlineData.filename,
+    ).to_wire()
+    assert wire[2] == [
+        "image/jpeg",
+        "/9j/4QFc",
+        None,
+        None,
+        None,
+        "Screenshot_20261115_115206.jpg",
+    ]

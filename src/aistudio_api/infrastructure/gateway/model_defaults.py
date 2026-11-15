@@ -178,6 +178,51 @@ def canonicalize_model_alias(model: str) -> str:
     return name
 
 
+# 原生接受「以 model 轮结尾」请求的模型（真 assistant prefill 语义）。
+# 对照 AIStudio2API internal/aistudio/turns.go 的 nativePrefillModels
+# （2026-11 快照）：这些模型上游不报 400 "Requests ending with a model
+# turn are not supported"，末尾 assistant 轮可直接透传。gemma- 前缀
+# 模型同样接受（见 model_supports_native_prefill）。
+# 白名单刻意收窄为已验证模型：未知/新模型（如 gemini-4 系、3.7/3.8）
+# 默认按「需要续写改写」处理（本项目 2026-11-14 真机五形态判别：非白
+# 名单模型 model 结尾 400），由 _rewrite_model_tail_for_continuation
+# 剥离尾部 model 轮并改写为系统指令续写，方向为默认拒绝。
+_NATIVE_PREFILL_MODELS: frozenset[str] = frozenset(
+    {
+        "gemini-3.1-pro-preview",
+        "gemini-pro-latest",
+        "gemini-3.1-flash-lite",
+        "gemini-3-flash-preview",
+        "gemini-omni-1.1-flash",
+        "gemini-nano-banana-2.1",
+        "gemini-3.1-flash-image",
+        "gemini-3.1-flash-lite-image",
+        "gemini-3-pro-image",
+        "gemini-2.5-flash-image",
+    }
+)
+
+
+def model_supports_native_prefill(model: str) -> bool:
+    """模型是否原生接受 model 轮结尾（assistant prefill），无需续写改写。
+
+    判定顺序：规范化名（去 ``models/`` 前缀 + 小写）命中白名单、别名解析
+    后的规范名命中（``nano-banana`` → ``gemini-3.1-flash-lite-image``）、
+    或 gemma- 前缀（AIStudio2API 同规则：Gemma 系模型全部原生接受）。
+    其余（含 gemini-4 系 / 3.5 / 3.7 / 3.8 等较新模型与未知模型）返回
+    False，由调用方改写尾部 model 轮（正文前缀并入系统指令续写）。
+    """
+    name = normalize_model_name(model)
+    if not name:
+        return False
+    if name.startswith("gemma-") or name in _NATIVE_PREFILL_MODELS:
+        return True
+    canonical = canonicalize_model_alias(model)
+    return canonical != name and (
+        canonical.startswith("gemma-") or canonical in _NATIVE_PREFILL_MODELS
+    )
+
+
 def _cached_model_info_for(model: str) -> Mapping[str, object] | None:
     """查询模型元数据（ListModels 缓存 → 静态保底目录），无则返回 None。
 

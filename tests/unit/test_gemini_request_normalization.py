@@ -861,7 +861,9 @@ def test_unboxed_single_pair_decoding():
 
 
 def test_normalize_gemini_request_preserves_system_instruction_thought_signature():
-    """Verify thought_signature is preserved on systemInstruction text parts."""
+    """Verify a valid (base64) thought_signature is preserved on
+    systemInstruction text parts; fake signatures would trigger the upstream
+    "Corrupted thought signature" 400 and are dropped instead."""
     req = GeminiGenerateContentRequest.model_validate(
         {
             "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
@@ -870,7 +872,7 @@ def test_normalize_gemini_request_preserves_system_instruction_thought_signature
                 "parts": [
                     {
                         "text": "System prompt with thought signature",
-                        "thoughtSignature": "sys_sig_123",
+                        "thoughtSignature": "c3lzX3NpZ18xMjM=",
                     }
                 ],
             },
@@ -881,7 +883,7 @@ def test_normalize_gemini_request_preserves_system_instruction_thought_signature
     assert len(normalized.system_instruction.parts) == 1
     sys_part = normalized.system_instruction.parts[0]
     assert sys_part.text == "System prompt with thought signature"
-    assert sys_part.thought_signature == "sys_sig_123"
+    assert sys_part.thought_signature == "c3lzX3NpZ18xMjM="
 
 
 def test_normalize_gemini_request_deduplicates_and_covers_builtin_tools():

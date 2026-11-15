@@ -46,6 +46,18 @@ class OpenAIChatCompletionRequest(BaseModel):
     n: int | None = None
     user: str | None = None
     reasoning_effort: str | None = None
+    # —— 思考强度的宽松兼容（2026-11：修复各生态客户端形态被静默丢弃）——
+    # 不同客户端生态对"思考强度"的传参形态互不兼容，历史上只有顶层
+    # ``reasoning_effort`` 被解析，其余形态被 pydantic 静默忽略（表现为
+    # "思考强度传不过去"）。这里全部收进来，由 compat_service 统一归一化：
+    # - OpenRouter / 新版网关: ``reasoning: {"effort": "high", ...}``
+    # - 智谱 GLM: ``thinking: {"type": "enabled", "budget_tokens": N}``
+    # - Qwen / DashScope: ``enable_thinking: bool``
+    # - vLLM: ``chat_template_kwargs: {"thinking": true}``
+    reasoning: dict[str, object] | None = None
+    thinking: dict[str, object] | None = None
+    enable_thinking: bool | None = None
+    chat_template_kwargs: dict[str, object] | None = None
 
 
 # ---------------------------------------------------------------------------

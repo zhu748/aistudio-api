@@ -3,10 +3,60 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 from dataclasses import dataclass, field
 from enum import IntEnum
 
 from .wire_spec import GenerationConfigIndex, JspbArray, PartIndex
+
+# Playground GenerateContent / CountTokens 接口接受的最长函数名字节数
+# （AIStudio2API maxWireFunctionNameLength 同源）。
+MAX_WIRE_FUNCTION_NAME_LENGTH = 63
+
+
+def wire_function_name(name: str) -> str:
+    """发往 Playground 的函数名：超长截短并以原名的 sha256 哈希结尾。
+
+    AIStudio2API wireFunctionName 移植。函数名超 63 字节会被上游拒绝，
+    截短到 63 - len(suffix) 后追加 "_" + sha256(原名)前 6 字节的 hex，
+    保证稳定且概率性唯一；响应侧凭请求内声明的映射换回原名。
+
+    与参考实现的差别：Go 按字节切片，可能切断多字节 UTF-8 序列；
+    Python 字符串无法持有半个字符，退到不超字节预算的最大字符前缀，
+    产物仍保证 ≤ 63 字节且后缀不变。
+    """
+    name = str(name)
+    encoded = name.encode("utf-8")
+    if len(encoded) <= MAX_WIRE_FUNCTION_NAME_LENGTH:
+        return name
+    digest = hashlib.sha256(encoded).digest()
+    suffix = "_" + digest[:6].hex()
+    budget = MAX_WIRE_FUNCTION_NAME_LENGTH - len(suffix)
+    prefix = name
+    while len(prefix.encode("utf-8")) > budget:
+        prefix = prefix[:-1]
+    return prefix + suffix
+
+
+# wire inlineData filename 的清洗上限：名称过长会无谓放大请求体且
+# 对模型无额外信息量，截断到与主流文件系统 basename 同量级。
+MAX_WIRE_INLINE_FILENAME_LENGTH = 255
+
+
+def _wire_inline_filename(value: object) -> str | None:
+    """inlineData 槽位 5 文件名的最后防线清洗。
+
+    非 str / 空白串 / 含控制字符 / 超长一律归一：控制字符剔除，超长按
+    字符截断（保持 UTF-8 完整性），清洗后为空则视为未提供。
+    """
+    if not isinstance(value, str):
+        return None
+    cleaned = "".join(ch for ch in value.strip() if ch >= " " and ch != "\x7f").strip()
+    if not cleaned:
+        return None
+    if len(cleaned) > MAX_WIRE_INLINE_FILENAME_LENGTH:
+        cleaned = cleaned[:MAX_WIRE_INLINE_FILENAME_LENGTH].rstrip()
+    return cleaned or None
 
 
 class ThinkingLevel(IntEnum):
@@ -255,6 +305,10 @@ class AistudioGenerationConfig:
 class AistudioPart:
     text: str | None = None
     inline_data: tuple[str, str] | None = None
+    # wire inlineData 槽位 5 的上传文件名（2026-11 AI Studio 真机抓包：
+    # [mime, b64, null, null, null, filename]）。独立字段而非并入二元组，
+    # 避免破坏既有 `mime, data = part.inline_data` 解包点。
+    inline_filename: str | None = None
     file_id: str | None = None
     function_call: tuple[str, object] | tuple[str, object, str] | None = None
     function_response: tuple[str, object] | tuple[str, object, str] | None = None
@@ -279,9 +333,17 @@ class AistudioPart:
             wire[PartIndex.FILE_DATA] = [self.file_id]
         if self.inline_data:
             mime, b64 = self.inline_data
-            wire[PartIndex.INLINE_DATA] = [mime, b64]
+            inline_wire = JspbArray([mime, b64])
+            filename = _wire_inline_filename(self.inline_filename)
+            if filename is not None:
+                # 槽位 5 = filename；2-4 由 JspbArray 自动补 null，
+                # compact 后还原抓包形态 [mime, b64, null, null, null, filename]
+                inline_wire[5] = filename
+            wire[PartIndex.INLINE_DATA] = inline_wire.compact()
         if self.function_call:
-            name = self.function_call[0]
+            # 声明侧超长名已截短（wire_function_name），历史回传的调用/
+            # 结果名必须同样截短才能与声明配对
+            name = wire_function_name(self.function_call[0])
             args = self.function_call[1] if len(self.function_call) > 1 else {}
             call_id = self.function_call[2] if len(self.function_call) > 2 else None
             function_call = [name, _encode_wire_args(args)]
@@ -289,7 +351,7 @@ class AistudioPart:
                 function_call.append(call_id)
             wire[PartIndex.FUNCTION_CALL_ALT] = function_call
         if self.function_response:
-            name = self.function_response[0]
+            name = wire_function_name(self.function_response[0])
             response = (
                 self.function_response[1] if len(self.function_response) > 1 else {}
             )

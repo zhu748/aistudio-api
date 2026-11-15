@@ -469,9 +469,16 @@ async def _openai_parts_from_content(content: object) -> list[GeminiPart]:
                 parsed = _parse_data_url(file_data)
                 if parsed is not None:
                     mime, data = parsed
+                    # OpenAI file.filename 透传到 wire inlineData 槽位 5
+                    # （2026-11 AI Studio 真机抓包形态），空串视为未提供。
+                    filename = _as_str(file_obj.get("filename")).strip()
                     parts.append(
                         GeminiPart(
-                            inlineData=GeminiInlineData(mimeType=mime, data=data)
+                            inlineData=GeminiInlineData(
+                                mimeType=mime,
+                                data=data,
+                                filename=filename or None,
+                            )
                         )
                     )
         elif block_type == "refusal":
@@ -546,6 +553,13 @@ def _openai_tools_to_gemini(
             parameters = tool.get("parameters")
         if isinstance(parameters, dict) and parameters:
             decl["parameters"] = parameters
+        # strict（OpenAI strict mode）透传：声明编码层据此把完整 JSON Schema
+        # 附加到 description（wire 无法表达 strict 的闭合对象语义）
+        strict = function.get("strict")
+        if not isinstance(strict, bool):
+            strict = tool.get("strict")
+        if isinstance(strict, bool):
+            decl["strict"] = strict
         declarations.append(decl)
     if not declarations:
         return []
@@ -616,9 +630,10 @@ async def openai_to_gemini_request(
     if req.n not in (None, 1):
         raise ValueError("Only n=1 is supported")
     if req.parallel_tool_calls is False:
-        raise ValueError(
-            "parallel_tool_calls=false cannot be enforced by this upstream"
-        )
+        # OpenAI 官方语义是提示而非硬约束（不少框架默认发 false）；上游
+        # 无法强制串行 ≠ 必须拒绝请求。接受+忽略+告警，与
+        # responses 侧同策略。
+        logger.warning("parallel_tool_calls=false 无法在上游强制串行，已忽略该提示")
     contents: list[GeminiContent] = []
     system_texts: list[str] = []
     tool_name_by_id: dict[str, str] = {}
@@ -729,12 +744,12 @@ async def openai_to_gemini_request(
         if req.top_logprobs is not None:
             generation_config["logprobs"] = req.top_logprobs
     generation_config.update(_openai_response_format_to_config(req.response_format))
-    if req.reasoning_effort is not None:
-        effort = req.reasoning_effort.strip().lower()
-        if effort in ("minimal", "low", "medium", "high", "very_high", "xhigh", "none"):
-            generation_config["reasoningEffort"] = effort
-        else:
-            logger.debug("忽略无法识别的 reasoning_effort: %s", req.reasoning_effort)
+    # 思考强度归一化：reasoning_effort / reasoning.effort / thinking /
+    # enable_thinking / chat_template_kwargs 全部形态统一为一个档位词。
+    # "none" 会在下游抑制 profile 注入的浏览器默认思考档。
+    effort = _openai_reasoning_effort(req)
+    if effort is not None:
+        generation_config["reasoningEffort"] = effort
 
     gemini_req = GeminiGenerateContentRequest(
         contents=contents,
@@ -983,6 +998,121 @@ def _claude_tool_choice_to_config(
                     "allowedFunctionNames": [name],
                 }
             }
+    return None
+
+
+# 思考强度词表：兼容大小写 / 连字符 / 下划线 / 别名，统一归一化为
+# 管线档位词（minimal / low / medium / high / very_high / xhigh / none）。
+# "none" 表示显式关闭思考（下游会抑制 profile 注入的浏览器默认档）。
+_EFFORT_ALIASES: dict[str, str] = {
+    "none": "none",
+    "off": "none",
+    "disabled": "none",
+    "disable": "none",
+    "false": "none",
+    "0": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "very_high": "very_high",
+    "xhigh": "xhigh",
+    "max": "xhigh",
+}
+
+
+def normalize_reasoning_effort_word(raw: object) -> str | None:
+    """把任意 effort 词归一化为管线档位词，无法识别返回 None。
+
+    容忍大小写、``very-high`` / ``VERYHIGH`` 等分隔符变体与 off/max 等别名。
+    与 chat_service._parse_thinking_level 的档位词汇保持同一集合。
+    """
+    if not isinstance(raw, str):
+        return None
+    word = raw.strip().lower().replace("-", "_")
+    if not word:
+        return None
+    if word in _EFFORT_ALIASES:
+        return _EFFORT_ALIASES[word]
+    compact = word.replace("_", "")
+    for key, value in _EFFORT_ALIASES.items():
+        if key.replace("_", "") == compact:
+            return value
+    return None
+
+
+def _budget_to_effort(budget: int) -> str:
+    """思考预算（token 数）→ 档位词（与 Claude budget_tokens 映射同语义）。"""
+    if budget <= 2048:
+        return "low"
+    if budget <= 8192:
+        return "medium"
+    if budget <= 32768:
+        return "high"
+    return "xhigh"
+
+
+def _openai_reasoning_effort(req: OpenAIChatCompletionRequest) -> str | None:
+    """归一化 OpenAI 兼容端点的全部思考强度参数形态。
+
+    优先级（高 → 低）：
+    1. ``reasoning_effort``（OpenAI 官方顶层字符串）
+    2. ``reasoning.effort``（OpenRouter / 新版网关）
+    3. ``thinking``（智谱 GLM：type=enabled/disabled + 可选 budget_tokens /
+       max_budget_tokens，预算按 token 数映射档位）
+    4. ``enable_thinking``（Qwen / DashScope 布尔开关）
+    5. ``chat_template_kwargs.thinking``（vLLM 布尔或档位词）
+
+    返回 None 表示未指定任何思考强度（profile 浏览器默认档照常生效）；
+    "none" 表示显式关闭。无法识别的非空值记 warning 后按未指定处理。
+    """
+    # 1) OpenAI 官方顶层 reasoning_effort
+    if req.reasoning_effort is not None:
+        effort = normalize_reasoning_effort_word(req.reasoning_effort)
+        if effort is not None:
+            return effort
+        if req.reasoning_effort.strip():
+            logger.warning("忽略无法识别的 reasoning_effort: %r", req.reasoning_effort)
+        return None
+
+    # 2) OpenRouter / 新版网关：reasoning: {"effort": ...}
+    if isinstance(req.reasoning, dict):
+        effort = normalize_reasoning_effort_word(req.reasoning.get("effort"))
+        if effort is not None:
+            return effort
+        enabled = req.reasoning.get("enabled")
+        if isinstance(enabled, bool):
+            return "medium" if enabled else "none"
+
+    # 3) 智谱 GLM：thinking: {"type": ..., "budget_tokens" / "max_budget_tokens": N}
+    if isinstance(req.thinking, dict):
+        thinking_type = _as_str(req.thinking.get("type")).strip().lower()
+        budget = _as_int(req.thinking.get("budget_tokens"))
+        if budget is None:
+            budget = _as_int(req.thinking.get("max_budget_tokens"))
+        if thinking_type in ("disabled", "off", "none"):
+            return "none"
+        if thinking_type in ("enabled", "on", "custom", "auto"):
+            if budget is not None and budget > 0:
+                return _budget_to_effort(budget)
+            return "medium"
+        if budget is not None:
+            return "none" if budget <= 0 else _budget_to_effort(budget)
+
+    # 4) Qwen / DashScope：enable_thinking
+    if req.enable_thinking is not None:
+        return "medium" if req.enable_thinking else "none"
+
+    # 5) vLLM：chat_template_kwargs: {"thinking": true}
+    if isinstance(req.chat_template_kwargs, dict):
+        raw = req.chat_template_kwargs.get("thinking")
+        if isinstance(raw, bool):
+            return "medium" if raw else "none"
+        if isinstance(raw, str):
+            effort = normalize_reasoning_effort_word(raw)
+            if effort is not None:
+                return effort
+
     return None
 
 

@@ -8,6 +8,12 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 class GeminiInlineData(BaseModel):
     mimeType: str = Field(validation_alias=AliasChoices("mimeType", "mime_type"))
     data: str
+    # 2026-11 AI Studio 真机抓包：inlineData wire 槽位 5 携带上传文件名
+    # （[mime, b64, null, null, null, filename]）。Gemini 原生 inlineData 无此
+    # 字段，仅 OpenAI file.filename / Responses input_file.filename 透传时出现。
+    filename: str | None = Field(
+        default=None, validation_alias=AliasChoices("filename", "file_name")
+    )
 
 
 class GeminiFileData(BaseModel):
