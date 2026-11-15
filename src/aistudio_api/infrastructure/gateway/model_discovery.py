@@ -86,7 +86,8 @@ def _extract_model_aliases(raw: object) -> list[str]:
 # 注意：gemini-4-hydrogen 为免费模型（线上目录实测 paid[77]=None /
 # accessModes[82]=None），与 argon/carbon 的付费定位不同，不得挂付费规则。
 # 付费/等级判定优先用上游目录数据（paid[77]/accessModes[82,87]），
-# 随模型列表同一次 ListModels 拉取缓存并 600s 周期刷新；config.yaml
+# 随模型列表同一次 ListModels 拉取缓存，后台任务周期刷新（启动预热 +
+# 60s 唤醒、内部 600s TTL 控制真实拉网频率）；config.yaml
 # 规则仅在模型不在目录或上游未标等级时兜底。
 _EXTRA_GUARANTEED_MODELS = [
     {
@@ -826,6 +827,11 @@ class ModelDiscoveryService:
         self._cache_ttl = cache_ttl_seconds
         self._cached_models: list[dict[str, object]] = []
         self._last_fetched_at: float = 0.0
+        # 后台目录刷新任务（生命周期由 app lifespan 的 start/stop 管理）。
+        # _refresh_bound_loop 记录任务所属事件循环：跨循环 stop 时只
+        # cancel 不 await（防在陌生循环上等待引发挂死/异常）。
+        self._refresh_task: asyncio.Task[None] | None = None
+        self._refresh_bound_loop: asyncio.AbstractEventLoop | None = None
         # 锁按事件循环惰性创建：模块级单例在 import 时创建 asyncio.Lock，
         # 若被多个事件循环先后使用（测试、内嵌场景），第二个 loop 上 acquire
         # 会永久挂起或抛 "bound to a different event loop"。与 transport 层
@@ -936,6 +942,53 @@ class ModelDiscoveryService:
             retry_ttl = min(60.0, max(0.0, self._cache_ttl))
             self._last_fetched_at = time.time() - self._cache_ttl + retry_ttl
             return self._cached_models
+
+    def start_background_refresh(self, tick_seconds: float = 60.0) -> None:
+        """启动后台目录周期刷新（幂等，服务启动时调用）。
+
+        目录刷新此前是"被动周期"：仅当 /v1beta/models、/v1/models 或管理端
+        模型列表被请求时才按 600s TTL 重新拉取；从不访问模型列表端点的
+        客户端（模型名写死）会让聊天路径的 get_cached_model_info 长期读到
+        静态保底快照——思考档位/付费状态随之过期（2026-11-15 hydrogen
+        最高档 5→6 迁移即经此漏过：过期快照 [1,2,3,5] 使档位吸附放行了
+        已被上游移除的 5 档）。
+
+        启动即预热一次，此后每 tick 唤醒一次 get_models：真实拉网频率仍
+        由其内部 TTL（600s）控制，拉取失败按内部退避（≤60s）在下一 tick
+        重试；无凭据/网络故障静默退避，不影响请求路径。
+        """
+        if self._refresh_task is not None and not self._refresh_task.done():
+            return
+        self._refresh_bound_loop = asyncio.get_running_loop()
+        self._refresh_task = asyncio.create_task(
+            self._catalog_refresh_loop(tick_seconds)
+        )
+
+    async def _catalog_refresh_loop(self, tick_seconds: float) -> None:
+        while True:
+            try:
+                await self.get_models()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug("后台模型目录刷新异常: %s", e)
+            await asyncio.sleep(tick_seconds)
+
+    async def stop_background_refresh(self) -> None:
+        """停止后台刷新任务（服务关闭时调用）。
+
+        跨事件循环调用（单例先后被多个 loop 使用）时只 cancel 不 await，
+        避免在陌生循环上等待任务引发 "bound to a different event loop"。
+        """
+        task = self._refresh_task
+        bound_loop = self._refresh_bound_loop
+        self._refresh_task = None
+        self._refresh_bound_loop = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        if bound_loop is not None and bound_loop is asyncio.get_running_loop():
+            await asyncio.gather(task, return_exceptions=True)
 
     async def get_model_by_id(
         self, model_id: str, session: GatewaySession | None = None
