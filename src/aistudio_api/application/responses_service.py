@@ -23,7 +23,10 @@ import secrets
 import time
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
 
-from aistudio_api.api.response_models import GeminiGenerateContentResponse
+from aistudio_api.api.response_models import (
+    GeminiGenerateContentResponse,
+    GeminiPartResponse,
+)
 from aistudio_api.api.schemas import (
     GeminiContent,
     GeminiFunctionCall,
@@ -43,26 +46,21 @@ from aistudio_api.application.compat_service import (
     _parse_data_url,
     _read_signature,
     _signature_extra,
+    normalize_reasoning_effort_word,
     resolve_compat_model,
 )
 from aistudio_api.application.media_session import has_remote_media, media_session
+from aistudio_api.domain.tool_signatures import (
+    remember_function_signature as _remember_function_signature,
+)
 from aistudio_api.infrastructure.request_context import record_result
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("compat.responses")
 
-# Responses reasoning.effort → Gemini reasoningEffort（xhigh/max 为上游
-# VERY_HIGH(5) 的 SDK 别名，与 chat completions 侧的 effort 白名单一致）
-_RESPONSES_EFFORT_MAP: dict[str, str] = {
-    "none": "none",
-    "minimal": "minimal",
-    "low": "low",
-    "medium": "medium",
-    "high": "high",
-    "xhigh": "xhigh",
-    "very_high": "very_high",
-    "max": "xhigh",
-}
+# Responses reasoning.effort → Gemini reasoningEffort：统一走
+# normalize_reasoning_effort_word（与 chat completions 侧同一套词表，
+# 额外获得 off/disabled 等别名与分隔符变体容错）。
 
 # Gemini finishReason → Responses status / incomplete_details.reason
 _FINISH_TO_INCOMPLETE_REASON: dict[str, str] = {
@@ -159,9 +157,16 @@ async def _parts_from_input_content(content: object) -> list[GeminiPart]:
                 parsed = _parse_data_url(file_data)
                 if parsed is not None:
                     mime, data = parsed
+                    # input_file.filename 透传到 wire inlineData 槽位 5
+                    # （2026-11 AI Studio 真机抓包形态），空串视为未提供。
+                    filename = _as_str(item.get("filename")).strip()
                     parts.append(
                         GeminiPart(
-                            inlineData=GeminiInlineData(mimeType=mime, data=data)
+                            inlineData=GeminiInlineData(
+                                mimeType=mime,
+                                data=data,
+                                filename=filename or None,
+                            )
                         )
                     )
         else:
@@ -219,9 +224,9 @@ async def responses_to_gemini_request(
             "previous_response_id is not supported; send the complete conversation in input"
         )
     if req.parallel_tool_calls is False:
-        raise ValueError(
-            "parallel_tool_calls=false cannot be enforced by this upstream"
-        )
+        # OpenAI 官方语义是提示而非硬约束；接受+忽略+告警（与 chat
+        # completions 侧同策略）。
+        logger.warning("parallel_tool_calls=false 无法在上游强制串行，已忽略该提示")
     contents: list[GeminiContent] = []
     system_texts: list[str] = [req.instructions] if req.instructions else []
     tool_name_by_call_id: dict[str, str] = {}
@@ -334,12 +339,16 @@ async def responses_to_gemini_request(
     if req.max_output_tokens is not None:
         generation_config["maxOutputTokens"] = req.max_output_tokens
     if req.reasoning is not None:
-        effort = _as_str(req.reasoning.get("effort")).strip().lower()
-        mapped = _RESPONSES_EFFORT_MAP.get(effort)
-        if mapped:
-            generation_config["reasoningEffort"] = mapped
-        elif effort:
-            logger.debug("忽略无法识别的 reasoning.effort: %s", effort)
+        raw_effort = _as_str(req.reasoning.get("effort"))
+        effort_word = normalize_reasoning_effort_word(raw_effort)
+        if effort_word is not None:
+            generation_config["reasoningEffort"] = effort_word
+        elif raw_effort.strip():
+            logger.warning("忽略无法识别的 reasoning.effort: %r", raw_effort)
+        elif req.reasoning.get("exclude") is True:
+            # OpenRouter 扩展：reasoning.exclude=true 表示不回传思维链。
+            # 上游无法关闭思考输出透传，忽略之（记录便于排查）。
+            logger.debug("忽略 reasoning.exclude（上游不支持关闭思考回传）")
     if req.text is not None:
         fmt = _as_dict(req.text.get("format"))
         fmt_type = fmt.get("type")
@@ -546,12 +555,25 @@ def build_responses_object(
 
 def _iter_response_parts(
     response: GeminiGenerateContentResponse,
-) -> list[object]:
+) -> list[GeminiPartResponse]:
     candidates = response.candidates or []
     if not candidates:
         return []
     content = candidates[0].content
-    return list(content.parts) if content else []
+    parts: list[GeminiPartResponse] = list(content.parts) if content else []
+    # 签名缓存回填（与 compat 层 _iter_response_parts 对齐）：非流式
+    # Responses 路径此前只取不存，纯 Codex CLI 用户丢签名后永远只能走
+    # SKIP 字面量，推理状态保真度失效。
+    for part in parts:
+        function_call = getattr(part, "functionCall", None)
+        if function_call is not None:
+            _remember_function_signature(
+                getattr(function_call, "id", None),
+                getattr(function_call, "name", None),
+                getattr(function_call, "args", None),
+                getattr(part, "thoughtSignature", None),
+            )
+    return parts
 
 
 # ---------------------------------------------------------------------------

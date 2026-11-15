@@ -9,6 +9,10 @@ from array import array
 from collections.abc import AsyncGenerator, AsyncIterable, Generator
 from dataclasses import dataclass, field
 
+from aistudio_api.infrastructure.utils.logger import get_logger
+
+logger = get_logger("stream.utils")
+
 _MAX_TOOL_ARGUMENT_BYTES = 16 * 1024 * 1024
 _MAX_TOOL_RESPONSE_BYTES = 64 * 1024 * 1024
 
@@ -190,16 +194,18 @@ class _ToolCall:
                 "Tool arguments must be an object or JSON object fragments"
             )
 
-    def part(self) -> dict[str, object]:
+    def part(self) -> dict[str, object] | None:
+        """组装完成的 wire part；参数不可用时返回 None（由调用方告警作废）。"""
         args = self.args
         if args is None:
             raw = "".join(self.fragments)
             try:
                 args = json.loads(raw) if raw.strip() else {}
-            except ValueError as exc:
-                raise ValueError(f"Incomplete tool arguments for {self.name}") from exc
+            except ValueError:
+                # 分片被内容边界打断/上游残帧：作废该调用而非让整条流硬失败。
+                return None
             if not isinstance(args, dict):
-                raise ValueError(f"Tool arguments must be an object: {self.name}")
+                return None
         part: dict[str, object] = {
             "functionCall": {
                 "id": self.call_id,
@@ -244,13 +250,25 @@ async def coalesce_tool_frames(
 
     Calls close at a content boundary, finish or EOF. This avoids exposing a
     partial JSON argument as an executable call. Plain text frames pass through.
+
+    残缺调用的处理分两个场景（2026-11 工具链路审计）：
+
+    - 内容边界（独立文本帧/图注插入分片中间）：作废该调用并告警，流继续——
+      已产出的正文不应为一个残缺分片陪葬（旧行为是整流硬失败 500）。
+    - 流终结（STOP/EOF）且全流无任何已投递内容：保持报错。此时响应的
+      唯一载荷就是这次调用，静默作废会变成空回（与空回防护同一哲学）。
     """
     pending: list[_ToolCall] = []
     by_id: dict[str, _ToolCall] = {}
     sent: dict[str, dict[str, object]] = {}
     total_size = 0
+    # 本流是否已向客户端投递过任何内容部件（文本/图片/完整调用）。
+    # 终结时若一无所出且仅剩残缺调用，报错好过静默空回。
+    delivered = False
 
-    def flush(*, before: _ToolCall | None = None) -> dict[str, object] | None:
+    def flush(
+        *, before: _ToolCall | None = None, terminal: bool = False
+    ) -> dict[str, object] | None:
         parts: list[dict[str, object]] = []
         count = pending.index(before) if before is not None else len(pending)
         ready_tools = pending[:count]
@@ -258,10 +276,29 @@ async def coalesce_tool_frames(
         for tool in ready_tools:
             by_id.pop(tool.call_id, None)
             part = tool.part()
+            if part is None:
+                if terminal and not delivered:
+                    # 全流无任何已投递内容且唯一载荷是残缺调用：报错好过
+                    # 静默空回（与空回防护同一哲学）。
+                    raise ValueError(
+                        f"Incomplete tool arguments for {tool.name or tool.call_id}"
+                    )
+                # 分片被独立文本帧/内容边界打断：作废该调用并告警，
+                # 不让整条流硬失败。
+                logger.warning(
+                    "丢弃参数不完整的工具调用 %s（分片中断或非对象载荷）",
+                    tool.name or tool.call_id,
+                )
+                continue
             previous = sent.get(tool.call_id)
             if previous is not None:
                 if previous.get("functionCall") != part.get("functionCall"):
-                    raise ValueError("Upstream changed an already completed tool call")
+                    # 上游对已完成调用下发了不同内容：保留已投递版本（客户端
+                    # 已按旧内容执行）并告警，不再硬失败。
+                    logger.warning(
+                        "上游修改了已完成的工具调用 %s，保留已投递版本",
+                        tool.call_id,
+                    )
                 continue
             sent[tool.call_id] = part
             parts.append(part)
@@ -312,6 +349,8 @@ async def coalesce_tool_frames(
         if not pending and not any(
             isinstance(p, dict) and "functionCall" in p for p in parts
         ):
+            if parts:
+                delivered = True
             yield frame
             continue
         for part in parts:
@@ -358,6 +397,7 @@ async def coalesce_tool_frames(
                         for key, value in part.items()
                         if key != "functionCall"
                     }
+                    delivered = True
                     yield {
                         "candidates": [
                             {
@@ -376,10 +416,11 @@ async def coalesce_tool_frames(
                 ready = flush()
                 if ready:
                     yield ready
+                delivered = True
                 yield {"candidates": [{"content": {"parts": [part]}}]}
         if candidate.get("finishReason"):
             if candidate["finishReason"] == "STOP":
-                ready = flush()
+                ready = flush(terminal=True)
                 if ready:
                     yield ready
             else:
@@ -388,6 +429,6 @@ async def coalesce_tool_frames(
                 by_id.clear()
         # Preserve usage, response ID and finish metadata without replaying parts.
         yield {**frame, "candidates": [{**candidate, "content": {"parts": []}}]}
-    ready = flush()
+    ready = flush(terminal=True)
     if ready:
         yield ready

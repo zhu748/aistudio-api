@@ -293,6 +293,31 @@ user:  [null×11, [name, response_wire, call_id]]
 > 不同调用的推理状态等价。当前缓存只按 ID、函数名、规范化参数精确匹配；
 > 缺签名时使用协议兼容占位值，不借用同名函数的其他签名，也不剥离工具历史。
 
+> [!NOTE]
+> **超长函数名与 schema 降级链（2026-11-15 AIStudio2API 行为对齐）**：
+>
+> - **函数名 63 字节上限**：Playground 接口拒绝超长函数名。声明侧
+>   `wire_function_name` 把超长名截短为 `前缀_<sha256(原名)前 6 字节 hex>`
+>   （总长 ≤ 63 字节，按字节计）；历史回传的 functionCall /
+>   functionResponse 同步截短保持配对；响应侧凭请求内声明映射
+>   （`NormalizedGeminiRequest.function_name_restore`）把截短名换回
+>   原名，客户端全程无感。`allowedFunctionNames` 过滤集同时收录原名
+>   与截短名。session 快照（raw wire）保持截短形态，与回放声明一致。
+> - **参数 schema 降级链**：`$ref` 展开 / 编码失败（递归引用等）不再
+>   拒绝整轮请求，降级为仅保留层级与类型的 shape 编码。
+> - **约束丢失兜底**：schema 含 wire 无法表达的键（additionalProperties、
+>   prefixItems、exclusiveMinimum、propertyNames、$ref、空串 enum）或
+>   OpenAI strict 模式时，完整 JSON Schema 原文以
+>   `"Arguments must follow this JSON Schema: <json>"` 附加到函数
+>   description，模型仍可按 JSON Schema 理解参数。结构化输出
+>   responseSchema 同款兜底（前缀 `"The response must follow this
+>   JSON Schema: "`，additionalProperties:false 不触发——它是 Gemini
+>   对象的默认闭合语义）。
+> - **enum 空串过滤**：上游拒绝空串 enum 值，编码时剔除（全空则省略
+>   enum 字段），完整 schema 随 description 兜底。
+> - **required 补全**：required 列出而 properties 未定义的属性补充空
+>   定义（不限类型），对齐前端线缆形态。
+
 ## 7. 响应报文解析与 Token 使用量 (Response & Usage)
 
 ### 7.1 响应 Chunk 容器

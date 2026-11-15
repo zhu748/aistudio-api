@@ -1,5 +1,7 @@
 from typing import Any, cast
 
+import pytest
+
 from aistudio_api.infrastructure.gateway.wire_parser import parse_response_chunk
 
 
@@ -208,6 +210,7 @@ def test_chat_service_does_not_convert_signed_text_into_thought():
 
     req = GeminiGenerateContentRequest(
         contents=[
+            GeminiContent(role="user", parts=[GeminiPart(text="Hi.")]),
             GeminiContent(
                 role="model",
                 parts=[
@@ -215,11 +218,13 @@ def test_chat_service_does_not_convert_signed_text_into_thought():
                         text="Normal answer", thoughtSignature="dmFsaWRfc2lnXzEyMw=="
                     ),
                 ],
-            )
+            ),
+            # 以 user 轮收尾：中间 model 轮不受续写改写触碰
+            GeminiContent(role="user", parts=[GeminiPart(text="Next.")]),
         ]
     )
     normalized = normalize_gemini_request(req, "gemini-3.7-flash")
-    part = normalized.contents[0].parts[0]
+    part = normalized.contents[1].parts[0]
     assert part.text == "Normal answer"
     assert part.thought is False
     assert part.thought_signature == "dmFsaWRfc2lnXzEyMw=="
@@ -336,9 +341,14 @@ def test_normalize_keeps_unsigned_tool_history_instead_of_creating_hollow_turns(
 
 
 def test_normalize_keeps_signature_only_part():
-    """纯签名 part（文本轮尾部信封）是有效载荷，不可被清理丢弃。"""
+    """纯签名 part（文本轮尾部信封）是有效载荷，clean 不可丢弃。
+
+    尾部 model 轮（含纯签名轮）由续写改写剥离：无正文前缀时直接删除，
+    对话以 user 轮收尾；中间位置的纯签名轮不受改写触碰，原样保留。
+    """
     from aistudio_api.api.schemas import GeminiContent, GeminiPart
 
+    # 尾部纯签名轮：续写改写剥离（prefix 全空白 → 直接删，无占位轮）
     normalized = _norm(
         [
             GeminiContent(role="model", parts=[GeminiPart(text="Answer.")]),
@@ -349,20 +359,32 @@ def test_normalize_keeps_signature_only_part():
             ),
         ]
     )
-    # 末尾空文本签名轮保留（有签名载荷，非空轮）；
-    # model 结尾追加单空格 user 占位（真机实测 200，见 2026-11-14 判别）
-    assert normalized.contents[-2].parts[0].thought_signature == (
+    assert [c.role for c in normalized.contents] == ["model", "user"]
+    assert normalized.contents[-1].parts[0].text == "Next."
+
+    # 中间纯签名轮（非尾部）：clean 保留，续写改写不触碰
+    normalized_mid = _norm(
+        [
+            GeminiContent(role="user", parts=[GeminiPart(text="Hi.")]),
+            GeminiContent(
+                role="model",
+                parts=[GeminiPart(text="", thoughtSignature="dmFsaWRfc2lnXzEyMw==")],
+            ),
+            GeminiContent(role="user", parts=[GeminiPart(text="Next.")]),
+        ]
+    )
+    assert [c.role for c in normalized_mid.contents] == ["user", "model", "user"]
+    assert normalized_mid.contents[1].parts[0].thought_signature == (
         "dmFsaWRfc2lnXzEyMw=="
     )
-    assert normalized.contents[-1].role == "user"
-    assert normalized.contents[-1].parts[0].text == " "
 
 
-def test_normalize_tail_model_text_gets_space_user_sentinel():
-    """真正以 model 收尾时仍追加单空格 user 占位，避免 model-turn 400。
+def test_normalize_tail_model_text_rewritten_to_continuation():
+    """尾部 model 轮改写为系统指令续写（AIStudio2API normalizeTurns 移植）。
 
-    真机五形态判别（2026-11-14）：model 结尾 400；空文本 user 占位无效
-    （上游不认空文本轮）；单空格 user 占位 200。
+    非白名单模型：尾部 model 轮剥离，正文前缀以续写提示词并入系统
+    指令（新建 text part，不碰可能带签名的 part），对话以 user 轮
+    收尾；函数调用不拼入前缀。单空格 user 占位轮已废弃。
     """
     from aistudio_api.api.schemas import (
         GeminiContent,
@@ -370,7 +392,6 @@ def test_normalize_tail_model_text_gets_space_user_sentinel():
         GeminiPart,
     )
 
-    # 混合轮：文本与无签名的原生工具调用均保留。
     normalized = _norm(
         [
             GeminiContent(role="user", parts=[GeminiPart(text="Hello.")]),
@@ -387,19 +408,171 @@ def test_normalize_tail_model_text_gets_space_user_sentinel():
             ),
         ]
     )
-    assert [c.role for c in normalized.contents] == ["user", "model", "user"]
+    # model 轮被剥离，无占位轮，对话只剩 user 轮
+    assert [c.role for c in normalized.contents] == ["user"]
     assert normalized.contents[0].parts[0].text == "Hello."
-    assert normalized.contents[1].parts[0].text == "Let me reply in style."
-    call = normalized.contents[1].parts[1]
-    assert call.function_call is not None
-    assert call.thought_signature == "skip_thought_signature_validator"
-    sentinel = normalized.contents[-1]
-    assert sentinel.role == "user"
-    assert sentinel.parts[0].text == " "
+    # 系统指令追加续写提示词 + 前缀（无原有 system 时不加前导换行）
+    system = normalized.system_instruction
+    assert system is not None
+    assert system.parts[-1].text == (
+        "Continue the assistant response after the following prefix. "
+        "Return only the continuation, without repeating the prefix."
+        "\nLet me reply in style."
+    )
 
 
-def test_normalize_all_hollow_falls_back_to_single_user_turn():
-    """全部轮被清空时回退单个空文本 user 轮（保持 user 收尾语义）。"""
+def test_continuation_rewrite_appends_to_existing_system():
+    """已有系统指令时，续写指令前置 ``"\n"`` 分隔后新建 part 追加。"""
+    from aistudio_api.api.schemas import GeminiContent, GeminiPart
+
+    normalized = _norm(
+        [
+            GeminiContent(role="user", parts=[GeminiPart(text="Hello.")]),
+            GeminiContent(role="model", parts=[GeminiPart(text="I will continue thi")]),
+        ],
+        systemInstruction=GeminiContent(
+            role="user", parts=[GeminiPart(text="You are a poet.")]
+        ),
+    )
+    assert [c.role for c in normalized.contents] == ["user"]
+    system = normalized.system_instruction
+    assert system is not None
+    assert [p.text for p in system.parts] == [
+        "You are a poet.",
+        (
+            "\nContinue the assistant response after the following prefix. "
+            "Return only the continuation, without repeating the prefix."
+            "\nI will continue thi"
+        ),
+    ]
+
+
+def test_native_prefill_model_keeps_model_ending():
+    """原生 prefill 模型（白名单 + gemma-）model 结尾直接透传，不注入占位轮。
+
+    对照 AIStudio2API turns.go nativePrefillModels：gemini-3.1/3.0 系
+    与 gemma- 模型上游原生接受 model 轮结尾，追加占位轮反而破坏客户端
+    assistant prefill 的逐字续写语义。
+    """
+    from aistudio_api.api.schemas import GeminiContent, GeminiPart
+
+    contents = [
+        GeminiContent(role="user", parts=[GeminiPart(text="Hello.")]),
+        GeminiContent(role="model", parts=[GeminiPart(text="I will continue thi")]),
+    ]
+    # 白名单模型：model 结尾原样透传
+    normalized = _norm(contents, model="gemini-3.1-pro-preview")
+    assert [c.role for c in normalized.contents] == ["user", "model"]
+    assert normalized.contents[-1].parts[0].text == "I will continue thi"
+
+    # 别名同样命中白名单（nano-banana → gemini-3.1-flash-lite-image）
+    normalized_alias = _norm(contents, model="nano-banana")
+    assert [c.role for c in normalized_alias.contents] == ["user", "model"]
+
+    # gemma- 前缀模型：同规则透传
+    normalized_gemma = _norm(contents, model="gemma-4-31b-it")
+    assert [c.role for c in normalized_gemma.contents] == ["user", "model"]
+
+    # models/ 前缀 + 大小写不敏感
+    normalized_prefixed = _norm(contents, model="models/Gemini-3.1-Pro-Preview")
+    assert [c.role for c in normalized_prefixed.contents] == ["user", "model"]
+
+
+def test_newest_models_get_continuation_rewrite():
+    """最新模型（gemini-4 系 / 3.5+）尾部 model 轮走续写改写（默认拒绝）。
+
+    本项目 2026-11-14 真机五形态判别（gemini-3.5-flash-lite）：model 结尾
+    400 "Requests ending with a model turn are not supported"。单空格
+    占位轮已废弃，改为 AIStudio2API 同构的续写改写：剥离尾部 model 轮、
+    正文前缀并入系统指令。白名单刻意不含这些模型。
+    """
+    from aistudio_api.api.schemas import GeminiContent, GeminiPart
+
+    contents = [
+        GeminiContent(role="user", parts=[GeminiPart(text="Hello.")]),
+        GeminiContent(role="model", parts=[GeminiPart(text="I will continue thi")]),
+    ]
+    for model in ("gemini-4-hydrogen", "gemini-3.8-flash", "future-model-x"):
+        normalized = _norm(contents, model=model)
+        # model 轮被剥离，无占位轮；前缀进系统指令
+        assert [c.role for c in normalized.contents] == ["user"], model
+        system = normalized.system_instruction
+        assert system is not None, model
+        assert (system.parts[-1].text or "").endswith("I will continue thi"), model
+
+
+def test_rewrite_with_empty_prompt_puts_prefix_in_user_turn():
+    """prompt 为空时前缀作为最后一轮 user 正文（AIStudio2API 可配置分支）。"""
+    from aistudio_api.application.chat_service import (
+        _rewrite_model_tail_for_continuation,
+    )
+    from aistudio_api.infrastructure.gateway.wire_types import (
+        AistudioContent,
+        AistudioPart,
+    )
+
+    contents, system = _rewrite_model_tail_for_continuation(
+        [
+            AistudioContent(role="user", parts=[AistudioPart(text="Hi.")]),
+            AistudioContent(role="model", parts=[AistudioPart(text="I will conti")]),
+        ],
+        None,
+        rewrite=True,
+        prompt="",
+    )
+    assert [c.role for c in contents] == ["user", "user"]
+    assert contents[-1].parts[0].text == "I will conti"
+    assert system is None
+
+
+def test_assistant_prefix_code_blocks_and_thought_skip():
+    """续写前缀拼接：正文直拼，代码/结果转代码块，思考 part 跳过。"""
+    from aistudio_api.application.chat_service import _assistant_prefix
+    from aistudio_api.infrastructure.gateway.wire_types import (
+        AistudioContent,
+        AistudioPart,
+    )
+
+    prefix = _assistant_prefix(
+        [
+            AistudioContent(
+                role="model",
+                parts=[
+                    AistudioPart(text="Running code."),
+                    AistudioPart(text="hidden reasoning", thought=True),
+                    AistudioPart(executable_code=("Python", "print(1)\n")),
+                ],
+            ),
+            AistudioContent(
+                role="model",
+                parts=[AistudioPart(code_execution_result=("OK", "1\n"))],
+            ),
+        ]
+    )
+    assert prefix == "Running code.\n```python\nprint(1)\n```\n```text\n1\n```\n"
+
+
+def test_all_hollow_without_system_raises():
+    """全部轮被清空且无系统指令 → 报错（单空格占位轮已废弃，
+    AIStudio2API 同场景直接拒绝空请求）。"""
+    from aistudio_api.api.schemas import (
+        GeminiContent,
+        GeminiPart,
+    )
+
+    with pytest.raises(ValueError, match="请求没有系统提示或对话内容"):
+        _norm(
+            [
+                GeminiContent(role="model", parts=[GeminiPart(text="")]),
+                GeminiContent(role="user", parts=[]),
+            ],
+            model="gemini-3.1-pro-preview",
+        )
+
+
+def test_normalize_all_hollow_with_system_becomes_user_turn():
+    """全部轮被清空但系统指令有载荷 → 系统指令整体转为 user 轮
+    （AIStudio2API 同构：SystemText(system) 作为 user 正文）。"""
     from aistudio_api.api.schemas import (
         GeminiContent,
         GeminiPart,
@@ -415,11 +588,16 @@ def test_normalize_all_hollow_falls_back_to_single_user_turn():
                 role="user",
                 parts=[],
             ),
-        ]
+        ],
+        systemInstruction=GeminiContent(
+            role="user", parts=[GeminiPart(text="You are helpful.")]
+        ),
     )
+    # 系统指令不再单独发送，转为唯一 user 轮
+    assert normalized.system_instruction is None
     assert len(normalized.contents) == 1
     assert normalized.contents[0].role == "user"
-    assert normalized.contents[0].parts[0].text == ""
+    assert normalized.contents[0].parts[0].text == "You are helpful."
 
 
 def test_normalize_merges_consecutive_same_role_turns():

@@ -1,5 +1,37 @@
-from aistudio_api.infrastructure.gateway.model_defaults import resolve_model_defaults
+from aistudio_api.infrastructure.gateway.model_defaults import (
+    model_supports_native_prefill,
+    resolve_model_defaults,
+)
 from aistudio_api.infrastructure.gateway.wire_types import AistudioImageOutputMode
+
+
+def test_model_supports_native_prefill_allowlist():
+    """原生 prefill 白名单判定（对照 AIStudio2API turns.go nativePrefillModels）。
+
+    白名单命中、别名解析命中、gemma- 前缀、models/ 前缀与大小写不敏感
+    均视为原生接受 model 轮结尾；白名单外（含最新 gemini-4 系、
+    3.5/3.7/3.8）与未知模型默认需要 user 占位兼容（默认拒绝）。
+    """
+    # 白名单直命中
+    assert model_supports_native_prefill("gemini-3.1-pro-preview") is True
+    assert model_supports_native_prefill("gemini-pro-latest") is True
+    assert model_supports_native_prefill("gemini-2.5-flash-image") is True
+    assert model_supports_native_prefill("gemini-omni-1.1-flash") is True
+    # models/ 前缀 + 大小写不敏感
+    assert model_supports_native_prefill("models/Gemini-3.1-Pro-Preview") is True
+    # 别名解析后命中（nano-banana → gemini-3.1-flash-lite-image）
+    assert model_supports_native_prefill("nano-banana") is True
+    assert model_supports_native_prefill("gemini-3.1-flash-lite-preview") is True
+    # gemma- 前缀同规则全部接受
+    assert model_supports_native_prefill("gemma-4-31b-it") is True
+    assert model_supports_native_prefill("models/gemma-4-26b-a4b-it") is True
+    # 白名单外：较新模型与未知模型 → 需要占位兼容
+    assert model_supports_native_prefill("gemini-4-hydrogen") is False
+    assert model_supports_native_prefill("gemini-4-argon") is False
+    assert model_supports_native_prefill("gemini-3.8-flash") is False
+    assert model_supports_native_prefill("gemini-3.5-flash-lite") is False
+    assert model_supports_native_prefill("some-future-model") is False
+    assert model_supports_native_prefill("") is False
 
 
 def test_resolve_model_defaults_uses_repo_config_for_gemma():

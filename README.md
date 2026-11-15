@@ -527,7 +527,18 @@ curl http://localhost:8080/v1/chat/completions \
 
 - `model` 直接填 Gemini 模型名；填 `gpt-4o` 等家族名会自动映射到 `config.yaml` 中 `compat.openai.default_model`；
 - 流式返回标准 `chat.completion.chunk` 序列（含 `data: [DONE]`），思考链走 `reasoning_content` 增量字段；
-- 工具调用（`tools` / `tool_choice`）、`response_format`（JSON 模式）、`reasoning_effort`、图片输入（data URL 或远程 URL）均已支持。
+- 工具调用（`tools` / `tool_choice`）、`response_format`（JSON 模式）、`reasoning_effort`、图片输入（data URL 或远程 URL）均已支持；
+- 思考强度兼容各客户端生态的传参形态，以下写法等价（归一化为上游思考档位，模型不支持时自动吸附就近档位）：
+
+| 参数形态 | 客户端生态 | 示例 |
+| --- | --- | --- |
+| `reasoning_effort` | OpenAI 官方 | `"reasoning_effort": "high"` |
+| `reasoning.effort` | OpenRouter / 新版网关 | `"reasoning": {"effort": "high"}` |
+| `thinking.type` / `thinking.budget_tokens` | 智谱 GLM | `"thinking": {"type": "enabled", "budget_tokens": 4096}` |
+| `enable_thinking` | Qwen / DashScope | `"enable_thinking": true` |
+| `chat_template_kwargs.thinking` | vLLM | `"chat_template_kwargs": {"thinking": true}` |
+
+  档位词支持 `minimal` / `low` / `medium` / `high` / `very_high`（别名 `xhigh` / `max`）；`none` / `off` / `disabled` 表示显式关闭思考；`budget_tokens` 按 token 预算映射档位（≤2048 low / ≤8192 medium / ≤32768 high / 更大 xhigh）。`/v1/responses` 的 `reasoning.effort` 同样支持。
 </details>
 
 <details>

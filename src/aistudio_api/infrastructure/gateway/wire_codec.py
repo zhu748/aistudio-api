@@ -19,6 +19,7 @@ from .model_defaults import (
 )
 from .wire_parser import (
     WIRE_PART_FILE_DATA_INDEX,
+    WIRE_PART_INLINE_DATA_INDEX,
     parse_response_part,
 )
 from .wire_spec import (
@@ -157,6 +158,27 @@ def build_tools_from_names(
     return tools
 
 
+def _has_search_grounding_tools(tools: list[list] | None) -> bool:
+    """tools 中是否存在 google_search 族服务端搜索工具。
+
+    判定特征：函数声明容器形态 [None, [声明...]] 的 t[1] 为列表；
+    google_search 族（含 image_search 变体）的搜索容器挂在 t[3]，即
+    t[0]/t[1] 均为 None 且 t[3] 非空。maps(容器在 t[9])/
+    url_context(t[7])/code_execution(t[0]) 均不满足该特征——与
+    2026-11-15 抓包「纯自定义 FC 无时区槽」的浏览器形态一致。
+    """
+    for tool in tools or []:
+        if (
+            isinstance(tool, list)
+            and len(tool) >= 4
+            and tool[0] is None
+            and tool[1] is None
+            and tool[3] is not None
+        ):
+            return True
+    return False
+
+
 class AistudioWireCodec:
     MODEL_INDEX = TopLevelIndex.MODEL
     CONTENTS_INDEX = TopLevelIndex.CONTENTS
@@ -249,7 +271,14 @@ class AistudioWireCodec:
         if model_defaults.disable_safety_settings:
             body[self.SAFETY_INDEX] = None
         if not model_defaults.is_image_model:
-            if request.tools or request.location is not None:
+            # 2026-11-15 getWeather 工具调用往返抓包（gc12/gc32）实证：
+            # request_context(槽13时区)仅随 google_search 族服务端搜索工具
+            # 出现（gc88/gc152 同批抓包带 [[null,null,"Asia/Shanghai"]]);
+            # 纯自定义函数声明与无工具请求均不带该槽（尾部裁剪）。
+            # AIStudio2API(Go) 全场景不发送该槽，上游宽容。
+            if _has_search_grounding_tools(request.tools) or (
+                request.location is not None
+            ):
                 self._ensure_len(body, self.TIMEZONE_INDEX + 1)
                 tz_str = settings.timezone
                 # 2026-11 真机抓包实测：request_context 恒为单元素形态
@@ -493,6 +522,19 @@ class AistudioWireCodec:
             part.file_id = raw_part[WIRE_PART_FILE_DATA_INDEX][0]
         elif parsed.inline_data is not None:
             part.inline_data = parsed.inline_data
+            # wire inlineData 槽位 5 的文件名（2026-11 真机抓包形态），
+            # 回读保真：decode→encode 往返不丢失。
+            raw_inline = (
+                raw_part[WIRE_PART_INLINE_DATA_INDEX]
+                if len(raw_part) > WIRE_PART_INLINE_DATA_INDEX
+                else None
+            )
+            if (
+                isinstance(raw_inline, list)
+                and len(raw_inline) > 5
+                and isinstance(raw_inline[5], str)
+            ):
+                part.inline_filename = raw_inline[5]
         elif parsed.function_call is not None:
             raw = parsed.function_call.get("raw")
             if isinstance(raw, list):
