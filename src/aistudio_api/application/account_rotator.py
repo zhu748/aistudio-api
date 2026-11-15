@@ -77,9 +77,35 @@ def _pacific_datetime(ts: float | None = None) -> datetime:
     return datetime.fromtimestamp(stamp + _pacific_offset_seconds(stamp), tz=UTC)
 
 
+# 日期键缓存（下次太平洋午夜的 UTC 时间戳, 当日键）：选路与配额打分在
+# 每请求/每候选账号上多次调用 get_pacific_date_key，而键只在太平洋午夜
+# 翻转。热路径仅一次浮点比较；午夜后首个调用自动重算，无陈旧窗口。
+# 元组整体替换赋值原子，并发竞争最坏多算一次，无害。
+_pacific_date_key_cache: tuple[float, str] | None = None
+
+
 def get_pacific_date_key(ts: float | None = None) -> str:
-    """获取美西太平洋时间（America/Los_Angeles）日期键值 YYYY-MM-DD。"""
-    return _pacific_datetime(ts).strftime("%Y-%m-%d")
+    """获取美西太平洋时间（America/Los_Angeles）日期键值 YYYY-MM-DD。
+
+    默认（``ts=None``，即热路径）走缓存；显式传入 ts（测试/回填历史）
+    精确计算，不经过缓存。
+    """
+    global _pacific_date_key_cache
+    stamp = time.time() if ts is None else ts
+    if ts is None:
+        cached = _pacific_date_key_cache
+        if cached is not None and stamp < cached[0]:
+            return cached[1]
+    dt = _pacific_datetime(stamp)
+    key = dt.strftime("%Y-%m-%d")
+    if ts is None:
+        # 明日 00:00 的 UTC 时间戳（DST 安全：用 timestamp() 差而非同区
+        # datetime 相减的墙钟小时）
+        tomorrow = (dt + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        _pacific_date_key_cache = (tomorrow.timestamp(), key)
+    return key
 
 
 def get_seconds_until_pacific_midnight() -> float:

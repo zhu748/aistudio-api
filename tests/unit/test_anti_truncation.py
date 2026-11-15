@@ -761,3 +761,22 @@ async def test_end_to_end_header_off_disables_injection(monkeypatch):
     assert resp.json()["candidates"][0]["content"]["parts"][0]["text"] == "普通正文"
     # 请求头强制关闭：未注入合成工具。
     assert captured.get("tools") is None
+
+
+def test_sse_buffer_ascii_fast_path_preserves_byte_limit_semantics():
+    """_append 的 ASCII 快路径不改变字节限额：非 ASCII 分片仍按 UTF-8 字节数计。"""
+    from aistudio_api.application.stream_utils import SSEEventBuffer
+
+    buf = SSEEventBuffer(max_bytes=10)
+    buf._append("abcdefghij")  # 纯 ASCII 10 字节 → 恰好不超限
+    assert buf._size == 10
+    with pytest.raises(ValueError):
+        buf._append("k")  # 第 11 字节 → 超限
+
+    buf2 = SSEEventBuffer(max_bytes=10)
+    buf2._append("你好")  # 非 ASCII：6 字节
+    assert buf2._size == 6
+    buf2._append("世")  # +3 = 9 ≤ 10
+    assert buf2._size == 9
+    with pytest.raises(ValueError):
+        buf2._append("界")  # +3 = 12 > 10

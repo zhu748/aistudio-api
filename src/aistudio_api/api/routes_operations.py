@@ -109,8 +109,14 @@ async def clear_upstream_snapshot_files(
 
 @router.get("/requests/active")
 async def list_active_requests() -> dict[str, object]:
-    records = _mask_json_value(active_requests())
-    return {"items": records, "total": len(records) if isinstance(records, list) else 0}
+    def _snapshot() -> list[dict[str, object]]:
+        masked = _mask_json_value(active_requests())
+        return masked if isinstance(masked, list) else []
+
+    # asdict 全量快照 + 递归脱敏是毫秒级纯 CPU：并发流式请求越多（events/
+    # attempts 满额），面板轮询期间的事件循环停顿越长，必须下放线程池。
+    records = await asyncio.to_thread(_snapshot)
+    return {"items": records, "total": len(records)}
 
 
 @router.get("/requests/stats")

@@ -70,6 +70,9 @@ class RuntimeState:
     )
     _last_saved_time: float = field(default=0.0, repr=False)
     _save_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    # model_stats 变更计数（record() 递增）：防抖 _flush 用它判断写入期间
+    # 是否有新变更，替代每轮第二份 asdict 全量快照 + 深比较
+    _stats_version: int = field(default=0, repr=False)
 
     def __post_init__(self) -> None:
         self.load_stats()
@@ -154,6 +157,10 @@ class RuntimeState:
                 await asyncio.sleep(delay)
             while True:
                 # 落盘是阻塞 I/O，放到线程池执行，避免阻塞事件循环。
+                # 写前记录脏版本号：此前用第二份 asdict + 深比较判断写入
+                # 期间是否有新变更，模型数撑大后是每轮两次全量快照的
+                # 周期性循环停顿；record() 里 +1 的整数计数等价且 O(1)。
+                version_at_write = self._stats_version
                 payload = {
                     model: asdict(item) for model, item in self.model_stats.items()
                 }
@@ -167,10 +174,7 @@ class RuntimeState:
                     # before shutdown writes a newer synchronous snapshot.
                     await write
                     raise
-                current = {
-                    model: asdict(item) for model, item in self.model_stats.items()
-                }
-                if payload == current:
+                if self._stats_version == version_at_write:
                     return
                 # 新请求在文件写入期间发生时，合并到下一轮快照中。
                 await asyncio.sleep(delay)
@@ -198,6 +202,7 @@ class RuntimeState:
             )
             return
         stats = self.model_stats[model]
+        self._stats_version += 1
         stats.requests += 1
         stats.last_used = datetime.now(_STATS_TZ).strftime("%Y-%m-%d %H:%M:%S")
 

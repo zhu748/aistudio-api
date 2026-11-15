@@ -525,9 +525,16 @@ class RequestMiddleware:
                 logger.exception("Failed to persist request start")
         if settings.request_history:
             try:
-                safe_record = _mask_json_value(record)
-                if isinstance(safe_record, dict):
-                    await asyncio.to_thread(request_history().insert, safe_record)
+
+                def _insert_masked() -> None:
+                    safe_record = _mask_json_value(record)
+                    if isinstance(safe_record, dict):
+                        request_history().insert(safe_record)
+
+                # 递归脱敏对整棵请求树逐字符串跑正则（events/attempts 满额时
+                # 毫秒级纯 CPU），与 SQLite 写入同在线程池执行，不再阻塞
+                # 事件循环。
+                await asyncio.to_thread(_insert_masked)
             except Exception:
                 logger.exception("Failed to persist request history")
         if dump_enabled:

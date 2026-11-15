@@ -37,7 +37,9 @@ class SSEEventBuffer:
     def _append(self, text: str) -> None:
         if not text:
             return
-        self._size += len(text.encode("utf-8"))
+        # ASCII 快路径：isascii() 是无分配的快速扫描，纯 ASCII 分片免去
+        # 一次全量 encode 分配；非 ASCII 仍按字节数计，限额语义不变。
+        self._size += len(text) if text.isascii() else len(text.encode("utf-8"))
         if self._size > self.max_bytes:
             raise ValueError("Gemini SSE event exceeds configured size limit")
         self._line.append(text)

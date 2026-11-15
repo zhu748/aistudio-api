@@ -735,6 +735,17 @@ def _function_declaration_name(declaration: dict[str, object]) -> str | None:
     return str(name) if name else None
 
 
+# 函数声明 → wire 编码的跨请求记忆化：Agent 客户端每请求原样重发完全相同
+# 的工具声明集合（数十个声明 × 每个 KB 级 schema），此前每声明每次都要
+# deepcopy + required 补全 + 递归 wire 编码，毫秒级 CPU × 声明数同步跑在
+# 事件循环上。以声明紧凑 JSON 为键缓存结果紧凑 JSON，命中经 json.loads
+# 返回全新对象（调用方任意突变不污染缓存）；键超限直接重算，防单个巨型
+# 声明撑爆缓存内存。编码链是纯函数（sha256 截短名确定性），结果可安全复用。
+_DECLARATION_CACHE_MAX = 128
+_DECLARATION_CACHE_MAX_KEY_BYTES = 256 * 1024
+_declaration_cache: dict[str, str] = {}
+
+
 def encode_function_declaration_to_wire(declaration: dict[str, object]) -> list[object]:
     """函数声明 → Playground wire 数组（AIStudio2API encodeFunctionDeclaration 移植）。
 
@@ -743,10 +754,26 @@ def encode_function_declaration_to_wire(declaration: dict[str, object]) -> list[
     - parameters 走 ``_encode_tool_parameters`` 降级链：编码失败降级为
       shape 而非整体 400，wire 无法表达的约束以完整 JSON Schema 附加到
       description；
-    - ``strict``（OpenAI strict mode）透传时同样附加完整 schema。
+    - ``strict``（OpenAI strict mode）透传时同样附加完整 schema；
+    - 同一声明（含 strict 标志，它取自声明本身）跨请求结果恒等，走
+      ``_declaration_cache`` 记忆化。
     """
     if isinstance(declaration.get("function"), dict):
         declaration = declaration["function"]  # type: ignore[assignment]
+    cache_key = ""
+    try:
+        key = json.dumps(declaration, ensure_ascii=False, separators=(",", ":"))
+        if len(key) <= _DECLARATION_CACHE_MAX_KEY_BYTES:
+            cache_key = key
+    except (TypeError, ValueError):
+        # 声明含非 JSON 类型（编程构造的极端入参）：跳过记忆化直接编码
+        cache_key = ""
+    if cache_key:
+        cached = _declaration_cache.get(cache_key)
+        if cached is not None:
+            # 命中即移到末尾：dict 插入序近似 LRU，与 _TIER_QUOTA_CACHE 同策略
+            _declaration_cache[cache_key] = _declaration_cache.pop(cache_key)
+            return json.loads(cached)
     name = _function_declaration_name(declaration)
     if not name:
         raise ValueError("functionDeclarations[].name is required")
@@ -772,7 +799,15 @@ def encode_function_declaration_to_wire(declaration: dict[str, object]) -> list[
         wire[2] = parameters
     if description:
         wire[1] = description
-    return wire.compact()
+    result = wire.compact()
+    if cache_key:
+        if len(_declaration_cache) >= _DECLARATION_CACHE_MAX:
+            for _ in range(_DECLARATION_CACHE_MAX // 2):
+                _declaration_cache.pop(next(iter(_declaration_cache)), None)
+        _declaration_cache[cache_key] = json.dumps(
+            result, ensure_ascii=False, separators=(",", ":")
+        )
+    return result
 
 
 def _normalize_gemini_modalities(

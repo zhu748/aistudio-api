@@ -477,3 +477,56 @@ def test_anti_truncation_registers_truncated_synthetic_name(monkeypatch):
     assert normalized.function_name_restore == {
         wire_function_name(long_tool): long_tool
     }
+
+
+# ───────────── 声明编码跨请求记忆化（性能优化：Agent 负载每请求重发相同声明） ─────────────
+
+
+def test_declaration_encoding_is_memoized_and_mutation_isolated():
+    """同一声明跨调用命中记忆化缓存；命中结果为全新对象，突变不污染缓存。"""
+    decl = {
+        "name": "memo_get_weather",
+        "description": "查询城市天气",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+            "required": ["city"],
+        },
+    }
+    from aistudio_api.application import chat_service as cs
+
+    first = cs.encode_function_declaration_to_wire(decl)
+    # 等值但非同一对象（模拟下一请求重新反序列化的声明）
+    second = cs.encode_function_declaration_to_wire(json.loads(json.dumps(decl)))
+    assert first == second
+    assert first is not second
+    # 突变命中结果不得影响后续调用
+    first.append("poison")
+    third = cs.encode_function_declaration_to_wire(json.loads(json.dumps(decl)))
+    assert third == second
+    assert "poison" not in third
+
+
+def test_declaration_cache_distinguishes_strict_flag():
+    """strict 取自声明本身：同一 schema 的 strict/非 strict 声明各自编码缓存。"""
+    base = {
+        "name": "memo_strict_check",
+        "parameters": {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+            "required": ["q"],
+        },
+    }
+    from aistudio_api.application import chat_service as cs
+
+    plain = cs.encode_function_declaration_to_wire(dict(base))
+    strict_decl = {**base, "strict": True}
+    strict = cs.encode_function_declaration_to_wire(json.loads(json.dumps(strict_decl)))
+    # strict 附加完整 schema 原文到 description，输出必须不同
+    assert plain != strict
+    # 各自缓存命中后仍稳定
+    assert cs.encode_function_declaration_to_wire(dict(base)) == plain
+    assert (
+        cs.encode_function_declaration_to_wire(json.loads(json.dumps(strict_decl)))
+        == strict
+    )
