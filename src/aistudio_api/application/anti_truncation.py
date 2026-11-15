@@ -702,17 +702,33 @@ class _StreamCallState:
 
 
 def _merge_content(state: _StreamCallState, new: str) -> str:
-    """合并新到的 content 片段，返回应作为正文增量下发的新文本。"""
-    prev = "".join(state.fragments)
-    if not prev:
+    """合并新到的 content 片段，返回应作为正文增量下发的新文本。
+
+    去重判定按片段游标推进（``new.startswith(frag, offset)`` 为 C 级比较，
+    且前缀长于 new 时 O(1) 失配），不再每事件 ``"".join`` 全量拼接——
+    增量追加模式下每个事件都重新拼接全部历史片段是 O(总字节×事件数)
+    的二次开销（长回答 + 多分片场景实测可达 MB 级冗余拷贝/事件）。
+    """
+    if not state.fragments:
         state.append(new)
         return new
-    if new.startswith(prev) and len(new) > len(prev):
-        # 上游重发了"到目前为止的全量"：只补发后缀。
-        state.fragments = [new]
-        state.size = len(new)
-        return new[len(prev) :]
-    if new == prev:
+    offset = 0
+    matched_all = True
+    for frag in state.fragments:
+        if new.startswith(frag, offset):
+            offset += len(frag)
+        else:
+            matched_all = False
+            break
+    if matched_all:
+        # 全量重发语义：new 以「到目前为止的完整正文」为前缀。
+        if len(new) > state.size:
+            # 只补发后缀。
+            suffix = new[offset:]
+            state.fragments = [new]
+            state.size = len(new)
+            return suffix
+        # 与已累积内容完全相同的全量重发：无增量。
         return ""
     # 增量追加模式。
     state.append(new)

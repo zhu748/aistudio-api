@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
@@ -767,7 +768,11 @@ async def import_cookies(
                         if probed and probed != "Free":
                             detected_tier = probed
     detected_tier = detected_tier or "Free"
-    account = account_service.save_account_from_cookies(
+    # save_account 是多文件原子写序列（auth/meta/registry + 兄弟账号 Cookie
+    # 同步会重读全部账号文件），直接在事件循环执行会拖停所有在途 SSE 流；
+    # AccountStore 自身线程安全（全程持锁设计），下放线程池执行。
+    account = await asyncio.to_thread(
+        account_service.save_account_from_cookies,
         name=name,
         email=detected_email,
         storage_state=storage_state,
@@ -1002,7 +1007,10 @@ async def import_bundle(
         acc_tier = acc_tier or "Free"
         cid = f"cookie_{secrets.token_hex(4)}"
 
-        account = account_service.save_account_from_cookies(
+        # 同上：批量导入逐账号的多文件写序列下放线程池，避免循环串行
+        # 阻塞整个导入期间的事件循环。
+        account = await asyncio.to_thread(
+            account_service.save_account_from_cookies,
             name=acc_name,
             email=acc_email,
             storage_state=storage_state,

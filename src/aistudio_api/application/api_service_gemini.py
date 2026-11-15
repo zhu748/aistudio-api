@@ -216,8 +216,15 @@ class Auth403RetryManager:
                     try:
                         session = getattr(client, "session", None)
                         await account_svc.rotate_account_cookies(target_acc.id, session)
-                    except Exception:
-                        pass
+                    except Exception as rot_err:
+                        # 轮换失败必须留痕：重签跳的前提是拿到新滚动 Cookie
+                        # （__Secure-1PSIDTS），静默吞掉会让第 3-4 跳“看起来
+                        # 在工作”而实际拿旧 Cookie 空转，排障无从下手。
+                        logger.warning(
+                            "403 重签前 Cookie 轮换失败 (account=%s): %s",
+                            target_acc.id,
+                            rot_err,
+                        )
             logger.warning(
                 "HTTP 403 重试 (%d/2 重签): model=%s",
                 self.count - 2,
@@ -456,7 +463,7 @@ async def handle_attempt_exception(
                             )
                             return True
             except Exception as rot_err:
-                logger.debug("401 Cookie 轮换探测异常: %s", rot_err)
+                logger.warning("401 Cookie 轮换探测异常: %s", rot_err)
 
         logger.warning("账号登录态已失效: account=%s, %s", failed_id, exc)
         if not has_yielded_data and await try_switch_account(
@@ -706,17 +713,23 @@ async def handle_gemini_generate_content(
     # 本次请求实际服务的账号（3.9）：在每次尝试发送前刷新，收尾记账用它，
     # 避免并发请求切号后把结果记到无关账号头上。
     serving_account_id: str | None = None
-
+    normalized = None
+    at_ctx = None
     for attempt in range(total_attempts):
         await ensure_active_account(attempt, model=model_path)
         _svc = runtime_state.account_service
         _acc = _svc.get_active_account() if _svc else None
         serving_account_id = _acc.id if _acc else None
         auth_manager.serving_account_id = serving_account_id
-        normalized = None
         try:
-            normalized = normalize_gemini_request(req, model_path)
-            at_ctx = prepare_anti_truncation(normalized, override=anti_truncation)
+            # 归一化与抗截断注入只随请求变化、与重试尝试无关（prepare 会
+            # 原地改写 normalized：contents 注入指令 / tools 追加声明）。
+            # 逐尝试重建会让带大工具 schema 的请求在 403 阶梯重放跳（复用
+            # 已签名请求、归一化产物被整体丢弃）白付全量 deepcopy+编码。
+            if normalized is None:
+                normalized = normalize_gemini_request(req, model_path)
+                at_ctx = prepare_anti_truncation(normalized, override=anti_truncation)
+            assert at_ctx is not None  # 与 normalized 同步初始化
             logger.info(
                 "非流式请求: model=%s, 轮数=%d, 尝试=%d/%d",
                 normalized.model,
@@ -1052,26 +1065,32 @@ def _build_gemini_streaming_response(
 
     async def stream_response() -> AsyncGenerator[dict[str, object], None]:
         normalized = None
+        at_ctx = None
         stream_start_time = time.perf_counter()
         has_yielded_any = False
+        # 断连/取消路径的记账幂等标记：正常成功块与异常块各自置位，
+        # finally 仅在两者都未触达（GeneratorExit/CancelledError）时补记。
+        accounting_recorded = False
+        # finally 兜底记账引用的循环内状态：在 try 之前初始化，断连或
+        # 异常发生在首次赋值之前也不会出现未绑定名。
+        has_yielded_data = False
+        final_usage: dict[str, object] | None = None
+        final_finish_reason: str = "STOP"
+        serving_account_id: str | None = None
         try:
             logger.info(
                 "流式请求: model=%s, 轮数=%d",
                 model_path,
                 len(req.contents),
             )
-            final_usage: dict[str, object] | None = None
-            final_finish_reason: str = "STOP"
+            final_usage = None
+            final_finish_reason = "STOP"
             latest_response_id: str | None = None
             stream_completed = False
             last_stream_error: Exception | None = None
-            # 预先初始化，避免循环零次执行时下方引用被判 possibly-unbound
-            has_yielded_data = False
             auth_manager = Auth403RetryManager()
             transient_failures = 0
             total_attempts = get_max_retries() + AUTH_403_MAX_RETRIES
-            # 本次请求实际服务的账号（3.9）：同非流式路径
-            serving_account_id: str | None = None
             for stream_attempt in range(total_attempts):
                 has_yielded_data = False
                 last_stream_error = None
@@ -1084,8 +1103,15 @@ def _build_gemini_streaming_response(
                 _acc = _svc.get_active_account() if _svc else None
                 serving_account_id = _acc.id if _acc else None
                 auth_manager.serving_account_id = serving_account_id
-                normalized = normalize_gemini_request(req, model_path)
-                at_ctx = prepare_anti_truncation(normalized, override=anti_truncation)
+                # 归一化与抗截断注入只随请求变化、与重试尝试无关（同非
+                # 流式路径：逐尝试重建在 403 重放跳是纯浪费，且 prepare
+                # 会原地注入、必须只执行一次）。
+                if normalized is None:
+                    normalized = normalize_gemini_request(req, model_path)
+                    at_ctx = prepare_anti_truncation(
+                        normalized, override=anti_truncation
+                    )
+                assert at_ctx is not None  # 与 normalized 同步初始化
                 try:
                     if force_buffer:
                         # 非流式抗截断变体：上游改走缓冲（非流式）传输，
@@ -1263,11 +1289,14 @@ def _build_gemini_streaming_response(
                     if observation and observation.account_id:
                         serving_account_id = observation.account_id
                         auth_manager.serving_account_id = serving_account_id
-                    if (
-                        isinstance(exc, AuthError)
-                        and not isinstance(exc, SessionExpiredError)
-                        and not has_yielded_data
+                    if isinstance(exc, AuthError) and not isinstance(
+                        exc, SessionExpiredError
                     ):
+                        # 403 全量经 handle_403 分流（含已产出数据的中途 403）：
+                        # 其 has_yielded_data 分支记 proof-accepted 信号并直接
+                        # 上抛。原先已产出后绕行 handle_attempt_exception 会对
+                        # 同一请求再记一次 auth_error（双重 200 权重惩罚），
+                        # 且令 handle_403 的 post-yield 分支成为死代码。
                         target_m = normalized.model if normalized else model_path
                         if await auth_manager.handle_403(
                             exc,
@@ -1338,6 +1367,7 @@ def _build_gemini_streaming_response(
                     usage=final_usage,
                     finish_reason=final_finish_reason,
                 )
+            accounting_recorded = True
             elapsed_total_ms = (time.perf_counter() - stream_start_time) * 1000
             pt = final_usage.get("prompt_tokens") if final_usage else 0
             ct = final_usage.get("completion_tokens") if final_usage else 0
@@ -1356,6 +1386,10 @@ def _build_gemini_streaming_response(
                 response_id=latest_response_id,
             )
         except Exception as exc:
+            # 异常路径的 rotator/统计记账已由 handle_attempt_exception 或
+            # handle_403 按尝试完成，这里只负责错误事件下发；先置位标记，
+            # 防止断连打断错误帧下发时 finally 再补记一次。
+            accounting_recorded = True
             elapsed_ms = (time.perf_counter() - stream_start_time) * 1000
             code, msg, status_str = classify_gemini_error_payload(exc)
             record_result("rate_limited" if code == 429 else "error", error=msg)
@@ -1378,6 +1412,34 @@ def _build_gemini_streaming_response(
                 if error_text_chunk:
                     yield error_text_chunk
             yield _error_payload(exc)
+        finally:
+            # 客户端断连（GeneratorExit）/任务取消（CancelledError）都不是
+            # Exception 子类，上方的成功记账块与异常块都执行不到——此前
+            # 每次断连都会丢失调度记账：成功流不计入账号健康度与
+            # daily_models 配额统计（选路权重失真），已通过的 proof 也不
+            # 上报签名器健康信号。此处兜底补记：已产出内容按 success 记
+            # 账（账号确实完成了服务）；零产出且无上游异常时不记（客户
+            # 端主动放弃不应惩罚账号）。记账全部为同步调用，在
+            # GeneratorExit 传播中执行安全（此路径严禁再 yield）。
+            if not accounting_recorded and has_yielded_data and normalized is not None:
+                with contextlib.suppress(Exception):
+                    record_rotator_event(
+                        "success",
+                        model=normalized.model,
+                        usage=final_usage,
+                        account_id=serving_account_id,
+                    )
+                    get_signer_health().record_proof_accepted(serving_account_id)
+                    runtime_state.record(
+                        normalized.model,
+                        "success",
+                        usage=final_usage,
+                        finish_reason=final_finish_reason,
+                    )
+                    logger.info(
+                        "流式因客户端断连提前结束，已按已产出内容补记调度账: model=%s",
+                        normalized.model,
+                    )
 
     return GeminiStreamResponse(stream_response())
 

@@ -36,6 +36,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from aistudio_api.infrastructure.utils.common import atomic_write_text
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("upstream-dump")
@@ -278,8 +279,14 @@ def save_upstream_exchange(
             if not is_model_rpc and target.exists():
                 # 辅助 RPC 失败不得覆盖主调用（或先到失败现场）的快照。
                 return None
-        target.write_text(
-            json.dumps(snapshot, ensure_ascii=False, indent=1), encoding="utf-8"
+        # 原子写（临时文件+rename）：SIGKILL 窗口留下的半截快照会让
+        # 请求详情页的 json.loads 静默报“无上游交换快照”，恰好丢掉本模块
+        # 要保留的错误现场。与同目录的请求 dump 落盘（logger.dump_request_
+        # exchange → atomic_write_json private=True）同一契约。
+        atomic_write_text(
+            target,
+            json.dumps(snapshot, ensure_ascii=False, indent=1),
+            private=True,
         )
         if success:
             _prune_success_snapshots(dump_dir, upstream_snapshot_keep())

@@ -594,10 +594,15 @@ class WaaSigner:
                 self._proof_cache.pop(key, None)
 
         # 2) 未命中：走远程签名服务。
-        remote = self._remote_signer
-        self._active_signers[remote] = self._active_signers.get(remote, 0) + 1
-        idle = self._signer_idle.setdefault(remote, asyncio.Event())
-        idle.clear()
+        # 租约登记与 reconfigure 的实例替换互斥（同 transport._lease_client
+        # 模式）：读取 _remote_signer 与登记租籍之间若被热切换插队，旧实例
+        # 的在途租约可能已全部排空并触发延迟关闭，把仍在 mint 的请求击落
+        # 在已关闭的签名器上（Proof signer is closed）。
+        async with self._get_reconfigure_lock():
+            remote = self._remote_signer
+            self._active_signers[remote] = self._active_signers.get(remote, 0) + 1
+            idle = self._signer_idle.setdefault(remote, asyncio.Event())
+            idle.clear()
         try:
             proof = await remote.mint_proof(
                 cookies=cookies,

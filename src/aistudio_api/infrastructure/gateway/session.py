@@ -50,35 +50,6 @@ _BROWSER_COUNTTOKENS_FOLLOWUP = os.getenv(
 _PAGE_COUNT_TOKENS_DELAY = 2.2
 
 
-def extract_page_prompt(body: str) -> str:
-    """从 GenerateContent wire 请求体提取当前用户轮次文本（页面提示词）。
-
-    与 Go countTokensBody 的 PagePrompt 语义一致：contents 槽中最后一个
-    user 角色内容的首个文本 part。找不到时返回空串（跳过后续行为）。
-    """
-    try:
-        parsed = json.loads(body)
-    except (json.JSONDecodeError, TypeError):
-        return ""
-    if not isinstance(parsed, list) or len(parsed) < 2:
-        return ""
-    contents = parsed[1]
-    if not isinstance(contents, list):
-        return ""
-    for raw_content in reversed(contents):
-        if not isinstance(raw_content, list) or len(raw_content) < 2:
-            continue
-        if raw_content[-1] != "user":
-            continue
-        parts = raw_content[0]
-        if not isinstance(parts, list) or not parts:
-            continue
-        part = parts[0]
-        if isinstance(part, list) and len(part) > 1 and isinstance(part[1], str):
-            return part[1]
-    return ""
-
-
 @dataclass
 class SessionContext:
     """Encapsulates active authentication context and metadata for AI Studio gateway."""
@@ -130,6 +101,12 @@ class GatewaySession:
         self._tier: str | None = None
         self._active_context: SessionContext | None = None
         self._transport = HTTPStreamTransport(proxy_url=settings.proxy_url)
+        # 账号切换互斥锁（按事件循环惰性创建，同 transport._get_client_lock
+        # 模式）：ensure_ready 的检查与 transition 的多字段写入若不互斥，
+        # 并发切换（管理端 switch_auth 撞上请求路径 ensure_ready）会让
+        # 镜像字段与 active_context 出现跨身份混读。
+        self._transition_lock: asyncio.Lock | None = None
+        self._transition_lock_loop: asyncio.AbstractEventLoop | None = None
         # 页面行为后台任务（GenerateContent 后 +2.2s CountTokens 补发）
         self._background_followups: set[asyncio.Task[None]] = set()
         from aistudio_api.infrastructure.gateway.model_defaults import (
@@ -172,12 +149,23 @@ class GatewaySession:
         self._tier = context.tier
         self._active_context = context
 
+    def _get_transition_lock(self) -> asyncio.Lock:
+        """返回与当前事件循环绑定的账号切换互斥锁。"""
+        loop = asyncio.get_running_loop()
+        if self._transition_lock is None or self._transition_lock_loop is not loop:
+            self._transition_lock = asyncio.Lock()
+            self._transition_lock_loop = loop
+        return self._transition_lock
+
     def get_current_auth_user(self) -> str:
         """Get auth_user index of active account."""
-        if self._auth_user is not None:
-            return self._auth_user
+        # 优先读 context（单一事实源）：transition 先写镜像字段、最后原子
+        # 赋值 _active_context，读者要么看到旧身份要么看到新身份，不会
+        # 撞上“新 auth_user + 旧 context”的撕裂窗口（与 get_current_tier 一致）。
         if self._active_context is not None:
             return self._active_context.auth_user
+        if self._auth_user is not None:
+            return self._auth_user
         return get_auth_user_from_meta(self._auth_file)
 
     def get_current_tier(self) -> str:
@@ -210,45 +198,58 @@ class GatewaySession:
     async def transition_to_account(
         self, auth_file: str | None, force_refresh: bool = False
     ) -> SessionContext:
-        """Execute instantaneous in-memory session transition."""
+        """Execute instantaneous in-memory session transition.
+
+        全程持切换锁：两个并发切换（管理端 switch_auth 撞上请求路径
+        ensure_ready 的冷启动/失效重转）交错执行时，四个分离赋值会让
+        并发读者观察到混合身份。同步凭据读取一并下放线程池（本类对
+        同一批文件的写路径已全部经由 to_thread，读路径对齐同一约束）。
+        """
         self._ensure_open()
-        if (
-            not force_refresh
-            and self.is_ready
-            and self._active_context is not None
-            and self._active_context.auth_file == auth_file
-        ):
-            return self._active_context
+        async with self._get_transition_lock():
+            # 双重检查：并发协程可能已完成同一目标账号的切换
+            if (
+                not force_refresh
+                and self.is_ready
+                and self._active_context is not None
+                and self._active_context.auth_file == auth_file
+            ):
+                return self._active_context
 
-        # 一次读 meta.json 取出三个字段：原先分别调用三个 get_*_from_meta
-        # 会把同一个文件解析三遍（实测约 0.28ms 纯浪费，且是同步 IO）。
-        target_meta = load_account_meta(auth_file)
-        target_auth_user = str(target_meta.get("auth_user") or "0")
-        raw_tier = target_meta.get("tier")
-        target_tier = normalize_benefit_tier(str(raw_tier or "Free"))
-        raw_proxy = target_meta.get("proxy_url")
-        target_proxy = normalize_proxy_url(str(raw_proxy)) if raw_proxy else None
-        cookies = load_cookies_from_auth_file(auth_file)
+            # 一次读 meta.json 取出三个字段：原先分别调用三个 get_*_from_meta
+            # 会把同一个文件解析三遍（实测约 0.28ms 纯浪费，且是同步 IO）。
+            target_meta, cookies = await asyncio.gather(
+                asyncio.to_thread(load_account_meta, auth_file),
+                asyncio.to_thread(load_cookies_from_auth_file, auth_file),
+            )
+            target_auth_user = str(target_meta.get("auth_user") or "0")
+            raw_tier = target_meta.get("tier")
+            target_tier = normalize_benefit_tier(str(raw_tier or "Free"))
+            raw_proxy = target_meta.get("proxy_url")
+            target_proxy = normalize_proxy_url(str(raw_proxy)) if raw_proxy else None
 
-        self._auth_file = auth_file
-        self._auth_user = target_auth_user
-        self._tier = target_tier
+            # 镜像字段先写、_active_context 最后单点赋值：无锁读者优先读
+            # context（见 get_current_auth_user/get_current_tier），切换在
+            # context 赋值瞬间原子生效。
+            self._auth_file = auth_file
+            self._auth_user = target_auth_user
+            self._tier = target_tier
 
-        new_context = SessionContext(
-            auth_user=target_auth_user,
-            auth_file=auth_file,
-            tier=target_tier,
-            cookies=cookies,
-            proxy_url=target_proxy,
-        )
-        self._active_context = new_context
-        log.info(
-            "会话已切换: auth_file=%s, u/%s, tier=%s",
-            auth_file,
-            target_auth_user,
-            target_tier,
-        )
-        return new_context
+            new_context = SessionContext(
+                auth_user=target_auth_user,
+                auth_file=auth_file,
+                tier=target_tier,
+                cookies=cookies,
+                proxy_url=target_proxy,
+            )
+            self._active_context = new_context
+            log.info(
+                "会话已切换: auth_file=%s, u/%s, tier=%s",
+                auth_file,
+                target_auth_user,
+                target_tier,
+            )
+            return new_context
 
     async def generate_snapshot(
         self,
@@ -276,7 +277,11 @@ class GatewaySession:
                     await res
 
         if not active_ctx.cookies and active_ctx.auth_file:
-            active_ctx.cookies = load_cookies_from_auth_file(active_ctx.auth_file)
+            # 惰性补载同样下放线程池：事件循环内同步读凭据文件与写路径
+            # 的既定约束相悖（transition/transport 均已 to_thread）。
+            active_ctx.cookies = await asyncio.to_thread(
+                load_cookies_from_auth_file, active_ctx.auth_file
+            )
         cookies = active_ctx.cookies
         auth_user = active_ctx.auth_user or "0"
         tier = active_ctx.tier or "Free"

@@ -2124,6 +2124,10 @@ async def claude_stream_adapter(
                 ):
                     # A retained text prefix belongs before this next block.
                     tail = stops.feed("", final=True)
+                    # 边界冲刷同样可能恰好补完停止序列：立即同步命中状态，
+                    # 否则 finish() 读不到 stop_hit，会按 finish_reason 推导出
+                    # tool_use/end_turn 等与「正文已截断」矛盾的终止元数据。
+                    emitter.stop_hit = stops.hit
                     if tail:
                         for event in emitter.text_delta(tail):
                             yield event
@@ -2179,6 +2183,8 @@ async def claude_stream_adapter(
         return
     else:
         tail = stops.feed("", final=True)
+        # 收尾冲刷若恰好补完停止序列，同样要同步命中状态（见上方边界冲刷）。
+        emitter.stop_hit = stops.hit
         if tail:
             for event in emitter.text_delta(tail):
                 yield event

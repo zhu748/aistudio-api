@@ -17,7 +17,6 @@ from aistudio_api.domain.errors import (
 from aistudio_api.infrastructure.gateway.client import PreparedRequest
 from aistudio_api.infrastructure.gateway.session import (
     GatewaySession,
-    extract_page_prompt,
 )
 from aistudio_api.infrastructure.gateway.stream_parser import (
     IncrementalJSONStreamParser,
@@ -71,13 +70,14 @@ class StreamingGateway:
             request.model_turn.capture() if request.model_turn is not None else None
         )
         # 真实页面行为：GenerateContent 发出 2.2s 后补一次 CountTokens
-        # （当前用户轮次；Go 签名器 SendProtected 同源行为）
+        # （当前用户轮次；Go 签名器 SendProtected 同源行为）。page_prompt
+        # 在 prepare_request 已从 typed contents 提取，无需重新解析 body。
         if request.url.rstrip("/").endswith("/GenerateContent"):
             scheduler = getattr(
                 self._session, "schedule_browser_counttokens_followup", None
             )
             if callable(scheduler):
-                scheduler(request.ctx, model, extract_page_prompt(request_body))
+                scheduler(request.ctx, model, request.page_prompt)
         parser = IncrementalJSONStreamParser()
         utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
         latest_usage: dict[str, object] | None = None

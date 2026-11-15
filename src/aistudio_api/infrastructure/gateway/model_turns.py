@@ -44,7 +44,10 @@ def _digest(previous: str, model: bool, parts: list[AistudioPart]) -> str:
             text.clear()
 
     for part in parts:
-        wire = part.to_wire()
+        # raw_wire 仅被只读检查（parse_response_part 不改写入参，签名位
+        # 归零在浅拷贝 visible 上进行），无需 to_wire 的整树 deepcopy——
+        # store() 对捕获轮的每个 part 深拷贝曾占摘要计算的大头。
+        wire = part.raw_wire if part.raw_wire is not None else part.to_wire()
         parsed = parse_response_part(wire)
         if parsed.thought:
             continue

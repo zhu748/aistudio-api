@@ -39,6 +39,11 @@ from aistudio_api.infrastructure.utils.upstream_dump import (
 
 logger = get_logger("transport")
 
+# 非流式响应体读取上限：与流式解析器（stream_parser）的总块上限对齐。
+# 足以容纳合法的大体积多模态响应，同时防住异常上游/中间层用巨型错误
+# 页按并发数放大内存占用（流式路径的错误样本硬限 64KiB，aread 无界）。
+_MAX_NONSTREAM_BODY_BYTES = 64 * 1024 * 1024
+
 __all__ = [
     "HTTPStreamTransport",
     "strip_to_aistudio_fingerprint",
@@ -566,6 +571,10 @@ class HTTPStreamTransport:
     # - CORS 预检缓存：Access-Control-Max-Age 上限 24h（Firefox 行为），
     #   缺省回退 5s（Go 同值）；预检失败也缓存 5s，避免每请求一次 OPTIONS 风暴
     _FIREFOX_MAX_CONNECTIONS = 6
+    # h2 缺失时的 H1 降级并发上限：每个在途生成独占一条连接直至完成，
+    # 6 连接 + 30s pool 超时会让第 7 个并发请求排队失败（可用性优先于
+    # H1 模式下本就无法达成的浏览器连接指纹）。
+    _H1_FALLBACK_MAX_CONNECTIONS = 32
     _PREFLIGHT_MAX_AGE_CAP = 24.0 * 3600.0
     _PREFLIGHT_FALLBACK_MAX_AGE = 5.0
 
@@ -762,7 +771,9 @@ class HTTPStreamTransport:
                 verify=_shared_ssl_context(),
                 limits=httpx.Limits(
                     max_keepalive_connections=self._FIREFOX_MAX_CONNECTIONS,
-                    max_connections=self._FIREFOX_MAX_CONNECTIONS,
+                    max_connections=self._FIREFOX_MAX_CONNECTIONS
+                    if _http2_enabled()
+                    else self._H1_FALLBACK_MAX_CONNECTIONS,
                 ),
             )
             self._clients[key] = client
@@ -943,20 +954,28 @@ class HTTPStreamTransport:
                 # its cleanup cannot be shielded by this transport otherwise.
                 resp = await client.send(request, stream=True, auth=None)
                 _protect_response_close(resp)
-                await resp.aread()
+                # 有界读入（替代无界 resp.aread）：超限抛 TransportError，
+                # 由下方 except 统一归类，finally 仍确定性关闭响应。
+                body_buffer = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    body_buffer.extend(chunk)
+                    if len(body_buffer) > _MAX_NONSTREAM_BODY_BYTES:
+                        raise TransportError(
+                            "upstream response exceeds maximum body size"
+                        )
+                content = bytes(body_buffer)
                 # Set-Cookie 回写下放线程池（3.4）：逐账号读盘/写盘的同步 I/O
-                # 若留在事件循环内会拖慢所有并发请求的首字延迟。
+                # 若留在事件循环内会拖慢所有并发请求的首字延迟。与流式路径
+                # 同款后台落盘，关停时由 _flush_cookie_persist 兜底排空。
                 set_cookies = resp.headers.get_list("set-cookie")
                 if set_cookies:
-                    await asyncio.to_thread(
-                        _persist_set_cookies, set_cookies, auth_file, cookies
-                    )
+                    self._schedule_cookie_persist(set_cookies, auth_file, cookies)
                 elapsed_ms = (time.perf_counter() - t0) * 1000
                 logger.debug(
                     "请求完成: status=%d, 耗时=%.1fms, 响应长度=%d",
                     resp.status_code,
                     elapsed_ms,
-                    len(resp.content),
+                    len(content),
                 )
                 # 交换快照：成功与失败均采集（函数内部按 RPC 类型与保留策略
                 # 决定落盘形态；httpx 最末请求头 multi_items 保真实线缆顺序）
@@ -966,13 +985,13 @@ class HTTPStreamTransport:
                     wire_headers=list(request.headers.multi_items()),
                     body=body,
                     status=resp.status_code,
-                    response_sample=resp.content,
+                    response_sample=content,
                     response_headers=dict(resp.headers.multi_items()),
                     response_http_version=resp.http_version,
                     elapsed_ms=elapsed_ms,
                     proxy_url=effective_proxy,
                 )
-                return resp.status_code, resp.content
+                return resp.status_code, content
             except Exception as exc:
                 err_detail = (
                     f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
