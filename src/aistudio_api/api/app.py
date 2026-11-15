@@ -15,6 +15,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from aistudio_api.application.api_service_gemini import classify_gemini_error_payload
 from aistudio_api.application.compat_service import build_compat_error_response
@@ -484,6 +485,37 @@ async def auth_check():
     from aistudio_api.api.dependencies import web_auth_required
 
     return {"auth_enabled": web_auth_required()}
+
+
+class CreateWebSessionRequest(BaseModel):
+    password: str
+
+
+@app.post("/auth/session")
+async def create_web_session(req: CreateWebSessionRequest, request: Request):
+    """管理密码换取持久会话令牌（浏览器重开免密登录）。
+
+    前端把返回的会话令牌（而非管理密码本身）持久化在 localStorage：
+    令牌为随机会话凭据，30 天过期、换密码即全部失效。仅配置 API Key
+    的部署回退为核验后直接持久化该 Key（本就是长期凭据）。
+    """
+    from aistudio_api.api.dependencies import verify_web_login_or_401
+    from aistudio_api.infrastructure.web_sessions import (
+        SESSION_TTL_SECONDS,
+        issue_web_session,
+    )
+
+    credential = req.password.strip()
+    client_ip = request.client.host if request.client else "unknown"
+    kind = verify_web_login_or_401(credential, client_ip)
+    if kind == "password":
+        token, expires_at = issue_web_session(credential)
+        return {"ok": True, "token": token, "expires_at": expires_at}
+    return {
+        "ok": True,
+        "token": credential,
+        "expires_at": time.time() + SESSION_TTL_SECONDS,
+    }
 
 
 @app.middleware("http")

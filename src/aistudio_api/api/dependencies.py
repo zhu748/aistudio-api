@@ -15,6 +15,7 @@ from aistudio_api.config import settings
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.request_context import current_request
 from aistudio_api.infrastructure.utils.logger import get_logger
+from aistudio_api.infrastructure.web_sessions import validate_web_session
 
 from .state import runtime_state
 
@@ -81,6 +82,38 @@ def web_auth_required() -> bool:
     API Key”这一最常见部署形态下管理面板完全开放。
     """
     return bool((settings.web_password or "").strip() or _all_configured_api_keys())
+
+
+def verify_web_login_or_401(credential: str, client_ip: str) -> str:
+    """核验管理端登录凭据，返回凭据类型（"password" / "api_key"）。
+
+    供 /auth/session 换取持久会话令牌使用：与 require_web_auth 共享同一
+    401 限流计数，防止绕开面板直接爆破会话签发端点。
+    """
+    web_password = (settings.web_password or "").strip()
+    if _register_auth_failure_and_check(client_ip):
+        raise HTTPException(429, "管理端鉴权失败次数过多，请 1 分钟后重试")
+    if web_password:
+        if secrets.compare_digest(
+            credential.encode("utf-8"), _encode_secret(web_password)
+        ):
+            _reset_auth_failures(client_ip)
+            return "password"
+    else:
+        # 无管理密码时的对称回退：API Key 持有者可登录（与 require_web_auth 一致）
+        credential_bytes = credential.encode("utf-8")
+        if any(
+            secrets.compare_digest(credential_bytes, candidate)
+            for candidate in _encoded_keys(_all_configured_api_keys())
+        ):
+            _reset_auth_failures(client_ip)
+            return "api_key"
+    logger.warning("管理控制台鉴权失败: 客户端=%s（会话签发）", client_ip)
+    raise HTTPException(
+        status_code=401,
+        detail="管理控制台鉴权失败，请输入正确的管理密码",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 @lru_cache(maxsize=32)
@@ -233,6 +266,11 @@ def require_web_auth(request: Request) -> None:
         if secrets.compare_digest(token.encode("utf-8"), _encode_secret(web_password)):
             _reset_auth_failures(client_ip)
             return
+        # 持久会话令牌（/auth/session 签发，与密码分离的随机凭据）：
+        # 过期或换密码后自动失效，浏览器重开免密登录由此实现
+        if validate_web_session(token, web_password):
+            _reset_auth_failures(client_ip)
+            return
     else:
         # 无管理密码时的对称回退：任意有效 API Key 可进入管理端（只读）
         token_bytes = token.encode("utf-8")
@@ -285,9 +323,10 @@ def is_management_session(request: Request) -> bool:
         return False
     web_password = (settings.web_password or "").strip()
     if web_password:
-        return secrets.compare_digest(
-            token.encode("utf-8"), _encode_secret(web_password)
-        )
+        if secrets.compare_digest(token.encode("utf-8"), _encode_secret(web_password)):
+            return True
+        # 会话令牌持有者等同于密码持有者（令牌仅签发给通过密码核验的调用方）
+        return validate_web_session(token, web_password)
     token_bytes = token.encode("utf-8")
     return any(
         secrets.compare_digest(token_bytes, candidate)
@@ -305,10 +344,12 @@ def is_admin_password_session(request: Request) -> bool:
     if not web_password:
         return False
     token = _extract_request_token(request, include_query=False)
-    return bool(
-        token
-        and secrets.compare_digest(token.encode("utf-8"), _encode_secret(web_password))
-    )
+    if not token:
+        return False
+    if secrets.compare_digest(token.encode("utf-8"), _encode_secret(web_password)):
+        return True
+    # 会话令牌即密码核验后的凭据，同样视为管理密码会话
+    return validate_web_session(token, web_password)
 
 
 def require_api_key(request: Request) -> None:
