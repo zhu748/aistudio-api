@@ -12,6 +12,7 @@ from typing import cast
 from uuid import uuid4
 
 from fastapi import HTTPException
+from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from aistudio_api.config import settings
@@ -36,6 +37,28 @@ from aistudio_api.infrastructure.utils.logger import (
 from aistudio_api.infrastructure.utils.redaction import redact_text
 
 logger = get_logger("requests")
+
+
+def _is_terminal_event(path: str, body: bytes) -> bool:
+    """Recognize complete frames emitted by our compatibility adapters.
+
+    Only inspect SSE control lines, never model text inside JSON. Adapters emit
+    each event in one ASGI body message, including large tool argument events.
+    """
+    if path == "/v1/chat/completions":
+        return body == b"data: [DONE]\n\n"
+    if path == "/v1/messages":
+        return body.startswith((b"event: message_stop\n", b"event: error\n"))
+    if path == "/v1/responses":
+        return body.startswith(
+            (
+                b"event: response.completed\n",
+                b"event: response.incomplete\n",
+                b"event: response.failed\n",
+                b"event: error\n",
+            )
+        )
+    return False
 
 
 class RequestMiddleware:
@@ -83,6 +106,9 @@ class RequestMiddleware:
         token = current_request.set(context)
         started_at, started = time.time(), time.perf_counter()
         status, response_started, completed = 500, False, False
+        sending = False
+        json_payload_sent = False
+        stream_terminal_sent = False
         is_stream = False
         first_byte_ms: float | None = None
         received_bytes = 0
@@ -140,6 +166,9 @@ class RequestMiddleware:
             message = await receive()
             if message["type"] == "http.disconnect" and not completed:
                 context.result = "cancelled"
+                context.error = "Downstream disconnected (client or reverse proxy)"
+                if model_call:
+                    request_event("disconnected", context.error)
             elif message["type"] == "http.request":
                 body = message.get("body", b"")
                 received_bytes += len(body)
@@ -183,7 +212,10 @@ class RequestMiddleware:
                 is_stream, \
                 first_byte_ms, \
                 response_headers, \
-                response_body_truncated
+                response_body_truncated, \
+                sending, \
+                json_payload_sent, \
+                stream_terminal_sent
             if message["type"] == "http.response.start":
                 response_started = True
                 status = message["status"]
@@ -217,9 +249,31 @@ class RequestMiddleware:
                     else:
                         response_body.clear()
                         response_body_truncated = True
+            sending = True
+            if model_call:
+                try:
+                    # Bound the actual socket send outside BaseHTTPMiddleware's
+                    # memory channels, including the final timeout error body.
+                    async with asyncio.timeout(settings.stream_send_timeout):
+                        await send(message)
+                except TimeoutError as exc:
+                    context.result = "cancelled"
+                    context.error = "Downstream response send timed out"
+                    raise OSError(context.error) from exc
+            else:
+                await send(message)
+            sending = False
+            if message["type"] == "http.response.body":
                 if not message.get("more_body", False):
                     completed = True
-            await send(message)
+                if is_stream and _is_terminal_event(path, message.get("body", b"")):
+                    stream_terminal_sent = True
+                if (
+                    not is_stream
+                    and scope.get("state", {}).get("json_keepalive_failure")
+                    and message.get("body", b"").strip()
+                ):
+                    json_payload_sent = True
 
         try:
             # Reserve a slot before the first await, including history I/O.
@@ -272,13 +326,35 @@ class RequestMiddleware:
                 else:
                     raise
                 return
+            if sending:
+                # The transport may have delivered part of this frame already.
+                # Never append an error to an interrupted JSON/SSE write.
+                context.result = "cancelled"
+                context.error = "Request timeout interrupted downstream send"
+                raise OSError(context.error) from None
+            if completed:
+                return
+            if json_payload_sent or stream_terminal_sent:
+                # The result or terminal event has reached ASGI send. Only end
+                # HTTP; appending an error would corrupt or contradict it.
+                await observed_send({"type": "http.response.body", "body": b""})
+                return
             context.result, context.error = "timeout", "Request exceeded total timeout"
             if not response_started:
                 await reply(504, context.error)
             else:
+                json_failure = scope.get("state", {}).get("json_keepalive_failure")
+                if not is_stream and callable(json_failure):
+                    body = cast(Callable[[str], bytes], json_failure)(context.error)
+                    await observed_send({"type": "http.response.body", "body": body})
+                    return
                 failure = scope.get("state", {}).get("stream_failure")
                 if is_stream and callable(failure):
                     chunks = cast(Callable[[str], list[str]], failure)(context.error)
+                    # An idempotent error handler may have nothing left to emit.
+                    # Still send the final HTTP body so clients do not hang.
+                    if not chunks:
+                        chunks = [""]
                     for index, chunk in enumerate(chunks):
                         await observed_send(
                             {
@@ -296,8 +372,10 @@ class RequestMiddleware:
                         else b"",
                     }
                 )
-        except OSError:
+        except (OSError, ClientDisconnect):
             context.result = "cancelled"
+            if not context.error:
+                context.error = "Downstream disconnected (client or reverse proxy)"
             raise
         except Exception:
             context.result, context.error = "error", "Internal server error"

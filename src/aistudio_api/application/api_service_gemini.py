@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
+import random
 import re
 import time
 from collections.abc import AsyncGenerator
 
 from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import StreamingResponse
 
+from aistudio_api.api.keepalive import STREAM_HEADERS, HeartbeatStreamingResponse
 from aistudio_api.api.response_models import (
     GeminiCandidateResponse,
     GeminiContentResponse,
@@ -47,8 +49,8 @@ from aistudio_api.domain.errors import (
     SessionExpiredError,
     TransportError,
     UsageLimitExceeded,
+    is_retryable_upstream_error,
     is_transient_rpc_error,
-    is_transport_error,
     parse_upstream_grpc_error,
 )
 from aistudio_api.domain.models import ModelOutput
@@ -342,6 +344,7 @@ def classify_gemini_error_payload(exc: Exception) -> tuple[int, str, str]:
             500: "INTERNAL",
             502: "UNAVAILABLE",
             503: "UNAVAILABLE",
+            504: "DEADLINE_EXCEEDED",
         }
         return (
             status,
@@ -360,6 +363,7 @@ def classify_gemini_error_payload(exc: Exception) -> tuple[int, str, str]:
             500: "INTERNAL",
             502: "UNAVAILABLE",
             503: "UNAVAILABLE",
+            504: "DEADLINE_EXCEEDED",
         }
         return (
             status,
@@ -384,6 +388,7 @@ async def handle_attempt_exception(
     normalized_model: str | None,
     has_yielded_data: bool = False,
     serving_account_id: str | None = None,
+    transient_attempt: int | None = None,
 ) -> bool:
     """Handle per-attempt error classification and account switching.
 
@@ -526,27 +531,31 @@ async def handle_attempt_exception(
             clean_upstream_error_message(str(exc)),
         )
         return True
-    if is_transport_error(exc):
-        logger.warning(
-            "传输或签名异常，切换账号重试 (%d/%d): %s",
-            attempt + 1,
-            get_max_retries(),
-            exc,
-        )
-        if not has_yielded_data and await try_switch_account(
-            model=target_model, failed_account_id=failed_id
-        ):
-            logger.info("已切换账号重试 (%d/%d)", attempt + 1, get_max_retries())
-            return True
-        if is_transport_error(exc):
-            runtime_state.record(target_model, "errors")
-            record_rotator_event(
-                "error", model=target_model, account_id=serving_account_id
+    if is_retryable_upstream_error(exc):
+        retry_index = attempt if transient_attempt is None else transient_attempt
+        # A single-account installation can recover from a transient network
+        # failure too. Never replay after exposing content/tool calls.
+        if not has_yielded_data and retry_index < min(2, get_max_retries() - 1):
+            switched = await try_switch_account(
+                model=target_model, failed_account_id=failed_id
             )
-            logger.warning("上游传输中断 (502): %s", exc)
-            raise HTTPException(
-                502, detail={"message": str(exc), "type": "upstream_error"}
-            ) from exc
+            delay = 0.5 * (2**retry_index) * random.uniform(0.8, 1.2)
+            logger.warning(
+                "上游传输异常，%s，%.1fs 后重试 (%d/2): %s",
+                "已切换账号" if switched else "保留当前账号",
+                delay,
+                retry_index + 1,
+                exc,
+            )
+            await asyncio.sleep(delay)
+            return True
+        runtime_state.record(target_model, "errors")
+        record_rotator_event("error", model=target_model, account_id=serving_account_id)
+        code = exc.status if isinstance(exc, RequestError) else 502
+        logger.warning("上游请求失败 (%d): %s", code, exc)
+        raise HTTPException(
+            code, detail={"message": str(exc), "type": "upstream_error"}
+        ) from exc
     if isinstance(exc, RequestError):
         clean_msg = clean_upstream_error_message(str(exc))
         status_code = exc.status if exc.status > 0 else 500
@@ -692,6 +701,7 @@ async def handle_gemini_generate_content(
 
     last_error: Exception | None = None
     auth_manager = Auth403RetryManager()
+    transient_failures = 0
     total_attempts = get_max_retries() + AUTH_403_MAX_RETRIES
     # 本次请求实际服务的账号（3.9）：在每次尝试发送前刷新，收尾记账用它，
     # 避免并发请求切号后把结果记到无关账号头上。
@@ -806,9 +816,14 @@ async def handle_gemini_generate_content(
                 if await auth_manager.handle_403(exc, model=target_m, client=client):
                     continue
                 raise
+            transient_failure = is_retryable_upstream_error(exc)
+            transient_failures += int(transient_failure)
+            if transient_failure:
+                auth_manager.current_prepared = None
             if await handle_attempt_exception(
                 exc,
                 attempt=attempt,
+                transient_attempt=transient_failures - 1 if transient_failure else None,
                 model_path=model_path,
                 normalized_model=normalized.model if normalized else None,
                 serving_account_id=serving_account_id,
@@ -1001,8 +1016,12 @@ def _error_text_payload(exc: Exception) -> dict[str, object] | None:
     return _event_payload("body", text)
 
 
-class GeminiStreamResponse(StreamingResponse):
+class GeminiStreamResponse(HeartbeatStreamingResponse):
     """Expose structured frames to adapters; serialize only at the HTTP boundary."""
+
+    # google-genai parses every nonempty line as JSON instead of skipping SSE
+    # comments. Empty SSE blocks keep bytes flowing without producing SDK chunks.
+    heartbeat = b"\n\n"
 
     def __init__(self, frames: AsyncGenerator[dict[str, object], None]) -> None:
         self.frames = frames
@@ -1017,7 +1036,7 @@ class GeminiStreamResponse(StreamingResponse):
         super().__init__(
             encode(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers=STREAM_HEADERS,
         )
 
 
@@ -1049,6 +1068,7 @@ def _build_gemini_streaming_response(
             # 预先初始化，避免循环零次执行时下方引用被判 possibly-unbound
             has_yielded_data = False
             auth_manager = Auth403RetryManager()
+            transient_failures = 0
             total_attempts = get_max_retries() + AUTH_403_MAX_RETRIES
             # 本次请求实际服务的账号（3.9）：同非流式路径
             serving_account_id: str | None = None
@@ -1257,9 +1277,16 @@ def _build_gemini_streaming_response(
                         ):
                             continue
                         raise
+                    transient_failure = is_retryable_upstream_error(exc)
+                    transient_failures += int(transient_failure)
+                    if transient_failure:
+                        auth_manager.current_prepared = None
                     if await handle_attempt_exception(
                         exc,
                         attempt=stream_attempt,
+                        transient_attempt=transient_failures - 1
+                        if transient_failure
+                        else None,
                         model_path=model_path,
                         normalized_model=normalized.model if normalized else None,
                         has_yielded_data=has_yielded_data,

@@ -393,6 +393,10 @@ Web 面板在「导入账号」「编辑账号」与「全局代理」处提供*
 | `AISTUDIO_MAX_REQUEST_BYTES` | int | `33554432` | 单个模型请求正文上限（字节） |
 | `AISTUDIO_MAX_CONCURRENT_REQUESTS` | int | `50` | 同时处理的模型请求上限，超出时返回 HTTP 429 |
 | `AISTUDIO_REQUEST_TIMEOUT` | int | `600` | 模型请求总超时（秒）；流式响应从请求开始计时 |
+| `AISTUDIO_STREAM_HEARTBEAT_INTERVAL` | float | `15` | 下行保活周期（秒，>0）：SSE 注释心跳；非流式等待超过此周期后发送 JSON 空白 |
+| `AISTUDIO_STREAM_SEND_TIMEOUT` | float | `30` | 单次下行写入超时（秒，>0），限制慢客户端占用 |
+| `AISTUDIO_UPSTREAM_READ_TIMEOUT` | float | `300` | 上游连续无数据读取超时（秒，>0），不替代整请求总超时 |
+| `AISTUDIO_NONSTREAM_KEEPALIVE` | bool | `true` | 默认开启非流式保活；开始保活后 HTTP 200 已发送，迟到的失败以 JSON 错误体返回 |
 | `AISTUDIO_DUMP_MAX_BYTES` | int | `1048576` | 详细转储时单个请求体或响应体的采集上限（字节） |
 | `AISTUDIO_DUMP_MAX_FILES` | int | `1000` | 详细转储文件最多保留数量 |
 | `AISTUDIO_DUMP_MAX_AGE_DAYS` | int | `7` | 详细转储文件最多保留天数 |
@@ -708,6 +712,7 @@ if response.function_calls:
 - **代理诊断 (Proxies)**：显示全局/账号级代理生效来源，可测试当前或草稿代理到 Google、AI Studio 与出口 IP；可在线更新全局代理。请求历史只显示脱敏代理地址。
 - **历史日志**：JSONL 后台线程轮转写入 `data/logs/`，最多约 30 MiB，按请求 ID、级别和关键字查询，并保留实时日志页面。
 - **服务保护**：请求正文默认限制 32 MiB、最大并发 50、总超时 600 秒。阈值均可通过环境变量调整。
+- **长请求保活**：思考、工具调用和抗截断缓冲生成默认持续保活，覆盖 OpenAI Chat / Responses、Claude 和 Gemini 的流式与非流式生成接口。Render + Cloudflare + 酒馆部署的配置、超时边界和排查步骤见 [长请求与断流处理](docs/STREAMING_RELIABILITY.md)。
 - **系统设置 (Settings)**：在线编辑 `config.yaml`（支持配置 profiles 与 models 默认规则），保存后服务端即时热重载。
 - **访问鉴权**：管理 API 与控制台受管理密码或有效 API Key 保护。未配置凭据时服务会生成随机管理密码；如仅在可信内网开放，可显式设置 `AISTUDIO_ALLOW_NO_AUTH=1`。
 

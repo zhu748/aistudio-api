@@ -38,6 +38,15 @@ services:
 
     # 监听端口由 Render 注入的 PORT 环境变量决定（entrypoint 自动映射）。
     envVars:
+      # 长工具调用 / 缓冲生成：SSE 和非流式 JSON 默认均启用保活。
+      - key: AISTUDIO_STREAM_HEARTBEAT_INTERVAL
+        value: "15"
+      - key: AISTUDIO_NONSTREAM_KEEPALIVE
+        value: "1"
+      - key: AISTUDIO_UPSTREAM_READ_TIMEOUT
+        value: "300"
+      - key: AISTUDIO_REQUEST_TIMEOUT
+        value: "600"
       # 【必填】Web 管理面板登录密码 —— 公网部署务必设置，否则面板裸奔
       - key: AISTUDIO_WEB_PASSWORD
         sync: false
