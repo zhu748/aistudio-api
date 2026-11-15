@@ -262,6 +262,31 @@ def test_normalize_gemini_request_thinking_and_reasoning_effort():
         "thinking_config": [1, None, None, 1],
     }
 
+    # 5. 顶格档 xhigh/max → 目录最高档 EXTRA_HIGH(6)：2026-11-15 真机抓包
+    #    hydrogen UI Extra High 档发送 [1,null,null,6] → 200（5 已被上游移除）
+    req_xhigh = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generationConfig": {"temperature": 1.0},
+            "reasoning_effort": "xhigh",
+        }
+    )
+    norm_xhigh = normalize_gemini_request(req_xhigh, "models/gemini-4-hydrogen")
+    assert norm_xhigh.generation_config_overrides == {
+        "temperature": 1.0,
+        "thinking_config": [1, None, None, 6],
+    }
+    req_max = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "reasoning_effort": "max",
+        }
+    )
+    norm_max = normalize_gemini_request(req_max, "models/gemini-4-hydrogen")
+    assert norm_max.generation_config_overrides == {
+        "thinking_config": [1, None, None, 6],
+    }
+
 
 def test_normalize_gemini_request_encodes_builtin_tools_to_wire():
     req = GeminiGenerateContentRequest.model_validate(

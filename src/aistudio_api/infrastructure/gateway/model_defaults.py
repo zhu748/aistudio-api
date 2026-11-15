@@ -241,14 +241,17 @@ def _cached_model_info_for(model: str) -> Mapping[str, object] | None:
 
 
 # 思考档位逻辑顺序（数值与逻辑序不同：MINIMAL=4 但强度最低）。
-# 与 AI Studio 前端 pmi() 映射一致；VERY_HIGH(5) 为 2026-11 目录实测新档，
-# 强度序在 HIGH 之上（gemini-4-hydrogen 的 thinkingLevels=[1,2,3,5]）。
+# 与 AI Studio 前端 pmi() 映射一致；2026-11 目录曾实测最高新档 5，
+# 2026-11-15 真机抓包确认目录最高档已上移至 EXTRA_HIGH(6)（UI Extra High
+# 档发送 [1,null,null,6] → 200；5 → 400 "EXTRA_HIGH is not supported"，
+# 仅 gemini-4-hydrogen 开放，carbon/argon 仍 [1,2,3]）。
 _THINKING_LEVEL_ORDER: tuple[ThinkingLevel, ...] = (
     ThinkingLevel.MINIMAL,
     ThinkingLevel.LOW,
     ThinkingLevel.MEDIUM,
     ThinkingLevel.HIGH,
     ThinkingLevel.VERY_HIGH,
+    ThinkingLevel.EXTRA_HIGH,
 )
 
 
@@ -401,20 +404,17 @@ def model_output_token_limit(model: str) -> int | None:
     return None
 
 
-# 浏览器恒定默认 maxOutputTokens（2026-11 全量 GenerateContent 抓包实测；
-# hybrid7/7b 多模型判别补充：gemini-4 系（目录 [85] 非空）恒 32768 ——
-# hydrogen 目录输出上限虽为 65536，浏览器仍默认 32768；其余模型按
-# 输出上限钳制在 65536）。
+# 浏览器恒定默认 maxOutputTokens（2026-11 全量 GenerateContent 抓包实测：
+# 其余模型按输出上限钳制在 65536）。2026-11-15 起对齐策略调整：默认值取
+# 「目录输出上限与 65536 的较小者」，不再复刻浏览器滑块的 32768 起始档
+# ——反截断长输出场景下，低于目录上限的默认钳制会无谓压缩可用输出
+# （hydrogen 目录上限 65536，此前被 gemini-4 家族 32768 覆盖压半）；
+# 客户端显式传入的 maxOutputTokens 仍优先，超出目录上限仍被钳回。
 _BROWSER_DEFAULT_MAX_TOKENS = 65536
-_BROWSER_GEMINI4_DEFAULT_MAX_TOKENS = 32768
 
 
 def browser_default_max_tokens(model: str) -> int:
-    """浏览器形态默认 max_tokens，按模型家族与输出上限钳制（仅作用于默认值）。"""
-    # gemini-4 系（目录 [85] 非空，与 generation_config[45] 同源标记）：
-    # 浏览器默认恒 32768（carbon/argon 输出上限亦为 32768，一致）。
-    if model_unknown_flag_45(model) is not None:
-        return _BROWSER_GEMINI4_DEFAULT_MAX_TOKENS
+    """浏览器形态默认 max_tokens，按目录输出上限钳制（仅作用于默认值）。"""
     limit = model_output_token_limit(model)
     if isinstance(limit, int) and 0 < limit < _BROWSER_DEFAULT_MAX_TOKENS:
         return limit
