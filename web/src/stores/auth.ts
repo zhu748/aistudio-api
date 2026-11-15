@@ -57,20 +57,38 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  async function login(newToken: string): Promise<boolean> {
-    const trimmed = newToken.trim()
+  async function login(password: string): Promise<boolean> {
+    const trimmed = password.trim()
     if (!trimmed) return false
 
     try {
-      await authApi.verifyToken(trimmed)
-      setToken(trimmed)
-      token.value = trimmed
+      // 用密码换取持久会话令牌：localStorage 存的是随机会话凭据（30 天
+      // 过期、换密码即失效），而非管理密码本身。401 即密码错误。
+      const session = await authApi.createSession(trimmed)
+      setToken(session.token)
+      token.value = session.token
       checkFailed.value = false
       // 登录成功即证明服务端开启了鉴权：此前 /auth/check 网络失败时
       // authEnabled 会停留在 false，导致退出按钮隐藏、日志流不取票据。
       authEnabled.value = true
       return true
     } catch {
+      return false
+    }
+  }
+
+  /** 恢复已持久化的会话令牌（浏览器重开后的免密登录路径）。 */
+  async function restoreSession(): Promise<boolean> {
+    if (!token.value) return false
+    try {
+      await authApi.verifyToken(token.value)
+      authEnabled.value = true
+      checkFailed.value = false
+      return true
+    } catch {
+      // 令牌过期/被撤销/换过密码：清掉回落到登录页
+      clearToken()
+      token.value = ''
       return false
     }
   }
@@ -95,6 +113,7 @@ export const useAuthStore = defineStore('auth', () => {
     checkAuth,
     shouldRetryCheck,
     login,
+    restoreSession,
     logout,
     updateToken,
   }

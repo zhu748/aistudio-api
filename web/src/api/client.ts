@@ -12,28 +12,29 @@ export class ApiError extends Error {
 
 const TOKEN_KEY = 'asp_api_token'
 
-// 令牌存储（3.17）：localStorage 使管理密码在浏览器中永久留存（任何 XSS
-// 都可直接窃取、无过期机制、shared device 上换用户也残留）。改为
-// sessionStorage + 进程内缓存：令牌随标签页会话结束自动消失，浏览器
-// 重启后需重新登录；首次读取时顺带把历史 localStorage 令牌迁移清理。
+// 令牌存储：持久会话。3.17 曾改用 sessionStorage 避免「管理密码永久留存
+// 浏览器」（XSS 窃取、无过期、共用设备残留），代价是浏览器重开就要重新
+// 输密码。现在后端 /auth/session 签发与管理密码分离的随机会话令牌
+// （30 天过期、换密码即全部失效、可服务端撤销），localStorage 持久化的
+// 是这枚可撤销凭据而非密码本身——免密体验回归，安全考量不丢。
+// 首次读取时顺带把 3.17 的 sessionStorage 令牌迁移过来。
 let cachedToken: string | null = null
 
 export function getToken(): string {
   if (cachedToken !== null) return cachedToken
-  // 历史版本把令牌落在 localStorage：迁移到 sessionStorage 并清除原值
-  const legacy = localStorage.getItem(TOKEN_KEY)
+  const legacy = sessionStorage.getItem(TOKEN_KEY)
   if (legacy) {
-    localStorage.removeItem(TOKEN_KEY)
+    sessionStorage.removeItem(TOKEN_KEY)
     try {
-      sessionStorage.setItem(TOKEN_KEY, legacy)
+      localStorage.setItem(TOKEN_KEY, legacy)
     } catch {
-      /* sessionStorage 不可用（隐私模式等）时退化为仅内存缓存 */
+      /* localStorage 不可用（隐私模式等）时退化为仅内存缓存 */
     }
     cachedToken = legacy
     return legacy
   }
   try {
-    cachedToken = sessionStorage.getItem(TOKEN_KEY) || ''
+    cachedToken = localStorage.getItem(TOKEN_KEY) || ''
   } catch {
     cachedToken = ''
   }
@@ -45,24 +46,24 @@ export function setToken(token: string): void {
   cachedToken = trimmed
   try {
     if (trimmed) {
-      sessionStorage.setItem(TOKEN_KEY, trimmed)
+      localStorage.setItem(TOKEN_KEY, trimmed)
     } else {
-      sessionStorage.removeItem(TOKEN_KEY)
+      localStorage.removeItem(TOKEN_KEY)
     }
   } catch {
     /* 存储不可用时仅保留内存缓存 */
   }
-  localStorage.removeItem(TOKEN_KEY)
+  sessionStorage.removeItem(TOKEN_KEY)
 }
 
 export function clearToken(): void {
   cachedToken = ''
   try {
-    sessionStorage.removeItem(TOKEN_KEY)
+    localStorage.removeItem(TOKEN_KEY)
   } catch {
     /* ignore */
   }
-  localStorage.removeItem(TOKEN_KEY)
+  sessionStorage.removeItem(TOKEN_KEY)
 }
 
 type UnauthorizedHandler = () => void

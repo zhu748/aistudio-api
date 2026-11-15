@@ -28,9 +28,10 @@ function safeRedirect(raw: unknown): string {
 
 onMounted(async () => {
   if (authStore.token) {
-    inputToken.value = authStore.token
+    // 持久会话令牌不回显到输入框（它是随机会话凭据，不是密码）：
+    // 直接验证并恢复登录态，失败（过期/换过密码）则留在登录页
     loading.value = true
-    const ok = await authStore.login(authStore.token)
+    const ok = await authStore.restoreSession()
     loading.value = false
     if (ok) {
       router.replace(safeRedirect(route.query.redirect))
