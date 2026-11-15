@@ -824,8 +824,15 @@ class AccountRotator:
                 ]
                 if tier_matched:
                     return tier_matched
-            except Exception:
-                pass
+            except Exception as e:
+                # 模型目录异常时保持 fail-open（不过滤、不阻断流量），
+                # 但必须留痕：否则 Free 账号被选去做付费模型会以难以定位的
+                # 上游 403 形式暴露，日志里没有任何线索。
+                logger.warning(
+                    "模型订阅准入过滤失败，候选集未按 tier 过滤 (model=%s): %s",
+                    model,
+                    e,
+                )
 
         return candidates
 

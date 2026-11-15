@@ -301,6 +301,9 @@ async def test_transport_captures_set_cookie_and_updates_store(tmp_path):
             cookies=mem_cookies,
         )
         assert status == 200
+        # Set-Cookie 持久化为后台任务（与流式路径同款，避免持锁 fsync
+        # 阻塞响应返回）：排空后台任务后再断言内存与磁盘状态。
+        await transport._flush_cookie_persist()
         assert mem_cookies["__Secure-1PSIDTS"] == "fresh_from_rpc"
         disk_cookies = load_cookies_from_auth_file(auth_path)
         assert disk_cookies["__Secure-1PSIDTS"] == "fresh_from_rpc"

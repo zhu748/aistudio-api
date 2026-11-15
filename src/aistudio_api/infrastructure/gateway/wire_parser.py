@@ -9,6 +9,9 @@ from __future__ import annotations
 import json
 
 from aistudio_api.domain.models import Candidate, GeneratedImage, ModelOutput
+from aistudio_api.infrastructure.gateway.wire_spec import (
+    WIRE_FINISH_REASON_CONTINUING,
+)
 from aistudio_api.infrastructure.utils.common import (
     decode_base64_images,
     extract_outer_json,
@@ -558,8 +561,13 @@ def parse_text_output(raw: str) -> ModelOutput:
     if not parts:
         return output
 
-    outer = parts[0]
-    chunks = _iter_response_chunks(outer)
+    # 多文档容错：extract_outer_json 在单体 JSON 解析失败时退化为逐行
+    # 解析；若上游/中间层按换行分隔下发多个 JSON 文档，逐个提取 chunk
+    # 合并（usage/response_id 以后到者为准），不再只取首个文档而静默
+    # 丢弃其余内容。单文档路径行为不变。
+    chunks: list[list[object]] = []
+    for outer in parts:
+        chunks.extend(_iter_response_chunks(outer))
     if not chunks:
         return output
 
@@ -611,7 +619,13 @@ def parse_text_output(raw: str) -> ModelOutput:
             merged.thought_signature = parsed.thought_signature
         if parsed.code_output:
             code_output_parts.append(parsed.code_output)
-        if parsed.finish_reason is not None:
+        if parsed.finish_reason is not None and parsed.finish_reason not in (
+            0,
+            WIRE_FINISH_REASON_CONTINUING,
+        ):
+            # 与流式路径（streaming.emit_parsed_chunk）对称：0/22 是占位/
+            # 续写中间态编码，不是终止结论；聚合并把它们当终点会把
+            # 续写中间态伪装成 FINISH_REASON_UNSPECIFIED 下发给客户端。
             merged.finish_reason = parsed.finish_reason
         if parsed.finish_message:
             merged.finish_message = parsed.finish_message

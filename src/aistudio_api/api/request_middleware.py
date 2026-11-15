@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextlib
 import json
 import time
+import urllib.parse
 from collections.abc import Callable
 from typing import cast
 from uuid import uuid4
@@ -78,7 +78,15 @@ class RequestMiddleware:
             # 路由 dependencies，受保护管理端点的尾斜杠变体会未鉴权拿到
             # 307 且 Location 原样回显查询串（含一次性票据值，会进反代日志）
             path = path.rstrip("/") or "/"
-            scope = {**scope, "path": path, "raw_path": path.encode("latin-1")}
+            try:
+                raw_path = path.encode("latin-1")
+            except UnicodeEncodeError:
+                # ASGI path 是百分号解码后的字符串，含非 Latin-1 字符（如
+                # /v1beta/模型:generateContent/）时直接 encode 会在下方
+                # try 块之前抛 UnicodeEncodeError 变成未分类 500；退回百分号
+                # 编码重建（raw_path 仅信息性字段，路由按 path 进行）。
+                raw_path = urllib.parse.quote(path, safe="/%").encode("ascii")
+            scope = {**scope, "path": path, "raw_path": raw_path}
         model_call = scope["method"] == "POST" and (
             path.startswith("/v1beta/")
             or path in ("/v1/chat/completions", "/v1/messages", "/v1/responses")
@@ -147,11 +155,31 @@ class RequestMiddleware:
                         }.get(code, "INTERNAL"),
                     }
                 }
+            response_headers = [(b"content-type", b"application/json")]
+            # RequestMiddleware 位于 CORS 兼容层之外（send 超时必须约束真实
+            # socket 而非 BaseHTTPMiddleware 的内存通道），本函数直接发出的
+            # 429/413/504/500 不会经过 compat_cors_middleware；对 /v1/ 白名单
+            # Origin 自行补 CORS 头，否则浏览器客户端只能看到被同源策略吞掉
+            # 的 opaque 网络错误而非具体失败原因。
+            if path.startswith("/v1/"):
+                origin = headers.get("origin", "")
+                if origin:
+                    from aistudio_api.api.app import _allowed_cors_origins
+
+                    if origin in _allowed_cors_origins():
+                        response_headers += [
+                            (
+                                b"access-control-allow-origin",
+                                origin.encode("latin-1"),
+                            ),
+                            (b"access-control-allow-credentials", b"true"),
+                            (b"vary", b"Origin"),
+                        ]
             await observed_send(
                 {
                     "type": "http.response.start",
                     "status": code,
-                    "headers": [(b"content-type", b"application/json")],
+                    "headers": response_headers,
                 }
             )
             await observed_send(
@@ -294,16 +322,17 @@ class RequestMiddleware:
                         context.model or "待解析",
                     )
                     if settings.request_history:
-                        try:
-                            history_start = asyncio.create_task(
-                                asyncio.to_thread(
-                                    request_history().insert,
-                                    request_snapshot(context, running=True),
-                                )
+                        # fire-and-forget：准入路径不再等待 SQLite 起始记录
+                        # 落盘（每次 insert 新开连接 + fsync，高并发下排队会
+                        # 直接推迟所有请求的 TTFB）。顺序由收尾 _persist 先
+                        # await history_start 保证（慢 worker 不会复活
+                        # 'running'），失败在收尾统一记日志。
+                        history_start = asyncio.create_task(
+                            asyncio.to_thread(
+                                request_history().insert,
+                                request_snapshot(context, running=True),
                             )
-                            await asyncio.shield(history_start)
-                        except Exception:
-                            logger.exception("Failed to persist request start")
+                        )
                     raw_length = headers.get("content-length", "0")
                     if (
                         not raw_length.isdigit()
@@ -490,8 +519,10 @@ class RequestMiddleware:
         # A cancelled to_thread await does not stop its worker. Order the final
         # record after the initial insert so a slow worker cannot resurrect 'running'.
         if history_start is not None:
-            with contextlib.suppress(Exception):
+            try:
                 await history_start
+            except Exception:
+                logger.exception("Failed to persist request start")
         if settings.request_history:
             try:
                 safe_record = _mask_json_value(record)

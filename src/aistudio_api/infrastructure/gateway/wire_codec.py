@@ -43,6 +43,11 @@ TOOLS_TEMPLATES: dict[str, list[object]] = {
     "url_context": [None, None, None, None, None, None, None, []],
 }
 
+# 与 shipped config.yaml gemini 档案 ``thinking_config: {level: 2}`` 等价的
+# wire 占位形态（AistudioThinkingConfig(level=MEDIUM, mode=1).to_wire()）。
+# 该占位表示「默认档位跟随 ListModels 目录」而非固定 MEDIUM。
+_SHIPPED_THINKING_PLACEHOLDER: list[object] = [1, None, None, 2]
+
 
 def build_image_generation_search_tool(
     *, google_search: bool = False, image_search: bool = False
@@ -309,6 +314,7 @@ class AistudioWireCodec:
         top_k: int | None = None,
         max_tokens: int | None = None,
         generation_config_overrides: dict | None = None,
+        session_token: str | None = None,
     ) -> AistudioRequest:
         effective_contents = (
             contents
@@ -364,7 +370,14 @@ class AistudioWireCodec:
         # 2) generation_config[13] 开关从 ListModels [83] 自动推导
         #    （3.8-flash/carbon/argon 恒为 1，3.5-flash-lite 为 null）；
         # 3) 默认 maxOutputTokens=65536 按模型输出上限钳制（carbon 32768）。
-        if "thinking_config" not in user_overrides and gc.thinking_config is not None:
+        # shipped 档案的 {"level": 2}（MEDIUM）是与抓包对齐的占位形态，默认
+        # 档位按目录自适应；管理员在模型档案里显式配置的其他形态（level≠2 /
+        # budget / 自定义 mode）不再被目录默认覆盖——此前它们会被静默替换，
+        # 档案配置形同虚设（2026-11 审查修复）。
+        if (
+            "thinking_config" not in user_overrides
+            and gc.thinking_config == _SHIPPED_THINKING_PLACEHOLDER
+        ):
             gc.thinking_config = browser_default_thinking_wire(model)
         gc.thinking_config = snap_thinking_wire_to_model(model, gc.thinking_config)
         if gc.unknown_flag_13 is None and (
@@ -487,6 +500,7 @@ class AistudioWireCodec:
             snapshot=snapshot,
             system_instruction=effective_sys,
             tools=effective_tools,
+            session_token=session_token,
         )
 
     def _decode_contents(self, raw_contents: object) -> list[AistudioContent]:
@@ -633,21 +647,6 @@ class AistudioWireCodec:
 
 _codec = AistudioWireCodec()
 
-_WIRE_SESSION_TOKEN_INDEX = TopLevelIndex.SESSION_TOKEN
-
-
-def attach_session_token(body: str, token: str | None) -> str:
-    """Write the matched conversation's turn token to request slot 11."""
-    if not token:
-        return body
-    parsed = json.loads(body)
-    if not isinstance(parsed, list):
-        return body
-    while len(parsed) <= _WIRE_SESSION_TOKEN_INDEX:
-        parsed.append(None)
-    parsed[_WIRE_SESSION_TOKEN_INDEX] = token
-    return json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
-
 
 def encode_request_body(
     *,
@@ -666,7 +665,12 @@ def encode_request_body(
     top_k: int | None = None,
     max_tokens: int | None = None,
     generation_config_overrides: dict | None = None,
+    session_token: str | None = None,
 ) -> str:
+    """构造并编码请求体；``session_token``（槽 11）在唯一一次 ``json.dumps``
+    前写入——此前 encode 后再用 attach_session_token 整体 loads/dumps 一遍，
+    多模态请求体（MB 级 base64）每请求多付两次全量序列化开销。
+    """
     request = _codec.build_request(
         model=model,
         snapshot=snapshot,
@@ -683,5 +687,6 @@ def encode_request_body(
         top_k=top_k,
         max_tokens=max_tokens,
         generation_config_overrides=generation_config_overrides,
+        session_token=session_token,
     )
     return _codec.encode(request)

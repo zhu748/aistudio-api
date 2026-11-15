@@ -28,10 +28,8 @@ from aistudio_api.infrastructure.gateway.session import (
     GENERATE_CONTENT_URL,
     GatewaySession,
     SessionContext,
-    extract_page_prompt,
 )
 from aistudio_api.infrastructure.gateway.wire_codec import (
-    attach_session_token,
     encode_request_body,
 )
 from aistudio_api.infrastructure.gateway.wire_parser import parse_text_output
@@ -49,6 +47,9 @@ class PreparedRequest:
     body: str
     model: str = ""
     snapshot: str = ""
+    # 当前用户轮文本（页面提示词）：在 prepare_request 从 typed contents
+    # 一次性提取，供 CountTokens 补发复用，避免事后重新解析 MB 级 body。
+    page_prompt: str = ""
     ctx: SessionContext | None = None
     model_turn: ModelTurnContext | None = None
 
@@ -59,6 +60,21 @@ class PreparedRequest:
 _LAST_PREPARED_REQUEST: contextvars.ContextVar[PreparedRequest | None] = (
     contextvars.ContextVar("aistudio_last_prepared_request", default=None)
 )
+
+
+def _page_prompt_from_contents(contents: list[AistudioContent]) -> str:
+    """从已还原的请求 contents 提取当前用户轮文本（typed 版 page prompt）。
+
+    与 wire 形态解析语义一致：最后一个 user 轮的首个 part 为文本 part
+    时返回该文本，否则继续向前找；找不到返回空串（跳过后续补发）。
+    """
+    for content in reversed(contents):
+        if content.role != "user" or not content.parts:
+            continue
+        text = content.parts[0].text
+        if text is not None:
+            return text
+    return ""
 
 
 def _apply_function_name_restore(
@@ -166,6 +182,9 @@ class AIStudioClient:
         snapshot = await self._session.generate_snapshot(
             effective_contents, ctx=ctx, model=model
         )
+        # Only the matched conversation's last model turn supplies slot 11.
+        # Restoration precedes WAA signing, so proof and contents stay aligned.
+        # token 在唯一一次编码时写入槽 11（不再整体二次 loads/dumps）。
         body = encode_request_body(
             model=model,
             prompt=prompt,
@@ -182,10 +201,8 @@ class AIStudioClient:
             max_tokens=max_tokens,
             generation_config_overrides=generation_config_overrides,
             snapshot=snapshot,
+            session_token=turn_token,
         )
-        # Only the matched conversation's last model turn supplies slot 11.
-        # Restoration precedes WAA signing, so proof and contents stay aligned.
-        body = attach_session_token(body, turn_token)
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_active_waa_server,
         )
@@ -222,6 +239,7 @@ class AIStudioClient:
             body=body,
             model=model,
             snapshot=snapshot,
+            page_prompt=_page_prompt_from_contents(effective_contents),
             ctx=ctx,
             model_turn=model_turn,
         )
@@ -383,7 +401,7 @@ class AIStudioClient:
                 scheduler(
                     effective_prep.ctx,
                     model,
-                    extract_page_prompt(effective_prep.body),
+                    effective_prep.page_prompt,
                 )
         output = parse_text_output(raw_text)
         output.model = model

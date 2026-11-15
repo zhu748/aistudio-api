@@ -296,15 +296,15 @@ class AccountStore:
         self._ensure_dirs()
         self._ensure_default_presets()
         self._initialized = True
-        # 清扫上次 SIGKILL/掉电可能残留的原子写临时文件（含完整凭据，3.13）
+        # 清扫上次 SIGKILL/掉电可能残留的原子写临时文件（含完整凭据，3.13）。
+        # 临时文件命名规则为 ``<stem>.tmp.<pid>_<ns>``（with_suffix 会替换
+        # 原后缀，registry.json → registry.tmp.123_456），因此根目录与各
+        # 账号子目录统一按 ``*.tmp.*`` 清扫；早先的 ``auth.json.tmp.*`` /
+        # ``registry.json.tmp.*`` 模式永远匹配不到实际产物，属于死代码。
         with contextlib.suppress(Exception):
             from aistudio_api.infrastructure.utils.common import cleanup_stale_tmp_files
 
-            removed = cleanup_stale_tmp_files(
-                self._accounts_dir, pattern="auth.json.tmp.*"
-            ) + cleanup_stale_tmp_files(
-                self._accounts_dir, pattern="registry.json.tmp.*"
-            )
+            removed = cleanup_stale_tmp_files(self._accounts_dir, pattern="*.tmp.*")
             for acc_dir in self._accounts_dir.iterdir():
                 if acc_dir.is_dir():
                     removed += cleanup_stale_tmp_files(acc_dir, pattern="*.tmp.*")
@@ -1161,46 +1161,60 @@ class AccountStore:
         return presets.get(preset_id)
 
     def save_preset(self, preset: AccountPreset) -> AccountPreset:
-        """创建或更新预设方案。"""
-        presets = self._load_presets()
-        now = datetime.now(UTC).isoformat()
-        if not preset.created_at:
-            preset.created_at = now
-        preset.updated_at = now
-        presets[preset.id] = preset
-        self._save_presets(presets)
-        return preset
+        """创建或更新预设方案。
+
+        全程持锁：与 save_account/delete_account 的并发契约对齐（本类声明
+        线程安全，读-改-写序列若不互斥，线程池调用方的更新会互相覆盖）。
+        """
+        with self._lock:
+            presets = self._load_presets()
+            now = datetime.now(UTC).isoformat()
+            if not preset.created_at:
+                preset.created_at = now
+            preset.updated_at = now
+            presets[preset.id] = preset
+            self._save_presets(presets)
+            return preset
 
     def delete_preset(self, preset_id: str) -> bool:
-        """删除自定义预设方案（内置方案不可删除）。"""
-        presets = self._load_presets()
-        if preset_id not in presets:
-            return False
-        if presets[preset_id].is_system:
-            raise ValueError("系统内置预设不允许删除")
-        del presets[preset_id]
-        self._save_presets(presets)
-        return True
+        """删除自定义预设方案（内置方案不可删除）。
+
+        全程持锁：同 save_preset，避免并发删除/保存互相覆盖。
+        """
+        with self._lock:
+            presets = self._load_presets()
+            if preset_id not in presets:
+                return False
+            if presets[preset_id].is_system:
+                raise ValueError("系统内置预设不允许删除")
+            del presets[preset_id]
+            self._save_presets(presets)
+            return True
 
     def create_snapshot_preset(self, name: str, description: str = "") -> AccountPreset:
-        """保存当前所有已启用账号的 ID 列表为预设方案。"""
+        """保存当前所有已启用账号的 ID 列表为预设方案。
+
+        全程持锁：registry.accounts 迭代与持锁写入方（save_account 等）
+        并发会触发 "dictionary changed size during iteration"。
+        """
         import secrets
 
-        registry = self._load_registry()
-        active_ids = [acc.id for acc in registry.accounts.values() if acc.enabled]
-        now = datetime.now(UTC).isoformat()
-        pid = f"preset_{secrets.token_hex(4)}"
-        preset = AccountPreset(
-            id=pid,
-            name=name.strip() or "自定义快照方案",
-            description=description.strip(),
-            action="snapshot",
-            account_ids=active_ids,
-            is_system=False,
-            created_at=now,
-            updated_at=now,
-        )
-        return self.save_preset(preset)
+        with self._lock:
+            registry = self._load_registry()
+            active_ids = [acc.id for acc in registry.accounts.values() if acc.enabled]
+            now = datetime.now(UTC).isoformat()
+            pid = f"preset_{secrets.token_hex(4)}"
+            preset = AccountPreset(
+                id=pid,
+                name=name.strip() or "自定义快照方案",
+                description=description.strip(),
+                action="snapshot",
+                account_ids=active_ids,
+                is_system=False,
+                created_at=now,
+                updated_at=now,
+            )
+            return self.save_preset(preset)
 
     def apply_preset(
         self, preset_id: str

@@ -38,6 +38,12 @@ def _resolve_stats_timezone() -> tzinfo:
 
 _STATS_TZ = _resolve_stats_timezone()
 
+# 模型统计条目上限：model 键来自请求路径（normalize 只做去前缀/小写，
+# 不校验模型清单），任意已鉴权调用方都能用伪造模型名让每次失败请求
+# 永久登记一个新键（内存 + stats.json 双重无界增长）。超限后已跟踪
+# 模型继续计数，新键不再登记；请求上下文计量（record_result）不受影响。
+_MAX_TRACKED_MODELS = 1000
+
 
 @dataclass
 class ModelStatsItem:
@@ -84,6 +90,8 @@ class RuntimeState:
         if not isinstance(data, dict):
             return
         for model, item in data.items():
+            if len(self.model_stats) >= _MAX_TRACKED_MODELS:
+                break
             if not isinstance(item, dict):
                 continue
             try:
@@ -176,6 +184,19 @@ class RuntimeState:
         usage: dict[str, object] | None = None,
         finish_reason: str | None = None,
     ) -> None:
+        if (
+            model not in self.model_stats
+            and len(self.model_stats) >= _MAX_TRACKED_MODELS
+        ):
+            # 统计表已满（键来自客户端可控的模型路径）：不再为新模型登记
+            # 条目，防止恶意/异常请求无界撑大内存与 stats.json；请求上下文
+            # 计量照常执行。
+            record_result(
+                "error" if result == "errors" else result,
+                usage=usage,
+                finish_reason=finish_reason or "",
+            )
+            return
         stats = self.model_stats[model]
         stats.requests += 1
         stats.last_used = datetime.now(_STATS_TZ).strftime("%Y-%m-%d %H:%M:%S")
