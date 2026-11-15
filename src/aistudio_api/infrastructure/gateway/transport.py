@@ -16,6 +16,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
+import anyio
 import httpx
 
 from aistudio_api.config import settings
@@ -512,6 +513,50 @@ class _PreflightLock:
     users: int = 0
 
 
+class _CancellationSafeResponseStream(httpx.AsyncByteStream):
+    """Protect httpx's automatic EOF close as well as explicit response close.
+
+    Response.aclose marks is_closed before awaiting stream.aclose; once that
+    await is interrupted, calling Response.aclose again cannot finish cleanup.
+    Keep the actual close in an owned, bounded task and drain it on cancellation.
+    """
+
+    def __init__(self, stream: httpx.AsyncByteStream) -> None:
+        self.stream = stream
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self.stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        async def close() -> None:
+            with anyio.move_on_after(5):
+                await self.stream.aclose()
+
+        task = asyncio.create_task(close())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            with anyio.CancelScope(shield=True):
+                # Drain the owned task even under ASGI level cancellation.
+                # Preserve the caller's cancellation after cleanup completes.
+                with contextlib.suppress(Exception):
+                    while not task.done():
+                        try:
+                            await asyncio.shield(task)
+                        except asyncio.CancelledError:
+                            # Shutdown may cancel the parent again while it
+                            # drains. Do not forward that cancellation to close.
+                            continue
+                    task.result()
+            raise
+
+
+def _protect_response_close(response: httpx.Response) -> None:
+    if isinstance(response.stream, httpx.AsyncByteStream):
+        response.stream = _CancellationSafeResponseStream(response.stream)
+
+
 class HTTPStreamTransport:
     """Direct HTTP streaming and non-streaming transport layer."""
 
@@ -524,9 +569,11 @@ class HTTPStreamTransport:
     _PREFLIGHT_MAX_AGE_CAP = 24.0 * 3600.0
     _PREFLIGHT_FALLBACK_MAX_AGE = 5.0
 
-    def __init__(self, proxy_url: str | None = None, timeout: float = 120.0) -> None:
+    def __init__(
+        self, proxy_url: str | None = None, timeout: float | None = None
+    ) -> None:
         self.proxy_url = proxy_url or settings.proxy_url
-        self.timeout = timeout
+        self.timeout = settings.upstream_read_timeout if timeout is None else timeout
         # 后台 Set-Cookie 持久化任务：流式请求不再在首块前同步等待
         # 落盘（持锁 stat+fsync 5-15ms，并发排队放大首字延迟数百 ms）
         self._pending_cookie_tasks: set[asyncio.Task[None]] = set()
@@ -706,7 +753,9 @@ class HTTPStreamTransport:
             if client is not None and not client.is_closed:
                 return client
             client = httpx.AsyncClient(
-                timeout=httpx.Timeout(self.timeout, connect=15.0),
+                timeout=httpx.Timeout(
+                    self.timeout, connect=15.0, write=120.0, pool=30.0
+                ),
                 proxy=effective,
                 trust_env=False,
                 http2=_http2_enabled(),
@@ -886,9 +935,15 @@ class HTTPStreamTransport:
             await self._ensure_cors_preflight(
                 url=url, rpc_headers=clean_headers, client=client
             )
+            resp: httpx.Response | None = None
             try:
                 request = _build_rpc_request(client, url, wire_headers, body_bytes)
-                resp = await client.send(request, auth=None)
+                # Keep ownership before buffering the body. httpx's implicit
+                # buffering can be cancelled before it returns a Response, so
+                # its cleanup cannot be shielded by this transport otherwise.
+                resp = await client.send(request, stream=True, auth=None)
+                _protect_response_close(resp)
+                await resp.aread()
                 # Set-Cookie 回写下放线程池（3.4）：逐账号读盘/写盘的同步 I/O
                 # 若留在事件循环内会拖慢所有并发请求的首字延迟。
                 set_cookies = resp.headers.get_list("set-cookie")
@@ -929,6 +984,10 @@ class HTTPStreamTransport:
                     err_detail,
                 )
                 raise TransportError(f"HTTP request failed: {err_detail}") from exc
+            finally:
+                if resp is not None:
+                    with anyio.move_on_after(5, shield=True):
+                        await resp.aclose()
 
     async def send_streaming_request(
         self,
@@ -966,6 +1025,7 @@ class HTTPStreamTransport:
             try:
                 req = _build_rpc_request(client, url, wire_headers, body_bytes)
                 resp = await client.send(req, stream=True, auth=None)
+                _protect_response_close(resp)
                 set_cookies = resp.headers.get_list("set-cookie")
                 if set_cookies:
                     # 后台落盘：Google 上游普遍带滚动 Set-Cookie，
@@ -1036,4 +1096,8 @@ class HTTPStreamTransport:
                 yield ("error", err_detail)
             finally:
                 if resp is not None:
-                    await resp.aclose()
+                    # Starlette disconnects use level cancellation: without a
+                    # shield, HTTP/2 connection cleanup is cancelled at its next
+                    # await and the pool can accumulate unusable leases.
+                    with anyio.move_on_after(5, shield=True):
+                        await resp.aclose()

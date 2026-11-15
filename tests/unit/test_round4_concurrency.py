@@ -118,11 +118,11 @@ async def test_transport_error_maps_generic_runtimeerror_to_502(monkeypatch):
 
     # A bare RuntimeError whose message contains a transport keyword is a
     # transport failure per domain/errors.is_transport_error, and must produce
-    # 502/upstream_error instead of falling through to the generic 500.
+    # 502/upstream_error after its retry budget, instead of a generic 500.
     with pytest.raises(HTTPException) as exc_info:
         await gemini_svc.handle_attempt_exception(
             RuntimeError("connection closed by peer"),
-            attempt=0,
+            attempt=2,
             model_path="models/gemini-3.7-flash",
             normalized_model="gemini-3.7-flash",
         )

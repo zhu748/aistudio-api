@@ -5,7 +5,9 @@ from __future__ import annotations
 import re
 
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import JSONResponse
 
+from aistudio_api.api.keepalive import keepalive_response
 from aistudio_api.api.response_models import GeminiGenerateContentResponse
 from aistudio_api.application.api_service_gemini import (
     handle_gemini_count_tokens,
@@ -57,13 +59,19 @@ async def generate_content(
 ):
     clean_model = _sanitize_model_path(model_path)
     logger.debug("收到 generateContent 请求: model=%s", clean_model)
-    return await handle_gemini_generate_content(
-        clean_model,
-        req,
-        client,
-        stream=False,
-        anti_truncation=_parse_anti_truncation_header(http_request),
-    )
+
+    async def respond():
+        response = await handle_gemini_generate_content(
+            clean_model,
+            req,
+            client,
+            stream=False,
+            anti_truncation=_parse_anti_truncation_header(http_request),
+        )
+        assert isinstance(response, GeminiGenerateContentResponse)
+        return JSONResponse(response.model_dump(mode="json"))
+
+    return await keepalive_response(respond, http_request)
 
 
 @router.post("/v1beta/{model_path:path}:countTokens")

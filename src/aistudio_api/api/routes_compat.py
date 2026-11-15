@@ -22,6 +22,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from aistudio_api.api.dependencies import get_client, get_runtime_state
+from aistudio_api.api.keepalive import (
+    STREAM_HEADERS,
+    HeartbeatStreamingResponse,
+    keepalive_response,
+)
 from aistudio_api.api.response_models import GeminiGenerateContentResponse
 from aistudio_api.api.schemas_compat import (
     ClaudeMessagesRequest,
@@ -62,7 +67,7 @@ if TYPE_CHECKING:
 logger = get_logger("routes.compat")
 router = APIRouter()
 
-_STREAM_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+_STREAM_HEADERS = STREAM_HEADERS
 
 
 def _truthy(value: object) -> bool:
@@ -158,55 +163,63 @@ async def openai_chat_completions(
     if observation is not None:
         observation.requested_model = req.model
         observation.is_stream = req.stream
-    try:
-        gemini_req, resolved_model = await openai_to_gemini_request(req)
-    except ValueError as exc:
-        raise HTTPException(
-            400, detail={"message": str(exc), "type": "bad_request"}
-        ) from exc
 
-    include_usage = False
-    if isinstance(req.stream_options, dict):
-        include_usage = _truthy(req.stream_options.get("include_usage"))
+    async def respond():
+        try:
+            gemini_req, resolved_model = await openai_to_gemini_request(req)
+        except ValueError as exc:
+            raise HTTPException(
+                400, detail={"message": str(exc), "type": "bad_request"}
+            ) from exc
 
-    logger.info(
-        "OpenAI 兼容请求: model=%s → %s, stream=%s, 轮数=%d",
-        req.model,
-        resolved_model,
-        req.stream,
-        len(req.messages),
-    )
-    response = await handle_gemini_generate_content(
-        resolved_model,
-        gemini_req,
-        client,
-        stream=req.stream,
-        anti_truncation=_parse_anti_truncation_header(http_request),
-    )
-    if req.stream:
-        if isinstance(response, StreamingResponse):
-            return StreamingResponse(
-                openai_stream_adapter(
-                    response.frames
-                    if isinstance(response, GeminiStreamResponse)
-                    else response.body_iterator,
-                    requested_model=req.model,
-                    include_usage=include_usage,
-                    register_failure=lambda handler: setattr(
-                        http_request.state, "stream_failure", handler
-                    ),
-                ),
-                media_type="text/event-stream",
-                headers=_STREAM_HEADERS,
-            )
-    elif isinstance(response, GeminiGenerateContentResponse):
-        return JSONResponse(
-            content=build_openai_completion(response, requested_model=req.model)
+        include_usage = False
+        if isinstance(req.stream_options, dict):
+            include_usage = _truthy(req.stream_options.get("include_usage"))
+
+        logger.info(
+            "OpenAI 兼容请求: model=%s → %s, stream=%s, 轮数=%d",
+            req.model,
+            resolved_model,
+            req.stream,
+            len(req.messages),
         )
-    raise HTTPException(
-        500,
-        detail={"message": "Unexpected upstream response type", "type": "server_error"},
-    )
+
+        response = await handle_gemini_generate_content(
+            resolved_model,
+            gemini_req,
+            client,
+            stream=req.stream,
+            anti_truncation=_parse_anti_truncation_header(http_request),
+        )
+        if req.stream:
+            if isinstance(response, StreamingResponse):
+                return HeartbeatStreamingResponse(
+                    openai_stream_adapter(
+                        response.frames
+                        if isinstance(response, GeminiStreamResponse)
+                        else response.body_iterator,
+                        requested_model=req.model,
+                        include_usage=include_usage,
+                        register_failure=lambda handler: setattr(
+                            http_request.state, "stream_failure", handler
+                        ),
+                    ),
+                    media_type="text/event-stream",
+                    headers=_STREAM_HEADERS,
+                )
+        elif isinstance(response, GeminiGenerateContentResponse):
+            return JSONResponse(
+                content=build_openai_completion(response, requested_model=req.model)
+            )
+        raise HTTPException(
+            500,
+            detail={
+                "message": "Unexpected upstream response type",
+                "type": "server_error",
+            },
+        )
+
+    return await keepalive_response(respond, http_request, stream=req.stream)
 
 
 @router.post("/v1/responses")
@@ -228,51 +241,59 @@ async def openai_responses(
     if observation is not None:
         observation.requested_model = req.model
         observation.is_stream = req.stream
-    try:
-        gemini_req, resolved_model = await responses_to_gemini_request(req)
-    except ValueError as exc:
-        raise HTTPException(
-            400, detail={"message": str(exc), "type": "bad_request"}
-        ) from exc
 
-    input_desc = "string" if isinstance(req.input, str) else "items"
-    logger.info(
-        "Responses 兼容请求: model=%s → %s, stream=%s, input=%s",
-        req.model,
-        resolved_model,
-        req.stream,
-        input_desc,
-    )
-    response = await handle_gemini_generate_content(
-        resolved_model,
-        gemini_req,
-        client,
-        stream=req.stream,
-        anti_truncation=_parse_anti_truncation_header(http_request),
-    )
-    if req.stream:
-        if isinstance(response, StreamingResponse):
-            return StreamingResponse(
-                responses_stream_adapter(
-                    response.frames
-                    if isinstance(response, GeminiStreamResponse)
-                    else response.body_iterator,
-                    requested_model=req.model,
-                    register_failure=lambda handler: setattr(
-                        http_request.state, "stream_failure", handler
-                    ),
-                ),
-                media_type="text/event-stream",
-                headers=_STREAM_HEADERS,
-            )
-    elif isinstance(response, GeminiGenerateContentResponse):
-        return JSONResponse(
-            content=build_responses_object(response, requested_model=req.model)
+    async def respond():
+        try:
+            gemini_req, resolved_model = await responses_to_gemini_request(req)
+        except ValueError as exc:
+            raise HTTPException(
+                400, detail={"message": str(exc), "type": "bad_request"}
+            ) from exc
+
+        input_desc = "string" if isinstance(req.input, str) else "items"
+        logger.info(
+            "Responses 兼容请求: model=%s → %s, stream=%s, input=%s",
+            req.model,
+            resolved_model,
+            req.stream,
+            input_desc,
         )
-    raise HTTPException(
-        500,
-        detail={"message": "Unexpected upstream response type", "type": "server_error"},
-    )
+
+        response = await handle_gemini_generate_content(
+            resolved_model,
+            gemini_req,
+            client,
+            stream=req.stream,
+            anti_truncation=_parse_anti_truncation_header(http_request),
+        )
+        if req.stream:
+            if isinstance(response, StreamingResponse):
+                return HeartbeatStreamingResponse(
+                    responses_stream_adapter(
+                        response.frames
+                        if isinstance(response, GeminiStreamResponse)
+                        else response.body_iterator,
+                        requested_model=req.model,
+                        register_failure=lambda handler: setattr(
+                            http_request.state, "stream_failure", handler
+                        ),
+                    ),
+                    media_type="text/event-stream",
+                    headers=_STREAM_HEADERS,
+                )
+        elif isinstance(response, GeminiGenerateContentResponse):
+            return JSONResponse(
+                content=build_responses_object(response, requested_model=req.model)
+            )
+        raise HTTPException(
+            500,
+            detail={
+                "message": "Unexpected upstream response type",
+                "type": "server_error",
+            },
+        )
+
+    return await keepalive_response(respond, http_request, stream=req.stream)
 
 
 @router.post("/v1/messages")
@@ -295,55 +316,63 @@ async def claude_messages(
     if observation is not None:
         observation.requested_model = req.model
         observation.is_stream = req.stream
-    try:
-        gemini_req, resolved_model = await claude_to_gemini_request(req)
-    except ValueError as exc:
-        raise HTTPException(
-            400, detail={"message": str(exc), "type": "bad_request"}
-        ) from exc
 
-    logger.info(
-        "Claude 兼容请求: model=%s → %s, stream=%s, 轮数=%d",
-        req.model,
-        resolved_model,
-        req.stream,
-        len(req.messages),
-    )
-    response = await handle_gemini_generate_content(
-        resolved_model,
-        gemini_req,
-        client,
-        stream=req.stream,
-        anti_truncation=_parse_anti_truncation_header(http_request),
-    )
-    if req.stream:
-        if isinstance(response, StreamingResponse):
-            return StreamingResponse(
-                claude_stream_adapter(
-                    response.frames
-                    if isinstance(response, GeminiStreamResponse)
-                    else response.body_iterator,
+    async def respond():
+        try:
+            gemini_req, resolved_model = await claude_to_gemini_request(req)
+        except ValueError as exc:
+            raise HTTPException(
+                400, detail={"message": str(exc), "type": "bad_request"}
+            ) from exc
+
+        logger.info(
+            "Claude 兼容请求: model=%s → %s, stream=%s, 轮数=%d",
+            req.model,
+            resolved_model,
+            req.stream,
+            len(req.messages),
+        )
+
+        response = await handle_gemini_generate_content(
+            resolved_model,
+            gemini_req,
+            client,
+            stream=req.stream,
+            anti_truncation=_parse_anti_truncation_header(http_request),
+        )
+        if req.stream:
+            if isinstance(response, StreamingResponse):
+                return HeartbeatStreamingResponse(
+                    claude_stream_adapter(
+                        response.frames
+                        if isinstance(response, GeminiStreamResponse)
+                        else response.body_iterator,
+                        requested_model=req.model,
+                        stop_sequences=req.stop_sequences,
+                        register_failure=lambda handler: setattr(
+                            http_request.state, "stream_failure", handler
+                        ),
+                    ),
+                    media_type="text/event-stream",
+                    headers=_STREAM_HEADERS,
+                )
+        elif isinstance(response, GeminiGenerateContentResponse):
+            return JSONResponse(
+                content=build_claude_message(
+                    response,
                     requested_model=req.model,
                     stop_sequences=req.stop_sequences,
-                    register_failure=lambda handler: setattr(
-                        http_request.state, "stream_failure", handler
-                    ),
-                ),
-                media_type="text/event-stream",
-                headers=_STREAM_HEADERS,
+                )
             )
-    elif isinstance(response, GeminiGenerateContentResponse):
-        return JSONResponse(
-            content=build_claude_message(
-                response,
-                requested_model=req.model,
-                stop_sequences=req.stop_sequences,
-            )
+        raise HTTPException(
+            500,
+            detail={
+                "message": "Unexpected upstream response type",
+                "type": "server_error",
+            },
         )
-    raise HTTPException(
-        500,
-        detail={"message": "Unexpected upstream response type", "type": "server_error"},
-    )
+
+    return await keepalive_response(respond, http_request, stream=req.stream)
 
 
 @router.post("/v1/messages/count_tokens")

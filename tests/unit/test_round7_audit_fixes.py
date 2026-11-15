@@ -183,26 +183,16 @@ async def test_streaming_set_cookie_persist_off_critical_path() -> None:
 
     from aistudio_api.infrastructure.gateway import transport as tr
 
-    class FakeHeaders:
-        def get_list(self, name: str) -> list[str]:
-            return ["SIDCC=x"] if name == "set-cookie" else []
-
-    class FakeResp:
-        status_code = 200
-        headers = FakeHeaders()
-
-        async def aiter_bytes(self):
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
             yield b"chunk"
-
-        async def aclose(self) -> None:
-            pass
 
     class FakeClient:
         def build_request(self, *a, **k):
             return httpx.Request(*a, **k)
 
         async def send(self, *a, **k):
-            return FakeResp()
+            return httpx.Response(200, headers={"set-cookie": "SIDCC=x"}, stream=Body())
 
     t = tr.HTTPStreamTransport()
     called = threading.Event()

@@ -158,3 +158,13 @@ def is_transport_error(exc: Exception) -> bool:
             )
         )
     return False
+
+
+def is_retryable_upstream_error(exc: Exception) -> bool:
+    """Transient transport failures and explicit gateway/service timeouts.
+
+    Permission, quota and invalid requests retain their own recovery policies.
+    """
+    return is_transport_error(exc) or (
+        isinstance(exc, RequestError) and exc.status in (502, 503, 504)
+    )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -32,6 +33,14 @@ def _load_bool_env(*names: str, default: bool) -> bool:
     if value is None:
         return default
     return value not in ("0", "false", "False")
+
+
+def _positive_seconds(name: str, default: float) -> float:
+    raw = _load_env(name)
+    value = float(raw) if raw is not None else default
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a finite positive number")
+    return value
 
 
 def _load_web_password() -> str | None:
@@ -286,6 +295,16 @@ class Settings:
     )
     request_timeout: float = max(
         1.0, float(os.getenv("AISTUDIO_REQUEST_TIMEOUT", "600"))
+    )
+    stream_heartbeat_interval: float = _positive_seconds(
+        "AISTUDIO_STREAM_HEARTBEAT_INTERVAL", 15.0
+    )
+    stream_send_timeout: float = _positive_seconds("AISTUDIO_STREAM_SEND_TIMEOUT", 30.0)
+    upstream_read_timeout: float = _positive_seconds(
+        "AISTUDIO_UPSTREAM_READ_TIMEOUT", 300.0
+    )
+    nonstream_keepalive: bool = _load_bool_env(
+        "AISTUDIO_NONSTREAM_KEEPALIVE", default=True
     )
 
     @property
