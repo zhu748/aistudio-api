@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -906,6 +906,40 @@ def config_file_write_lock() -> Iterator[None]:
     """跨模块共享的 config.yaml 读改写锁（进程级、可重入）。"""
     with _CONFIG_FILE_WRITE_LOCK:
         yield
+
+
+def update_config_yaml_document(
+    mutator: Callable[[dict[str, object]], None],
+    config_path: str | os.PathLike[str] | None = None,
+    *,
+    private: bool = False,
+) -> dict[str, object]:
+    """持锁读-改-写 config.yaml（闭包式文档编辑），写后失效缓存。
+
+    面板 API Key 增删改、全局代理等路由端点与模块内各 update_* 配置写
+    函数同属「读整份 YAML → 改内存 → 整文件覆盖」的并发临界区：统一经
+    此入口在 ``config_file_write_lock`` 内完成，杜绝各处样板复制锁语义
+    （漏锁或双锁）。``mutator`` 就地修改已解析的顶层字典；``private``
+    透传 ``atomic_write_text``（代理 URL 含凭据时 0600 落盘）。
+    """
+    resolved_path = _resolve_config_path(config_path)
+    with config_file_write_lock():
+        content = (
+            resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
+        )
+        parsed = yaml.safe_load(content) or {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+
+        mutator(parsed)
+
+        atomic_write_text(
+            resolved_path,
+            yaml.dump(parsed, allow_unicode=True, sort_keys=False),
+            private=private,
+        )
+    invalidate_config_cache()
+    return parsed
 
 
 def get_compat_settings(

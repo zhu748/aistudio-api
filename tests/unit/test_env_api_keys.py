@@ -130,7 +130,7 @@ async def test_list_api_keys_merges_env_injected(monkeypatch):
 
     未配置管理密码时（API Key 回退鉴权场景），Key 明文应脱敏展示（2.1）。
     """
-    from aistudio_api.api import routes_system
+    from aistudio_api.api import routes_config
     from aistudio_api.config import settings
 
     monkeypatch.setattr(
@@ -144,7 +144,7 @@ async def test_list_api_keys_merges_env_injected(monkeypatch):
     class _StubRequest:
         headers: ClassVar[dict[str, str]] = {"authorization": "Bearer sk-env-a"}
 
-    items = await routes_system.list_api_keys(_StubRequest())  # type: ignore[arg-type]
+    items = await routes_config.list_api_keys(_StubRequest())  # type: ignore[arg-type]
     by_key = {i.key: i for i in items}
 
     # 无管理密码：脱敏展示，但保留首尾可辨识字符

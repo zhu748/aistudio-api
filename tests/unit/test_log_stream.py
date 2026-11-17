@@ -19,7 +19,7 @@ from starlette.requests import Request
 from aistudio_api.api.app import (  # noqa: F401
     app,  # pyright: ignore[reportUnusedImport]
 )
-from aistudio_api.api.routes_system import protected_router, stream_runtime_logs
+from aistudio_api.api.routes_logs import protected_router, stream_runtime_logs
 from aistudio_api.infrastructure.utils.logger import (
     get_log_subscriber_count,
     get_logger,
@@ -176,7 +176,7 @@ def test_stream_route_registered_on_protected_router():
 
 
 # ---------------------------------------------------------------------------
-# SSE 流事件协议（routes_system.py）
+# SSE 流事件协议（routes_logs.py）
 # ---------------------------------------------------------------------------
 
 

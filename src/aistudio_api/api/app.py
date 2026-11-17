@@ -34,9 +34,21 @@ from .dependencies import require_api_key, require_web_auth
 from .request_middleware import RequestMiddleware
 from .routes_accounts import router as accounts_router
 from .routes_compat import router as compat_router
+from .routes_config import (
+    protected_router as config_protected_router,
+    public_router as config_public_router,
+)
 from .routes_gemini import router as gemini_router
+from .routes_logs import (
+    protected_router as logs_protected_router,
+    public_router as logs_public_router,
+)
 from .routes_models import router as models_router
 from .routes_operations import router as operations_router
+from .routes_signer import (
+    protected_router as signer_protected_router,
+    public_router as signer_public_router,
+)
 from .routes_system import (
     protected_router as system_protected_router,
     public_router as system_public_router,
@@ -415,6 +427,12 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="AI Studio API", lifespan=lifespan)
 app.include_router(system_public_router)
 app.include_router(system_protected_router, dependencies=[Depends(require_web_auth)])
+app.include_router(config_public_router)
+app.include_router(config_protected_router, dependencies=[Depends(require_web_auth)])
+app.include_router(signer_public_router)
+app.include_router(signer_protected_router, dependencies=[Depends(require_web_auth)])
+app.include_router(logs_public_router)
+app.include_router(logs_protected_router, dependencies=[Depends(require_web_auth)])
 app.include_router(
     accounts_router, prefix="/api", dependencies=[Depends(require_web_auth)]
 )

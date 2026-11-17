@@ -44,7 +44,7 @@ def test_redact_text_bridge_proxy_userinfo() -> None:
 
 
 def test_mask_yaml_api_keys_structural() -> None:
-    from aistudio_api.api.routes_system import _mask_yaml_api_keys
+    from aistudio_api.api.routes_config import _mask_yaml_api_keys
 
     for raw in (
         "api_keys: [{name: prod, key: sk-flow-secret-value-456}]",

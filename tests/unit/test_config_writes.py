@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import threading
 import time
@@ -16,7 +17,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from aistudio_api.api import routes_system
+from aistudio_api.api import routes_config
 from aistudio_api.application.account_rotator import AccountRotator
 from aistudio_api.infrastructure.gateway import model_defaults
 from aistudio_api.infrastructure.utils.common import (
@@ -90,14 +91,19 @@ def test_atomic_write_json_remains_valid_json(tmp_path: Path) -> None:
 
 @pytest.fixture
 def _isolated_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """把 _resolve_config_path 指向临时文件，避免污染仓库 config.yaml。"""
+    """把 _resolve_config_path 指向临时文件，避免污染仓库 config.yaml。
+
+    API Key 端点的读改写已收敛到 model_defaults.update_config_yaml_document，
+    patch 点统一落在 model_defaults（与 update_anti_truncation_settings 等
+    模块内写函数同一处），路由侧不再持有独立的 path/cache 引用。
+    """
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         yaml.dump({"api_keys": [], "logging": {"level": "INFO"}}, allow_unicode=True),
         encoding="utf-8",
     )
-    monkeypatch.setattr(routes_system, "_resolve_config_path", lambda _p: config_path)
-    monkeypatch.setattr(routes_system, "invalidate_config_cache", lambda: None)
+    monkeypatch.setattr(model_defaults, "_resolve_config_path", lambda _p: config_path)
+    monkeypatch.setattr(model_defaults, "invalidate_config_cache", lambda: None)
     return config_path
 
 
@@ -112,13 +118,13 @@ def _patch_slow_write(monkeypatch: pytest.MonkeyPatch, delay: float = 0.05) -> N
     无锁时所有线程都会在写之前读到同一份旧配置，最终只剩最后一个线程的
     改动；有锁时临界区串行，所有改动都会保留。
     """
-    original_write = routes_system.atomic_write_text
+    original_write = model_defaults.atomic_write_text
 
-    def _slow(path: Path | str, text: str) -> None:
+    def _slow(path: Path | str, text: str, *, private: bool = False) -> None:
         time.sleep(delay)
-        original_write(path, text)
+        original_write(path, text, private=private)
 
-    monkeypatch.setattr(routes_system, "atomic_write_text", _slow)
+    monkeypatch.setattr(model_defaults, "atomic_write_text", _slow)
 
 
 def test_threaded_create_api_keys_keeps_all_entries(
@@ -131,8 +137,8 @@ def test_threaded_create_api_keys_keeps_all_entries(
     def _create(index: int) -> None:
         try:
             asyncio.run(
-                routes_system.create_api_key(
-                    routes_system.CreateApiKeyRequest(
+                routes_config.create_api_key(
+                    routes_config.CreateApiKeyRequest(
                         key=f"sk-thread-{index:02d}", name=f"key-{index}"
                     )
                 )
@@ -160,8 +166,8 @@ async def test_threaded_delete_and_create_do_not_clobber(
     # event loop，导致 pytest-asyncio 保存的 loop 成为孤儿（GC 时报
     # "unclosed event loop"）。auto 模式下直接 await 即可。
     for index in range(4):
-        await routes_system.create_api_key(
-            routes_system.CreateApiKeyRequest(key=f"sk-old-{index}", name="old")
+        await routes_config.create_api_key(
+            routes_config.CreateApiKeyRequest(key=f"sk-old-{index}", name="old")
         )
 
     _patch_slow_write(monkeypatch)
@@ -169,15 +175,15 @@ async def test_threaded_delete_and_create_do_not_clobber(
 
     def _delete_old() -> None:
         try:
-            asyncio.run(routes_system.delete_api_key("sk-old-0"))
+            asyncio.run(routes_config.delete_api_key("sk-old-0"))
         except Exception as exc:
             errors.append(exc)
 
     def _create_new(key: str) -> None:
         try:
             asyncio.run(
-                routes_system.create_api_key(
-                    routes_system.CreateApiKeyRequest(key=key, name="new")
+                routes_config.create_api_key(
+                    routes_config.CreateApiKeyRequest(key=key, name="new")
                 )
             )
         except Exception as exc:
@@ -205,12 +211,12 @@ async def test_update_api_key_name_is_atomic_and_preserves_other_fields(
     _isolated_config: Path,
 ) -> None:
     """改名只应影响目标 Key 的 name，其余字段与同级配置块保持不变。"""
-    await routes_system.create_api_key(
-        routes_system.CreateApiKeyRequest(key="sk-target-abc", name="旧名")
+    await routes_config.create_api_key(
+        routes_config.CreateApiKeyRequest(key="sk-target-abc", name="旧名")
     )
 
-    updated = await routes_system.update_api_key_name(
-        "sk-target-abc", routes_system.UpdateApiKeyRequest(name="新名")
+    updated = await routes_config.update_api_key_name(
+        "sk-target-abc", routes_config.UpdateApiKeyRequest(name="新名")
     )
 
     assert updated.name == "新名"
@@ -275,8 +281,62 @@ def test_config_write_lock_is_shared_between_routes_and_model_defaults() -> None
     """路由端点与 model_defaults 的配置写函数必须共用同一把锁。
 
     两边各持一把锁时，面板保存 YAML 与切换 WAA 节点并发仍会互相覆盖。
+    拆分后 API Key 端点的读改写收敛到 model_defaults.update_config_yaml_document
+    （内部经 config_file_write_lock），路由侧不再直接持锁；此处验证路由
+    引用的正是该模块级共享实现，锁只剩唯一一份。
     """
-    assert routes_system.config_file_write_lock is model_defaults.config_file_write_lock
+    assert (
+        routes_config.update_config_yaml_document
+        is model_defaults.update_config_yaml_document
+    )
+    # 收敛入口内部使用 config_file_write_lock（模块级共享锁，持锁读改写）：
+    # 其实现与 model_defaults 自身配置写函数（switch_active_waa_server 等）
+    # 引用同一把 _CONFIG_FILE_WRITE_LOCK。
+    source = inspect.getsource(model_defaults.update_config_yaml_document)
+    assert "config_file_write_lock()" in source
+
+
+@pytest.mark.asyncio
+async def test_routes_key_writes_go_through_update_config_yaml_document(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """API Key 端点必须经 model_defaults.update_config_yaml_document 落盘。
+
+    这是拆分后「路由与配置写函数共用同一把锁」的结构性保证：monkeypatch
+    该函数即可验证调用关系（替代旧的 `routes_system.config_file_write_lock
+    is model_defaults.config_file_write_lock` 模块属性断言）。
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.dump({"api_keys": [], "logging": {"level": "INFO"}}, allow_unicode=True),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(model_defaults, "_resolve_config_path", lambda _p: config_path)
+    monkeypatch.setattr(model_defaults, "invalidate_config_cache", lambda: None)
+
+    real_doc = routes_config.update_config_yaml_document
+    calls: list[object] = []
+
+    def _spy(mutator, config_path=None, *, private=False):
+        calls.append(mutator)
+        return real_doc(mutator, config_path, private=private)
+
+    # 端点经 routes_config 命名空间引用该函数（模块级 from-import），
+    # patch 点必须落在 routes_config 上才能拦到调用。
+    monkeypatch.setattr(routes_config, "update_config_yaml_document", _spy)
+
+    await routes_config.create_api_key(
+        routes_config.CreateApiKeyRequest(key="sk-spy-1", name="a")
+    )
+    await routes_config.delete_api_key("sk-spy-1")
+    await routes_config.create_api_key(
+        routes_config.CreateApiKeyRequest(key="sk-spy-2", name="b")
+    )
+    await routes_config.update_api_key_name(
+        "sk-spy-2", routes_config.UpdateApiKeyRequest(name="renamed")
+    )
+
+    assert len(calls) == 4  # 每次读改写都经收敛入口
 
 
 @pytest.mark.asyncio
@@ -291,8 +351,8 @@ async def test_cross_module_config_writes_do_not_clobber(
 
     await asyncio.gather(
         *(
-            routes_system.create_api_key(
-                routes_system.CreateApiKeyRequest(key=f"sk-cross-{index:02d}", name="x")
+            routes_config.create_api_key(
+                routes_config.CreateApiKeyRequest(key=f"sk-cross-{index:02d}", name="x")
             )
             for index in range(4)
         ),
