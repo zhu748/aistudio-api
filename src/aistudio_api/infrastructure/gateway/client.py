@@ -118,12 +118,6 @@ class AIStudioClient:
         """Expose active gateway session facade."""
         return self._session
 
-    async def warmup(self) -> None:
-        """初始化活跃账号会话。"""
-        if self._session is not None:
-            await self._session.ensure_ready()
-            logger.info("网关会话已就绪")
-
     async def switch_auth(self, auth_file: str | None) -> None:
         if self._session is not None:
             await self._session.switch_auth(auth_file)

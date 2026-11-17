@@ -229,6 +229,37 @@ def discover_proxy_url() -> str | None:
     return None
 
 
+def discover_keepalive_url() -> str:
+    """解析出站保活目标 URL（AISTUDIO_KEEPALIVE_URL > config.yaml network.keepalive_url）。
+
+    典型用法：Render / HuggingFace Space 等免费平台会冻结闲置实例，
+    填自己的 ``https://域名/healthz`` 定期自我唤醒；留空 = 不启动。
+    详见 infrastructure/outbound_keepalive.py。
+    """
+    env_value = os.getenv("AISTUDIO_KEEPALIVE_URL")
+    if env_value is not None and env_value.strip():
+        return env_value.strip()
+    try:
+        config = yaml.safe_load(resolve_config_file().read_text(encoding="utf-8"))
+        network = config.get("network", {}) if isinstance(config, dict) else {}
+        if isinstance(network, dict) and "keepalive_url" in network:
+            return str(network["keepalive_url"] or "").strip()
+    except (OSError, ValueError, yaml.YAMLError):
+        pass
+    return ""
+
+
+def discover_keepalive_interval() -> int:
+    """解析保活间隔秒数（AISTUDIO_KEEPALIVE_INTERVAL，默认 60，下限 5）。"""
+    raw = os.getenv("AISTUDIO_KEEPALIVE_INTERVAL")
+    if raw is None or not raw.strip():
+        return 60
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return 60
+
+
 def resolve_timezone() -> str:
     """解析系统或配置时区（优先使用 AISTUDIO_TIMEZONE 环境变量）。"""
     override = os.getenv("AISTUDIO_TIMEZONE")
@@ -305,6 +336,15 @@ class Settings:
     )
     nonstream_keepalive: bool = _load_bool_env(
         "AISTUDIO_NONSTREAM_KEEPALIVE", default=True
+    )
+    # 出站保活（见 infrastructure/outbound_keepalive.py）：定期 GET 目标 URL，
+    # 防免费托管平台冻结闲置实例；留空 = 不启动（零开销）。
+    keepalive_url: str = discover_keepalive_url()
+    keepalive_interval: int = max(
+        5, discover_keepalive_interval()
+    )  # 秒，下限 5（见 outbound_keepalive._MIN_INTERVAL_SECONDS）
+    keepalive_allow_private: bool = _load_bool_env(
+        "AISTUDIO_KEEPALIVE_ALLOW_PRIVATE", default=False
     )
 
     @property

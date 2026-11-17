@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import threading
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from os.path import basename, join, realpath
@@ -15,6 +16,14 @@ from pathlib import Path
 from typing import ClassVar
 
 from aistudio_api.infrastructure.utils.common import atomic_write_json
+
+
+def _assign_if_changed(acc: AccountMeta, field_name: str, value: object) -> bool:
+    """值有变化时赋值并返回 True；值相同返回 False（供幂等跳过写盘）。"""
+    if getattr(acc, field_name) == value:
+        return False
+    setattr(acc, field_name, value)
+    return True
 
 
 def _atomic_write_json(path: Path, data: object, *, private: bool = True) -> None:
@@ -657,16 +666,41 @@ class AccountStore:
             self._save_registry(registry)
             return True
 
-    def update_account(self, account_id: str, name: str) -> AccountMeta | None:
-        """更新账号名称。"""
-        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
-        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
+    def _update_account_fields(
+        self, account_id: str, mutate: Callable[[AccountMeta], bool]
+    ) -> AccountMeta | bool | None:
+        """单账号字段的持锁读-改-写公共骨架（meta.json 与 registry.json 同步落盘）。
+
+        返回三态：未找到账号 -> None；找到账号 -> ``mutate`` 返回的 changed
+        布尔（True = 已改并落盘，False = 值未变化跳过写盘的幂等行为，
+        与历史语义一致）。
+
+        全程持锁：与 save_account/delete_account 的并发契约对齐，
+        避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
+        """
         with self._lock:
             registry = self._load_registry()
             acc = self._find_registered_account(registry, account_id)
             if acc is None:
                 return None
-            acc.name = name
+            changed = mutate(acc)
+            if changed:
+                # 同步更新 meta.json
+                account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+                meta_path = account_dir / "meta.json"
+                if meta_path.exists():
+                    _atomic_write_json(meta_path, acc.to_dict())
+                self._save_registry(registry)
+            return changed
+
+    def update_account(self, account_id: str, name: str) -> AccountMeta | None:
+        """更新账号名称（名称恒写入，与历史行为一致）。"""
+        with self._lock:
+            registry = self._load_registry()
+            acc = self._find_registered_account(registry, account_id)
+            if acc is None:
+                return None
+            acc.name = str(name or "").strip() or acc.name
             # 同步更新 meta.json
             account_dir = _safe_account_dir(self._accounts_dir, acc.id)
             meta_path = account_dir / "meta.json"
@@ -677,69 +711,48 @@ class AccountStore:
 
     def update_account_email(self, account_id: str, email: str) -> bool:
         """更新账号的登录邮箱，并持久化 meta.json 与 registry.json。"""
-        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
-        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
-        with self._lock:
-            registry = self._load_registry()
-            acc = self._find_registered_account(registry, account_id)
-            if acc is None or acc.email == email:
-                return False
-            acc.email = email
-            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
-            meta_path = account_dir / "meta.json"
-            if meta_path.exists():
-                _atomic_write_json(meta_path, acc.to_dict())
-            self._save_registry(registry)
-            return True
+        result = self._update_account_fields(
+            account_id, lambda acc: _assign_if_changed(acc, "email", str(email or ""))
+        )
+        return result is not None and result is not False
 
     def update_account_proxy(self, account_id: str, proxy_url: str | None) -> bool:
         """更新账号的独立出口代理（None 表示回退全局代理），并持久化 meta.json 与 registry.json。"""
-        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
-        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
-        with self._lock:
-            from aistudio_api.infrastructure.account.cookie_parser import (
-                normalize_proxy_url,
-            )
+        from aistudio_api.infrastructure.account.cookie_parser import (
+            normalize_proxy_url,
+        )
 
-            clean_proxy = normalize_proxy_url(proxy_url)
-            registry = self._load_registry()
-            acc = self._find_registered_account(registry, account_id)
-            if acc is None or acc.proxy_url == clean_proxy:
-                return False
-            acc.proxy_url = clean_proxy
-            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
-            meta_path = account_dir / "meta.json"
-            if meta_path.exists():
-                _atomic_write_json(meta_path, acc.to_dict())
-            self._save_registry(registry)
-            return True
+        clean_proxy = normalize_proxy_url(proxy_url)
+        result = self._update_account_fields(
+            account_id,
+            lambda acc: _assign_if_changed(acc, "proxy_url", clean_proxy),
+        )
+        return result is not None and result is not False
 
     def update_account_tier(
         self, account_id: str, tier: str, checked_at: float | None = None
     ) -> bool:
-        """更新账号的订阅权益等级 (Free / Pro / Ultra / Ultra_20X / Plus)，并持久化 meta.json 与 registry.json。"""
-        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
-        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
-        with self._lock:
-            from aistudio_api.infrastructure.account.cookie_parser import (
-                normalize_benefit_tier,
-            )
+        """更新账号的订阅权益等级 (Free / Pro / Ultra / Ultra_20X / Plus)，并持久化 meta.json 与 registry.json。
 
-            registry = self._load_registry()
-            acc = self._find_registered_account(registry, account_id)
-            if acc is None:
-                return False
-            clean_tier = normalize_benefit_tier(tier)
+        返回 True 表示等级发生变化（或显式带 checked_at 刷新）；同值
+        且不带 checked_at 时返回 False（幂等，不写盘）。
+        """
+        from aistudio_api.infrastructure.account.cookie_parser import (
+            normalize_benefit_tier,
+        )
+
+        clean_tier = normalize_benefit_tier(tier)
+
+        def _mutate(acc: AccountMeta) -> bool:
             changed = acc.tier != clean_tier
             acc.tier = clean_tier
             if checked_at is not None:
                 acc.tier_checked_at = checked_at
-            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
-            meta_path = account_dir / "meta.json"
-            if meta_path.exists():
-                _atomic_write_json(meta_path, acc.to_dict())
-            self._save_registry(registry)
+                changed = True
             return changed
+
+        result = self._update_account_fields(account_id, _mutate)
+        return result is not None and result is not False
 
     def _sync_sibling_cookies_locked(self, registry: Registry) -> bool:
         """同步共享同一浏览器会话 (SAPISID / SID) 的多登兄弟账号 (u/0..u/N) 的滚动 Cookie。"""
@@ -967,8 +980,7 @@ class AccountStore:
         self, account_id: str, enabled: bool | None = None
     ) -> AccountMeta | None:
         """切换账号的启用/禁用状态。若未指定 enabled 则取反。"""
-        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
-        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
+        # 恒写盘（取反语义无"未变化"短路），沿用持锁读-改-写骨架。
         with self._lock:
             registry = self._load_registry()
             acc = self._find_registered_account(registry, account_id)
@@ -984,15 +996,13 @@ class AccountStore:
 
     def update_account_group(self, account_id: str, group: str) -> AccountMeta | None:
         """更新账号所属业务分组。"""
-        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
-        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
+        # 恒写盘（分组值清洗后允许与原值相同），沿用持锁读-改-写骨架。
         with self._lock:
             registry = self._load_registry()
             acc = self._find_registered_account(registry, account_id)
             if acc is None:
                 return None
-            clean_group = str(group or "default").strip() or "default"
-            acc.group = clean_group
+            acc.group = str(group or "default").strip() or "default"
             account_dir = _safe_account_dir(self._accounts_dir, acc.id)
             meta_path = account_dir / "meta.json"
             if meta_path.exists():
@@ -1002,8 +1012,7 @@ class AccountStore:
 
     def update_account_notes(self, account_id: str, notes: str) -> AccountMeta | None:
         """更新账号运维备注信息。"""
-        # 全程持锁：与 save_account/delete_account 的并发契约对齐，
-        # 避免 _save_registry 的锁外 to_dict 迭代撞上持锁方的 dict 变更。
+        # 恒写盘（清空备注是合法的显式操作），沿用持锁读-改-写骨架。
         with self._lock:
             registry = self._load_registry()
             acc = self._find_registered_account(registry, account_id)
