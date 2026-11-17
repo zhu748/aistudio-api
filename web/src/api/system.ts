@@ -17,6 +17,8 @@ import type {
   TestSignerServerResponse,
   AntiTruncationConfig,
   UpdateAntiTruncationConfigRequest,
+  KeepaliveConfig,
+  UpdateKeepaliveConfigRequest,
   LogsResponse,
 } from '@/types'
 
@@ -77,6 +79,17 @@ export const systemApi = {
 
   updateAntiTruncationConfig(req: UpdateAntiTruncationConfigRequest): Promise<AntiTruncationConfig & { ok: boolean }> {
     return request('/config/anti-truncation', {
+      method: 'PUT',
+      body: JSON.stringify(req),
+    })
+  },
+
+  getKeepaliveConfig(): Promise<KeepaliveConfig> {
+    return request<KeepaliveConfig>('/config/keepalive')
+  },
+
+  updateKeepaliveConfig(req: UpdateKeepaliveConfigRequest): Promise<KeepaliveConfig> {
+    return request<KeepaliveConfig>('/config/keepalive', {
       method: 'PUT',
       body: JSON.stringify(req),
     })

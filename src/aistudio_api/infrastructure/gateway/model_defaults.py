@@ -887,6 +887,88 @@ def update_config_yaml_document(
     return parsed
 
 
+# 出站保活面板设置（config.yaml network.keepalive_*；读写均含 mtime 缓存 /
+# 写锁语义，与 compat / anti_truncation 同款骨架）。
+_keepalive_cache: dict[str, tuple[float, dict[str, object]]] = {}
+_KEEPALIVE_MIN_INTERVAL = 5  # 与 outbound_keepalive._MIN_INTERVAL_SECONDS 一致
+
+
+def get_keepalive_settings(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """获取 config.yaml network.keepalive_* 出站保活设置。
+
+    返回固定形状::
+
+        {"url": "", "interval": 60, "allow_private": False}
+
+    面板读端点直接消费；环境变量覆盖（AISTUDIO_KEEPALIVE_URL 等）在
+    ``Settings`` 侧生效，此处只反映 YAML 文件值。
+    """
+    resolved_path = _resolve_config_path(config_path)
+    result: dict[str, object] = {
+        "url": "",
+        "interval": 60,
+        "allow_private": False,
+    }
+    if not resolved_path.exists():
+        return result
+
+    path_key = str(resolved_path.absolute())
+    mtime = _cached_mtime(resolved_path)
+    cached = _keepalive_cache.get(path_key)
+    if cached is not None and _cache_fresh(cached[0], mtime):
+        return dict(cached[1])
+
+    config = _load_yaml_config(resolved_path)
+    raw_network = config.get("network")
+    if isinstance(raw_network, dict):
+        raw_url = raw_network.get("keepalive_url")
+        if isinstance(raw_url, str):
+            result["url"] = raw_url.strip()
+        raw_interval = raw_network.get("keepalive_interval")
+        if isinstance(raw_interval, int) and not isinstance(raw_interval, bool):
+            result["interval"] = max(_KEEPALIVE_MIN_INTERVAL, raw_interval)
+        raw_allow = raw_network.get("keepalive_allow_private")
+        if isinstance(raw_allow, bool):
+            result["allow_private"] = raw_allow
+    _keepalive_cache[path_key] = (mtime, dict(result))
+    return dict(result)
+
+
+def update_keepalive_settings(
+    url: str,
+    interval: int,
+    allow_private: bool,
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """更新 network.keepalive_* 三键并持久化（读改写统一走文档编辑器）。
+
+    interval 域外时夹到 [5, 86400]（面板滑杆语义）；url 不合法由路由层
+    先行校验（此处只做形状清洗）。
+    """
+    cleaned_url = url.strip()
+    clamped_interval = min(86400, max(_KEEPALIVE_MIN_INTERVAL, int(interval)))
+    allow_private = bool(allow_private)
+
+    def mutate(parsed: dict[str, object]) -> None:
+        network = parsed.get("network")
+        if not isinstance(network, dict):
+            network = {}
+            parsed["network"] = network
+        network["keepalive_url"] = cleaned_url
+        network["keepalive_interval"] = clamped_interval
+        network["keepalive_allow_private"] = allow_private
+
+    update_config_yaml_document(mutate, config_path)
+    _keepalive_cache.pop(str(_resolve_config_path(config_path).absolute()), None)
+    return {
+        "url": cleaned_url,
+        "interval": clamped_interval,
+        "allow_private": allow_private,
+    }
+
+
 def get_compat_settings(
     config_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
