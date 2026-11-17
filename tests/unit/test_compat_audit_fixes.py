@@ -740,7 +740,7 @@ async def test_responses_request_system_content_array() -> None:
 def test_model_mapping_wildcard_key_matches(monkeypatch: pytest.MonkeyPatch) -> None:
     """通配符键 "claude-sonnet-*" 能命中 "claude-sonnet-4-5-20250929"。"""
     monkeypatch.setattr(
-        "aistudio_api.application.compat_service.get_compat_settings",
+        "aistudio_api.application.compat_shared.get_compat_settings",
         lambda: {
             "claude_default_model": "gemini-fallback",
             "claude_model_mapping": {"claude-sonnet-*": "gemini-4-argon"},

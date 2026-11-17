@@ -64,3 +64,16 @@
 - **微修批**：app.py 函数内重复 `import httpx` 清理；`_iter_response_parts` 两份经归一化比对语义不同（签名缓存行为差异），保留各自实现；404 文案、`_EXTRA_GUARANTEED_MODELS` 去重两项经核实（测试断言措辞/嵌套作用域风险）不值得改，维持现状。
 
 剩余未执行（均为低优先微修，收益低于风险）：routes_accounts 拆导入端点、compat_service 五关注点文件级拆分、wire_parser PartIndex 双轨统一、logger/log 命名统一。至此路线图高/中优先项全部清零。
+
+## 路线图执行完成记录（2026-11-17 第四批，收尾批）
+
+上批遗留的低优先项全部落地或核销。最终验证（CI 同位口径）：ruff check . / ruff format --check . 全过、pyright src tests 0 errors、全量 pytest 1449 passed + 5 skipped。
+
+- **CI 红灯修复**：上批 c9174f6 将拆分脚本入库但带 21 个 lint 错误（本地验证口径是 `src` 而 CI 是全仓 `.`，盲区）→ ruff --fix + format 修复，本地补齐 CI 同位四连校验。
+- **routes_accounts.py 拆分**（1038 → 575 行）：Cookie 导入端点族（import-cookies / probe-import / import-bundle 三端点 + 7 个请求/响应模型）拆出 `routes_account_imports.py`（493 行）；app.py 同款双挂载，URL 零变化；`log` → `logger` 命名统一。
+- **compat_service.py 五关注点拆分**（2311 → 100 行聚合门面）：共享层 `compat_shared.py`（486 行：媒体/签名/并发/SSE 帧解析 + resolve_compat_model）、`compat_errors.py`（214 行：双侧错误类型映射 + 错误 payload 构造）、`compat_openai.py`（826 行：请求转换 + completion 构建 + 流适配器）、`compat_claude.py`（855 行：Claude 全族）；门面单向 re-export，routes/responses_service/测试 import 路径零变化；openai/claude 互不依赖。
+- **wire_parser PartIndex 双轨统一**：13 个 `WIRE_PART_*_INDEX` 模块级常量改为 `wire_spec.PartIndex` 取值别名（单一真相源，wire_codec import 面零改动）。
+- **logger/log 命名统一**：session.py 收尾（`log = get_logger("session")` → `logger`）。
+- **维持现状**（上批已注明理由）：404 文案统一（测试断言既有措辞）、`_EXTRA_GUARANTEED_MODELS` 去重（嵌套作用域风险大于收益）。
+
+至此审查报告路线图全部条目执行完毕（执行 / 核销均有记录）。

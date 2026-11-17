@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from aistudio_api.api.response_models import GeminiGenerateContentResponse
-from aistudio_api.application import compat_service
+from aistudio_api.application import compat_shared
 from aistudio_api.application.compat_service import (
     _parse_gemini_sse_frames,
     build_claude_message,
@@ -89,7 +89,7 @@ async def test_sse_line_endings_multiline_data_and_utf8(newline, fragment_size):
 async def test_sse_size_limit_includes_complete_events_and_utf8_bytes(
     monkeypatch, terminated, text
 ):
-    monkeypatch.setattr(compat_service, "_MAX_SSE_EVENT_BYTES", 200)
+    monkeypatch.setattr(compat_shared, "_MAX_SSE_EVENT_BYTES", 200)
     raw = "data: " + json.dumps(frame([{"text": text}]), ensure_ascii=False)
     if terminated:
         raw += "\n\n"
@@ -98,7 +98,7 @@ async def test_sse_size_limit_includes_complete_events_and_utf8_bytes(
 
 
 async def test_sse_size_limit_is_per_event_in_a_single_network_chunk(monkeypatch):
-    monkeypatch.setattr(compat_service, "_MAX_SSE_EVENT_BYTES", 200)
+    monkeypatch.setattr(compat_shared, "_MAX_SSE_EVENT_BYTES", 200)
     item = frame([{"text": "hi"}])
     raw = ("data: " + json.dumps(item) + "\n\n") * 10
     assert [f async for f in _parse_gemini_sse_frames(source([raw]))] == [item] * 10

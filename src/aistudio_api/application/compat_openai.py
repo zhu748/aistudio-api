@@ -1,0 +1,826 @@
+"""OpenAI Chat Completions 协议兼容转换层。
+
+自 compat_service.py 拆出：请求侧（Chat Completions → Gemini 请求模型）、
+响应侧（Gemini 响应 / SSE 帧 → Chat Completion 对象与 chunk 流），以及
+各生态客户端思考强度参数的归一化族（``reasoning_effort`` / ``reasoning.effort``
+/ ``thinking`` / ``enable_thinking`` / ``chat_template_kwargs``）。
+
+媒体管线、签名缓存、SSE 帧解析等双侧共用工具见 compat_shared；
+错误码表与终结语义见 compat_errors。
+"""
+
+from __future__ import annotations
+
+import json
+import secrets
+import time
+from collections.abc import AsyncGenerator, AsyncIterable, Callable
+
+from aistudio_api.api.response_models import GeminiGenerateContentResponse
+from aistudio_api.api.schemas import (
+    GeminiContent,
+    GeminiFunctionCall,
+    GeminiFunctionResponse,
+    GeminiGenerateContentRequest,
+    GeminiGenerationConfig,
+    GeminiInlineData,
+    GeminiPart,
+    GeminiTool,
+)
+from aistudio_api.api.schemas_compat import OpenAIChatCompletionRequest
+from aistudio_api.application.compat_errors import (
+    _GEMINI_TO_OPENAI_FINISH,
+    _OPENAI_ERROR_TYPE,
+)
+from aistudio_api.application.compat_shared import (
+    _as_dict,
+    _as_int,
+    _as_str,
+    _assert_media_size,
+    _convert_items_concurrently,
+    _file_block_to_part,
+    _frame_candidate,
+    _frame_parts,
+    _iter_gemini_sse_frames,
+    _iter_response_parts,
+    _media_part_from_url,
+    _read_signature,
+    _signature_extra,
+    _stream_adapter_lifecycle,
+    _usage_from_gemini,
+    resolve_compat_model,
+)
+from aistudio_api.application.media_session import has_remote_media, media_session
+from aistudio_api.domain.tool_signatures import (
+    SKIP_THOUGHT_SIGNATURE,
+    lookup_function_signature as _lookup_function_signature,
+    valid_thought_signature as _valid_thought_signature,
+)
+from aistudio_api.infrastructure.request_context import record_result
+from aistudio_api.infrastructure.utils.logger import get_logger
+
+logger = get_logger("compat.openai")
+
+
+def _openai_content_text(content: object) -> str:
+    """提取 OpenAI content（str 或块数组）中的纯文本。
+
+    多个文本块之间以空行分隔，避免无分隔符拼接导致相邻单词粘连
+    （如 ``["You are a", "helpful assistant."]`` → ``"You are ahelpful..."``）。
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    texts.append(text)
+        return "\n\n".join(texts)
+    return ""
+
+
+def _openai_tool_arguments(raw: object) -> dict[str, object] | list[object]:
+    """OpenAI tool_calls function.arguments（JSON 字符串）→ 参数对象。"""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(parsed, (dict, list)):
+            return parsed
+    return {}
+
+
+async def _openai_parts_from_content(content: object) -> list[GeminiPart]:
+    """OpenAI content（str 或多模态块数组）→ Gemini parts。"""
+    if isinstance(content, str):
+        return [GeminiPart(text=content)]
+    if not isinstance(content, list):
+        return []
+    if len(content) > 1 and has_remote_media(content):
+        return await _convert_items_concurrently(content, _openai_parts_from_content)
+    parts: list[GeminiPart] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        block_type = item.get("type")
+        if block_type == "text":
+            text = item.get("text")
+            if isinstance(text, str):
+                parts.append(GeminiPart(text=text))
+        elif block_type == "image_url":
+            image_url = _as_dict(item.get("image_url"))
+            url = _as_str(image_url.get("url")).strip()
+            if url:
+                parts.append(await _media_part_from_url(url))
+        elif block_type == "input_audio":
+            audio = _as_dict(item.get("input_audio"))
+            data = _as_str(audio.get("data"))
+            if data:
+                fmt = _as_str(audio.get("format")).lower() or "wav"
+                _assert_media_size(data, kind="input_audio media")
+                parts.append(
+                    GeminiPart(
+                        inlineData=GeminiInlineData(mimeType=f"audio/{fmt}", data=data)
+                    )
+                )
+        elif block_type == "file":
+            file_obj = _as_dict(item.get("file"))
+            file_data = _as_str(file_obj.get("file_data"))
+            part = _file_block_to_part(file_data, file_obj.get("filename"))
+            if part is not None:
+                parts.append(part)
+        elif block_type == "refusal":
+            refusal = item.get("refusal")
+            if isinstance(refusal, str):
+                parts.append(GeminiPart(text=refusal))
+        else:
+            logger.debug("忽略不支持的 OpenAI content 块类型: %s", block_type)
+    return parts
+
+
+def _openai_tool_content_to_response(content: object) -> dict[str, object]:
+    """OpenAI tool 消息 content → Gemini functionResponse.response 载荷。"""
+    if isinstance(content, list):
+        texts = [
+            _as_str(item.get("text"))
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        text = "\n".join(t for t in texts if t)
+    elif isinstance(content, str):
+        text = content
+    else:
+        text = ""
+    if text.strip():
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+    return {"result": text}
+
+
+def _openai_tools_to_gemini(
+    tools: list[dict[str, object]] | None,
+) -> list[GeminiTool] | None:
+    """OpenAI/Responses function 工具声明 → Gemini functionDeclarations。
+
+    兼容两种形态：Chat Completions 把 name/description/parameters 放在
+    ``tool.function`` 子对象里，Responses API 直接放在 tool 顶层——两侧
+    字段都做 fallback，只认单一形态会静默丢掉另一侧的参数 schema。
+    空列表返回 ``[]`` 而非 None：``None`` 表示"未传 tools"（会触发
+    default_tools 注入），``[]`` 表示客户端显式禁用工具。
+    """
+    if tools is None:
+        return None
+    # 显式空列表返回空列表（而非 None）：None 会触发 normalize 层注入
+    # config.yaml 的 default_tools（Google Search 等），违背客户端
+    # "显式禁用工具" 的意图
+    if not tools:
+        return []
+    declarations: list[dict[str, object]] = []
+    for tool in tools:
+        # 只转换 function 工具；custom / web_search 等其他类型不误声明为函数
+        tool_type = tool.get("type")
+        if tool_type is not None and tool_type != "function":
+            logger.debug("跳过非 function 类型的 OpenAI 工具: %s", tool_type)
+            continue
+        function = _as_dict(tool.get("function"))
+        name = _as_str(function.get("name")) or _as_str(tool.get("name"))
+        if not name:
+            continue
+        decl: dict[str, object] = {"name": name}
+        description = function.get("description")
+        if not (isinstance(description, str) and description):
+            description = tool.get("description")
+        if isinstance(description, str) and description:
+            decl["description"] = description
+        parameters = function.get("parameters")
+        if not (isinstance(parameters, dict) and parameters):
+            parameters = tool.get("parameters")
+        if isinstance(parameters, dict) and parameters:
+            decl["parameters"] = parameters
+        # strict（OpenAI strict mode）透传：声明编码层据此把完整 JSON Schema
+        # 附加到 description（wire 无法表达 strict 的闭合对象语义）
+        strict = function.get("strict")
+        if not isinstance(strict, bool):
+            strict = tool.get("strict")
+        if isinstance(strict, bool):
+            decl["strict"] = strict
+        declarations.append(decl)
+    if not declarations:
+        return []
+    return [GeminiTool(functionDeclarations=declarations)]
+
+
+def _openai_tool_choice_to_config(
+    tool_choice: str | dict[str, object] | None,
+) -> dict[str, object] | None:
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        normalized = tool_choice.strip().lower()
+        mode_map = {"auto": "AUTO", "none": "NONE", "required": "ANY"}
+        mode = mode_map.get(normalized)
+        if mode is None:
+            return None
+        return {"functionCallingConfig": {"mode": mode}}
+    if isinstance(tool_choice, dict):
+        choice_type = tool_choice.get("type")
+        if choice_type == "function":
+            function = _as_dict(tool_choice.get("function"))
+            name = _as_str(function.get("name")) or _as_str(tool_choice.get("name"))
+            if name:
+                return {
+                    "functionCallingConfig": {
+                        "mode": "ANY",
+                        "allowedFunctionNames": [name],
+                    }
+                }
+        elif choice_type == "none":
+            return {"functionCallingConfig": {"mode": "NONE"}}
+        elif choice_type in ("auto", "any", "required"):
+            mode_map = {"auto": "AUTO", "any": "ANY", "required": "ANY"}
+            return {
+                "functionCallingConfig": {
+                    "mode": mode_map.get(str(choice_type), "AUTO")
+                }
+            }
+    return None
+
+
+def _openai_response_format_to_config(
+    response_format: dict[str, object] | None,
+) -> dict[str, object]:
+    """OpenAI response_format → Gemini responseMimeType / responseSchema。"""
+    if not isinstance(response_format, dict):
+        return {}
+    format_type = response_format.get("type")
+    if format_type == "json_object":
+        return {"responseMimeType": "application/json"}
+    if format_type == "json_schema":
+        json_schema = _as_dict(response_format.get("json_schema"))
+        config: dict[str, object] = {"responseMimeType": "application/json"}
+        schema = json_schema.get("schema")
+        if isinstance(schema, dict) and schema:
+            config["responseSchema"] = schema
+        return config
+    return {}
+
+
+@media_session()
+async def openai_to_gemini_request(
+    req: OpenAIChatCompletionRequest,
+) -> tuple[GeminiGenerateContentRequest, str]:
+    """OpenAI Chat Completions 请求 → (Gemini 请求, 解析后的模型名)。"""
+    resolved_model = resolve_compat_model(req.model, channel="openai")
+    if req.n not in (None, 1):
+        raise ValueError("Only n=1 is supported")
+    if req.parallel_tool_calls is False:
+        # OpenAI 官方语义是提示而非硬约束（不少框架默认发 false）；上游
+        # 无法强制串行 ≠ 必须拒绝请求。接受+忽略+告警，与
+        # responses 侧同策略。
+        logger.warning("parallel_tool_calls=false 无法在上游强制串行，已忽略该提示")
+    contents: list[GeminiContent] = []
+    system_texts: list[str] = []
+    tool_name_by_id: dict[str, str] = {}
+
+    # 第一遍：先扫全部 assistant 消息建 tool_call_id → 函数名映射。
+    # 与 Claude 侧一致的两遍扫描：容忍客户端把 tool 结果放在对应
+    # assistant 消息之前（裁剪/乱序历史），避免函数名回退 "unknown"
+    # 透传给上游 functionResponse 导致上游报错。
+    for message in req.messages:
+        if message.role.strip().lower() != "assistant":
+            continue
+        for tool_call in message.tool_calls or []:
+            function = _as_dict(tool_call.get("function"))
+            call_id = _as_str(tool_call.get("id"))
+            name = _as_str(function.get("name"))
+            if call_id and name:
+                tool_name_by_id.setdefault(call_id, name)
+
+    for message in req.messages:
+        role = message.role.strip().lower()
+        if role in ("system", "developer"):
+            system_texts.append(_openai_content_text(message.content))
+            continue
+        if role == "assistant":
+            parts: list[GeminiPart] = []
+            text = _openai_content_text(message.content)
+            if text:
+                parts.append(GeminiPart(text=text))
+            for tool_call in message.tool_calls or []:
+                function = _as_dict(tool_call.get("function"))
+                name = _as_str(function.get("name")) or "unknown"
+                args = _openai_tool_arguments(function.get("arguments"))
+                call_id = _as_str(tool_call.get("id"))
+                signature = _read_signature(tool_call)
+                if not _valid_thought_signature(signature):
+                    # 客户端未回传可用签名时，仅恢复同一次调用的缓存。
+                    signature = _lookup_function_signature(call_id or None, name, args)
+                if not _valid_thought_signature(signature):
+                    signature = SKIP_THOUGHT_SIGNATURE
+                parts.append(
+                    GeminiPart(
+                        thoughtSignature=signature,
+                        functionCall=GeminiFunctionCall(
+                            name=name, args=args, id=call_id or None
+                        ),
+                    )
+                )
+                if call_id:
+                    tool_name_by_id[call_id] = name
+            contents.append(
+                GeminiContent(role="model", parts=parts or [GeminiPart(text="")])
+            )
+            continue
+        if role in ("tool", "function"):
+            # 旧版 "function" 角色（LangChain 等客户端）与 "tool" 同义：
+            # 函数名优先取 tool_call_id 反查，其次 message.name 字段
+            name = tool_name_by_id.get(
+                message.tool_call_id or "", message.name or "unknown"
+            )
+            payload = _openai_tool_content_to_response(message.content)
+            contents.append(
+                GeminiContent(
+                    role="user",
+                    parts=[
+                        GeminiPart(
+                            functionResponse=GeminiFunctionResponse(
+                                name=name,
+                                response=payload,
+                                id=message.tool_call_id,
+                            )
+                        )
+                    ],
+                )
+            )
+            continue
+        # user 与未知角色按用户消息处理
+        parts = await _openai_parts_from_content(message.content)
+        contents.append(
+            GeminiContent(role="user", parts=parts or [GeminiPart(text="")])
+        )
+
+    generation_config: dict[str, object] = {}
+    if req.temperature is not None:
+        generation_config["temperature"] = req.temperature
+    if req.top_p is not None:
+        generation_config["topP"] = req.top_p
+    max_output_tokens = (
+        req.max_completion_tokens
+        if req.max_completion_tokens is not None
+        else req.max_tokens
+    )
+    if max_output_tokens is not None:
+        generation_config["maxOutputTokens"] = max_output_tokens
+    if req.frequency_penalty is not None:
+        generation_config["frequencyPenalty"] = req.frequency_penalty
+    if req.presence_penalty is not None:
+        generation_config["presencePenalty"] = req.presence_penalty
+    if req.seed is not None:
+        generation_config["seed"] = req.seed
+    if req.stop is not None:
+        stops = [req.stop] if isinstance(req.stop, str) else list(req.stop)
+        # 过滤空串停止词：空 stopSequences 会被上游 400 拒绝
+        stops = [s for s in stops if isinstance(s, str) and s]
+        if stops:
+            generation_config["stopSequences"] = stops
+    if req.logprobs:
+        generation_config["responseLogprobs"] = True
+        if req.top_logprobs is not None:
+            generation_config["logprobs"] = req.top_logprobs
+    generation_config.update(_openai_response_format_to_config(req.response_format))
+    # 思考强度归一化：reasoning_effort / reasoning.effort / thinking /
+    # enable_thinking / chat_template_kwargs 全部形态统一为一个档位词。
+    # "none" 会在下游抑制 profile 注入的浏览器默认思考档。
+    effort = _openai_reasoning_effort(req)
+    if effort is not None:
+        generation_config["reasoningEffort"] = effort
+
+    gemini_req = GeminiGenerateContentRequest(
+        contents=contents,
+        systemInstruction=(
+            GeminiContent(
+                role="user",
+                parts=[GeminiPart(text="\n\n".join(t for t in system_texts if t))],
+            )
+            if any(system_texts)
+            else None
+        ),
+        tools=_openai_tools_to_gemini(req.tools),
+        toolConfig=_openai_tool_choice_to_config(req.tool_choice),
+        generationConfig=(
+            GeminiGenerationConfig.model_validate(generation_config)
+            if generation_config
+            else None
+        ),
+    )
+    return gemini_req, resolved_model
+
+
+# 思考强度词表：兼容大小写 / 连字符 / 下划线 / 别名，统一归一化为
+# 管线档位词（minimal / low / medium / high / very_high / xhigh / none）。
+# "none" 表示显式关闭思考（下游会抑制 profile 注入的浏览器默认档）。
+_EFFORT_ALIASES: dict[str, str] = {
+    "none": "none",
+    "off": "none",
+    "disabled": "none",
+    "disable": "none",
+    "false": "none",
+    "0": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "very_high": "very_high",
+    "xhigh": "xhigh",
+    "max": "xhigh",
+}
+
+
+def normalize_reasoning_effort_word(raw: object) -> str | None:
+    """把任意 effort 词归一化为管线档位词，无法识别返回 None。
+
+    容忍大小写、``very-high`` / ``VERYHIGH`` 等分隔符变体与 off/max 等别名。
+    与 chat_service._parse_thinking_level 的档位词汇保持同一集合。
+    """
+    if not isinstance(raw, str):
+        return None
+    word = raw.strip().lower().replace("-", "_")
+    if not word:
+        return None
+    if word in _EFFORT_ALIASES:
+        return _EFFORT_ALIASES[word]
+    compact = word.replace("_", "")
+    for key, value in _EFFORT_ALIASES.items():
+        if key.replace("_", "") == compact:
+            return value
+    return None
+
+
+def _budget_to_effort(budget: int) -> str:
+    """思考预算（token 数）→ 档位词（与 Claude budget_tokens 映射同语义）。"""
+    if budget <= 2048:
+        return "low"
+    if budget <= 8192:
+        return "medium"
+    if budget <= 32768:
+        return "high"
+    return "xhigh"
+
+
+def _openai_reasoning_effort(req: OpenAIChatCompletionRequest) -> str | None:
+    """归一化 OpenAI 兼容端点的全部思考强度参数形态。
+
+    优先级（高 → 低）：
+    1. ``reasoning_effort``（OpenAI 官方顶层字符串）
+    2. ``reasoning.effort``（OpenRouter / 新版网关）
+    3. ``thinking``（智谱 GLM：type=enabled/disabled + 可选 budget_tokens /
+       max_budget_tokens，预算按 token 数映射档位）
+    4. ``enable_thinking``（Qwen / DashScope 布尔开关）
+    5. ``chat_template_kwargs.thinking``（vLLM 布尔或档位词）
+
+    返回 None 表示未指定任何思考强度（profile 浏览器默认档照常生效）；
+    "none" 表示显式关闭。无法识别的非空值记 warning 后按未指定处理。
+    """
+    # 1) OpenAI 官方顶层 reasoning_effort
+    if req.reasoning_effort is not None:
+        effort = normalize_reasoning_effort_word(req.reasoning_effort)
+        if effort is not None:
+            return effort
+        if req.reasoning_effort.strip():
+            logger.warning("忽略无法识别的 reasoning_effort: %r", req.reasoning_effort)
+        return None
+
+    # 2) OpenRouter / 新版网关：reasoning: {"effort": ...}
+    if isinstance(req.reasoning, dict):
+        effort = normalize_reasoning_effort_word(req.reasoning.get("effort"))
+        if effort is not None:
+            return effort
+        enabled = req.reasoning.get("enabled")
+        if isinstance(enabled, bool):
+            return "medium" if enabled else "none"
+
+    # 3) 智谱 GLM：thinking: {"type": ..., "budget_tokens" / "max_budget_tokens": N}
+    if isinstance(req.thinking, dict):
+        thinking_type = _as_str(req.thinking.get("type")).strip().lower()
+        budget = _as_int(req.thinking.get("budget_tokens"))
+        if budget is None:
+            budget = _as_int(req.thinking.get("max_budget_tokens"))
+        if thinking_type in ("disabled", "off", "none"):
+            return "none"
+        if thinking_type in ("enabled", "on", "custom", "auto"):
+            if budget is not None and budget > 0:
+                return _budget_to_effort(budget)
+            return "medium"
+        if budget is not None:
+            return "none" if budget <= 0 else _budget_to_effort(budget)
+
+    # 4) Qwen / DashScope：enable_thinking
+    if req.enable_thinking is not None:
+        return "medium" if req.enable_thinking else "none"
+
+    # 5) vLLM：chat_template_kwargs: {"thinking": true}
+    if isinstance(req.chat_template_kwargs, dict):
+        raw = req.chat_template_kwargs.get("thinking")
+        if isinstance(raw, bool):
+            return "medium" if raw else "none"
+        if isinstance(raw, str):
+            effort = normalize_reasoning_effort_word(raw)
+            if effort is not None:
+                return effort
+
+    return None
+
+
+def _openai_finish_reason(finish_reason: str | None, *, has_tool_calls: bool) -> str:
+    raw = finish_reason or "STOP"
+    # 安全/异常终结优先于 tool_calls：同一帧带 functionCall 但被 SAFETY 拦截时
+    # 必须报 content_filter，不能误报成成功完成的 tool_calls。
+    mapped = _GEMINI_TO_OPENAI_FINISH.get(raw)
+    if mapped is None:
+        # 未来新增的上游枚举不得静默变 "stop"（客户端会误信回答完整）
+        logger.warning("未识别的 Gemini finishReason: %s，按 length 处理", raw)
+        mapped = "length"
+    if mapped == "content_filter":
+        return "content_filter"
+    if mapped == "length":
+        return "length"
+    if has_tool_calls:
+        return "tool_calls"
+    return mapped or "stop"
+
+
+def build_openai_completion(
+    response: GeminiGenerateContentResponse, requested_model: str
+) -> dict[str, object]:
+    """Gemini 完整响应 → OpenAI Chat Completion 对象。"""
+    finish_reason_raw: str | None = None
+    candidates = response.candidates or []
+    if candidates:
+        finish_reason_raw = candidates[0].finishReason
+
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls: list[dict[str, object]] = []
+    has_tool_calls = False
+
+    for part in _iter_response_parts(response):
+        text = getattr(part, "text", None)
+        if isinstance(text, str) and text:
+            if getattr(part, "thought", None) is True:
+                reasoning_parts.append(text)
+            else:
+                text_parts.append(text)
+        inline = getattr(part, "inlineData", None)
+        if inline is not None:
+            text_parts.append(
+                f"\n\n![image](data:{inline.mimeType};base64,{inline.data})"
+            )
+        function_call = getattr(part, "functionCall", None)
+        if function_call is not None and finish_reason_raw in (None, "STOP"):
+            has_tool_calls = True
+            call_id = function_call.id or f"call_{secrets.token_hex(12)}"
+            args = function_call.args if function_call.args is not None else {}
+            tool_calls.append(
+                {
+                    **_signature_extra(getattr(part, "thoughtSignature", None)),
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": function_call.name,
+                        "arguments": json.dumps(args, ensure_ascii=False),
+                    },
+                }
+            )
+
+    content_text = "".join(text_parts)
+    message: dict[str, object] = {
+        "role": "assistant",
+        "content": content_text,
+    }
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    usage_payload = _openai_usage_from_frame(response.usageMetadata)
+
+    return {
+        "id": f"chatcmpl-{secrets.token_hex(14)}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": requested_model,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": _openai_finish_reason(
+                    finish_reason_raw, has_tool_calls=has_tool_calls
+                ),
+                "logprobs": None,
+            }
+        ],
+        "usage": usage_payload,
+        "system_fingerprint": "aistudio-api",
+    }
+
+
+def _openai_usage_from_frame(usage_metadata: object) -> dict[str, object]:
+    usage = _usage_from_gemini(usage_metadata or {})
+    payload: dict[str, object] = {
+        "prompt_tokens": usage["prompt"],
+        "completion_tokens": usage["completion"],
+        "total_tokens": usage["total"],
+    }
+    if usage["reasoning"]:
+        payload["completion_tokens_details"] = {"reasoning_tokens": usage["reasoning"]}
+    if usage["cached"]:
+        payload["prompt_tokens_details"] = {"cached_tokens": usage["cached"]}
+    return payload
+
+
+async def openai_stream_adapter(
+    source: AsyncIterable[object],
+    *,
+    requested_model: str,
+    include_usage: bool,
+    register_failure: Callable[[Callable[[str], list[str]]], None] | None = None,
+) -> AsyncGenerator[str, None]:
+    """Gemini SSE → OpenAI chat.completion.chunk SSE 流（含 data: [DONE]）。"""
+    completion_id = f"chatcmpl-{secrets.token_hex(14)}"
+    created = int(time.time())
+
+    def _sse(payload: dict[str, object]) -> str:
+        return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+
+    def _chunk(
+        delta: dict[str, object], finish_reason: str | None
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": requested_model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        if include_usage:
+            payload["usage"] = None
+        return payload
+
+    def _error_chunk(message: str, error_type: str, code: int) -> dict[str, object]:
+        # 错误必须包装成合法的 ChatCompletionChunk：SDK 会用
+        # ChatCompletionChunk.model_validate 校验每个 chunk，裸 error 帧缺
+        # id/object/created/model/choices 会直接抛 ValidationError。error 字段
+        # 作为附加信息保留（SDK 默认忽略未知字段），finish_reason 用终止态，
+        # 保证流以正常终结块收尾而不是异常断流。
+        payload = _chunk({}, "stop")
+        payload["error"] = {
+            "message": message,
+            "type": error_type,
+            "param": None,
+            "code": code,
+        }
+        return payload
+
+    finish_reason_raw: str | None = None
+    usage_frame: dict[str, object] | None = None
+    tool_index = 0
+    has_tool_calls = False
+    saw_error = False
+
+    # 确定性关闭内层 SSE 生成器（3.6）：适配器自身异常或客户端断连时，
+    # 不再依赖事件循环的异步生成器终结器延迟释放上游连接。
+    async with _stream_adapter_lifecycle(
+        source,
+        lambda message: [
+            _sse(_error_chunk(message, "api_error", 504)),
+            "data: [DONE]\n\n",
+        ],
+        register_failure,
+    ):
+        yield _sse(_chunk({"role": "assistant", "content": ""}, None))
+        try:
+            async for frame in _iter_gemini_sse_frames(source):
+                error_obj = frame.get("error")
+                if isinstance(error_obj, dict):
+                    saw_error = True
+                    code = _as_int(error_obj.get("code")) or 500
+                    message = _as_str(error_obj.get("message")) or "Upstream error"
+                    yield _sse(
+                        _error_chunk(
+                            message, _OPENAI_ERROR_TYPE.get(code, "api_error"), code
+                        )
+                    )
+                    break
+                candidate = _frame_candidate(frame)
+                finish = _as_str(candidate.get("finishReason"))
+                if finish:
+                    finish_reason_raw = finish
+                usage_metadata = frame.get("usageMetadata")
+                if isinstance(usage_metadata, dict):
+                    usage_frame = usage_metadata
+                for part in _frame_parts(candidate):
+                    function_call = _as_dict(part.get("functionCall"))
+                    if function_call:
+                        has_tool_calls = True
+                        call_id = _as_str(function_call.get("id")) or (
+                            f"call_{secrets.token_hex(12)}"
+                        )
+                        name = _as_str(function_call.get("name")) or "unknown"
+                        args = function_call.get("args")
+                        if args is None:
+                            args = {}
+                        yield _sse(
+                            _chunk(
+                                {
+                                    "tool_calls": [
+                                        {
+                                            **_signature_extra(
+                                                part.get("thoughtSignature")
+                                            ),
+                                            "index": tool_index,
+                                            "id": call_id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": name,
+                                                "arguments": json.dumps(
+                                                    args, ensure_ascii=False
+                                                ),
+                                            },
+                                        }
+                                    ]
+                                },
+                                None,
+                            )
+                        )
+                        tool_index += 1
+                        continue
+                    inline = _as_dict(part.get("inlineData"))
+                    if inline:
+                        mime = _as_str(inline.get("mimeType")) or "image/png"
+                        data = _as_str(inline.get("data"))
+                        if data:
+                            yield _sse(
+                                _chunk(
+                                    {
+                                        "content": (
+                                            f"\n\n![image](data:{mime};base64,{data})"
+                                        )
+                                    },
+                                    None,
+                                )
+                            )
+                        continue
+                    text = part.get("text")
+                    if isinstance(text, str) and text:
+                        if part.get("thought") is True:
+                            yield _sse(_chunk({"reasoning_content": text}, None))
+                        else:
+                            yield _sse(_chunk({"content": text}, None))
+        except Exception as exc:
+            saw_error = True
+            record_result(
+                "error", error=f"Stream conversion failed: {type(exc).__name__}: {exc}"
+            )
+            logger.warning("OpenAI 流式转换异常: %s", exc)
+            yield _sse(
+                _error_chunk(f"{type(exc).__name__}: {exc}", "internal_error", 500)
+            )
+
+        if saw_error:
+            yield "data: [DONE]\n\n"
+            return
+
+        finish_reason = _openai_finish_reason(
+            finish_reason_raw, has_tool_calls=has_tool_calls
+        )
+        usage_payload = (
+            _openai_usage_from_frame(usage_frame) if usage_frame is not None else None
+        )
+        final_chunk = _chunk({}, finish_reason)
+        # OpenAI 语义：仅 include_usage=True 时发送 usage（且以 choices 为空的
+        # 独立尾块形式）。False 时任何 chunk 都不得携带 usage 字段，否则 SDK
+        # 会把带 finish_reason 的终结块解析成混合块（协议不允许）。
+        yield _sse(final_chunk)
+        if include_usage and usage_payload is not None:
+            yield _sse(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": requested_model,
+                    "choices": [],
+                    "usage": usage_payload,
+                }
+            )
+        yield "data: [DONE]\n\n"

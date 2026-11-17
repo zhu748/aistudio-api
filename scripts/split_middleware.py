@@ -18,8 +18,7 @@ text = SRC.read_text(encoding="utf-8")
 # ---------------------------------------------------------------------------
 A1_OLD = "from collections.abc import Callable\n"
 A1_NEW = (
-    "from collections.abc import Callable\n"
-    "from dataclasses import dataclass, field\n"
+    "from collections.abc import Callable\nfrom dataclasses import dataclass, field\n"
 )
 assert text.count(A1_OLD) == 1, "anchor1 import"
 text = text.replace(A1_OLD, A1_NEW, 1)
@@ -27,11 +26,11 @@ text = text.replace(A1_OLD, A1_NEW, 1)
 # ---------------------------------------------------------------------------
 # Anchor 2: insert _ResponseObserver between _is_terminal_event and RequestMiddleware
 # ---------------------------------------------------------------------------
-A2_OLD = '''class RequestMiddleware:
+A2_OLD = """class RequestMiddleware:
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
         self.active = 0
-'''
+"""
 A2_NEW = '''@dataclass
 class _ResponseObserver:
     """__call__ 内观测到的请求/响应状态（原 14 个 nonlocal 闭包变量）。
@@ -69,7 +68,7 @@ text = text.replace(A2_OLD, A2_NEW, 1)
 # ---------------------------------------------------------------------------
 # Anchor 3: state init block in __call__
 # ---------------------------------------------------------------------------
-A3_OLD = '''        token = current_request.set(context)
+A3_OLD = """        token = current_request.set(context)
         started_at, started = time.time(), time.perf_counter()
         status, response_started, completed = 500, False, False
         sending = False
@@ -89,22 +88,22 @@ A3_OLD = '''        token = current_request.set(context)
         admitted = False
         request_timeout = asyncio.timeout(settings.request_timeout)
         history_start: asyncio.Task[None] | None = None
-'''
-A3_NEW = '''        observer = _ResponseObserver()
+"""
+A3_NEW = """        observer = _ResponseObserver()
         token = current_request.set(context)
         started_at, started = time.time(), time.perf_counter()
         headers = {k.decode("latin1"): v.decode("latin1") for k, v in scope["headers"]}
         admitted = False
         request_timeout = asyncio.timeout(settings.request_timeout)
         history_start: asyncio.Task[None] | None = None
-'''
+"""
 assert text.count(A3_OLD) == 1, "anchor3 state init"
 text = text.replace(A3_OLD, A3_NEW, 1)
 
 # ---------------------------------------------------------------------------
 # Anchor 4: reply() body — response_headers is now observer field
 # ---------------------------------------------------------------------------
-A4_OLD = '''            response_headers = [(b"content-type", b"application/json")]
+A4_OLD = """            response_headers = [(b"content-type", b"application/json")]
             # RequestMiddleware 位于 CORS 兼容层之外（send 超时必须约束真实
             # socket 而非 BaseHTTPMiddleware 的内存通道），本函数直接发出的
             # 429/413/504/500 不会经过 compat_cors_middleware；对 /v1/ 白名单
@@ -117,8 +116,8 @@ A4_OLD = '''            response_headers = [(b"content-type", b"application/json
 
                     if origin in _allowed_cors_origins():
                         response_headers += [
-'''
-A4_NEW = '''            reply_headers = [(b"content-type", b"application/json")]
+"""
+A4_NEW = """            reply_headers = [(b"content-type", b"application/json")]
             # RequestMiddleware 位于 CORS 兼容层之外（send 超时必须约束真实
             # socket 而非 BaseHTTPMiddleware 的内存通道），本函数直接发出的
             # 429/413/504/500 不会经过 compat_cors_middleware；对 /v1/ 白名单
@@ -131,33 +130,33 @@ A4_NEW = '''            reply_headers = [(b"content-type", b"application/json")]
 
                     if origin in _allowed_cors_origins():
                         reply_headers += [
-'''
+"""
 assert text.count(A4_OLD) == 1, "anchor4 reply headers"
 text = text.replace(A4_OLD, A4_NEW, 1)
 
-A4B_OLD = '''            await observed_send(
+A4B_OLD = """            await observed_send(
                 {
                     "type": "http.response.start",
                     "status": code,
                     "headers": response_headers,
                 }
             )
-'''
-A4B_NEW = '''            await observed_send(
+"""
+A4B_NEW = """            await observed_send(
                 {
                     "type": "http.response.start",
                     "status": code,
                     "headers": reply_headers,
                 }
             )
-'''
+"""
 assert text.count(A4B_OLD) == 1, "anchor4b reply send"
 text = text.replace(A4B_OLD, A4B_NEW, 1)
 
 # ---------------------------------------------------------------------------
 # Anchor 5: observed_receive rewrite
 # ---------------------------------------------------------------------------
-A5_OLD = '''        async def observed_receive() -> Message:
+A5_OLD = """        async def observed_receive() -> Message:
             nonlocal received_bytes, request_body_truncated, request_body_complete
             message = await receive()
             if message["type"] == "http.disconnect" and not completed:
@@ -199,8 +198,8 @@ A5_OLD = '''        async def observed_receive() -> Message:
                 if received_bytes > body_limit:
                     raise HTTPException(413, "Request body exceeds configured limit")
             return message
-'''
-A5_NEW = '''        async def observed_receive() -> Message:
+"""
+A5_NEW = """        async def observed_receive() -> Message:
             message = await receive()
             if message["type"] == "http.disconnect" and not observer.completed:
                 context.result = "cancelled"
@@ -244,14 +243,14 @@ A5_NEW = '''        async def observed_receive() -> Message:
                 if observer.received_bytes > body_limit:
                     raise HTTPException(413, "Request body exceeds configured limit")
             return message
-'''
+"""
 assert text.count(A5_OLD) == 1, "anchor5 observed_receive"
 text = text.replace(A5_OLD, A5_NEW, 1)
 
 # ---------------------------------------------------------------------------
 # Anchor 6: observed_send rewrite
 # ---------------------------------------------------------------------------
-A6_OLD = '''        async def observed_send(message: Message) -> None:
+A6_OLD = """        async def observed_send(message: Message) -> None:
             nonlocal \\
                 status, \\
                 response_started, \\
@@ -321,8 +320,8 @@ A6_OLD = '''        async def observed_send(message: Message) -> None:
                     and message.get("body", b"").strip()
                 ):
                     json_payload_sent = True
-'''
-A6_NEW = '''        async def observed_send(message: Message) -> None:
+"""
+A6_NEW = """        async def observed_send(message: Message) -> None:
             if message["type"] == "http.response.start":
                 observer.response_started = True
                 observer.status = message["status"]
@@ -390,14 +389,14 @@ A6_NEW = '''        async def observed_send(message: Message) -> None:
                     and message.get("body", b"").strip()
                 ):
                     observer.json_payload_sent = True
-'''
+"""
 assert text.count(A6_OLD) == 1, "anchor6 observed_send"
 text = text.replace(A6_OLD, A6_NEW, 1)
 
 # ---------------------------------------------------------------------------
 # Anchor 7: except TimeoutError branch
 # ---------------------------------------------------------------------------
-A7_OLD = '''        except TimeoutError:
+A7_OLD = """        except TimeoutError:
             if not request_timeout.expired():
                 context.result, context.error = "error", "Upstream operation timed out"
                 logger.exception("Request raised an upstream timeout")
@@ -452,8 +451,8 @@ A7_OLD = '''        except TimeoutError:
                         else b"",
                     }
                 )
-'''
-A7_NEW = '''        except TimeoutError:
+"""
+A7_NEW = """        except TimeoutError:
             if not request_timeout.expired():
                 context.result, context.error = "error", "Upstream operation timed out"
                 logger.exception("Request raised an upstream timeout")
@@ -508,36 +507,36 @@ A7_NEW = '''        except TimeoutError:
                         else b"",
                     }
                 )
-'''
+"""
 assert text.count(A7_OLD) == 1, "anchor7 timeout branch"
 text = text.replace(A7_OLD, A7_NEW, 1)
 
 # ---------------------------------------------------------------------------
 # Anchor 8: except Exception branch
 # ---------------------------------------------------------------------------
-A8_OLD = '''        except Exception:
+A8_OLD = """        except Exception:
             context.result, context.error = "error", "Internal server error"
             logger.exception("Request failed")
             if not response_started:
                 await reply(500, context.error)
             else:
                 raise
-'''
-A8_NEW = '''        except Exception:
+"""
+A8_NEW = """        except Exception:
             context.result, context.error = "error", "Internal server error"
             logger.exception("Request failed")
             if not observer.response_started:
                 await reply(500, context.error)
             else:
                 raise
-'''
+"""
 assert text.count(A8_OLD) == 1, "anchor8 exception branch"
 text = text.replace(A8_OLD, A8_NEW, 1)
 
 # ---------------------------------------------------------------------------
 # Anchor 9: finally block
 # ---------------------------------------------------------------------------
-A9_OLD = '''        finally:
+A9_OLD = """        finally:
             if admitted:
                 self.active -= 1
             try:
@@ -618,8 +617,8 @@ A9_OLD = '''        finally:
                 if model_call and admitted:
                     unregister_request(context.request_id)
                 current_request.reset(token)
-'''
-A9_NEW = '''        finally:
+"""
+A9_NEW = """        finally:
             if admitted:
                 self.active -= 1
             try:
@@ -691,14 +690,14 @@ A9_NEW = '''        finally:
                 if model_call and admitted:
                     unregister_request(context.request_id)
                 current_request.reset(token)
-'''
+"""
 assert text.count(A9_OLD) == 1, "anchor9 finally"
 text = text.replace(A9_OLD, A9_NEW, 1)
 
 # ---------------------------------------------------------------------------
 # Anchor 10: _persist signature + body references
 # ---------------------------------------------------------------------------
-A10_OLD = '''    @staticmethod
+A10_OLD = """    @staticmethod
     async def _persist(
         record: dict[str, object],
         dump_enabled: bool,
@@ -834,8 +833,8 @@ A10_OLD = '''    @staticmethod
             else "未提供",
             context.usage.get("cached_tokens", "未提供"),
         )
-'''
-A10_NEW = '''    @staticmethod
+"""
+A10_NEW = """    @staticmethod
     async def _persist(
         record: dict[str, object],
         context: RequestContext,
@@ -968,7 +967,7 @@ A10_NEW = '''    @staticmethod
             else "未提供",
             context.usage.get("cached_tokens", "未提供"),
         )
-'''
+"""
 assert text.count(A10_OLD) == 1, "anchor10 _persist"
 text = text.replace(A10_OLD, A10_NEW, 1)
 

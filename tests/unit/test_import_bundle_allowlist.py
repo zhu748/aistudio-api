@@ -13,8 +13,11 @@ import json
 import pytest
 from fastapi import HTTPException
 
-from aistudio_api.api import routes_accounts
-from aistudio_api.api.routes_accounts import ImportBundleRequest, import_bundle
+from aistudio_api.api import routes_account_imports
+from aistudio_api.api.routes_account_imports import (
+    ImportBundleRequest,
+    import_bundle,
+)
 from aistudio_api.application.account_service import AccountService
 from aistudio_api.infrastructure.account.account_store import AccountStore
 
@@ -27,8 +30,10 @@ def service(tmp_path, monkeypatch) -> AccountService:
     async def _fake_email(*_args, **_kwargs) -> str:
         return "mock@example.com"
 
-    monkeypatch.setattr(routes_accounts, "probe_account_benefit_tier", _fake_tier)
-    monkeypatch.setattr(routes_accounts, "probe_account_email", _fake_email)
+    monkeypatch.setattr(
+        routes_account_imports, "probe_account_benefit_tier", _fake_tier
+    )
+    monkeypatch.setattr(routes_account_imports, "probe_account_email", _fake_email)
     return AccountService(AccountStore(accounts_dir=tmp_path / "accounts"))
 
 

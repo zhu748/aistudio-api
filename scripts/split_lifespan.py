@@ -16,12 +16,12 @@ text = SRC.read_text(encoding="utf-8")
 # ---------------------------------------------------------------------------
 # Anchor 1: TYPE_CHECKING imports for helper signatures
 # ---------------------------------------------------------------------------
-A1_OLD = '''if TYPE_CHECKING:
+A1_OLD = """if TYPE_CHECKING:
     from aistudio_api.infrastructure.account.account_store import AccountMeta
 
 _log_cfg = get_configured_logging_settings()
-'''
-A1_NEW = '''if TYPE_CHECKING:
+"""
+A1_NEW = """if TYPE_CHECKING:
     from aistudio_api.application.account_rotator import AccountRotator
     from aistudio_api.application.account_service import AccountService
     from aistudio_api.application.env_account_injector import EnvInjectionReport
@@ -31,7 +31,7 @@ A1_NEW = '''if TYPE_CHECKING:
     )
 
 _log_cfg = get_configured_logging_settings()
-'''
+"""
 assert text.count(A1_OLD) == 1, "anchor1 TYPE_CHECKING"
 text = text.replace(A1_OLD, A1_NEW, 1)
 
