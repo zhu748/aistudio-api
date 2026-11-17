@@ -8,6 +8,7 @@ import json
 import time
 import urllib.parse
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import cast
 from uuid import uuid4
 
@@ -61,6 +62,32 @@ def _is_terminal_event(path: str, body: bytes) -> bool:
     return False
 
 
+@dataclass
+class _ResponseObserver:
+    """__call__ 内观测到的请求/响应状态（原 14 个 nonlocal 闭包变量）。
+
+    observed_receive/observed_send 通过实例字段读写，取代 nonlocal 声明；
+    elapsed/started 类时间戳不在此列（收尾 finally 现算）。
+    """
+
+    status: int = 500
+    response_started: bool = False
+    completed: bool = False
+    sending: bool = False
+    json_payload_sent: bool = False
+    stream_terminal_sent: bool = False
+    is_stream: bool = False
+    first_byte_ms: float | None = None
+    received_bytes: int = 0
+    request_body_truncated: bool = False
+    request_body_complete: bool = False
+    response_body_truncated: bool = False
+    metadata_body: bytearray = field(default_factory=bytearray)
+    request_body: bytearray = field(default_factory=bytearray)
+    response_body: bytearray = field(default_factory=bytearray)
+    response_headers: dict[str, str] = field(default_factory=dict)
+
+
 class RequestMiddleware:
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -111,22 +138,9 @@ class RequestMiddleware:
         if model_call and path.startswith("/v1beta/"):
             context.requested_model = path.removeprefix("/v1beta/").split(":", 1)[0]
             context.model = context.requested_model
+        observer = _ResponseObserver()
         token = current_request.set(context)
         started_at, started = time.time(), time.perf_counter()
-        status, response_started, completed = 500, False, False
-        sending = False
-        json_payload_sent = False
-        stream_terminal_sent = False
-        is_stream = False
-        first_byte_ms: float | None = None
-        received_bytes = 0
-        metadata_body = bytearray()
-        request_body = bytearray()
-        response_body = bytearray()
-        request_body_truncated = False
-        request_body_complete = False
-        response_body_truncated = False
-        response_headers: dict[str, str] = {}
         headers = {k.decode("latin1"): v.decode("latin1") for k, v in scope["headers"]}
         admitted = False
         request_timeout = asyncio.timeout(settings.request_timeout)
@@ -155,7 +169,7 @@ class RequestMiddleware:
                         }.get(code, "INTERNAL"),
                     }
                 }
-            response_headers = [(b"content-type", b"application/json")]
+            reply_headers = [(b"content-type", b"application/json")]
             # RequestMiddleware 位于 CORS 兼容层之外（send 超时必须约束真实
             # socket 而非 BaseHTTPMiddleware 的内存通道），本函数直接发出的
             # 429/413/504/500 不会经过 compat_cors_middleware；对 /v1/ 白名单
@@ -167,7 +181,7 @@ class RequestMiddleware:
                     from aistudio_api.api.app import _allowed_cors_origins
 
                     if origin in _allowed_cors_origins():
-                        response_headers += [
+                        reply_headers += [
                             (
                                 b"access-control-allow-origin",
                                 origin.encode("latin-1"),
@@ -179,7 +193,7 @@ class RequestMiddleware:
                 {
                     "type": "http.response.start",
                     "status": code,
-                    "headers": response_headers,
+                    "headers": reply_headers,
                 }
             )
             await observed_send(
@@ -190,26 +204,25 @@ class RequestMiddleware:
             )
 
         async def observed_receive() -> Message:
-            nonlocal received_bytes, request_body_truncated, request_body_complete
             message = await receive()
-            if message["type"] == "http.disconnect" and not completed:
+            if message["type"] == "http.disconnect" and not observer.completed:
                 context.result = "cancelled"
                 context.error = "Downstream disconnected (client or reverse proxy)"
                 if model_call:
                     request_event("disconnected", context.error)
             elif message["type"] == "http.request":
                 body = message.get("body", b"")
-                received_bytes += len(body)
-                request_body_complete = not message.get("more_body", False)
+                observer.received_bytes += len(body)
+                observer.request_body_complete = not message.get("more_body", False)
                 if (
                     model_call
                     and not context.requested_model
-                    and received_bytes <= 65536
+                    and observer.received_bytes <= 65536
                 ):
-                    metadata_body.extend(body)
+                    observer.metadata_body.extend(body)
                     if not message.get("more_body", False):
                         try:
-                            metadata = json.loads(metadata_body)
+                            metadata = json.loads(observer.metadata_body)
                             if isinstance(metadata, dict) and isinstance(
                                 metadata.get("model"), str
                             ):
@@ -222,62 +235,61 @@ class RequestMiddleware:
                 # 管理路径同样施加请求体上限（1MB）：写端点无界接收可把
                 # 磁盘与 yaml 解析 CPU 打爆（实测 50MB config 被完整落盘）
                 body_limit = settings.max_request_bytes if model_call else 1_048_576
-                if dump_enabled and not request_body_truncated:
-                    if len(request_body) + len(body) <= settings.dump_max_bytes:
-                        request_body.extend(body)
+                if dump_enabled and not observer.request_body_truncated:
+                    if (
+                        len(observer.request_body) + len(body)
+                        <= settings.dump_max_bytes
+                    ):
+                        observer.request_body.extend(body)
                     else:
-                        request_body.clear()
-                        request_body_truncated = True
-                if received_bytes > body_limit:
+                        observer.request_body.clear()
+                        observer.request_body_truncated = True
+                if observer.received_bytes > body_limit:
                     raise HTTPException(413, "Request body exceeds configured limit")
             return message
 
         async def observed_send(message: Message) -> None:
-            nonlocal \
-                status, \
-                response_started, \
-                completed, \
-                is_stream, \
-                first_byte_ms, \
-                response_headers, \
-                response_body_truncated, \
-                sending, \
-                json_payload_sent, \
-                stream_terminal_sent
             if message["type"] == "http.response.start":
-                response_started = True
-                status = message["status"]
-                context.status_code = status
+                observer.response_started = True
+                observer.status = message["status"]
+                context.status_code = observer.status
                 raw_headers = list(message.get("headers", []))
                 raw_headers = [
                     (k, v) for k, v in raw_headers if k.lower() != b"x-request-id"
                 ]
                 raw_headers.append((b"x-request-id", context.request_id.encode()))
                 message = {**message, "headers": raw_headers}
-                response_headers = {
+                observer.response_headers = {
                     k.decode("latin1"): v.decode("latin1") for k, v in raw_headers
                 }
-                is_stream = "text/event-stream" in response_headers.get(
-                    "content-type", ""
+                observer.is_stream = "text/event-stream" in (
+                    observer.response_headers.get("content-type", "")
                 )
-                context.is_stream = is_stream
+                context.is_stream = observer.is_stream
             elif message["type"] == "http.response.body":
                 body = message.get("body", b"")
-                if body and first_byte_ms is None:
-                    first_byte_ms = (time.perf_counter() - started) * 1000
-                    context.first_byte_ms = first_byte_ms
+                if body and observer.first_byte_ms is None:
+                    observer.first_byte_ms = (time.perf_counter() - started) * 1000
+                    context.first_byte_ms = observer.first_byte_ms
                     if model_call:
                         request_event(
-                            "streaming" if is_stream else "response",
+                            "streaming" if observer.is_stream else "response",
                             "首个响应数据已发送",
                         )
-                if dump_enabled and not is_stream and not response_body_truncated:
-                    if len(response_body) + len(body) <= settings.dump_max_bytes:
-                        response_body.extend(body)
+                if (
+                    dump_enabled
+                    and not observer.is_stream
+                    and not observer.response_body_truncated
+                ):
+                    if (
+                        len(observer.response_body) + len(body)
+                        <= settings.dump_max_bytes
+                    ):
+                        observer.response_body.extend(body)
                     else:
-                        response_body.clear()
-                        response_body_truncated = True
-            sending = True
+                        observer.response_body.clear()
+                        observer.response_body_truncated = True
+            observer.sending = True
             if model_call:
                 try:
                     # Bound the actual socket send outside BaseHTTPMiddleware's
@@ -290,18 +302,20 @@ class RequestMiddleware:
                     raise OSError(context.error) from exc
             else:
                 await send(message)
-            sending = False
+            observer.sending = False
             if message["type"] == "http.response.body":
                 if not message.get("more_body", False):
-                    completed = True
-                if is_stream and _is_terminal_event(path, message.get("body", b"")):
-                    stream_terminal_sent = True
+                    observer.completed = True
+                if observer.is_stream and _is_terminal_event(
+                    path, message.get("body", b"")
+                ):
+                    observer.stream_terminal_sent = True
                 if (
-                    not is_stream
+                    not observer.is_stream
                     and scope.get("state", {}).get("json_keepalive_failure")
                     and message.get("body", b"").strip()
                 ):
-                    json_payload_sent = True
+                    observer.json_payload_sent = True
 
         try:
             # Reserve a slot before the first await, including history I/O.
@@ -350,35 +364,35 @@ class RequestMiddleware:
             if not request_timeout.expired():
                 context.result, context.error = "error", "Upstream operation timed out"
                 logger.exception("Request raised an upstream timeout")
-                if not response_started:
+                if not observer.response_started:
                     await reply(500, "Internal server error")
                 else:
                     raise
                 return
-            if sending:
+            if observer.sending:
                 # The transport may have delivered part of this frame already.
                 # Never append an error to an interrupted JSON/SSE write.
                 context.result = "cancelled"
                 context.error = "Request timeout interrupted downstream send"
                 raise OSError(context.error) from None
-            if completed:
+            if observer.completed:
                 return
-            if json_payload_sent or stream_terminal_sent:
+            if observer.json_payload_sent or observer.stream_terminal_sent:
                 # The result or terminal event has reached ASGI send. Only end
                 # HTTP; appending an error would corrupt or contradict it.
                 await observed_send({"type": "http.response.body", "body": b""})
                 return
             context.result, context.error = "timeout", "Request exceeded total timeout"
-            if not response_started:
+            if not observer.response_started:
                 await reply(504, context.error)
             else:
                 json_failure = scope.get("state", {}).get("json_keepalive_failure")
-                if not is_stream and callable(json_failure):
+                if not observer.is_stream and callable(json_failure):
                     body = cast(Callable[[str], bytes], json_failure)(context.error)
                     await observed_send({"type": "http.response.body", "body": body})
                     return
                 failure = scope.get("state", {}).get("stream_failure")
-                if is_stream and callable(failure):
+                if observer.is_stream and callable(failure):
                     chunks = cast(Callable[[str], list[str]], failure)(context.error)
                     # An idempotent error handler may have nothing left to emit.
                     # Still send the final HTTP body so clients do not hang.
@@ -397,7 +411,7 @@ class RequestMiddleware:
                     {
                         "type": "http.response.body",
                         "body": b'data: {"error":{"code":504,"message":"Request exceeded total timeout"}}\n\n'
-                        if is_stream
+                        if observer.is_stream
                         else b"",
                     }
                 )
@@ -409,7 +423,7 @@ class RequestMiddleware:
         except Exception:
             context.result, context.error = "error", "Internal server error"
             logger.exception("Request failed")
-            if not response_started:
+            if not observer.response_started:
                 await reply(500, context.error)
             else:
                 raise
@@ -421,12 +435,12 @@ class RequestMiddleware:
                 if not context.result:
                     context.result = (
                         "rate_limited"
-                        if status == 429
+                        if observer.status == 429
                         else "success"
-                        if completed and status < 400
+                        if observer.completed and observer.status < 400
                         else "error"
                     )
-                if not completed and context.result == "success":
+                if not observer.completed and context.result == "success":
                     context.result = "cancelled"
                 if model_call and admitted:
                     from aistudio_api.api.state import runtime_state
@@ -451,8 +465,8 @@ class RequestMiddleware:
                         "started_at": started_at,
                         "method": scope["method"],
                         "path": redact_text(path),
-                        "status_code": status,
-                        "is_stream": is_stream,
+                        "status_code": observer.status,
+                        "is_stream": observer.is_stream,
                         "elapsed_ms": round(elapsed_ms, 2),
                         "finished_at": time.time(),
                         "generation_ms": round(
@@ -460,29 +474,20 @@ class RequestMiddleware:
                         )
                         if context.first_content_ms is not None
                         else None,
-                        "first_byte_ms": first_byte_ms,
+                        "first_byte_ms": observer.first_byte_ms,
                     }
                     # Drain bookkeeping, then preserve cancellation semantics.
                     task = asyncio.create_task(
                         self._persist(
                             record,
-                            dump_enabled,
                             context,
+                            observer,
                             headers,
-                            request_body,
-                            response_headers,
-                            response_body,
-                            request_body_truncated,
-                            response_body_truncated,
-                            is_stream,
-                            completed,
-                            status,
-                            elapsed_ms,
                             path,
+                            elapsed_ms,
                             history_start,
                             original_scope,
-                            received_bytes,
-                            request_body_complete,
+                            dump_enabled,
                         )
                     )
                     try:
@@ -498,23 +503,14 @@ class RequestMiddleware:
     @staticmethod
     async def _persist(
         record: dict[str, object],
-        dump_enabled: bool,
         context: RequestContext,
+        observer: _ResponseObserver,
         headers: dict[str, str],
-        request_body: bytearray,
-        response_headers: dict[str, str],
-        response_body: bytearray,
-        request_body_truncated: bool,
-        response_body_truncated: bool,
-        is_stream: bool,
-        completed: bool,
-        status: int,
-        elapsed_ms: float,
         path: str,
+        elapsed_ms: float,
         history_start: asyncio.Task[None] | None,
         original_scope: Scope,
-        received_bytes: int,
-        request_body_complete: bool,
+        dump_enabled: bool,
     ) -> None:
         # A cancelled to_thread await does not stop its worker. Order the final
         # record after the initial insert so a slow worker cannot resurrect 'running'.
@@ -546,9 +542,11 @@ class RequestMiddleware:
                     # credentials are masked; tool schemas/prompts are data.
                     encoding = "utf-8"
                     try:
-                        body_text = request_body.decode("utf-8")
+                        body_text = observer.request_body.decode("utf-8")
                     except UnicodeDecodeError:
-                        body_text = base64.b64encode(request_body).decode("ascii")
+                        body_text = base64.b64encode(observer.request_body).decode(
+                            "ascii"
+                        )
                         encoding = "base64"
                     raw_path = original_scope.get("raw_path")
                     target = (
@@ -571,12 +569,14 @@ class RequestMiddleware:
                             ]
                             for key, value in original_scope["headers"]
                         ],
-                        "body": None if request_body_truncated else body_text,
+                        "body": (
+                            None if observer.request_body_truncated else body_text
+                        ),
                         "body_encoding": encoding,
-                        "body_bytes": received_bytes,
-                        "complete": request_body_complete
-                        and not request_body_truncated,
-                        "truncated": request_body_truncated,
+                        "body_bytes": observer.received_bytes,
+                        "complete": observer.request_body_complete
+                        and not observer.request_body_truncated,
+                        "truncated": observer.request_body_truncated,
                     }
                 await asyncio.to_thread(
                     dump_request_exchange,
@@ -586,15 +586,17 @@ class RequestMiddleware:
                     client="",
                     headers=headers,
                     query_params={},
-                    body_text=request_body.decode("utf-8", errors="replace"),
-                    request_body_truncated=request_body_truncated,
-                    status_code=status,
+                    body_text=observer.request_body.decode("utf-8", errors="replace"),
+                    request_body_truncated=observer.request_body_truncated,
+                    status_code=observer.status,
                     elapsed_ms=elapsed_ms,
-                    response_headers=response_headers,
-                    response_text=response_body.decode("utf-8", errors="replace"),
-                    response_body_truncated=response_body_truncated,
-                    is_stream=is_stream,
-                    stream_complete=completed,
+                    response_headers=observer.response_headers,
+                    response_text=observer.response_body.decode(
+                        "utf-8", errors="replace"
+                    ),
+                    response_body_truncated=observer.response_body_truncated,
+                    is_stream=observer.is_stream,
+                    stream_complete=observer.completed,
                     model=context.model,
                     account_id=context.account_id,
                     auth_user=context.auth_user,
@@ -610,7 +612,7 @@ class RequestMiddleware:
             "%s %s -> %d model=%s account=%s result=%s duration=%.1fms attempts=%d request_id=%s",
             record["method"],
             path,
-            status,
+            observer.status,
             context.model,
             context.account_name or context.account_id,
             context.result,

@@ -8,7 +8,9 @@ import json
 import random
 import re
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
+from dataclasses import dataclass
+from typing import Any
 
 from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
@@ -33,6 +35,7 @@ from aistudio_api.application.account_orchestrator import (
     try_switch_account,
 )
 from aistudio_api.application.anti_truncation import (
+    AntiTruncationContext,
     _close_stream_quietly,
     prepare_anti_truncation,
     resolve_model_variant,
@@ -40,6 +43,7 @@ from aistudio_api.application.anti_truncation import (
     restore_anti_truncation_stream,
 )
 from aistudio_api.application.chat_service import (
+    NormalizedGeminiRequest,
     normalize_gemini_request,
 )
 from aistudio_api.domain.errors import (
@@ -999,6 +1003,373 @@ class GeminiStreamResponse(HeartbeatStreamingResponse):
         )
 
 
+# ─── 流式响应拆分出的纯逻辑辅助（无重试编排、无 yield 语义）───
+
+
+@dataclass
+class _StreamAttemptState:
+    """单次流式尝试的可变收尾状态（事件循环写入，重试编排层读取）。"""
+
+    has_yielded_data: bool = False
+    final_usage: dict[str, object] | None = None
+    final_finish_reason: str = "STOP"
+    latest_response_id: str | None = None
+    pending_signature: str | None = None
+
+    def reset(self) -> None:
+        self.has_yielded_data = False
+        self.final_usage = None
+        self.final_finish_reason = "STOP"
+        self.latest_response_id = None
+        self.pending_signature = None
+
+
+def _stream_request_kwargs(normalized: NormalizedGeminiRequest) -> dict[str, Any]:
+    """展开归一化请求为上游调用 kwargs（缓冲/流式两条路径共用同一参数表）。
+
+    仅 ``prepared`` 逐尝试变化（403 重放跳复用已签名请求），由调用方追加，
+    单一来源避免两处 15 参列表漂移。返回值用于 ``**`` 展开到类型化调用点，
+    故值为 Any（构造处来源字段均为强类型，实际类型不受影响）。
+    """
+    return {
+        "model": normalized.model,
+        "contents": normalized.contents,
+        "system_instruction_content": normalized.system_instruction,
+        "tools": normalized.tools,
+        "tool_config": normalized.tool_config,
+        "safety_settings": normalized.safety_settings,
+        "temperature": normalized.temperature,
+        "top_p": normalized.top_p,
+        "top_k": normalized.top_k,
+        "max_tokens": normalized.max_tokens,
+        "generation_config_overrides": normalized.generation_config_overrides,
+        "function_name_restore": normalized.function_name_restore,
+    }
+
+
+def _empty_stream_diagnostic(finish_reason: str) -> str:
+    """空回防护可见诊断文本（流式/缓冲/非流式三处共用同一文案）。"""
+    return (
+        "[aistudio-api 空回诊断] 上游返回 200 但内容为空 "
+        f"(finish={finish_reason})。"
+        "可能为账号风控拦截或安全策略，请在面板“运行日志”页查看详情。"
+    )
+
+
+def _empty_stream_diagnostic_payload(
+    finish_reason: str,
+) -> dict[str, object] | None:
+    """空回防护帧：把可见诊断文本编码为候选 SSE 帧。"""
+    return _event_payload("body", _empty_stream_diagnostic(finish_reason))
+
+
+def _finalize_buffered_output(
+    output: ModelOutput,
+    at_ctx: AntiTruncationContext,
+    model: str,
+) -> tuple[
+    dict[str, object] | None,
+    str,
+    str,
+    GeminiGenerateContentResponse,
+    bool,
+]:
+    """缓冲（非流式上游）尝试的纯收尾：还原抗截断、判定空回并注入诊断。
+
+    与非流式路径（空回防护 3.8）对齐：-at 缓冲变体仅在真正产出内容时才算
+    has_yielded_data，否则上游 200 但零内容的空回会被记为 success 且跳过
+    诊断注入，被风控软封的账号健康度虚高。
+    """
+    restore_anti_truncation_output(output, at_ctx)
+    final_usage = output.usage if isinstance(output.usage, dict) else None
+    final_finish_reason = to_gemini_finish_reason(
+        output.candidates[0].finish_reason if output.candidates else None
+    )
+    buffered_resp = _build_gemini_response_from_output(output, model)
+    buffered_has_output = bool(
+        output.text
+        or output.function_calls
+        or output.function_responses
+        or output.images
+        or output.reasoning_images
+    )
+    if not buffered_has_output:
+        logger.warning(
+            "抗截断缓冲变体返回 200 但内容为空（可能是风控拦截）: model=%s, finish=%s",
+            model,
+            final_finish_reason,
+        )
+        if buffered_resp.candidates:
+            buffered_resp.candidates[0].content.parts.append(
+                GeminiPartResponse(text=_empty_stream_diagnostic(final_finish_reason))
+            )
+    return (
+        final_usage,
+        final_finish_reason,
+        output.response_id,
+        buffered_resp,
+        buffered_has_output,
+    )
+
+
+def _remember_stream_tool_signatures(
+    text: object, pending_signature: str | None
+) -> None:
+    """签名缓存回填（原生流式路径，与 _build_gemini_response_from_output 同
+    标准）：tool_calls 事件载荷是 function_call dict 列表，签名内嵌在 dict
+    或前置 pending_signature 中。
+    """
+    if not isinstance(text, list):
+        return
+    for call_index, call in enumerate(text):
+        if not isinstance(call, dict):
+            continue
+        signature = call.get("thought_signature") or (
+            pending_signature if call_index == 0 else None
+        )
+        _remember_function_signature(
+            call.get("call_id") or call.get("id"),
+            call.get("name"),
+            call.get("args"),
+            signature,
+        )
+
+
+def _record_usage_observation(usage: dict[str, object] | None) -> None:
+    """usage 事件到达时同步到请求观测（request_context.usage）。"""
+    observation = current_request.get()
+    if observation is not None and usage is not None:
+        observation.usage = dict(usage)
+
+
+def _observed_serving_account(current_id: str | None) -> str | None:
+    """以请求上下文记录的实际服务账号为准（并发下全局活跃账号可能已切走）。"""
+    observation = current_request.get()
+    if observation and observation.account_id:
+        return observation.account_id
+    return current_id
+
+
+def _log_empty_stream(target_model: str, finish_reason: str) -> None:
+    logger.warning(
+        "流式完成但未产生任何内容（可能是上游风控拦截或安全策略）: model=%s, finish=%s",
+        target_model,
+        finish_reason,
+    )
+
+
+def _record_stream_success(
+    *,
+    target_model: str,
+    has_yielded_data: bool,
+    final_usage: dict[str, object] | None,
+    final_finish_reason: str,
+    serving_account_id: str | None,
+    normalized: NormalizedGeminiRequest | None,
+) -> None:
+    """流式成功收尾的调度记账（rotator / 签名器健康 / 运行时统计）。
+
+    与空回防护一致：零内容不能记为 success（记 success 会让账号健康度虚高）。
+    """
+    stream_event = "success" if has_yielded_data else "error"
+    record_rotator_event(
+        stream_event,
+        model=target_model,
+        usage=final_usage,
+        account_id=serving_account_id,
+    )
+    # 签名器健康信号：已产出数据即当次 proof 通过了上游 attestation，解除
+    # 熔断（半开探测语义，见 waa/health.py）。
+    if has_yielded_data:
+        get_signer_health().record_proof_accepted(serving_account_id)
+    if normalized is not None:
+        runtime_state.record(
+            normalized.model,
+            stream_event,
+            usage=final_usage,
+            finish_reason=final_finish_reason,
+        )
+
+
+def _log_stream_completed(
+    target_model: str,
+    stream_start_time: float,
+    finish_reason: str,
+    final_usage: dict[str, object] | None,
+) -> None:
+    elapsed_total_ms = (time.perf_counter() - stream_start_time) * 1000
+    pt = final_usage.get("prompt_tokens") if final_usage else 0
+    ct = final_usage.get("completion_tokens") if final_usage else 0
+    logger.info(
+        "流式完成: model=%s, 耗时=%.1fms, finish=%s, in=%s, out=%s",
+        target_model,
+        elapsed_total_ms,
+        finish_reason,
+        pt,
+        ct,
+    )
+
+
+def _log_stream_failure(
+    exc: Exception,
+    elapsed_ms: float,
+    model_path: str,
+    has_yielded_any: bool,
+) -> None:
+    code, msg, status_str = classify_gemini_error_payload(exc)
+    record_result("rate_limited" if code == 429 else "error", error=msg)
+    logger.warning(
+        "流式生成失败: model=%s, 耗时=%.1fms, code=%d(%s), "
+        "已输出内容=%s, 异常类型=%s, 原因=%s",
+        model_path,
+        elapsed_ms,
+        code,
+        status_str,
+        "是" if has_yielded_any else "否",
+        type(exc).__name__,
+        msg,
+    )
+
+
+def _record_stream_disconnect(
+    normalized: NormalizedGeminiRequest,
+    state: _StreamAttemptState,
+    serving_account_id: str | None,
+) -> None:
+    """客户端断连（GeneratorExit/CancelledError）路径的兜底补记。
+
+    成功块与异常块都执行不到该路径；已产出内容按 success 记账（账号确实
+    完成了服务）；全部为同步调用，在 GeneratorExit 传播中执行安全。
+    """
+    record_rotator_event(
+        "success",
+        model=normalized.model,
+        usage=state.final_usage,
+        account_id=serving_account_id,
+    )
+    get_signer_health().record_proof_accepted(serving_account_id)
+    runtime_state.record(
+        normalized.model,
+        "success",
+        usage=state.final_usage,
+        finish_reason=state.final_finish_reason,
+    )
+    logger.info(
+        "流式因客户端断连提前结束，已按已产出内容补记调度账: model=%s",
+        normalized.model,
+    )
+
+
+async def _retry_stream_attempt(
+    exc: Exception,
+    *,
+    stream_attempt: int,
+    transient_failures: int,
+    auth_manager: Auth403RetryManager,
+    client: AIStudioClient,
+    model_path: str,
+    normalized: NormalizedGeminiRequest | None,
+    has_yielded_data: bool,
+    serving_account_id: str | None,
+) -> tuple[bool, int]:
+    """单次流式尝试失败后的重试决策（403 阶梯分流 + 瞬态重试判定）。
+
+    返回 ``(可重试, 新瞬态失败计数)``；不可重试时直接上抛（handle_403 /
+    handle_attempt_exception 的既有语义，含 HTTPException 转换）。已 yield
+    过数据（has_yielded_data）后不可重试的守卫语义全部保持。
+    """
+    if isinstance(exc, AuthError) and not isinstance(exc, SessionExpiredError):
+        # 403 全量经 handle_403 分流（含已产出数据的中途 403）：其
+        # has_yielded_data 分支记 proof-accepted 信号并直接上抛。原先已
+        # 产出后绕行 handle_attempt_exception 会对同一请求再记一次
+        # auth_error（双重 200 权重惩罚），且令 handle_403 的 post-yield
+        # 分支成为死代码。
+        target_m = normalized.model if normalized else model_path
+        if await auth_manager.handle_403(
+            exc,
+            model=target_m,
+            client=client,
+            has_yielded_data=has_yielded_data,
+        ):
+            return True, transient_failures
+        raise exc
+    transient_failure = is_retryable_upstream_error(exc)
+    increment = int(transient_failure)
+    if transient_failure:
+        auth_manager.current_prepared = None
+    retry = await handle_attempt_exception(
+        exc,
+        attempt=stream_attempt,
+        transient_attempt=transient_failures + increment - 1
+        if transient_failure
+        else None,
+        model_path=model_path,
+        normalized_model=normalized.model if normalized else None,
+        has_yielded_data=has_yielded_data,
+        serving_account_id=serving_account_id,
+    )
+    return retry, transient_failures + increment
+
+
+async def _stream_attempt_frames(
+    anti_stream: AsyncIterator[tuple[str, object | None]],
+    state: _StreamAttemptState,
+    model: str,
+    stream_start_time: float,
+) -> AsyncGenerator[dict[str, object], None]:
+    """消费单次尝试的上游事件流，产出对外 SSE 帧（yield 顺序与拆分前一致）。
+
+    usage / finish_reason / response_id 事件不产帧，只更新尝试状态；
+    thought_signature 在首个内容帧前缓存（pending_signature），其后独立成
+    帧；其余内容事件编码为候选帧，首个内容帧附带 TTFT 日志与签名缓存回填。
+    """
+    async for event_type, text in anti_stream:
+        if event_type == "usage":
+            state.final_usage = text if isinstance(text, dict) else None
+            _record_usage_observation(state.final_usage)
+        elif event_type == "finish_reason":
+            if text not in _IGNORED_WIRE_FINISH_REASONS:
+                state.final_finish_reason = (
+                    to_gemini_finish_reason(text)
+                    if isinstance(text, int)
+                    else str(text)
+                )
+        elif event_type == "response_id":
+            state.latest_response_id = str(text)
+        elif event_type == "thought_signature":
+            if state.has_yielded_data:
+                signature_frame = _event_payload(
+                    "signature",
+                    text,
+                    model_version=model,
+                    response_id=state.latest_response_id,
+                )
+                if signature_frame:
+                    yield signature_frame
+            else:
+                state.pending_signature = str(text)
+        else:
+            chunk = _event_payload(
+                event_type,
+                text,
+                model_version=model,
+                response_id=state.latest_response_id,
+                thought_signature=state.pending_signature,
+            )
+            if chunk:
+                _remember_stream_tool_signatures(text, state.pending_signature)
+                state.pending_signature = None
+                record_output_timing(event_type)
+                if not state.has_yielded_data:
+                    logger.info(
+                        "流式首包到达: model=%s, ttft=%.1fms",
+                        model,
+                        (time.perf_counter() - stream_start_time) * 1000,
+                    )
+                state.has_yielded_data = True
+                yield chunk
+
+
 def _build_gemini_streaming_response(
     *,
     client: AIStudioClient,
@@ -1010,48 +1381,39 @@ def _build_gemini_streaming_response(
     """构建 Gemini 流式响应（暴露结构化 frames 供适配层消费）。"""
 
     async def stream_response() -> AsyncGenerator[dict[str, object], None]:
-        normalized = None
-        at_ctx = None
+        normalized: NormalizedGeminiRequest | None = None
+        at_ctx: AntiTruncationContext | None = None
         stream_start_time = time.perf_counter()
         has_yielded_any = False
-        # 断连/取消路径的记账幂等标记：正常成功块与异常块各自置位，
-        # finally 仅在两者都未触达（GeneratorExit/CancelledError）时补记。
+        stream_completed = False
+        last_stream_error: Exception | None = None
+        # 断连/取消路径的记账幂等标记：正常成功块与异常块各自置位，finally
+        # 仅在两者都未触达（GeneratorExit/CancelledError）时补记。
         accounting_recorded = False
-        # finally 兜底记账引用的循环内状态：在 try 之前初始化，断连或
-        # 异常发生在首次赋值之前也不会出现未绑定名。
-        has_yielded_data = False
-        final_usage: dict[str, object] | None = None
-        final_finish_reason: str = "STOP"
+        # finally 兜底记账引用的循环内状态：在 try 之前初始化，断连或异常
+        # 发生在首次赋值之前也不会出现未绑定名。
         serving_account_id: str | None = None
+        state = _StreamAttemptState()
         try:
             logger.info(
                 "流式请求: model=%s, 轮数=%d",
                 model_path,
                 len(req.contents),
             )
-            final_usage = None
-            final_finish_reason = "STOP"
-            latest_response_id: str | None = None
-            stream_completed = False
-            last_stream_error: Exception | None = None
             auth_manager = Auth403RetryManager()
             transient_failures = 0
             total_attempts = get_max_retries() + AUTH_403_MAX_RETRIES
             for stream_attempt in range(total_attempts):
-                has_yielded_data = False
+                state.reset()
                 last_stream_error = None
-                final_usage = None
-                final_finish_reason = "STOP"
-                latest_response_id = None
-                pending_signature: str | None = None
                 await ensure_active_account(stream_attempt, model=model_path)
                 _svc = runtime_state.account_service
                 _acc = _svc.get_active_account() if _svc else None
                 serving_account_id = _acc.id if _acc else None
                 auth_manager.serving_account_id = serving_account_id
-                # 归一化与抗截断注入只随请求变化、与重试尝试无关（同非
-                # 流式路径：逐尝试重建在 403 重放跳是纯浪费，且 prepare
-                # 会原地注入、必须只执行一次）。
+                # 归一化与抗截断注入只随请求变化、与重试尝试无关（同非流式
+                # 路径：逐尝试重建在 403 重放跳是纯浪费，且 prepare 会原地
+                # 注入、必须只执行一次）。
                 if normalized is None:
                     normalized = normalize_gemini_request(req, model_path)
                     at_ctx = prepare_anti_truncation(
@@ -1060,299 +1422,119 @@ def _build_gemini_streaming_response(
                 assert at_ctx is not None  # 与 normalized 同步初始化
                 try:
                     if force_buffer:
-                        # 非流式抗截断变体：上游改走缓冲（非流式）传输，
-                        # 整体还原后打包为单条完整 SSE 事件下发。
+                        # 非流式抗截断变体：上游改走缓冲（非流式）传输，整体
+                        # 还原后打包为单条完整 SSE 事件下发。
                         output = await client.generate_content(
-                            model=normalized.model,
-                            contents=normalized.contents,
-                            system_instruction_content=normalized.system_instruction,
-                            tools=normalized.tools,
-                            tool_config=normalized.tool_config,
-                            safety_settings=normalized.safety_settings,
-                            temperature=normalized.temperature,
-                            top_p=normalized.top_p,
-                            top_k=normalized.top_k,
-                            max_tokens=normalized.max_tokens,
-                            generation_config_overrides=normalized.generation_config_overrides,
+                            **_stream_request_kwargs(normalized),
                             prepared=auth_manager.current_prepared,
-                            function_name_restore=normalized.function_name_restore,
                         )
                         auth_manager.current_prepared = None
-                        restore_anti_truncation_output(output, at_ctx)
-                        final_usage = (
-                            output.usage if isinstance(output.usage, dict) else None
-                        )
-                        final_finish_reason = to_gemini_finish_reason(
-                            output.candidates[0].finish_reason
-                            if output.candidates
-                            else None
-                        )
-                        latest_response_id = output.response_id
-                        buffered_resp = _build_gemini_response_from_output(
-                            output, normalized.model
-                        )
-                        # 与非流式路径（空回防护）对齐（3.8）：-at 缓冲变体
-                        # 仅在真正产出内容时才算 has_yielded_data，否则上游
-                        # 200 但零内容的空回会被记为 success 且跳过诊断注入，
-                        # 被风控软封的账号健康度虚高。
-                        buffered_has_output = bool(
-                            output.text
-                            or output.function_calls
-                            or output.function_responses
-                            or output.images
-                            or output.reasoning_images
-                        )
-                        has_yielded_data = buffered_has_output
+                        (
+                            state.final_usage,
+                            state.final_finish_reason,
+                            state.latest_response_id,
+                            buffered_resp,
+                            buffered_has_output,
+                        ) = _finalize_buffered_output(output, at_ctx, normalized.model)
+                        state.has_yielded_data = buffered_has_output
                         has_yielded_any = True
-                        # 空回防护（3.8）：缓冲变体零内容时同样注入可见诊断文本
-                        if not buffered_has_output:
-                            logger.warning(
-                                "抗截断缓冲变体返回 200 但内容为空（可能是风控拦截）: "
-                                "model=%s, finish=%s",
-                                normalized.model,
-                                final_finish_reason,
-                            )
-                            if buffered_resp.candidates:
-                                buffered_resp.candidates[0].content.parts.append(
-                                    GeminiPartResponse(
-                                        text=(
-                                            "[aistudio-api 空回诊断] 上游返回 200 但内容为空 "
-                                            f"(finish={final_finish_reason})。"
-                                            "可能为账号风控拦截或安全策略，请在面板“运行日志”页查看详情。"
-                                        )
-                                    )
-                                )
                         yield buffered_resp.model_dump(mode="json", exclude_none=True)
                         stream_completed = True
                         break
                     upstream_events = client.stream_generate_content(
-                        model=normalized.model,
-                        contents=normalized.contents,
-                        system_instruction_content=normalized.system_instruction,
-                        tools=normalized.tools,
-                        tool_config=normalized.tool_config,
-                        safety_settings=normalized.safety_settings,
-                        temperature=normalized.temperature,
-                        top_p=normalized.top_p,
-                        top_k=normalized.top_k,
-                        max_tokens=normalized.max_tokens,
-                        generation_config_overrides=normalized.generation_config_overrides,
+                        **_stream_request_kwargs(normalized),
                         prepared=auth_manager.current_prepared,
-                        function_name_restore=normalized.function_name_restore,
                     )
-                    # 重试 continue / 客户端断连时，async for 不会自动关闭被迭代
-                    # 的异步生成器，只能等 GC 的 asyncgen finalizer 释放上游连接；
-                    # 高断连/重试率下会积压未释放连接。这里持引用并用
-                    # try/finally 确定性关闭（与 compat 适配器同标准）。
+                    # 重试 continue / 客户端断连时，async for 不会自动关闭被
+                    # 迭代的异步生成器；这里持引用并用 try/finally 确定性
+                    # 关闭（与 compat 适配器同标准）。
                     anti_stream = restore_anti_truncation_stream(
                         upstream_events, at_ctx
                     )
                     try:
-                        async for event_type, text in anti_stream:
-                            if event_type == "usage":
-                                final_usage = text if isinstance(text, dict) else None
-                                observation = current_request.get()
-                                if observation is not None and final_usage is not None:
-                                    observation.usage = dict(final_usage)
-                            elif event_type == "finish_reason":
-                                if text not in _IGNORED_WIRE_FINISH_REASONS:
-                                    final_finish_reason = (
-                                        to_gemini_finish_reason(text)
-                                        if isinstance(text, int)
-                                        else str(text)
-                                    )
-                            elif event_type == "response_id":
-                                latest_response_id = str(text)
-                            elif event_type == "thought_signature":
-                                if has_yielded_data:
-                                    signature_frame = _event_payload(
-                                        "signature",
-                                        text,
-                                        model_version=normalized.model,
-                                        response_id=latest_response_id,
-                                    )
-                                    if signature_frame:
-                                        yield signature_frame
-                                else:
-                                    pending_signature = str(text)
-                            else:
-                                chunk = _event_payload(
-                                    event_type,
-                                    text,
-                                    model_version=normalized.model,
-                                    response_id=latest_response_id,
-                                    thought_signature=pending_signature,
-                                )
-                                if chunk:
-                                    # 签名缓存回填（原生流式路径，与
-                                    # _build_gemini_response_from_output
-                                    # 同标准）：tool_calls 事件载荷是
-                                    # function_call dict 列表，签名内嵌在
-                                    # dict 或前置 pending_signature 中。
-                                    if event_type == "tool_calls" and isinstance(
-                                        text, list
-                                    ):
-                                        for call_index, call in enumerate(text):
-                                            if not isinstance(call, dict):
-                                                continue
-                                            signature = call.get(
-                                                "thought_signature"
-                                            ) or (
-                                                pending_signature
-                                                if call_index == 0
-                                                else None
-                                            )
-                                            _remember_function_signature(
-                                                call.get("call_id") or call.get("id"),
-                                                call.get("name"),
-                                                call.get("args"),
-                                                signature,
-                                            )
-                                    pending_signature = None
-                                    record_output_timing(event_type)
-                                    if not has_yielded_data:
-                                        ttft_ms = (
-                                            time.perf_counter() - stream_start_time
-                                        ) * 1000
-                                        logger.info(
-                                            "流式首包到达: model=%s, ttft=%.1fms",
-                                            normalized.model,
-                                            ttft_ms,
-                                        )
-                                    has_yielded_data = True
-                                    has_yielded_any = True
-                                    yield chunk
+                        async for frame in _stream_attempt_frames(
+                            anti_stream,
+                            state,
+                            normalized.model,
+                            stream_start_time,
+                        ):
+                            has_yielded_any = True
+                            yield frame
                         auth_manager.current_prepared = None
                         stream_completed = True
                         break
                     finally:
-                        # 正常完成 / 异常重试 / 客户端断连部走这里，
-                        # 确定性释放上游连接（关闭包装器会连带关闭内层流）。
+                        # 正常完成 / 异常重试 / 客户端断连都走这里，确定性
+                        # 释放上游连接（关闭包装器会连带关闭内层流）。
                         await _close_stream_quietly(anti_stream)
                 except Exception as exc:
                     last_stream_error = exc
-                    observation = current_request.get()
-                    if observation and observation.account_id:
-                        serving_account_id = observation.account_id
-                        auth_manager.serving_account_id = serving_account_id
-                    if isinstance(exc, AuthError) and not isinstance(
-                        exc, SessionExpiredError
-                    ):
-                        # 403 全量经 handle_403 分流（含已产出数据的中途 403）：
-                        # 其 has_yielded_data 分支记 proof-accepted 信号并直接
-                        # 上抛。原先已产出后绕行 handle_attempt_exception 会对
-                        # 同一请求再记一次 auth_error（双重 200 权重惩罚），
-                        # 且令 handle_403 的 post-yield 分支成为死代码。
-                        target_m = normalized.model if normalized else model_path
-                        if await auth_manager.handle_403(
-                            exc,
-                            model=target_m,
-                            client=client,
-                            has_yielded_data=has_yielded_data,
-                        ):
-                            continue
-                        raise
-                    transient_failure = is_retryable_upstream_error(exc)
-                    transient_failures += int(transient_failure)
-                    if transient_failure:
-                        auth_manager.current_prepared = None
-                    if await handle_attempt_exception(
+                    serving_account_id = _observed_serving_account(serving_account_id)
+                    auth_manager.serving_account_id = serving_account_id
+                    # 重试决策（403 阶梯分流 + 瞬态判定）见
+                    # _retry_stream_attempt；已 yield 过数据后不可重试的守卫
+                    # 语义全部保持。
+                    retry, transient_failures = await _retry_stream_attempt(
                         exc,
-                        attempt=stream_attempt,
-                        transient_attempt=transient_failures - 1
-                        if transient_failure
-                        else None,
+                        stream_attempt=stream_attempt,
+                        transient_failures=transient_failures,
+                        auth_manager=auth_manager,
+                        client=client,
                         model_path=model_path,
-                        normalized_model=normalized.model if normalized else None,
-                        has_yielded_data=has_yielded_data,
+                        normalized=normalized,
+                        has_yielded_data=state.has_yielded_data,
                         serving_account_id=serving_account_id,
-                    ):
+                    )
+                    if retry:
                         continue
                     raise
 
             if not stream_completed and last_stream_error is not None:
                 raise last_stream_error
             target_model = normalized.model if normalized else model_path
-            # 空回防护：流式完成但未产出任何内容时，注入可见诊断文本，
-            # 避免客户端收到 200 却“空回啥都没有”无从排查
-            if stream_completed and not has_yielded_data and not force_buffer:
-                logger.warning(
-                    "流式完成但未产生任何内容（可能是上游风控拦截或安全策略）: "
-                    "model=%s, finish=%s",
-                    target_model,
-                    final_finish_reason,
+            # 空回防护：流式完成但未产出任何内容时注入可见诊断文本，避免
+            # 客户端收到 200 却“空回啥都没有”无从排查。
+            if stream_completed and not state.has_yielded_data and not force_buffer:
+                _log_empty_stream(target_model, state.final_finish_reason)
+                diagnostic_chunk = _empty_stream_diagnostic_payload(
+                    state.final_finish_reason
                 )
-                diagnostic = (
-                    "[aistudio-api 空回诊断] 上游返回 200 但内容为空 "
-                    f"(finish={final_finish_reason})。"
-                    "可能为账号风控拦截或安全策略，请在面板“运行日志”页查看详情。"
-                )
-                diagnostic_chunk = _event_payload("body", diagnostic)
                 if diagnostic_chunk:
                     has_yielded_any = True
                     yield diagnostic_chunk
-            # 与空回防护一致：零内容不能记为 success（见上方流式空回诊断）
-            observation = current_request.get()
-            if observation and observation.account_id:
-                serving_account_id = observation.account_id
-            stream_event = "success" if has_yielded_data else "error"
-            record_rotator_event(
-                stream_event,
-                model=target_model,
-                usage=final_usage,
-                account_id=serving_account_id,
+            # 收尾记账以请求上下文记录的实际服务账号为准（防并发串号）。
+            serving_account_id = _observed_serving_account(serving_account_id)
+            _record_stream_success(
+                target_model=target_model,
+                has_yielded_data=state.has_yielded_data,
+                final_usage=state.final_usage,
+                final_finish_reason=state.final_finish_reason,
+                serving_account_id=serving_account_id,
+                normalized=normalized,
             )
-            # 签名器健康信号：已产出数据即当次 proof 通过了上游
-            # attestation，解除熔断（半开探测语义，见 waa/health.py）。
-            if has_yielded_data:
-                get_signer_health().record_proof_accepted(serving_account_id)
-            if normalized is not None:
-                runtime_state.record(
-                    normalized.model,
-                    stream_event,
-                    usage=final_usage,
-                    finish_reason=final_finish_reason,
-                )
             accounting_recorded = True
-            elapsed_total_ms = (time.perf_counter() - stream_start_time) * 1000
-            pt = final_usage.get("prompt_tokens") if final_usage else 0
-            ct = final_usage.get("completion_tokens") if final_usage else 0
-            logger.info(
-                "流式完成: model=%s, 耗时=%.1fms, finish=%s, in=%s, out=%s",
+            _log_stream_completed(
                 target_model,
-                elapsed_total_ms,
-                final_finish_reason,
-                pt,
-                ct,
+                stream_start_time,
+                state.final_finish_reason,
+                state.final_usage,
             )
             yield _usage_payload(
-                final_usage,
-                finish_reason=final_finish_reason,
+                state.final_usage,
+                finish_reason=state.final_finish_reason,
                 model_version=target_model,
-                response_id=latest_response_id,
+                response_id=state.latest_response_id,
             )
         except Exception as exc:
-            # 异常路径的 rotator/统计记账已由 handle_attempt_exception 或
-            # handle_403 按尝试完成，这里只负责错误事件下发；先置位标记，
-            # 防止断连打断错误帧下发时 finally 再补记一次。
+            # 异常路径的记账已由 handle_attempt_exception / handle_403 按
+            # 尝试完成，这里只负责错误事件下发；先置位标记，防止断连打断
+            # 错误帧下发时 finally 再补记一次。
             accounting_recorded = True
             elapsed_ms = (time.perf_counter() - stream_start_time) * 1000
-            code, msg, status_str = classify_gemini_error_payload(exc)
-            record_result("rate_limited" if code == 429 else "error", error=msg)
-            logger.warning(
-                "流式生成失败: model=%s, 耗时=%.1fms, code=%d(%s), "
-                "已输出内容=%s, 异常类型=%s, 原因=%s",
-                model_path,
-                elapsed_ms,
-                code,
-                status_str,
-                "是" if has_yielded_any else "否",
-                type(exc).__name__,
-                msg,
-            )
-            # 错误透传：尚未输出任何内容时，把具体失败原因作为可见文本 part
-            # 下发，避免 Chatbox 等客户端只忽略 {"error":...} 事件而表现为空回；
-            # 已输出部分内容时不追加，保持正文纯净（仅下发结构化错误事件）。
+            _log_stream_failure(exc, elapsed_ms, model_path, has_yielded_any)
+            # 错误透传：尚未输出任何内容时把失败原因作为可见文本 part 下发
+            # （部分客户端忽略 {"error":...} 表现为空回）；已输出时不追加，
+            # 保持正文纯净（仅下发结构化错误事件）。
             if not has_yielded_any:
                 error_text_chunk = _error_text_payload(exc)
                 if error_text_chunk:
@@ -1360,32 +1542,17 @@ def _build_gemini_streaming_response(
             yield _error_payload(exc)
         finally:
             # 客户端断连（GeneratorExit）/任务取消（CancelledError）都不是
-            # Exception 子类，上方的成功记账块与异常块都执行不到——此前
-            # 每次断连都会丢失调度记账：成功流不计入账号健康度与
-            # daily_models 配额统计（选路权重失真），已通过的 proof 也不
-            # 上报签名器健康信号。此处兜底补记：已产出内容按 success 记
-            # 账（账号确实完成了服务）；零产出且无上游异常时不记（客户
-            # 端主动放弃不应惩罚账号）。记账全部为同步调用，在
+            # Exception 子类，成功块与异常块都执行不到——此处兜底补记：已
+            # 产出内容按 success 记账（账号确实完成了服务）；零产出且无上游
+            # 异常时不记（客户端主动放弃不应惩罚账号）。全部为同步调用，在
             # GeneratorExit 传播中执行安全（此路径严禁再 yield）。
-            if not accounting_recorded and has_yielded_data and normalized is not None:
+            if (
+                not accounting_recorded
+                and state.has_yielded_data
+                and normalized is not None
+            ):
                 with contextlib.suppress(Exception):
-                    record_rotator_event(
-                        "success",
-                        model=normalized.model,
-                        usage=final_usage,
-                        account_id=serving_account_id,
-                    )
-                    get_signer_health().record_proof_accepted(serving_account_id)
-                    runtime_state.record(
-                        normalized.model,
-                        "success",
-                        usage=final_usage,
-                        finish_reason=final_finish_reason,
-                    )
-                    logger.info(
-                        "流式因客户端断连提前结束，已按已产出内容补记调度账: model=%s",
-                        normalized.model,
-                    )
+                    _record_stream_disconnect(normalized, state, serving_account_id)
 
     return GeminiStreamResponse(stream_response())
 

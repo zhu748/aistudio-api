@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import os
 import threading
 from collections.abc import Callable, Iterator, Mapping
@@ -14,6 +15,7 @@ import yaml
 
 from aistudio_api.config import DEFAULT_TEXT_MODEL, resolve_config_file
 from aistudio_api.infrastructure.utils.common import atomic_write_text
+from aistudio_api.infrastructure.utils.logger import get_logger
 
 from .wire_types import (
     AistudioImageOutputMode,
@@ -22,6 +24,8 @@ from .wire_types import (
     MediaResolution,
     ThinkingLevel,
 )
+
+logger = get_logger("model_defaults")
 
 _resolve_config_path = resolve_config_file
 _SAFETY_CATEGORY_ORDER = (
@@ -625,243 +629,184 @@ def _profile_from_mapping(raw: dict[str, object]) -> ModelProfile:
     )
 
 
+# ─── 默认配置模板：defaults/config.yaml 单一真相源 ───
+# 审查报告指出 _default_config 的 233 行内嵌 dict 与 defaults/config.yaml 已
+# 实测漂移（两份数据不一致）。修复方向：以内嵌 dict（运行时实际生效）为真相
+# 源，先把差异逐项修入 defaults/config.yaml（见 scripts/default_config_drift.md
+# 漂移清单），然后切换为从模板文件加载——此后默认值只有一份，天然不再漂移。
+# 兜底：模板文件读失败（打包缺文件/损坏等）时回退到内置最小默认块，保证
+# 缺文件也能启动；仅 warning 一次，避免热路径刷屏。
+_default_config_template: dict[str, object] | None = None
+_default_config_template_lock = threading.Lock()
+_default_config_warned = False
+# 模板定位：与 config.py 的 _TEMPLATE_CONFIG_PATHS 第一项一致（项目根
+# defaults/config.yaml）；多候选是打包形态（PyInstaller 等）的容错。
+_TEMPLATE_CONFIG_CANDIDATES = (
+    Path(__file__).resolve().parents[4] / "defaults" / "config.yaml",
+    Path.cwd() / "defaults" / "config.yaml",
+)
+
+
+def _load_default_config_template() -> dict[str, object]:
+    """读模板 defaults/config.yaml；任何失败回退内置最小默认块（warning 一次）。"""
+    global _default_config_warned
+    for candidate in _TEMPLATE_CONFIG_CANDIDATES:
+        try:
+            if not candidate.is_file():
+                continue
+            loaded = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning("默认配置模板读取失败，回退内置默认: %s: %s", candidate, exc)
+            _default_config_warned = True
+            continue
+        if isinstance(loaded, dict) and loaded:
+            return loaded
+    if not _default_config_warned:
+        logger.warning(
+            "默认配置模板 defaults/config.yaml 缺失或为空，回退内置最小默认块"
+        )
+        _default_config_warned = True
+    return dict(_FALLBACK_DEFAULT_CONFIG)
+
+
 def _default_config() -> dict[str, object]:
-    return {
-        "anti_truncation": {
-            "enabled": False,
-            "tool_name": "router_emit",
+    """默认配置（deep copy，调用方任意改写互不影响）。
+
+    首次调用懒加载 defaults/config.yaml 并进程级缓存（锁内双检，读失败
+    兜底内置最小默认块）；此后每次返回深拷贝。合并语义（rotator /
+    model_defaults 深合并见 _load_yaml_config）要求返回可变独立副本。
+    """
+    global _default_config_template
+    template = _default_config_template
+    if template is None:
+        with _default_config_template_lock:
+            template = _default_config_template
+            if template is None:
+                template = _load_default_config_template()
+                _default_config_template = template
+    return copy.deepcopy(template)
+
+
+# 兜底最小默认块：仅覆盖运行时硬依赖的键（_load_yaml_config 的深合并、
+# get_configured_rotator_settings 的 KeyError 防护等），不是完整模板复刻。
+# 正常情况下永远走不到这里；走到了也只求「能启动、行为保守」。
+_FALLBACK_DEFAULT_CONFIG: dict[str, object] = {
+    "anti_truncation": {"enabled": False, "tool_name": "router_emit"},
+    "waa": {"active_server": "local_spidermonkey", "servers": []},
+    "logging": {"level": "INFO", "dump_requests": False},
+    "model_defaults": {"drop_unsupported_params": False, "profiles": [], "models": {}},
+    "rotator": {
+        "max_retries": 5,
+        "strategy": "sticky",
+        "stickiness_bonus": 400.0,
+        "stickiness_threshold": 0.8,
+        "drip_penalty": 500.0,
+        "tier_weights": {
+            "Free": 0.0,
+            "Plus": 0.5,
+            "Pro": 1.0,
+            "Ultra": 2.0,
+            "Ultra_20X": 3.0,
         },
-        "waa": {
-            "active_server": "local_spidermonkey",
-            "servers": [
-                {
-                    "id": "local_spidermonkey",
-                    "name": "本地原生引擎 (SpiderMonkey 152)",
-                    "description": "本地独立纯静态 Go 服务，毫秒级快速生成官方原生高精度快照 Proof",
-                    "url": "http://127.0.0.1:8081",
-                    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0",
-                    "headers": {
-                        "X-User-Agent": "grpc-web-javascript/0.1",
-                    },
-                },
-                {
-                    "id": "remote_spinsnow",
-                    "name": "远程公共服务 (spinsnow / NodeVM)",
-                    "description": "远程 Node.js VM 沙箱证明签名服务，绑定 Chromium 模拟特征环境",
-                    "url": "https://waa.spinsnow.fun",
-                    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
-                    "headers": {
-                        "X-User-Agent": "grpc-web-javascript/0.1",
-                    },
-                },
-            ],
+        "cooldowns": {
+            "rate_limited_short": 60,
+            "rate_limited_drip": 300,
+            "rate_limited_drip_extended": 600,
         },
-        "logging": {
-            "level": "INFO",
-            "dump_requests": False,
+    },
+    "paid_model_rules": {
+        "ultra_required": {
+            "contains": ["veo", "ultra", "antigravity", "carbon"],
+            "required_tiers": ["Ultra", "Ultra_20X"],
         },
-        "model_defaults": {
-            "drop_unsupported_params": False,
-            "profiles": [
-                {
-                    "name": "image_models",
-                    "match": {"contains": ["image", "imagen"]},
-                    "is_image_model": True,
-                    "disable_safety_settings": True,
-                },
-                {
-                    "name": "video_models",
-                    "match": {"prefixes": ["veo-"], "contains": ["veo"]},
-                    "disable_safety_settings": True,
-                },
-                {
-                    "name": "gemma_models",
-                    "match": {"prefixes": ["gemma-"]},
-                    "safety_settings": {
-                        "Harassment": 5,
-                        "Hate": 5,
-                        "Sexually Explicit": 5,
-                        "Dangerous Content": 5,
-                    },
-                },
-                {
-                    "name": "gemini_models",
-                    "match": {"prefixes": ["gemini-"]},
-                    "safety_settings": {
-                        "Harassment": 5,
-                        "Hate": 5,
-                        "Sexually Explicit": 5,
-                        "Dangerous Content": 5,
-                    },
-                    "drop_unsupported_params": True,
-                    # 2026-11 真机抓包（全量 9 条 GenerateContent 逆向）：浏览器
-                    # 对 gemini 文本模型恒定携带 maxOutputTokens=65536、
-                    # temperature=1、topP=0.95、topK=64 与思考配置
-                    # [1,null,null,<默认档>]（档位由 wire 构造时按 ListModels
-                    # 元数据自适应，见 model_defaults.browser_default_thinking_wire）。
-                    # 用户显式传入的参数仍优先；详见 docs/CAPTURE_ALIGNMENT_2026-11.md。
-                    "generation_config_defaults": {
-                        "max_tokens": 65536,
-                        "temperature": 1,
-                        "top_p": 0.95,
-                        "top_k": 64,
-                        "thinking_config": {"level": 2},
-                    },
-                },
-                # 特殊输出模型（图像/视频/语音/TTS/Live 等）豁免浏览器文本默认值：
-                # 这些模型的输出上限（如 TTS 8192）远低于 65536，携带文本默认
-                # 会造成未知行为；清除槽位 3/4/5/6/13/16（maxTokens/temperature/
-                # topP/topK/flag13/thinkingConfig）。
-                {
-                    "name": "aux_output_models",
-                    "match": {
-                        "contains": [
-                            "image",
-                            "imagen",
-                            "veo",
-                            "lyria",
-                            "tts",
-                            "live",
-                            "transcribe",
-                            "robotics",
-                            "omni",
-                            "nano-banana",
-                        ]
-                    },
-                    "clear_generation_config_indexes": [3, 4, 5, 6, 13, 16],
-                },
-            ],
-            "models": {},
+        "pro_required": {
+            "contains": ["argon", "image", "imagen"],
+            "required_tiers": ["Pro", "Ultra", "Ultra_20X"],
         },
-        "rotator": {
-            "max_retries": 5,
-            "strategy": "sticky",
-            "stickiness_bonus": 400.0,
-            "stickiness_threshold": 0.8,
-            "drip_penalty": 500.0,
-            "tier_weights": {
-                "Free": 0.0,
-                "Plus": 0.5,
-                "Pro": 1.0,
-                "Ultra": 2.0,
-                "Ultra_20X": 3.0,
-            },
-            "cooldowns": {
-                "rate_limited_short": 60,
-                "rate_limited_drip": 300,
-                "rate_limited_drip_extended": 600,
-            },
+    },
+    "tier_quotas": {
+        "Free": {
+            "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 100},
+            "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 10},
+            "default_limit": 20,
         },
-        "paid_model_rules": {
-            "ultra_required": {
-                "contains": ["veo", "ultra", "antigravity", "carbon"],
-                "required_tiers": ["Ultra", "Ultra_20X"],
-            },
-            "pro_required": {
-                "contains": ["argon", "image", "imagen"],
-                "required_tiers": ["Pro", "Ultra", "Ultra_20X"],
-            },
+        "Plus": {
+            "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 300},
+            "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 30},
+            "default_limit": 50,
         },
-        "tier_quotas": {
-            "Free": {
-                "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 100},
-                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 10},
-                "default_limit": 20,
+        "Pro": {
+            "argon_models": {
+                "match": {"contains": ["argon", "carbon"]},
+                "daily_limit": 50,
             },
-            "Plus": {
-                "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 300},
-                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 30},
-                "default_limit": 50,
+            "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 150},
+            "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 50},
+            "image_models": {
+                "match": {"contains": ["image", "imagen"]},
+                "daily_limit": 50,
             },
-            "Pro": {
-                "argon_models": {
-                    "match": {"contains": ["argon", "carbon"]},
-                    "daily_limit": 50,
-                },
-                "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 150},
-                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 50},
-                "image_models": {
-                    "match": {"contains": ["image", "imagen"]},
-                    "daily_limit": 50,
-                },
-                "default_limit": 50,
-            },
-            "Ultra": {
-                "argon_models": {
-                    "match": {"contains": ["argon", "carbon"]},
-                    "daily_limit": 250,
-                },
-                "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 1500},
-                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 250},
-                "image_models": {
-                    "match": {"contains": ["image", "imagen"]},
-                    "daily_limit": 250,
-                },
-                "video_models": {"match": {"contains": ["veo"]}, "daily_limit": 50},
-                "default_limit": 250,
-            },
-            "Ultra_20X": {
-                "argon_models": {
-                    "match": {"contains": ["argon", "carbon"]},
-                    "daily_limit": 1000,
-                },
-                "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 5000},
-                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 1000},
-                "image_models": {
-                    "match": {"contains": ["image", "imagen"]},
-                    "daily_limit": 1000,
-                },
-                "video_models": {"match": {"contains": ["veo"]}, "daily_limit": 200},
-                "default_limit": 1000,
-            },
-            "overrides": {},
+            "default_limit": 50,
         },
-        "account_presets": [
-            {
-                "id": "preset_all",
-                "name": "全部启用 (最大并发)",
-                "description": "激活所有可用账号，提供最充沛的并发与负载池",
-                "action": "enable_all",
-                "is_system": True,
+        "Ultra": {
+            "argon_models": {
+                "match": {"contains": ["argon", "carbon"]},
+                "daily_limit": 250,
             },
-            {
-                "id": "preset_paid_only",
-                "name": "纯高阶付费池 (Plus/Pro/Ultra)",
-                "description": "仅激活具有付费权益的账号，全力保障高阶模型调用",
-                "action": "filter_tier",
-                "target_tiers": ["Plus", "Pro", "Ultra", "Ultra_20X"],
-                "is_system": True,
+            "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 1500},
+            "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 250},
+            "image_models": {
+                "match": {"contains": ["image", "imagen"]},
+                "daily_limit": 250,
             },
-            {
-                "id": "preset_ultra_only",
-                "name": "旗舰专属池 (Ultra 独占)",
-                "description": "仅激活 Ultra 顶级算力账号，保障最顶尖模型调用",
-                "action": "filter_tier",
-                "target_tiers": ["Ultra", "Ultra_20X"],
-                "is_system": True,
+            "video_models": {"match": {"contains": ["veo"]}, "daily_limit": 50},
+            "default_limit": 250,
+        },
+        "Ultra_20X": {
+            "argon_models": {
+                "match": {"contains": ["argon", "carbon"]},
+                "daily_limit": 1000,
             },
-            {
-                "id": "preset_free_only",
-                "name": "纯免费节能池 (Free)",
-                "description": "仅激活 Free 等级账号，用于日常普通模型测试",
-                "action": "filter_tier",
-                "target_tiers": ["Free"],
-                "is_system": True,
+            "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 5000},
+            "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 1000},
+            "image_models": {
+                "match": {"contains": ["image", "imagen"]},
+                "daily_limit": 1000,
             },
-            {
-                "id": "preset_production",
-                "name": "生产专属集群 (Production)",
-                "description": "仅激活 group 标记为 production 的核心业务账号",
-                "action": "filter_group",
-                "target_groups": ["production"],
-                "is_system": True,
-            },
-        ],
-    }
+            "video_models": {"match": {"contains": ["veo"]}, "daily_limit": 200},
+            "default_limit": 1000,
+        },
+        "overrides": {},
+    },
+    "account_presets": [],
+}
 
 
 _CONFIG_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
 _API_KEYS_CACHE: dict[str, tuple[float, frozenset[str], list[dict[str, str]]]] = {}
+
+
+def _cached_mtime(path: Path) -> float:
+    """取 config.yaml 的 mtime（文件缺失/不可读统一回退 0.0）。
+
+    此前 7 处各自手写 ``stat().st_mtime`` + exists/OSError 守卫（个别处只写
+    其中一半），语义相同但样板漂移（见 P6 收敛）；统一入口后失效语义不变：
+    缓存键/命中判定仍按 mtime 相等比较，mtime 变化即失效。
+    """
+    try:
+        return path.stat().st_mtime if path.exists() else 0.0
+    except OSError:
+        return 0.0
+
+
+def _cache_fresh(cached_mtime: float | None, mtime: float) -> bool:
+    """mtime 缓存命中判定：缓存记录的 mtime 与当前一致才视为新鲜。
+
+    各处条目均为「首元素是 mtime」的 tuple（形状不一），调用方以
+    ``cached[0] if cached is not None else None`` 取首元素传入，本函数只做
+    纯比较；mtime 变化即失效的语义与收敛前完全一致。
+    """
+    return cached_mtime is not None and cached_mtime == mtime
 
 
 def invalidate_config_cache() -> None:
@@ -972,12 +917,9 @@ def get_compat_settings(
         return settings
 
     path_key = str(resolved_path.absolute())
-    try:
-        mtime = resolved_path.stat().st_mtime
-    except OSError:
-        mtime = 0.0
+    mtime = _cached_mtime(resolved_path)
     cached = _compat_cache.get(path_key)
-    if cached is not None and cached[0] == mtime:
+    if cached is not None and _cache_fresh(cached[0], mtime):
         return dict(cached[1])
 
     config = _load_yaml_config(resolved_path)
@@ -1025,12 +967,9 @@ def get_anti_truncation_settings(
     }
     if resolved_path.exists():
         path_key = str(resolved_path.absolute())
-        try:
-            mtime = resolved_path.stat().st_mtime
-        except OSError:
-            mtime = 0.0
+        mtime = _cached_mtime(resolved_path)
         cached = _anti_truncation_cache.get(path_key)
-        if cached is not None and cached[0] == mtime:
+        if cached is not None and _cache_fresh(cached[0], mtime):
             settings = dict(cached[1])
         else:
             config = _load_yaml_config(resolved_path)
@@ -1122,13 +1061,10 @@ def _load_yaml_config(config_path: Path) -> dict[str, object]:
     # 而这条路径每处理一个配置项都要走一次（resolve_model_defaults、
     # get_configured_api_keys、get_active_waa_server 等），是本项目的头号热点。
     path_key = str(config_path.absolute())
-    try:
-        mtime = config_path.stat().st_mtime
-    except OSError:
-        mtime = 0.0
+    mtime = _cached_mtime(config_path)
 
     cached = _CONFIG_CACHE.get(path_key)
-    if cached is not None and cached[0] == mtime:
+    if cached is not None and _cache_fresh(cached[0], mtime):
         return cached[1]
 
     loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
@@ -1222,10 +1158,7 @@ def resolve_model_defaults(
     # model-specific override still wins over the canonical-derived one.
     canonical = canonicalize_model_alias(model)
     candidates = (normalized,) if canonical == normalized else (normalized, canonical)
-    try:
-        config_mtime = Path(resolved_path).stat().st_mtime
-    except OSError:
-        config_mtime = 0.0
+    config_mtime = _cached_mtime(Path(resolved_path))
     profiles = _compiled_profiles(resolved_path, config_mtime)
     resolved = ModelDefaults(drop_unsupported_params=global_drop)
     for profile in profiles:
@@ -1253,13 +1186,10 @@ def get_configured_api_key_items(
     """获取 config.yaml 中配置的结构化 API Key 列表（含备注名与创建时间）。"""
     resolved_path = _resolve_config_path(config_path)
     path_key = str(resolved_path.absolute())
-    try:
-        mtime = resolved_path.stat().st_mtime if resolved_path.exists() else 0.0
-    except OSError:
-        mtime = 0.0
+    mtime = _cached_mtime(resolved_path)
 
     cached = _API_KEYS_CACHE.get(path_key)
-    if cached is not None and cached[0] == mtime:
+    if cached is not None and _cache_fresh(cached[0], mtime):
         return list(cached[2])
 
     config = _load_yaml_config(resolved_path)
@@ -1295,13 +1225,10 @@ def get_configured_api_keys(
     """获取 config.yaml 中配置的所有有效 API Key 集合。"""
     resolved_path = _resolve_config_path(config_path)
     path_key = str(resolved_path.absolute())
-    try:
-        mtime = resolved_path.stat().st_mtime if resolved_path.exists() else 0.0
-    except OSError:
-        mtime = 0.0
+    mtime = _cached_mtime(resolved_path)
 
     cached = _API_KEYS_CACHE.get(path_key)
-    if cached is not None and cached[0] == mtime:
+    if cached is not None and _cache_fresh(cached[0], mtime):
         return cached[1]
 
     items = get_configured_api_key_items(config_path)
@@ -1416,10 +1343,7 @@ def resolve_tier_quota(
     """计算指定账号层级在目标模型上的每日软额度限制（仅用于轮询打分权重，超额绝不禁用账号）。"""
     normalized_model = _normalize_model_name(model) if model else ""
     resolved_path = _resolve_config_path(config_path)
-    try:
-        mtime = resolved_path.stat().st_mtime
-    except OSError:
-        mtime = 0.0
+    mtime = _cached_mtime(resolved_path)
     cache_key = (
         str(resolved_path.absolute()),
         mtime,
