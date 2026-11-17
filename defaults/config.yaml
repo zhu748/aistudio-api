@@ -294,3 +294,14 @@ account_presets:
     action: filter_group
     target_groups: ["production"]
     is_system: true
+
+# 出站保活 (Outbound Keepalive)
+# 定期 GET keepalive_url 防免费托管平台 (Render / HF Space 等) 冻结闲置实例；
+# 常见填法：本服务自身 healthz 地址 https://<域名>/healthz 自我唤醒。
+# url 留空 = 不启动（零开销）。运行时改面板设置走「设置 → 出站保活」卡片，
+# 保存即写此文件并自动重启保活任务；环境变量 AISTUDIO_KEEPALIVE_URL /
+# _INTERVAL / _ALLOW_PRIVATE 优先级更高（面板无法覆盖，仅展示）。
+network:
+  keepalive_url: ""
+  keepalive_interval: 60
+  keepalive_allow_private: false

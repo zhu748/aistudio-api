@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from collections.abc import Mapping, Sequence
 
 import yaml
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from aistudio_api.api.state import runtime_state
 from aistudio_api.config import settings
@@ -364,6 +365,100 @@ class CreateApiKeyRequest(BaseModel):
 
 class UpdateApiKeyRequest(BaseModel):
     name: str
+
+
+# ── 出站保活设置（面板「出站保活」卡片数据源） ─────────────────────────
+
+
+class UpdateKeepaliveConfigRequest(BaseModel):
+    """PUT /config/keepalive 请求体（三字段全量提交）。"""
+
+    url: str = ""
+    interval: int = Field(default=60, ge=5, le=86400)
+    allow_private: bool = False
+
+
+def _keepalive_env_override() -> dict[str, str]:
+    """环境变量覆盖展示（AISTUDIO_KEEPALIVE_* 存在时面板只读提示）。"""
+    overrides: dict[str, str] = {}
+    if os.getenv("AISTUDIO_KEEPALIVE_URL", "").strip():
+        overrides["url"] = "AISTUDIO_KEEPALIVE_URL"
+    if os.getenv("AISTUDIO_KEEPALIVE_INTERVAL", "").strip():
+        overrides["interval"] = "AISTUDIO_KEEPALIVE_INTERVAL"
+    if os.getenv("AISTUDIO_KEEPALIVE_ALLOW_PRIVATE", "").strip():
+        overrides["allow_private"] = "AISTUDIO_KEEPALIVE_ALLOW_PRIVATE"
+    return overrides
+
+
+def _keepalive_payload() -> dict[str, object]:
+    """组装保活卡片数据：yaml 设置 + env 覆盖 + 服务运行态。"""
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_keepalive_settings,
+    )
+    from aistudio_api.infrastructure.outbound_keepalive import (
+        outbound_keepalive_service,
+    )
+
+    yaml_settings = get_keepalive_settings()
+    service = outbound_keepalive_service
+    return {
+        **yaml_settings,
+        "running": service.is_running,
+        "env_overrides": _keepalive_env_override(),
+        "effective_url": (settings.keepalive_url or "").strip(),
+        "effective_interval": int(settings.keepalive_interval),
+        "effective_allow_private": bool(settings.keepalive_allow_private),
+    }
+
+
+@protected_router.get("/config/keepalive")
+async def get_keepalive_config() -> dict[str, object]:
+    """获取出站保活设置（URL / 间隔 / 私网许可）与服务运行态。"""
+    return _keepalive_payload()
+
+
+@protected_router.put("/config/keepalive")
+async def update_keepalive_config(
+    req: UpdateKeepaliveConfigRequest,
+) -> dict[str, object]:
+    """更新出站保活配置，持久化到 config.yaml 并立即重启保活任务。
+
+    URL 非空时先行校验（http/https + 合法主机名；私网目标需
+    allow_private，否则 400 拒绝——保活任务可被劫持会话用于内网探测）。
+    """
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        update_keepalive_settings,
+    )
+    from aistudio_api.infrastructure.outbound_keepalive import (
+        outbound_keepalive_service,
+        validate_keepalive_url,
+    )
+
+    url = req.url.strip()
+    if url and not validate_keepalive_url(url, allow_private=req.allow_private):
+        if validate_keepalive_url(url, allow_private=True):
+            raise HTTPException(
+                status_code=400,
+                detail="保活目标是私网/环回地址：如确属自我保活或内网监控，请先开启「允许私网目标」再保存",
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="保活 URL 必须是包含主机名的合法 http(s) 地址",
+        )
+    update_keepalive_settings(
+        url=url,
+        interval=req.interval,
+        allow_private=req.allow_private,
+    )
+    # 配置已写盘，按新配置重启保活任务（URL 清空时即为停止）。
+    await outbound_keepalive_service.restart()
+    logger.info(
+        "出站保活配置已更新: url=%s, interval=%ds, allow_private=%s",
+        url or "(空，停止保活)",
+        req.interval,
+        req.allow_private,
+    )
+    return _keepalive_payload()
 
 
 def _normalize_key_entries(raw: object) -> list[dict[str, str]]:
