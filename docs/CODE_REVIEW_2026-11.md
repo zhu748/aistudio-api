@@ -52,3 +52,15 @@
 - **小批次**：代理脱敏 `redaction.mask_proxy_url()` 三处收敛；account_rotator `_coerce_int/_coerce_float` 提升 + AccountStats 别名删除；status_map 常量化；routes_accounts `_failover_after_delete` / `_register_rotator_account` 收敛 + secrets/logger 规范化。
 
 测试同步调整：test_config_writes / test_log_stream / test_round6_audit_fixes / test_env_api_keys 的 patch 与 import 目标迁移至新模块（test_env_cookie_injection 的 healthz 留 routes_system）。
+
+## 路线图执行完成记录（2026-11-17 第三批）
+
+中优先超长函数拆分与 model_defaults 两项全部落地，微修批部分落地。最终验证：ruff All checks passed / pyright 0 errors / pytest 1449 passed + 5 skipped。
+
+- **request_middleware.py**：`__call__` 428 → 407 行，新增 `_ResponseObserver` dataclass（16 字段）清零 14 个 nonlocal；`_persist` 18 → 9 参数（observer 内字段不再直传）。AST 级比对确认编排逻辑逐 token 等价。
+- **app.py**：lifespan 334 → 64 行编排，拆出 `_init_core_services` / `_auto_refresh_tiers` / `_cookie_rotation_loop` / `_env_subaccount_probe` / `_graceful_shutdown`；关停 14 个动作顺序脚本化比对严格一致（含 6679723 的 save_task CancelledError 兜底）。
+- **api_service_gemini.py**：`stream_response` ~380 → 140 行编排 + 14 个模块级辅助（`_StreamAttemptState`、`_stream_attempt_frames`、`_retry_stream_attempt` 等）；yield 顺序与双层重试守卫零变化。
+- **model_defaults.py**：mtime 样板 7 处收敛为 `_cached_mtime` / `_cache_fresh`；`_default_config` 233 行内嵌 dict 改为模板加载 `defaults/config.yaml`（懒加载 + deepcopy + 缺文件兜底），按"内嵌 dict 为真相源"修复 6 处实测漂移（video_models.match、paid_model_rules 两处、tier_quotas 三处 carbon、waa.servers 文案），yaml 注释全保留。
+- **微修批**：app.py 函数内重复 `import httpx` 清理；`_iter_response_parts` 两份经归一化比对语义不同（签名缓存行为差异），保留各自实现；404 文案、`_EXTRA_GUARANTEED_MODELS` 去重两项经核实（测试断言措辞/嵌套作用域风险）不值得改，维持现状。
+
+剩余未执行（均为低优先微修，收益低于风险）：routes_accounts 拆导入端点、compat_service 五关注点文件级拆分、wire_parser PartIndex 双轨统一、logger/log 命名统一。至此路线图高/中优先项全部清零。
