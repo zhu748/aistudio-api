@@ -19,7 +19,14 @@ import json
 import re
 import secrets
 import time
-from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterable,
+    Awaitable,
+    Callable,
+    Coroutine,
+)
+from typing import cast
 
 import httpx
 from fastapi import Request
@@ -41,6 +48,7 @@ from aistudio_api.api.schemas_compat import (
     ClaudeMessagesRequest,
     OpenAIChatCompletionRequest,
 )
+from aistudio_api.application.anti_truncation import _close_stream_quietly
 from aistudio_api.application.media_session import (
     current_media,
     has_remote_media,
@@ -190,6 +198,107 @@ def _as_dict(value: object) -> dict[str, object]:
 
 def _as_str(value: object) -> str:
     return value if isinstance(value, str) else ""
+
+
+# 远程媒体（http/https 下载）的分批并发上限：与媒体会话 semaphore 共同约束
+# 单请求同时在途的下载数，4 是移动网络下的经验安全值。
+MEDIA_CONCURRENCY = 4
+
+
+async def _convert_items_concurrently(
+    items: list[object],
+    convert_one: Callable[[list[object]], Awaitable[list[GeminiPart]]],
+    *,
+    concurrency: int = MEDIA_CONCURRENCY,
+) -> list[GeminiPart]:
+    """分批并发转换媒体条目（每批最多 ``concurrency`` 个）。
+
+    ``convert_one`` 收到单元素列表（与各 ``_*_parts_from_content`` 的入参
+    形态一致，递归触发远端下载与体积校验）；批内任一 ValueError 透传首个
+    消息，与原先 ``except* ValueError`` 行为一致。
+    """
+    parts: list[GeminiPart] = []
+    for offset in range(0, len(items), concurrency):
+        try:
+            async with asyncio.TaskGroup() as group:
+                # create_task 需要 Coroutine 而非裸 Awaitable（TaskGroup 泛型
+                # 协变限制），这里用 cast 收窄协程类型。
+                tasks = [
+                    group.create_task(
+                        cast(
+                            "Coroutine[object, object, list[GeminiPart]]",
+                            convert_one([item]),
+                        )
+                    )
+                    for item in items[offset : offset + concurrency]
+                ]
+        except* ValueError as exc:
+            raise ValueError(str(exc.exceptions[0])) from exc
+        for task in tasks:
+            parts.extend(task.result())
+    return parts
+
+
+def _file_block_to_part(file_data: str, filename: object) -> GeminiPart | None:
+    """OpenAI ``file`` / Responses ``input_file`` 的 data URL → inlineData part。
+
+    filename 透传到 wire inlineData 槽位 5（2026-11 AI Studio 真机抓包
+    形态），空串视为未提供；非 data URL 形态返回 None（忽略）。
+    """
+    if not file_data.startswith("data:"):
+        return None
+    parsed = _parse_data_url(file_data)
+    if parsed is None:
+        return None
+    mime, data = parsed
+    clean = _as_str(filename).strip()
+    return GeminiPart(
+        inlineData=GeminiInlineData(mimeType=mime, data=data, filename=clean or None)
+    )
+
+
+def _claude_base64_part(
+    source: dict[str, object], default_mime: str, *, kind: str
+) -> GeminiPart | None:
+    """Claude base64 source 块 → inlineData part（缺 data 返回 None）。"""
+    media_type = _as_str(source.get("media_type")) or default_mime
+    data = _as_str(source.get("data"))
+    if not data:
+        return None
+    _assert_media_size(data, kind=kind)
+    return GeminiPart(inlineData=GeminiInlineData(mimeType=media_type, data=data))
+
+
+def _claude_usage_payload(usage: dict[str, int]) -> dict[str, object]:
+    """统一 Gemini token 计数 → Claude usage（input 剔除缓存命中部分）。"""
+    payload: dict[str, object] = {
+        "input_tokens": max(0, usage["prompt"] - usage["cached"]),
+        "output_tokens": usage["completion"],
+    }
+    if usage["cached"]:
+        payload["cache_read_input_tokens"] = usage["cached"]
+    return payload
+
+
+@contextlib.asynccontextmanager
+async def _stream_adapter_lifecycle(
+    source: AsyncIterable[object],
+    failure_events: Callable[[str], list[str]],
+    register_failure: Callable[[Callable[[str], list[str]]], None] | None,
+) -> AsyncGenerator[None]:
+    """三个协议流适配器（OpenAI / Claude / Responses）共用的生命周期骨架。
+
+    - 进入时把 ``failure_events``（message → 各协议自己的错误帧列表）注册
+      给 ``register_failure``（上游重试耗尽后由传输层调用收束流）；
+    - 退出时安静关闭内层 SSE 生成器（3.6）：适配器自身异常或客户端断连
+      时，不再依赖事件循环的异步生成器终结器延迟释放上游连接。
+    """
+    if register_failure is not None:
+        register_failure(failure_events)
+    try:
+        yield
+    finally:
+        await _close_stream_quietly(source)
 
 
 def _signature_extra(signature: object) -> dict[str, object]:
@@ -424,19 +533,7 @@ async def _openai_parts_from_content(content: object) -> list[GeminiPart]:
     if not isinstance(content, list):
         return []
     if len(content) > 1 and has_remote_media(content):
-        parts: list[GeminiPart] = []
-        for offset in range(0, len(content), 4):
-            try:
-                async with asyncio.TaskGroup() as group:
-                    tasks = [
-                        group.create_task(_openai_parts_from_content([item]))
-                        for item in content[offset : offset + 4]
-                    ]
-            except* ValueError as exc:
-                raise ValueError(str(exc.exceptions[0])) from exc
-            for task in tasks:
-                parts.extend(task.result())
-        return parts
+        return await _convert_items_concurrently(content, _openai_parts_from_content)
     parts: list[GeminiPart] = []
     for item in content:
         if not isinstance(item, dict):
@@ -465,22 +562,9 @@ async def _openai_parts_from_content(content: object) -> list[GeminiPart]:
         elif block_type == "file":
             file_obj = _as_dict(item.get("file"))
             file_data = _as_str(file_obj.get("file_data"))
-            if file_data.startswith("data:"):
-                parsed = _parse_data_url(file_data)
-                if parsed is not None:
-                    mime, data = parsed
-                    # OpenAI file.filename 透传到 wire inlineData 槽位 5
-                    # （2026-11 AI Studio 真机抓包形态），空串视为未提供。
-                    filename = _as_str(file_obj.get("filename")).strip()
-                    parts.append(
-                        GeminiPart(
-                            inlineData=GeminiInlineData(
-                                mimeType=mime,
-                                data=data,
-                                filename=filename or None,
-                            )
-                        )
-                    )
+            part = _file_block_to_part(file_data, file_obj.get("filename"))
+            if part is not None:
+                parts.append(part)
         elif block_type == "refusal":
             refusal = item.get("refusal")
             if isinstance(refusal, str):
@@ -793,24 +877,12 @@ async def _claude_blocks_to_parts(
     if not isinstance(content, list):
         return []
     if len(content) > 1 and has_remote_media(content):
-        parts: list[GeminiPart] = []
-        for offset in range(0, len(content), 4):
-            try:
-                async with asyncio.TaskGroup() as group:
-                    tasks = [
-                        group.create_task(
-                            _claude_blocks_to_parts(
-                                [block],
-                                tool_name_by_id=tool_name_by_id,
-                            )
-                        )
-                        for block in content[offset : offset + 4]
-                    ]
-            except* ValueError as exc:
-                raise ValueError(str(exc.exceptions[0])) from exc
-            for task in tasks:
-                parts.extend(task.result())
-        return parts
+        return await _convert_items_concurrently(
+            content,
+            lambda blocks: _claude_blocks_to_parts(
+                blocks, tool_name_by_id=tool_name_by_id
+            ),
+        )
     parts: list[GeminiPart] = []
     for block in content:
         if not isinstance(block, dict):
@@ -830,15 +902,9 @@ async def _claude_blocks_to_parts(
             source = _as_dict(block.get("source"))
             source_type = source.get("type")
             if source_type == "base64":
-                media_type = _as_str(source.get("media_type")) or "image/png"
-                data = _as_str(source.get("data"))
-                if data:
-                    _assert_media_size(data, kind="image media")
-                    parts.append(
-                        GeminiPart(
-                            inlineData=GeminiInlineData(mimeType=media_type, data=data)
-                        )
-                    )
+                part = _claude_base64_part(source, "image/png", kind="image media")
+                if part is not None:
+                    parts.append(part)
             elif source_type == "url":
                 url = _as_str(source.get("url")).strip()
                 if url:
@@ -846,15 +912,11 @@ async def _claude_blocks_to_parts(
         elif block_type == "document":
             source = _as_dict(block.get("source"))
             if source.get("type") == "base64":
-                media_type = _as_str(source.get("media_type")) or "application/pdf"
-                data = _as_str(source.get("data"))
-                if data:
-                    _assert_media_size(data, kind="document media")
-                    parts.append(
-                        GeminiPart(
-                            inlineData=GeminiInlineData(mimeType=media_type, data=data)
-                        )
-                    )
+                part = _claude_base64_part(
+                    source, "application/pdf", kind="document media"
+                )
+                if part is not None:
+                    parts.append(part)
             elif source.get("type") == "url":
                 url = _as_str(source.get("url")).strip()
                 if url:
@@ -900,19 +962,11 @@ async def _claude_blocks_to_parts(
                     elif item.get("type") == "image":
                         source = _as_dict(item.get("source"))
                         if source.get("type") == "base64":
-                            media_type = (
-                                _as_str(source.get("media_type")) or "image/png"
+                            part = _claude_base64_part(
+                                source, "image/png", kind="tool_result media"
                             )
-                            data = _as_str(source.get("data"))
-                            if data:
-                                _assert_media_size(data, kind="tool_result media")
-                                extra_parts.append(
-                                    GeminiPart(
-                                        inlineData=GeminiInlineData(
-                                            mimeType=media_type, data=data
-                                        )
-                                    )
-                                )
+                            if part is not None:
+                                extra_parts.append(part)
                 joined = "\n".join(t for t in texts if t)
                 payload = {"result": joined} if joined else {}
             if block.get("is_error") is True:
@@ -1323,7 +1377,6 @@ def build_openai_completion(
             )
 
     content_text = "".join(text_parts)
-    usage = _usage_from_gemini(response.usageMetadata)
     message: dict[str, object] = {
         "role": "assistant",
         "content": content_text,
@@ -1333,17 +1386,7 @@ def build_openai_completion(
     if tool_calls:
         message["tool_calls"] = tool_calls
 
-    usage_payload: dict[str, object] = {
-        "prompt_tokens": usage["prompt"],
-        "completion_tokens": usage["completion"],
-        "total_tokens": usage["total"],
-    }
-    if usage["reasoning"]:
-        usage_payload["completion_tokens_details"] = {
-            "reasoning_tokens": usage["reasoning"]
-        }
-    if usage["cached"]:
-        usage_payload["prompt_tokens_details"] = {"cached_tokens": usage["cached"]}
+    usage_payload = _openai_usage_from_frame(response.usageMetadata)
 
     return {
         "id": f"chatcmpl-{secrets.token_hex(14)}",
@@ -1390,15 +1433,10 @@ def _claude_stop_reason(
     finish_reason: str | None,
     *,
     has_tool_use: bool,
-    full_text: str,
-    stop_sequences: list[str] | None,
 ) -> tuple[str, str | None]:
-    stops = StopSequenceBuffer(stop_sequences)
-    stops.feed(full_text, final=True)
-    stop_seq = stops.hit
+    """Gemini finishReason → Claude stop_reason 纯映射；停止序列命中由调用方
+    （StopSequenceBuffer 的 stop_hit）先行判定，不再具备重复扫描语义。"""
     raw = finish_reason or "STOP"
-    if stop_seq is not None:
-        return "stop_sequence", stop_seq
     # 安全/异常拦截优先于 tool_use，避免把被风控终止的响应误报成正常工具调用。
     if raw in _CLAUDE_REFUSAL_FINISH:
         return "refusal", None
@@ -1497,16 +1535,8 @@ def build_claude_message(
         stop_reason, stop_seq = _claude_stop_reason(
             finish_reason_raw,
             has_tool_use=has_tool_use,
-            full_text="",
-            stop_sequences=None,
         )
-    usage = _usage_from_gemini(response.usageMetadata)
-    usage_payload: dict[str, object] = {
-        "input_tokens": max(0, usage["prompt"] - usage["cached"]),
-        "output_tokens": usage["completion"],
-    }
-    if usage["cached"]:
-        usage_payload["cache_read_input_tokens"] = usage["cached"]
+    usage_payload = _claude_usage_payload(_usage_from_gemini(response.usageMetadata))
     return {
         "id": f"msg_{secrets.token_hex(12)}",
         "type": "message",
@@ -1627,9 +1657,7 @@ def _frame_parts(candidate: dict[str, object]) -> list[dict[str, object]]:
 # ---------------------------------------------------------------------------
 
 
-def _openai_usage_from_frame(
-    usage_metadata: dict[str, object] | None,
-) -> dict[str, object]:
+def _openai_usage_from_frame(usage_metadata: object) -> dict[str, object]:
     usage = _usage_from_gemini(usage_metadata or {})
     payload: dict[str, object] = {
         "prompt_tokens": usage["prompt"],
@@ -1686,13 +1714,6 @@ async def openai_stream_adapter(
         }
         return payload
 
-    if register_failure is not None:
-        register_failure(
-            lambda message: [
-                _sse(_error_chunk(message, "api_error", 504)),
-                "data: [DONE]\n\n",
-            ]
-        )
     finish_reason_raw: str | None = None
     usage_frame: dict[str, object] | None = None
     tool_index = 0
@@ -1701,10 +1722,14 @@ async def openai_stream_adapter(
 
     # 确定性关闭内层 SSE 生成器（3.6）：适配器自身异常或客户端断连时，
     # 不再依赖事件循环的异步生成器终结器延迟释放上游连接。
-    source_aclose: Callable[[], Awaitable[None]] | None = getattr(
-        source, "aclose", None
-    )
-    try:
+    async with _stream_adapter_lifecycle(
+        source,
+        lambda message: [
+            _sse(_error_chunk(message, "api_error", 504)),
+            "data: [DONE]\n\n",
+        ],
+        register_failure,
+    ):
         yield _sse(_chunk({"role": "assistant", "content": ""}, None))
         try:
             async for frame in _iter_gemini_sse_frames(source):
@@ -1821,10 +1846,6 @@ async def openai_stream_adapter(
                 }
             )
         yield "data: [DONE]\n\n"
-    finally:
-        if callable(source_aclose):
-            with contextlib.suppress(Exception):
-                await source_aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -2056,16 +2077,8 @@ class _ClaudeStreamEmitter:
             stop_reason, stop_seq = _claude_stop_reason(
                 self.finish_reason_raw,
                 has_tool_use=self.has_tool_use,
-                full_text="",
-                stop_sequences=None,
             )
-        usage = _usage_from_gemini(self.usage_frame)
-        usage_payload: dict[str, object] = {
-            "input_tokens": max(0, usage["prompt"] - usage["cached"]),
-            "output_tokens": usage["completion"],
-        }
-        if usage["cached"]:
-            usage_payload["cache_read_input_tokens"] = usage["cached"]
+        usage_payload = _claude_usage_payload(_usage_from_gemini(self.usage_frame))
         events.append(
             self.sse(
                 "message_delta",
@@ -2090,98 +2103,97 @@ async def claude_stream_adapter(
     """Gemini SSE → Claude Messages SSE 事件流。"""
     emitter = _ClaudeStreamEmitter(f"msg_{secrets.token_hex(12)}", requested_model)
     stops = StopSequenceBuffer(stop_sequences)
-    if register_failure is not None:
-        register_failure(lambda message: emitter.error(504, message))
     # 确定性关闭内层 SSE 生成器（3.6）：自身异常或客户端断连时立即释放上游连接
-    source_aclose: Callable[[], Awaitable[None]] | None = getattr(
-        source, "aclose", None
-    )
-    try:
+    async with _stream_adapter_lifecycle(
+        source,
+        lambda message: emitter.error(504, message),
+        register_failure,
+    ):
         yield emitter.message_start()
         yield emitter.ping()
-        async for frame in _iter_gemini_sse_frames(source):
-            error_obj = frame.get("error")
-            if isinstance(error_obj, dict):
-                code = _as_int(error_obj.get("code")) or 500
-                message = _as_str(error_obj.get("message")) or "Upstream error"
-                for event in emitter.error(code, message):
-                    yield event
-                return
-            candidate = _frame_candidate(frame)
-            finish = _as_str(candidate.get("finishReason"))
-            if finish:
-                emitter.finish_reason_raw = finish
-            usage_metadata = frame.get("usageMetadata")
-            if isinstance(usage_metadata, dict):
-                emitter.usage_frame = usage_metadata
-            for part in _frame_parts(candidate):
-                if stops.hit is not None:
-                    continue
-                if (
-                    part.get("functionCall")
-                    or part.get("inlineData")
-                    or part.get("thought") is True
-                ):
-                    # A retained text prefix belongs before this next block.
-                    tail = stops.feed("", final=True)
-                    # 边界冲刷同样可能恰好补完停止序列：立即同步命中状态，
-                    # 否则 finish() 读不到 stop_hit，会按 finish_reason 推导出
-                    # tool_use/end_turn 等与「正文已截断」矛盾的终止元数据。
-                    emitter.stop_hit = stops.hit
-                    if tail:
-                        for event in emitter.text_delta(tail):
-                            yield event
-                function_call = _as_dict(part.get("functionCall"))
-                if function_call:
-                    call_id = _as_str(function_call.get("id"))
-                    if not call_id:
-                        call_id = f"toolu_{secrets.token_hex(12)}"
-                    name = _as_str(function_call.get("name")) or "unknown"
-                    args = function_call.get("args")
-                    for event in emitter.tool_use(
-                        call_id, name, args, _as_str(part.get("thoughtSignature"))
-                    ):
+        try:
+            async for frame in _iter_gemini_sse_frames(source):
+                error_obj = frame.get("error")
+                if isinstance(error_obj, dict):
+                    code = _as_int(error_obj.get("code")) or 500
+                    message = _as_str(error_obj.get("message")) or "Upstream error"
+                    for event in emitter.error(code, message):
                         yield event
-                    continue
-                inline = _as_dict(part.get("inlineData"))
-                if inline:
-                    mime = _as_str(inline.get("mimeType")) or "image/png"
-                    data = _as_str(inline.get("data"))
-                    if data:
-                        for event in emitter.image(mime, data):
-                            yield event
-                    continue
-                text = part.get("text")
-                if isinstance(text, str) and text:
-                    if part.get("thought") is True:
-                        for event in emitter.thinking_delta(text):
-                            yield event
-                        signature = part.get("thoughtSignature")
-                        if isinstance(signature, str):
-                            emitter.thinking_signature = signature
-                    else:
-                        # stop sequence 命中后丢弃后续正文（Claude 语义是
-                        # 文本在 stop sequence 处截断，不透传其后内容）；
-                        # 命中点在本帧中间时，命中点之前的文本仍需下发
-                        text = stops.feed(text)
+                    return
+                candidate = _frame_candidate(frame)
+                finish = _as_str(candidate.get("finishReason"))
+                if finish:
+                    emitter.finish_reason_raw = finish
+                usage_metadata = frame.get("usageMetadata")
+                if isinstance(usage_metadata, dict):
+                    emitter.usage_frame = usage_metadata
+                for part in _frame_parts(candidate):
+                    if stops.hit is not None:
+                        continue
+                    if (
+                        part.get("functionCall")
+                        or part.get("inlineData")
+                        or part.get("thought") is True
+                    ):
+                        # A retained text prefix belongs before this next block.
+                        tail = stops.feed("", final=True)
+                        # 边界冲刷同样可能恰好补完停止序列：立即同步命中状态，
+                        # 否则 finish() 读不到 stop_hit，会按 finish_reason 推导出
+                        # tool_use/end_turn 等与「正文已截断」矛盾的终止元数据。
                         emitter.stop_hit = stops.hit
-                        if not text:
-                            continue
-                        for event in emitter.text_delta(text):
+                        if tail:
+                            for event in emitter.text_delta(tail):
+                                yield event
+                    function_call = _as_dict(part.get("functionCall"))
+                    if function_call:
+                        call_id = _as_str(function_call.get("id"))
+                        if not call_id:
+                            call_id = f"toolu_{secrets.token_hex(12)}"
+                        name = _as_str(function_call.get("name")) or "unknown"
+                        args = function_call.get("args")
+                        for event in emitter.tool_use(
+                            call_id, name, args, _as_str(part.get("thoughtSignature"))
+                        ):
                             yield event
-                elif emitter.open_kind == "thinking" and isinstance(
-                    part.get("thoughtSignature"), str
-                ):
-                    emitter.thinking_signature = str(part["thoughtSignature"])
-    except Exception as exc:
-        logger.warning("Claude 流式转换异常: %s", exc)
-        record_result(
-            "error", error=f"Stream conversion failed: {type(exc).__name__}: {exc}"
-        )
-        for event in emitter.error(500, f"{type(exc).__name__}: {exc}"):
-            yield event
-        return
-    else:
+                        continue
+                    inline = _as_dict(part.get("inlineData"))
+                    if inline:
+                        mime = _as_str(inline.get("mimeType")) or "image/png"
+                        data = _as_str(inline.get("data"))
+                        if data:
+                            for event in emitter.image(mime, data):
+                                yield event
+                        continue
+                    text = part.get("text")
+                    if isinstance(text, str) and text:
+                        if part.get("thought") is True:
+                            for event in emitter.thinking_delta(text):
+                                yield event
+                            signature = part.get("thoughtSignature")
+                            if isinstance(signature, str):
+                                emitter.thinking_signature = signature
+                        else:
+                            # stop sequence 命中后丢弃后续正文（Claude 语义是
+                            # 文本在 stop sequence 处截断，不透传其后内容）；
+                            # 命中点在本帧中间时，命中点之前的文本仍需下发
+                            text = stops.feed(text)
+                            emitter.stop_hit = stops.hit
+                            if not text:
+                                continue
+                            for event in emitter.text_delta(text):
+                                yield event
+                    elif emitter.open_kind == "thinking" and isinstance(
+                        part.get("thoughtSignature"), str
+                    ):
+                        emitter.thinking_signature = str(part["thoughtSignature"])
+        except Exception as exc:
+            logger.warning("Claude 流式转换异常: %s", exc)
+            record_result(
+                "error", error=f"Stream conversion failed: {type(exc).__name__}: {exc}"
+            )
+            for event in emitter.error(500, f"{type(exc).__name__}: {exc}"):
+                yield event
+            return
         tail = stops.feed("", final=True)
         # 收尾冲刷若恰好补完停止序列，同样要同步命中状态（见上方边界冲刷）。
         emitter.stop_hit = stops.hit
@@ -2190,10 +2202,6 @@ async def claude_stream_adapter(
                 yield event
         for event in emitter.finish():
             yield event
-    finally:
-        if callable(source_aclose):
-            with contextlib.suppress(Exception):
-                await source_aclose()
 
 
 # ---------------------------------------------------------------------------

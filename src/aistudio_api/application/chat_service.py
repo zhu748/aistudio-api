@@ -5,12 +5,40 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from aistudio_api.api.schemas import GeminiGenerateContentRequest, GeminiTool
+    from aistudio_api.api.schemas import (
+        GeminiFunctionResponse,
+        GeminiGenerateContentRequest,
+        GeminiPart,
+        GeminiTool,
+    )
+    from aistudio_api.infrastructure.gateway.model_defaults import ModelDefaults
 
-import copy
-import json
 from dataclasses import dataclass
 
+# 编码器区整体迁移至 schema_wire_codec（重导出保持 anti_truncation.py 与
+# 既有测试的 import 路径不变；F401 经下方 __all__ 声明豁免）
+from aistudio_api.application.schema_wire_codec import (  # noqa: F401
+    _DECLARATION_LOSSY_KEYS,
+    _RESPONSE_LOSSY_KEYS,
+    _RESPONSE_SCHEMA_NOTE,
+    _SHAPE_KEY_ALIASES,
+    _TOOL_ARGUMENTS_SCHEMA_NOTE,
+    SCHEMA_TYPE_CODES,
+    _compact_schema_json,
+    _declaration_cache,
+    _define_required_properties,
+    _encode_schema_combiners,
+    _encode_schema_to_wire,
+    _encode_tool_parameters,
+    _function_declaration_name,
+    _resolve_schema_type_code,
+    _schema_has_empty_enum,
+    _schema_has_lossy_keys,
+    _tool_schema_shape,
+    encode_function_declaration_to_wire,
+    encode_response_schema_to_wire,
+    encode_schema_to_wire,
+)
 from aistudio_api.domain.tool_signatures import (
     SKIP_THOUGHT_SIGNATURE,
     lookup_function_signature as _lookup_function_signature,
@@ -24,7 +52,6 @@ from aistudio_api.infrastructure.gateway.model_defaults import (
     snap_thinking_wire_to_model as _snap_thinking_wire_to_model,
 )
 from aistudio_api.infrastructure.gateway.wire_codec import build_tools_from_names
-from aistudio_api.infrastructure.gateway.wire_spec import JspbArray, SchemaIndex
 from aistudio_api.infrastructure.gateway.wire_types import (
     AistudioContent,
     AistudioImageOutputMode,
@@ -57,757 +84,14 @@ class NormalizedGeminiRequest:
     function_name_restore: dict[str, str] | None = None
 
 
-SCHEMA_TYPE_CODES = {
-    "string": 1,
-    "number": 2,
-    "float": 2,
-    "integer": 3,
-    "int": 3,
-    "boolean": 4,
-    "bool": 4,
-    "array": 5,
-    "object": 6,
-    "null": 7,
-}
-
-
-def _resolve_schema_type_code(schema: dict[str, object]) -> tuple[int, str, bool]:
-    raw_type = schema.get("type")
-    is_nullable = False
-    if isinstance(raw_type, list):
-        non_null_types = [t for t in raw_type if str(t).lower() != "null"]
-        if any(str(t).lower() == "null" for t in raw_type):
-            is_nullable = True
-        raw_type = non_null_types[0] if non_null_types else "string"
-    schema_type = str(raw_type or "").split(".")[-1].strip().lower()
-
-    if not schema_type or schema_type not in SCHEMA_TYPE_CODES or schema_type == "null":
-        if "properties" in schema:
-            schema_type = "object"
-        elif "items" in schema or "prefixItems" in schema or "prefix_items" in schema:
-            schema_type = "array"
-        elif "const" in schema:
-            cv = schema["const"]
-            if isinstance(cv, str):
-                schema_type = "string"
-            elif isinstance(cv, bool):
-                schema_type = "boolean"
-            elif isinstance(cv, int):
-                schema_type = "integer"
-            elif isinstance(cv, float):
-                schema_type = "number"
-            elif isinstance(cv, dict):
-                schema_type = "object"
-            elif isinstance(cv, list):
-                schema_type = "array"
-        elif (
-            "enum" in schema
-            and isinstance(schema["enum"], (list, tuple))
-            and schema["enum"]
-        ):
-            all_types = {type(x) for x in schema["enum"]}
-            if all_types == {str}:
-                schema_type = "string"
-            elif all_types == {bool}:
-                schema_type = "boolean"
-            elif all_types == {int}:
-                schema_type = "integer"
-            elif all_types <= {int, float}:
-                schema_type = "number"
-        elif any(
-            k in schema
-            for k in ("anyOf", "any_of", "oneOf", "one_of", "allOf", "all_of")
-        ):
-            combiner = (
-                schema.get("anyOf")
-                or schema.get("any_of")
-                or schema.get("oneOf")
-                or schema.get("one_of")
-                or schema.get("allOf")
-                or schema.get("all_of")
-            )
-            if isinstance(combiner, list) and combiner:
-                # OpenAI 常用 {type:"null"} 表达可空：剔除 null 分支后
-                # 若只剩一种类型，正确语义是「该类型 + nullable」，而非
-                # 降级成 object（null-first / object+null 组合此前都错编）
-                branch_types = [
-                    str(b.get("type") or "").split(".")[-1].strip().lower()
-                    for b in combiner
-                    if isinstance(b, dict) and b.get("type")
-                ]
-                has_null = "null" in branch_types
-                non_null = [t for t in branch_types if t != "null"]
-                if has_null and len(non_null) == 1:
-                    schema_type = non_null[0]
-                    is_nullable = True
-                elif "object" in non_null:
-                    schema_type = "object"
-                    if has_null:
-                        is_nullable = True
-                elif non_null:
-                    schema_type = non_null[0]
-                    if has_null:
-                        is_nullable = True
-                else:
-                    schema_type = "object"
-            else:
-                schema_type = "object"
-        else:
-            schema_type = "object"
-
-    type_code = SCHEMA_TYPE_CODES.get(schema_type, 6)
-    if type_code not in (1, 2, 3, 4, 5, 6):
-        type_code = 6
-    return type_code, schema_type, is_nullable
-
-
-def _encode_schema_combiners(
-    schema: dict[str, object], wire: JspbArray, include_required: bool
-) -> None:
-    one_of = schema.get("oneOf") or schema.get("one_of")
-    if isinstance(one_of, list) and one_of:
-        wire[SchemaIndex.ONE_OF] = [
-            _encode_schema_to_wire(
-                sub if isinstance(sub, dict) else {},
-                include_required=include_required,
-            )
-            for sub in one_of
-            if isinstance(sub, dict) or sub is True
-        ]
-
-    any_of = schema.get("anyOf") or schema.get("any_of")
-    if isinstance(any_of, list) and any_of:
-        wire[SchemaIndex.ANY_OF] = [
-            _encode_schema_to_wire(
-                sub if isinstance(sub, dict) else {},
-                include_required=include_required,
-            )
-            for sub in any_of
-            if isinstance(sub, dict) or sub is True
-        ]
-
-    all_of = schema.get("allOf") or schema.get("all_of")
-    if isinstance(all_of, list) and all_of:
-        wire[SchemaIndex.ALL_OF] = [
-            _encode_schema_to_wire(
-                sub if isinstance(sub, dict) else {},
-                include_required=include_required,
-            )
-            for sub in all_of
-            if isinstance(sub, dict) or sub is True
-        ]
-
-    not_schema = schema.get("not") or schema.get("not_")
-    if isinstance(not_schema, dict):
-        wire[SchemaIndex.NOT] = _encode_schema_to_wire(
-            not_schema, include_required=include_required
-        )
-
-
-def encode_schema_to_wire(
-    schema: dict[str, object], *, include_required: bool = True
-) -> list[object]:
-    """Resolve local JSON Schema references before encoding the wire subset."""
-    remaining = 10_000
-
-    def expand(node: object, refs: tuple[str, ...] = (), depth: int = 0) -> object:
-        nonlocal remaining
-        remaining -= 1
-        if depth > 64 or remaining < 0:
-            raise ValueError("JSON Schema expansion exceeds complexity limit")
-        if isinstance(node, list):
-            return [expand(item, refs, depth + 1) for item in node]
-        if not isinstance(node, dict):
-            return node
-        reference = node.get("$ref")
-        if reference is not None:
-            if not isinstance(reference, str) or not reference.startswith("#/"):
-                raise ValueError("Only local JSON Schema $ref references are supported")
-            if reference in refs:
-                raise ValueError(
-                    f"Recursive JSON Schema reference is not supported: {reference}"
-                )
-            target: object = schema
-            for segment in reference[2:].split("/"):
-                key = segment.replace("~1", "/").replace("~0", "~")
-                if not isinstance(target, dict) or key not in target:
-                    raise ValueError(f"Unresolved JSON Schema reference: {reference}")
-                target = target[key]
-            resolved = expand(target, (*refs, reference), depth + 1)
-            siblings = {key: value for key, value in node.items() if key != "$ref"}
-            if siblings:
-                return {"allOf": [resolved, expand(siblings, refs, depth + 1)]}
-            return resolved
-        result: dict[str, object] = {}
-        for key, value in node.items():
-            if key in ("$defs", "definitions"):
-                continue
-            if key in (
-                "properties",
-                "patternProperties",
-                "dependentSchemas",
-            ) and isinstance(value, dict):
-                result[key] = {
-                    name: expand(child, refs, depth + 1)
-                    for name, child in value.items()
-                }
-            elif key in (
-                "items",
-                "prefixItems",
-                "prefix_items",
-                "anyOf",
-                "any_of",
-                "oneOf",
-                "one_of",
-                "allOf",
-                "all_of",
-                "not",
-                "not_",
-                "additionalProperties",
-                "propertyNames",
-                "contains",
-                "if",
-                "then",
-                "else",
-            ):
-                result[key] = expand(value, refs, depth + 1)
-            else:
-                # Literal data and property names can themselves contain '$ref'.
-                result[key] = value
-        return result
-
-    resolved = expand(schema)
-    if not isinstance(resolved, dict):
-        raise ValueError("JSON Schema must resolve to an object")
-    return _encode_schema_to_wire(resolved, include_required=include_required)
-
-
-def _encode_schema_to_wire(
-    schema: dict[str, object], *, include_required: bool = True
-) -> list[object]:
-    type_code, schema_type, is_nullable = _resolve_schema_type_code(schema)
-    wire = JspbArray([type_code])
-
-    fmt = schema.get("format")
-    if isinstance(fmt, str) and fmt:
-        wire[SchemaIndex.FORMAT] = fmt
-
-    desc = schema.get("description")
-    if isinstance(desc, str) and desc:
-        wire[SchemaIndex.DESCRIPTION] = desc
-
-    nullable = schema.get("nullable")
-    if isinstance(nullable, bool):
-        wire[SchemaIndex.NULLABLE] = nullable
-    elif is_nullable:
-        wire[SchemaIndex.NULLABLE] = True
-
-    enum_vals = schema.get("enum")
-    if not enum_vals and "const" in schema:
-        enum_vals = [schema["const"]]
-    if isinstance(enum_vals, (list, tuple)) and enum_vals:
-        # 上游拒绝空串 enum 值（AIStudio2API geminiSchema 同款过滤）：
-        # 剔除空串，全空则整体省略；含空串的 schema 由降级链把完整
-        # JSON Schema 附加到 description 兜底
-        filtered_enum = [str(x) for x in enum_vals if str(x) != ""]
-        if filtered_enum:
-            wire[SchemaIndex.ENUM] = filtered_enum
-
-    items = schema.get("items")
-    if schema_type == "array" or items is not None:
-        if isinstance(items, dict):
-            wire[SchemaIndex.ITEMS] = _encode_schema_to_wire(
-                items,
-                include_required=include_required,
-            )
-        elif isinstance(items, list) and items and isinstance(items[0], dict):
-            wire[SchemaIndex.ITEMS] = _encode_schema_to_wire(
-                items[0],
-                include_required=include_required,
-            )
-        elif items is True:
-            wire[SchemaIndex.ITEMS] = [6]
-
-    properties = schema.get("properties")
-    if isinstance(properties, dict):
-        wire[SchemaIndex.PROPERTIES] = [
-            [
-                name,
-                _encode_schema_to_wire(
-                    prop if isinstance(prop, dict) else {},
-                    include_required=include_required,
-                ),
-            ]
-            for name, prop in properties.items()
-            if isinstance(prop, dict) or prop is True
-        ]
-
-    required = schema.get("required")
-    if include_required and isinstance(required, (list, tuple, set)):
-        wire[SchemaIndex.REQUIRED] = [str(x) for x in required]
-
-    min_props = schema.get("minProperties", schema.get("min_properties"))
-    if isinstance(min_props, int):
-        wire[SchemaIndex.MIN_PROPERTIES] = min_props
-
-    max_props = schema.get("maxProperties", schema.get("max_properties"))
-    if isinstance(max_props, int):
-        wire[SchemaIndex.MAX_PROPERTIES] = max_props
-
-    minimum = schema.get("minimum")
-    if isinstance(minimum, (int, float)) and not isinstance(minimum, bool):
-        wire[SchemaIndex.MINIMUM] = minimum
-
-    maximum = schema.get("maximum")
-    if isinstance(maximum, (int, float)) and not isinstance(maximum, bool):
-        wire[SchemaIndex.MAXIMUM] = maximum
-
-    min_len = schema.get("minLength", schema.get("min_length"))
-    if isinstance(min_len, int):
-        wire[SchemaIndex.MIN_LENGTH] = min_len
-
-    max_len = schema.get("maxLength", schema.get("max_length"))
-    if isinstance(max_len, int):
-        wire[SchemaIndex.MAX_LENGTH] = max_len
-
-    pattern = schema.get("pattern")
-    if isinstance(pattern, str) and pattern:
-        wire[SchemaIndex.PATTERN] = pattern
-
-    _encode_schema_combiners(schema, wire, include_required)
-
-    max_items = schema.get("maxItems", schema.get("max_items"))
-    if isinstance(max_items, int):
-        wire[SchemaIndex.MAX_ITEMS] = max_items
-
-    min_items = schema.get("minItems", schema.get("min_items"))
-    if isinstance(min_items, int):
-        wire[SchemaIndex.MIN_ITEMS] = min_items
-
-    example = schema.get("example", schema.get("examples"))
-    if isinstance(example, (str, int, float, bool)):
-        wire[SchemaIndex.EXAMPLE] = example
-
-    # default (Field 25) 不存在于 Google Schema Proto（wire_spec 逆向
-    # 结论：注入下标 23+ 会 400）。把 default 折叠进 description 尾部
-    # 而非静默丢弃——模型仍可感知默认值语义
-    default_val = schema.get("default")
-    if default_val is not None:
-        default_str = str(default_val)
-        if default_str:
-            desc_now = (
-                wire[SchemaIndex.DESCRIPTION]
-                if len(wire) > SchemaIndex.DESCRIPTION
-                else None
-            )
-            if isinstance(desc_now, str) and desc_now:
-                wire[SchemaIndex.DESCRIPTION] = f"{desc_now} (default: {default_str})"
-            else:
-                wire[SchemaIndex.DESCRIPTION] = f"(default: {default_str})"
-
-    property_ordering = schema.get("propertyOrdering") or schema.get(
-        "property_ordering"
-    )
-    if not isinstance(property_ordering, list):
-        # 2026-11 AI Studio 真机抓包（hybrid6 函数调用实验）：前端对
-        # object schema 恒在槽位 22 携带 propertyOrdering（= properties
-        # 的键序快照），即使客户端未显式声明。缺省时按键序推导对齐
-        # 浏览器线缆形态；仅 object 且有属性时推导。
-        if schema_type == "object" and isinstance(properties, dict) and properties:
-            property_ordering = [
-                str(name)
-                for name, prop in properties.items()
-                if isinstance(prop, dict) or prop is True
-            ]
-        else:
-            property_ordering = None
-    if isinstance(property_ordering, list):
-        wire[SchemaIndex.PROPERTY_ORDERING] = list(property_ordering)
-
-    return wire.compact(max_index=SchemaIndex.PROPERTY_ORDERING)
-
-
-# 完整 schema 附加到 description 时的前缀（AIStudio2API 同文）
-_TOOL_ARGUMENTS_SCHEMA_NOTE = "Arguments must follow this JSON Schema: "
-_RESPONSE_SCHEMA_NOTE = "The response must follow this JSON Schema: "
-
-# 声明侧：wire 无法表达、需附加完整 schema 到 description 的键
-# （AIStudio2API encodeFunctionDeclaration 的字符串包含判定，改为键遍历）
-_DECLARATION_LOSSY_KEYS = frozenset(
-    {
-        "additionalProperties",
-        "additional_properties",
-        "prefixItems",
-        "prefix_items",
-        "exclusiveMinimum",
-        "exclusive_minimum",
-        "propertyNames",
-        "property_names",
-        "$ref",
-    }
-)
-
-# 结构化输出侧：jsonSchemaBeyondPlayground 的键集（additionalProperties
-# 仅真值时触发，单独判断）
-_RESPONSE_LOSSY_KEYS = frozenset(
-    {
-        "prefixItems",
-        "prefix_items",
-        "propertyNames",
-        "property_names",
-        "exclusiveMinimum",
-        "exclusive_minimum",
-        "exclusiveMaximum",
-        "exclusive_maximum",
-        "uniqueItems",
-        "unique_items",
-    }
-)
-
-# shape 提取时需要兼容的别名：canonical → 可接受的 snake_case 形态
-_SHAPE_KEY_ALIASES = {
-    "minLength": ("min_length",),
-    "maxLength": ("max_length",),
-    "minItems": ("min_items",),
-    "maxItems": ("max_items",),
-    "minProperties": ("min_properties",),
-    "maxProperties": ("max_properties",),
-    "propertyOrdering": ("property_ordering",),
-}
-
-
-def _schema_has_lossy_keys(node: object, *, response: bool = False) -> bool:
-    """递归查找 wire 无法表达的 schema 约束键。
-
-    声明侧（response=False）对照 AIStudio2API encodeFunctionDeclaration 的
-    触发集：additionalProperties（任意值）、prefixItems、exclusiveMinimum、
-    propertyNames、$ref。结构化输出侧（response=True）对照
-    jsonSchemaBeyondPlayground：另含 exclusiveMaximum / uniqueItems，且
-    additionalProperties 仅真值触发（false 是 Gemini 对象的默认闭合语义）。
-    """
-    if isinstance(node, dict):
-        for key, value in node.items():
-            if response:
-                if key in _RESPONSE_LOSSY_KEYS:
-                    return True
-                if (
-                    key in ("additionalProperties", "additional_properties")
-                    and value is not False
-                ):
-                    return True
-            elif key in _DECLARATION_LOSSY_KEYS:
-                return True
-            if _schema_has_lossy_keys(value, response=response):
-                return True
-        return False
-    if isinstance(node, list):
-        return any(_schema_has_lossy_keys(item, response=response) for item in node)
-    return False
-
-
-def _schema_has_empty_enum(node: object) -> bool:
-    """任一层 enum 含空串（上游拒绝的值，AIStudio2API schemaHasEmptyEnum）。"""
-    if isinstance(node, dict):
-        values = node.get("enum")
-        if isinstance(values, (list, tuple)) and any(v == "" for v in values):
-            return True
-        return any(_schema_has_empty_enum(value) for value in node.values())
-    if isinstance(node, list):
-        return any(_schema_has_empty_enum(item) for item in node)
-    return False
-
-
-def _define_required_properties(schema: dict[str, object]) -> None:
-    """为 required 列出而 properties 未定义的属性补充不限类型的定义。
-
-    AIStudio2API defineRequiredProperties 移植（原地修改，调用方传深拷贝）。
-    """
-    required = schema.get("required")
-    if isinstance(required, list):
-        properties = schema.get("properties")
-        if not isinstance(properties, dict):
-            properties = None
-        for item in required:
-            if not isinstance(item, str):
-                continue
-            if properties is not None and item in properties:
-                continue
-            if properties is None:
-                properties = {}
-                schema["properties"] = properties
-            properties[item] = {}
-    for key, child in schema.items():
-        if key in ("properties", "$defs", "definitions"):
-            if isinstance(child, dict):
-                for nested in child.values():
-                    if isinstance(nested, dict):
-                        _define_required_properties(nested)
-        elif key in (
-            "items",
-            "additionalProperties",
-            "additional_properties",
-            "not",
-            "not_",
-        ):
-            if isinstance(child, dict):
-                _define_required_properties(child)
-        elif key in (
-            "anyOf",
-            "any_of",
-            "oneOf",
-            "one_of",
-            "allOf",
-            "all_of",
-            "prefixItems",
-            "prefix_items",
-        ) and isinstance(child, list):
-            for nested in child:
-                if isinstance(nested, dict):
-                    _define_required_properties(nested)
-
-
-def _tool_schema_shape(value: object) -> dict[str, object]:
-    """提取工具参数的层级与类型供 Playground 编码。
-
-    AIStudio2API toolSchemaShape 移植：只保留 wire 可表达的键；const 折叠
-    为类型 + 最小/最大值（或 string enum）；仅全字符串 enum 保留；type 为
-    null 联合时转 string + nullable + 说明。降级链的兜底编码输入。
-    """
-    result: dict[str, object] = {}
-    if not isinstance(value, dict):
-        return result
-    for key in (
-        "type",
-        "format",
-        "nullable",
-        "description",
-        "required",
-        "minimum",
-        "maximum",
-        "minLength",
-        "maxLength",
-        "pattern",
-        "minItems",
-        "maxItems",
-        "minProperties",
-        "maxProperties",
-        "propertyOrdering",
-    ):
-        if key in value:
-            result[key] = value[key]
-            continue
-        for alias in _SHAPE_KEY_ALIASES.get(key, ()):
-            if alias in value:
-                result[key] = value[alias]
-                break
-    constant = value.get("const")
-    if constant is not None:
-        result["description"] = (
-            str(result.get("description") or "")
-            + "\nThe value must be: "
-            + json.dumps(constant, ensure_ascii=False, separators=(",", ":"))
-        )
-        if isinstance(constant, bool):
-            result["type"] = "boolean"
-        elif isinstance(constant, (int, float)):
-            result["type"] = "integer" if float(constant).is_integer() else "number"
-            result["minimum"] = constant
-            result["maximum"] = constant
-        elif isinstance(constant, str):
-            result["type"] = "string"
-            result["enum"] = [constant]
-        elif isinstance(constant, list):
-            result["type"] = "array"
-        elif isinstance(constant, dict):
-            result["type"] = "object"
-    enum_values = value.get("enum")
-    if (
-        isinstance(enum_values, list)
-        and enum_values
-        and all(isinstance(item, str) for item in enum_values)
-    ):
-        result["enum"] = enum_values
-    type_field = result.get("type")
-    if (isinstance(type_field, str) and type_field.lower() == "null") or (
-        isinstance(type_field, list)
-        and type_field
-        and all(str(item).lower() == "null" for item in type_field)
-    ):
-        result["type"] = "string"
-        result["nullable"] = True
-        result["description"] = "The value must be JSON null"
-    if constant is None and "const" in value:
-        result["type"] = "string"
-        result["nullable"] = True
-        result["description"] = "The value must be JSON null"
-    properties = value.get("properties")
-    if isinstance(properties, dict):
-        result["properties"] = {
-            str(name): _tool_schema_shape(child) for name, child in properties.items()
-        }
-    if "items" in value:
-        result["items"] = _tool_schema_shape(value["items"])
-    for key in ("anyOf", "oneOf", "allOf"):
-        branches = value.get(key)
-        if isinstance(branches, list):
-            result[key] = [_tool_schema_shape(branch) for branch in branches]
-    return result
-
-
-def _compact_schema_json(schema: object) -> str:
-    """附加到 description 用的 schema 原文（紧凑 JSON，保序）。"""
-    return json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
-
-
-def _encode_tool_parameters(
-    schema: dict[str, object], *, strict: bool
-) -> tuple[list[object], str | None]:
-    """工具参数 schema 编码与降级链（AIStudio2API encodeFunctionDeclaration 移植）。
-
-    返回 ``(wire, 需附加到 description 的 schema 原文 JSON 或 None)``：
-
-    - 先补全 required-but-undeclared 属性再完整编码；
-    - 编码失败（递归/非本地/未解析 $ref、复杂度超限）时降级为仅保留
-      层级与类型的 shape 编码，不再让整轮请求 400；
-    - 编码失败 / strict / wire 无法表达的约束（additionalProperties、
-      prefixItems、exclusiveMinimum、propertyNames、$ref、空串 enum）
-      时返回原文 JSON，由调用方附加到 description 供模型按 JSON Schema
-      理解参数。
-    """
-    normalized = copy.deepcopy(schema)
-    _define_required_properties(normalized)
-    encoding_error: ValueError | None = None
-    try:
-        parameters = encode_schema_to_wire(normalized, include_required=True)
-    except ValueError as exc:
-        encoding_error = exc
-        parameters = encode_schema_to_wire(
-            _tool_schema_shape(normalized), include_required=True
-        )
-    if (
-        encoding_error is not None
-        or strict
-        or _schema_has_lossy_keys(normalized)
-        or _schema_has_empty_enum(normalized)
-    ):
-        return parameters, _compact_schema_json(normalized)
-    return parameters, None
-
-
-def encode_response_schema_to_wire(schema: dict[str, object]) -> list[object]:
-    """结构化输出 responseSchema 编码与降级链。
-
-    AIStudio2API encodeResponseSchema 移植：完整编码失败时降级为 shape
-    编码；失败或含 wire 无法表达的约束 / 空串 enum 时，把完整 schema
-    原文附加到根 description（已附加时幂等）。
-    """
-    encoding_error: ValueError | None = None
-    try:
-        wire = encode_schema_to_wire(schema)
-    except ValueError as exc:
-        encoding_error = exc
-        wire = encode_schema_to_wire(_tool_schema_shape(schema))
-    if (
-        encoding_error is not None
-        or _schema_has_lossy_keys(schema, response=True)
-        or _schema_has_empty_enum(schema)
-    ):
-        existing = (
-            wire[SchemaIndex.DESCRIPTION]
-            if len(wire) > SchemaIndex.DESCRIPTION
-            else None
-        )
-        description = existing if isinstance(existing, str) else ""
-        if _RESPONSE_SCHEMA_NOTE not in description:
-            wire = JspbArray(wire)
-            wire[SchemaIndex.DESCRIPTION] = (
-                f"{description}\n{_RESPONSE_SCHEMA_NOTE}{_compact_schema_json(schema)}".strip()
-            )
-            wire = wire.compact(max_index=SchemaIndex.PROPERTY_ORDERING)
-    return wire
-
-
-def _function_declaration_name(declaration: dict[str, object]) -> str | None:
-    """提取声明名（兼容 OpenAI 嵌套 function 形态）。"""
-    if isinstance(declaration.get("function"), dict):
-        declaration = declaration["function"]  # type: ignore[assignment]
-    name = declaration.get("name")
-    return str(name) if name else None
-
-
-# 函数声明 → wire 编码的跨请求记忆化：Agent 客户端每请求原样重发完全相同
-# 的工具声明集合（数十个声明 × 每个 KB 级 schema），此前每声明每次都要
-# deepcopy + required 补全 + 递归 wire 编码，毫秒级 CPU × 声明数同步跑在
-# 事件循环上。以声明紧凑 JSON 为键缓存结果紧凑 JSON，命中经 json.loads
-# 返回全新对象（调用方任意突变不污染缓存）；键超限直接重算，防单个巨型
-# 声明撑爆缓存内存。编码链是纯函数（sha256 截短名确定性），结果可安全复用。
-_DECLARATION_CACHE_MAX = 128
-_DECLARATION_CACHE_MAX_KEY_BYTES = 256 * 1024
-_declaration_cache: dict[str, str] = {}
-
-
-def encode_function_declaration_to_wire(declaration: dict[str, object]) -> list[object]:
-    """函数声明 → Playground wire 数组（AIStudio2API encodeFunctionDeclaration 移植）。
-
-    - 函数名超 63 字节截短 + sha256 后缀（Playground 长度限制）；响应侧
-      由 ``NormalizedGeminiRequest.function_name_restore`` 换回原名；
-    - parameters 走 ``_encode_tool_parameters`` 降级链：编码失败降级为
-      shape 而非整体 400，wire 无法表达的约束以完整 JSON Schema 附加到
-      description；
-    - ``strict``（OpenAI strict mode）透传时同样附加完整 schema；
-    - 同一声明（含 strict 标志，它取自声明本身）跨请求结果恒等，走
-      ``_declaration_cache`` 记忆化。
-    """
-    if isinstance(declaration.get("function"), dict):
-        declaration = declaration["function"]  # type: ignore[assignment]
-    cache_key = ""
-    try:
-        key = json.dumps(declaration, ensure_ascii=False, separators=(",", ":"))
-        if len(key) <= _DECLARATION_CACHE_MAX_KEY_BYTES:
-            cache_key = key
-    except (TypeError, ValueError):
-        # 声明含非 JSON 类型（编程构造的极端入参）：跳过记忆化直接编码
-        cache_key = ""
-    if cache_key:
-        cached = _declaration_cache.get(cache_key)
-        if cached is not None:
-            # 命中即移到末尾：dict 插入序近似 LRU，与 _TIER_QUOTA_CACHE 同策略
-            _declaration_cache[cache_key] = _declaration_cache.pop(cache_key)
-            return json.loads(cached)
-    name = _function_declaration_name(declaration)
-    if not name:
-        raise ValueError("functionDeclarations[].name is required")
-    description = declaration.get("description")
-    if not isinstance(description, str):
-        description = ""
-    parameters = (
-        declaration.get("parameters")
-        or declaration.get("parametersJsonSchema")
-        or declaration.get("parameters_json_schema")
-        or declaration.get("input_schema")
-        or declaration.get("parameters_schema")
-    )
-    wire = JspbArray([_wire_function_name(name)])
-    if isinstance(parameters, dict) and parameters:
-        parameters_wire, embed_json = _encode_tool_parameters(
-            parameters, strict=declaration.get("strict") is True
-        )
-        if embed_json is not None:
-            description = f"{description}\n{_TOOL_ARGUMENTS_SCHEMA_NOTE}{embed_json}"
-        wire[2] = parameters_wire
-    elif isinstance(parameters, list):
-        wire[2] = parameters
-    if description:
-        wire[1] = description
-    result = wire.compact()
-    if cache_key:
-        if len(_declaration_cache) >= _DECLARATION_CACHE_MAX:
-            for _ in range(_DECLARATION_CACHE_MAX // 2):
-                _declaration_cache.pop(next(iter(_declaration_cache)), None)
-        _declaration_cache[cache_key] = json.dumps(
-            result, ensure_ascii=False, separators=(",", ":")
-        )
-    return result
+__all__ = [
+    "SCHEMA_TYPE_CODES",
+    "NormalizedGeminiRequest",
+    "encode_function_declaration_to_wire",
+    "encode_response_schema_to_wire",
+    "encode_schema_to_wire",
+    "normalize_gemini_request",
+]
 
 
 def _normalize_gemini_modalities(
@@ -837,6 +121,12 @@ def _normalize_gemini_modalities(
     if "TEXT" in modalities:
         return AistudioImageOutputMode.text_and_image()
     return AistudioImageOutputMode.image_only()
+
+
+# 思考「显式关闭」词表：thinkingLevel / reasoningEffort 文本标签统一命中
+# （_parse_thinking_level / _user_explicitly_disabled_thinking /
+# _normalize_gemini_thinking_config 三处共用；"0" 仅数字档位路径独有）。
+_THINKING_OFF_LABELS = frozenset({"NONE", "OFF", "DISABLE", "DISABLED"})
 
 
 _REASONING_EFFORT_TO_LEVEL: dict[str, ThinkingLevel] = {
@@ -875,7 +165,7 @@ def _parse_thinking_level(raw_level: object) -> ThinkingLevel | None:
     ):
         return ThinkingLevel(int(raw_level))
     label = str(raw_level).strip().upper()
-    if not label or label in ("NONE", "OFF", "DISABLE", "DISABLED", "0"):
+    if not label or label in _THINKING_OFF_LABELS | {"0"}:
         return None
     if label in _REASONING_EFFORT_TO_LEVEL:
         return _REASONING_EFFORT_TO_LEVEL[label]
@@ -912,12 +202,7 @@ def _user_explicitly_disabled_thinking(value: object) -> bool:
     raw_level = value.get(
         "thinkingLevel", value.get("thinking_level", value.get("level"))
     )
-    if isinstance(raw_level, str) and raw_level.strip().upper() in (
-        "NONE",
-        "OFF",
-        "DISABLE",
-        "DISABLED",
-    ):
+    if isinstance(raw_level, str) and raw_level.strip().upper() in _THINKING_OFF_LABELS:
         return True
     raw_budget = value.get(
         "thinkingBudget", value.get("thinking_budget", value.get("budget"))
@@ -968,12 +253,7 @@ def _normalize_gemini_thinking_config(
     raw_mode = value.get("mode")
     raw_include = value.get("includeThoughts", value.get("include_thoughts"))
 
-    if isinstance(raw_level, str) and raw_level.strip().upper() in (
-        "NONE",
-        "OFF",
-        "DISABLE",
-        "DISABLED",
-    ):
+    if isinstance(raw_level, str) and raw_level.strip().upper() in _THINKING_OFF_LABELS:
         return None
     if (
         raw_include is False
@@ -1029,8 +309,15 @@ def _normalize_gemini_image_config(
     return normalized
 
 
-def _normalize_gemini_tool_config(value: object) -> list[object] | None:
-    """toolConfig → fcc wire（语义解析用，MakerSuite wire 无 tool_config 槽位）。
+def _normalize_gemini_tool_config(
+    value: object,
+) -> tuple[list[object] | None, bool, list[str] | None]:
+    """toolConfig → (fcc wire, mode==NONE, allowedFunctionNames) 三元组。
+
+    is_mode_none / allowed_names 由本函数统一解析（原主函数的二次
+    toolConfig 解析段合并至此），主函数删除重复解析。所有早退路径同样
+    返回三元组（wire 为 None / 原值时语义位为 False / None），调用方
+    无需判空再解包。
 
     2026-11 前端 bundle 逆向结论（boq-makersuite jspb 类 _.Rv 全字段）：
     MakerSuite GenerateContentRequest 顶层字段为 1=model, 2=contents,
@@ -1047,18 +334,18 @@ def _normalize_gemini_tool_config(value: object) -> list[object] | None:
     在 normalize_gemini_request 中前置执行。
     """
     if value is None:
-        return None
+        return None, False, None
     if isinstance(value, list):
-        return value
+        return value, False, None
     model_dump_fn = getattr(value, "model_dump", None)
     if callable(model_dump_fn):
         value = model_dump_fn(mode="json", exclude_none=True)
     if not isinstance(value, dict):
-        return None
+        return None, False, None
 
     fcc = value.get("functionCallingConfig") or value.get("function_calling_config")
     if not isinstance(fcc, dict):
-        return None
+        return None, False, None
 
     mode_map = {
         "MODE_UNSPECIFIED": 0,
@@ -1073,10 +360,13 @@ def _normalize_gemini_tool_config(value: object) -> list[object] | None:
     else:
         mode_code = mode_map.get(str(raw_mode).strip().upper(), 1)
 
-    allowed_names = fcc.get("allowedFunctionNames") or fcc.get("allowed_function_names")
+    raw_allowed = fcc.get("allowedFunctionNames") or fcc.get("allowed_function_names")
     fcc_wire: list[object] = [mode_code]
-    if isinstance(allowed_names, list) and allowed_names:
-        fcc_wire.append(list(allowed_names))
+    if isinstance(raw_allowed, list) and raw_allowed:
+        fcc_wire.append(list(raw_allowed))
+    allowed_names: list[str] | None = None
+    if isinstance(raw_allowed, list) and raw_allowed:
+        allowed_names = [str(x) for x in raw_allowed]
 
     # includeServerSideToolInvocations 在 MakerSuite wire 协议中无槽位可
     # 编码（见函数 docstring），仅保留在语义层供观察/后续上游支持。
@@ -1086,7 +376,8 @@ def _normalize_gemini_tool_config(value: object) -> list[object] | None:
     tool_config_wire: list[object] = [None, fcc_wire]
     if include_invocations is not None:
         tool_config_wire.append(bool(include_invocations))
-    return tool_config_wire
+    is_mode_none = mode_code == 3
+    return tool_config_wire, is_mode_none, allowed_names
 
 
 def _extract_google_search_tool_names(
@@ -1382,211 +673,240 @@ def _rewrite_model_tail_for_continuation(
     return contents, system_instruction
 
 
-def normalize_gemini_request(
-    req: GeminiGenerateContentRequest, requested_model: str
-) -> NormalizedGeminiRequest:
-    if not req.contents:
-        raise ValueError("contents is required")
+def _match_pending_call(
+    fr: GeminiFunctionResponse, pending_calls: list[tuple[str | None, str]]
+) -> int | None:
+    """按 ID（并行调用）或名称/唯一挂起项匹配 functionResponse。
 
-    model = (
-        requested_model
-        if requested_model.startswith("models/")
-        else f"models/{requested_model}"
+    IDs identify parallel calls. When an endpoint omits IDs, use the only
+    pending call or the next matching name. 无任何匹配时返回 None（调用方
+    回落 tool_history 转录形态）。
+    """
+    matched = next(
+        (
+            i
+            for i, (call_id, _) in enumerate(pending_calls)
+            if fr.id and call_id == fr.id
+        ),
+        None,
     )
+    if matched is None:
+        matched = next(
+            (
+                i
+                for i, (call_id, name) in enumerate(pending_calls)
+                if not (fr.id and call_id)
+                and (fr.name == name or (not fr.name and len(pending_calls) == 1))
+            ),
+            None,
+        )
+    return matched
+
+
+def _convert_part(
+    part: GeminiPart, pending_calls: list[tuple[str | None, str]]
+) -> list[AistudioPart]:
+    """单个 Gemini part → AistudioPart 列表（functionResponse 附图会展开多部件）。
+
+    纯签名 part（历史快照残留）：签名必须过校验，失效时丢弃整个部件而非
+    写入空部件（空 part 会造成全空轮，触发上游 WAA 403，交由
+    _drop_hollow_and_merge_same_role 统一清理）。
+    """
+    parts: list[AistudioPart] = []
+    if part.text is not None:
+        is_thought = bool(part.thought)
+        parts.append(
+            AistudioPart(
+                text=part.text,
+                thought=is_thought,
+                thought_signature=_valid_thought_signature_or_none(
+                    part.thoughtSignature
+                ),
+            )
+        )
+        return parts
+    if part.inlineData is not None:
+        img_data = (part.inlineData.mimeType, part.inlineData.data)
+        parts.append(
+            AistudioPart(
+                inline_data=img_data,
+                inline_filename=part.inlineData.filename,
+                thought_signature=_valid_thought_signature_or_none(
+                    part.thoughtSignature
+                ),
+            )
+        )
+        return parts
+    if part.functionCall is not None:
+        fc = part.functionCall
+        args_payload = fc.args if fc.args is not None else {}
+        signature = (
+            _valid_thought_signature_or_none(part.thoughtSignature)
+            or _lookup_function_signature(fc.id, fc.name, args_payload)
+            or SKIP_THOUGHT_SIGNATURE
+        )
+        pending_calls.append((fc.id, fc.name))
+        parts.append(
+            AistudioPart(
+                function_call=(fc.name, args_payload, fc.id)
+                if fc.id
+                else (fc.name, args_payload),
+                thought_signature=signature,
+            )
+        )
+        return parts
+    if part.functionResponse is not None:
+        fr = part.functionResponse
+        resp_payload = fr.response if fr.response is not None else {}
+        matched = _match_pending_call(fr, pending_calls)
+        if matched is None:
+            parts.append(
+                AistudioPart(
+                    text=tool_history_text("tool_result", fr.name, fr.id, resp_payload)
+                )
+            )
+        else:
+            call_id, name = pending_calls.pop(matched)
+            result_id = fr.id or call_id
+            parts.append(
+                AistudioPart(
+                    function_response=(name, resp_payload, result_id)
+                    if result_id
+                    else (name, resp_payload),
+                )
+            )
+        if fr.parts:
+            for subpart in fr.parts:
+                if subpart.inlineData is not None:
+                    img_data = (
+                        subpart.inlineData.mimeType,
+                        subpart.inlineData.data,
+                    )
+                    parts.append(
+                        AistudioPart(
+                            inline_data=img_data,
+                            # 工具结果附图的签名同样必须过校验：伪
+                            # 签名会触发上游 400 "Corrupted thought
+                            # signature."（密码学校验，2026-11 实验）
+                            thought_signature=_valid_thought_signature_or_none(
+                                subpart.thoughtSignature
+                            ),
+                        )
+                    )
+                elif subpart.text is not None:
+                    parts.append(AistudioPart(text=subpart.text))
+        return parts
+    if part.executableCode is not None:
+        ec = part.executableCode
+        parts.append(
+            AistudioPart(
+                executable_code=(ec.language, ec.code),
+                thought_signature=_valid_thought_signature_or_none(
+                    part.thoughtSignature
+                ),
+            )
+        )
+        return parts
+    if part.codeExecutionResult is not None:
+        cer = part.codeExecutionResult
+        parts.append(
+            AistudioPart(
+                code_execution_result=(cer.outcome, cer.output),
+                thought_signature=_valid_thought_signature_or_none(
+                    part.thoughtSignature
+                ),
+            )
+        )
+        return parts
+    if part.fileData is not None:
+        raise ValueError("fileData is not supported yet")
+    if part.thoughtSignature:
+        signature = _valid_thought_signature_or_none(part.thoughtSignature)
+        if signature:
+            parts.append(AistudioPart(thought_signature=signature))
+    return parts
+
+
+def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioContent]:
+    """contents → AistudioContent 轮次列表（含 pending call 追踪与剥离残留清理）。
+
+    Only orphan/reordered results need a transcript. Unsigned calls retain
+    their native structure using the explicit skip-signature literal.
+    user 轮（无 functionResponse）清空挂起调用表，保证跨轮不误匹配。
+    剥离残留清理：丢弃全空轮（WAA 403）并合并相邻同角色轮，
+    详见 _drop_hollow_and_merge_same_role docstring。
+    """
     contents: list[AistudioContent] = []
-    # Only orphan/reordered results need a transcript. Unsigned calls retain
-    # their native structure using the explicit skip-signature literal.
     pending_calls: list[tuple[str | None, str]] = []
 
     for content in req.contents:
         role = content.role or "user"
         if role == "user" and not any(p.functionResponse for p in content.parts):
             pending_calls.clear()
-        parts: list[AistudioPart] = []
-        for part in content.parts:
-            if part.text is not None:
-                is_thought = bool(part.thought)
-                parts.append(
-                    AistudioPart(
-                        text=part.text,
-                        thought=is_thought,
-                        thought_signature=_valid_thought_signature_or_none(
-                            part.thoughtSignature
-                        ),
-                    )
-                )
-                continue
-            if part.inlineData is not None:
-                img_data = (part.inlineData.mimeType, part.inlineData.data)
-                parts.append(
-                    AistudioPart(
-                        inline_data=img_data,
-                        inline_filename=part.inlineData.filename,
-                        thought_signature=_valid_thought_signature_or_none(
-                            part.thoughtSignature
-                        ),
-                    )
-                )
-                continue
-            if part.functionCall is not None:
-                fc = part.functionCall
-                args_payload = fc.args if fc.args is not None else {}
-                signature = (
-                    _valid_thought_signature_or_none(part.thoughtSignature)
-                    or _lookup_function_signature(fc.id, fc.name, args_payload)
-                    or SKIP_THOUGHT_SIGNATURE
-                )
-                pending_calls.append((fc.id, fc.name))
-                parts.append(
-                    AistudioPart(
-                        function_call=(fc.name, args_payload, fc.id)
-                        if fc.id
-                        else (fc.name, args_payload),
-                        thought_signature=signature,
-                    )
-                )
-                continue
-            if part.functionResponse is not None:
-                fr = part.functionResponse
-                resp_payload = fr.response if fr.response is not None else {}
-                # IDs identify parallel calls. When an endpoint omits IDs,
-                # use the only pending call or the next matching name.
-                matched = next(
-                    (
-                        i
-                        for i, (call_id, _) in enumerate(pending_calls)
-                        if fr.id and call_id == fr.id
-                    ),
-                    None,
-                )
-                if matched is None:
-                    matched = next(
-                        (
-                            i
-                            for i, (call_id, name) in enumerate(pending_calls)
-                            if not (fr.id and call_id)
-                            and (
-                                fr.name == name
-                                or (not fr.name and len(pending_calls) == 1)
-                            )
-                        ),
-                        None,
-                    )
-                if matched is None:
-                    parts.append(
-                        AistudioPart(
-                            text=tool_history_text(
-                                "tool_result", fr.name, fr.id, resp_payload
-                            )
-                        )
-                    )
-                else:
-                    call_id, name = pending_calls.pop(matched)
-                    result_id = fr.id or call_id
-                    parts.append(
-                        AistudioPart(
-                            function_response=(name, resp_payload, result_id)
-                            if result_id
-                            else (name, resp_payload),
-                        )
-                    )
-                if fr.parts:
-                    for subpart in fr.parts:
-                        if subpart.inlineData is not None:
-                            img_data = (
-                                subpart.inlineData.mimeType,
-                                subpart.inlineData.data,
-                            )
-                            parts.append(
-                                AistudioPart(
-                                    inline_data=img_data,
-                                    # 工具结果附图的签名同样必须过校验：伪
-                                    # 签名会触发上游 400 "Corrupted thought
-                                    # signature."（密码学校验，2026-11 实验）
-                                    thought_signature=_valid_thought_signature_or_none(
-                                        subpart.thoughtSignature
-                                    ),
-                                )
-                            )
-                        elif subpart.text is not None:
-                            parts.append(AistudioPart(text=subpart.text))
-                continue
-            if part.executableCode is not None:
-                ec = part.executableCode
-                parts.append(
-                    AistudioPart(
-                        executable_code=(ec.language, ec.code),
-                        thought_signature=_valid_thought_signature_or_none(
-                            part.thoughtSignature
-                        ),
-                    )
-                )
-                continue
-            if part.codeExecutionResult is not None:
-                cer = part.codeExecutionResult
-                parts.append(
-                    AistudioPart(
-                        code_execution_result=(cer.outcome, cer.output),
-                        thought_signature=_valid_thought_signature_or_none(
-                            part.thoughtSignature
-                        ),
-                    )
-                )
-                continue
-            if part.fileData is not None:
-                raise ValueError("fileData is not supported yet")
-            if part.thoughtSignature:
-                # 纯签名 part（历史快照常见残留形态）：签名必须过校验，
-                # 失效时丢弃整个部件而非写入空部件（空 part 会造成全空轮，
-                # 触发上游 WAA 403，交由 _drop_hollow_and_merge_same_role
-                # 统一清理）。
-                signature = _valid_thought_signature_or_none(part.thoughtSignature)
-                if signature:
-                    parts.append(AistudioPart(thought_signature=signature))
+        parts = [
+            p for part in content.parts for p in _convert_part(part, pending_calls)
+        ]
         contents.append(AistudioContent(role=role, parts=parts))
-    # 剥离残留清理：丢弃全空轮（WAA 403）并合并相邻同角色轮，
-    # 详见函数 docstring。model 结尾兼容已移交续写改写（见下）。
-    contents = _drop_hollow_and_merge_same_role(contents)
-    system_instruction = None
-    if req.systemInstruction is not None:
-        # systemInstruction 的 part 签名同样过校验（与正文 part 同标准，
-        # 多路径不一致正是 B1 类缺陷的温床）。
-        system_instruction = AistudioContent(
-            role=req.systemInstruction.role or "user",
-            parts=[
-                AistudioPart(
-                    text=part.text,
-                    thought_signature=_valid_thought_signature_or_none(
-                        part.thoughtSignature
-                    ),
-                )
-                if part.text is not None
-                else AistudioPart(
-                    inline_data=(part.inlineData.mimeType, part.inlineData.data)
-                    if part.inlineData
-                    else ("", ""),
-                    thought_signature=_valid_thought_signature_or_none(
-                        part.thoughtSignature
-                    ),
-                )
-                for part in req.systemInstruction.parts
-                if part.text is not None or part.inlineData is not None
-            ],
-        )
+    return _drop_hollow_and_merge_same_role(contents)
 
-    # 末尾 model 轮（assistant prefill）兼容按模型分化（AIStudio2API
-    # normalizeTurns 移植）：原生 prefill 模型（白名单 + gemma-）透传；
-    # 其余模型剥离尾部 model 轮，正文前缀以续写提示词并入系统指令，
-    # 对话恒以 user 轮收尾（单空格占位轮已废弃）。
-    contents, system_instruction = _rewrite_model_tail_for_continuation(
-        contents,
-        system_instruction,
-        rewrite=not _model_supports_native_prefill(model),
-        prompt=_CONTINUATION_PROMPT,
+
+def _normalize_system_instruction(
+    req: GeminiGenerateContentRequest,
+) -> AistudioContent | None:
+    """systemInstruction → AistudioContent（无则 None）。
+
+    systemInstruction 的 part 签名同样过校验（与正文 part 同标准，
+    多路径不一致正是 B1 类缺陷的温床）。
+    """
+    if req.systemInstruction is None:
+        return None
+    return AistudioContent(
+        role=req.systemInstruction.role or "user",
+        parts=[
+            AistudioPart(
+                text=part.text,
+                thought_signature=_valid_thought_signature_or_none(
+                    part.thoughtSignature
+                ),
+            )
+            if part.text is not None
+            else AistudioPart(
+                inline_data=(part.inlineData.mimeType, part.inlineData.data)
+                if part.inlineData
+                else ("", ""),
+                thought_signature=_valid_thought_signature_or_none(
+                    part.thoughtSignature
+                ),
+            )
+            for part in req.systemInstruction.parts
+            if part.text is not None or part.inlineData is not None
+        ],
     )
 
-    model_defaults = resolve_model_defaults(model)
-    tools = None
+
+def _normalize_tools(
+    req: GeminiGenerateContentRequest,
+    model: str,
+    defaults: ModelDefaults,
+) -> tuple[list[list[object]] | None, dict[str, str], list[object] | None]:
+    """tools → (候选工具容器列表, wire 名→原名还原表, toolConfig fcc wire)。
+
+    toolConfig 的语义处理（mode==NONE 置空 / allowedFunctionNames 过滤）
+    合并自 _normalize_gemini_tool_config 的三元组返回值，本函数内完成：
+
+    - 仅当客户端未传 tools 时注入 config.yaml 的 default_tools。若客户端
+      显式声明了 tools（如自定义函数声明），绝不自动混入 Google Search 等
+      内置工具，避免触发 Google MakerSuite "Please enable
+      tool_config.include_server_side_tool_invocations" 400 报错。
+    - mode 为 NONE：显式置空 tools 与 tool_config，确保模型仅输出纯文本
+      且不调用任何工具。
+    - allowedFunctionNames（tool_choice 指定具体函数）：与旧 wire 层过滤
+      逻辑对齐，仅保留声明名在 allowed 集合内的 functionDeclarations 工具
+      容器；内置工具容器不受影响。allowedFunctionNames 携带客户端原名，
+      而 tools 内已编码为 wire 名（超长声明已截短）——集合同时收录两种
+      形态才能正确命中。
+    """
+    tools: list[list[object]] | None = None
     seen_builtin: set[str] = set()
     # wire 名 → 原名（仅超长截短过的声明）；生成链路据此在响应侧换回
     function_name_restore: dict[str, str] = {}
@@ -1605,12 +925,12 @@ def normalize_gemini_request(
                             wire_name = _wire_function_name(decl_name)
                             if wire_name != decl_name:
                                 function_name_restore[wire_name] = decl_name
-                        all_function_declarations.append(
-                            encode_function_declaration_to_wire(decl)
-                        )
+                    all_function_declarations.append(
+                        encode_function_declaration_to_wire(decl)
+                    )
             builtin_tool_names.extend(
                 _extract_google_search_tool_names(
-                    tool, is_image_model=model_defaults.is_image_model
+                    tool, is_image_model=defaults.is_image_model
                 )
             )
             if tool.googleMaps is not None:
@@ -1626,62 +946,38 @@ def normalize_gemini_request(
                         build_tools_from_names(
                             filtered_builtin,
                             model=model,
-                            is_image_model=model_defaults.is_image_model,
-                            drop_unsupported=model_defaults.drop_unsupported_params,
+                            is_image_model=defaults.is_image_model,
+                            drop_unsupported=defaults.drop_unsupported_params,
                         )
                     )
                     seen_builtin.update(filtered_builtin)
         if all_function_declarations:
             tools.append([None, all_function_declarations])
 
-    # 仅当客户端未传 tools 时注入 config.yaml 的 default_tools。
-    # 若客户端显式声明了 tools（如自定义函数声明），绝不自动混入 Google Search 等内置工具，
-    # 避免触发 Google MakerSuite "Please enable tool_config.include_server_side_tool_invocations" 400 报错。
-    if req.tools is None and model_defaults.default_tools:
+    if req.tools is None and defaults.default_tools:
         default_tool_names = _filter_default_tools_for_model(
-            model_defaults.default_tools,
-            is_image_model=model_defaults.is_image_model,
+            defaults.default_tools,
+            is_image_model=defaults.is_image_model,
         )
         injected = (
             build_tools_from_names(
                 default_tool_names,
                 model=model,
-                is_image_model=model_defaults.is_image_model,
+                is_image_model=defaults.is_image_model,
             )
             if default_tool_names
             else []
         )
         tools = injected if injected else None
 
-    raw_tool_config = getattr(req, "toolConfig", None)
-    tool_config = _normalize_gemini_tool_config(raw_tool_config)
-
-    # 检查工具调用模式。若为 NONE，显式置空 tools 与 tool_config，确保模型仅输出纯文本且不调用任何工具。
-    # allowedFunctionNames（tool_choice 指定具体函数）在网关层过滤候选工具列表。
-    is_mode_none = False
-    allowed_names: list[str] | None = None
-    if isinstance(raw_tool_config, dict):
-        fcc = raw_tool_config.get("functionCallingConfig") or raw_tool_config.get(
-            "function_calling_config"
-        )
-        if isinstance(fcc, dict):
-            m_val = fcc.get("mode")
-            if m_val in (3, "NONE", "none"):
-                is_mode_none = True
-            raw_allowed = fcc.get("allowedFunctionNames") or fcc.get(
-                "allowed_function_names"
-            )
-            if isinstance(raw_allowed, list) and raw_allowed:
-                allowed_names = [str(x) for x in raw_allowed]
+    # toolConfig 二次解析已合并进 _normalize_gemini_tool_config 的三元组返回。
+    tool_config, is_mode_none, allowed_names = _normalize_gemini_tool_config(
+        getattr(req, "toolConfig", None)
+    )
 
     if is_mode_none:
-        tools = None
-        tool_config = None
-    elif allowed_names is not None and tools:
-        # 与旧 wire 层过滤逻辑对齐：仅保留声明名在 allowed 集合内的
-        # functionDeclarations 工具容器；内置工具容器不受影响。
-        # allowedFunctionNames 携带客户端原名，而 tools 内已编码为 wire
-        # 名（超长声明已截短）——集合同时收录两种形态才能正确命中。
+        return None, function_name_restore, None
+    if allowed_names is not None and tools:
         allowed_set = set(allowed_names) | {
             _wire_function_name(name) for name in allowed_names
         }
@@ -1696,57 +992,57 @@ def normalize_gemini_request(
             else:
                 filtered_tools.append(t)
         tools = filtered_tools or None
+    return tools, function_name_restore, tool_config
+
+
+def _normalize_generation_overrides(
+    req: GeminiGenerateContentRequest,
+    model: str,
+    defaults: ModelDefaults,
+) -> dict[str, object]:
+    """generationConfig → 用户显式指定的生成参数覆盖表（无则空 dict）。
+
+    只透传用户显式指定的生成参数：profile 的浏览器形态默认值
+    （max_tokens/temperature/top_p/top_k/thinking/…）由 wire_codec.build_request
+    统一注入并做模型自适应（元数据默认档位/flag13/输出上限钳制/清除语义），
+    这里不再预先合并 —— 否则 build_request 将无法区分「用户指定」与
+    「profile 默认」，钳制与档位自适应会因此失效。
+
+    顶层 reasoningEffort（generationConfig 缺席时仍生效）在函数末尾统一
+    处理。返回 dict（可能为空）；主函数以 ``or None`` 归一化无覆盖场景。
+    """
+    overrides: dict[str, object] = {}
     generation_config = req.generationConfig
-    # 只透传用户显式指定的生成参数：profile 的浏览器形态默认值
-    # （max_tokens/temperature/top_p/top_k/thinking/…）由 wire_codec.build_request
-    # 统一注入并做模型自适应（元数据默认档位/flag13/输出上限钳制/清除语义），
-    # 这里不再预先合并 —— 否则 build_request 将无法区分「用户指定」与
-    # 「profile 默认」，钳制与档位自适应会因此失效。
-    generation_config_overrides: dict[str, object] | None = None
     if generation_config is not None:
-        if generation_config_overrides is None:
-            generation_config_overrides = {}
         if generation_config.stopSequences is not None:
-            generation_config_overrides["stop_sequences"] = (
-                generation_config.stopSequences
-            )
+            overrides["stop_sequences"] = generation_config.stopSequences
         if generation_config.maxOutputTokens is not None:
-            generation_config_overrides["max_tokens"] = (
-                generation_config.maxOutputTokens
-            )
+            overrides["max_tokens"] = generation_config.maxOutputTokens
         if generation_config.temperature is not None:
-            generation_config_overrides["temperature"] = generation_config.temperature
+            overrides["temperature"] = generation_config.temperature
         if generation_config.topP is not None:
-            generation_config_overrides["top_p"] = generation_config.topP
+            overrides["top_p"] = generation_config.topP
         if generation_config.topK is not None:
-            generation_config_overrides["top_k"] = generation_config.topK
+            overrides["top_k"] = generation_config.topK
         if generation_config.responseMimeType is not None:
-            generation_config_overrides["response_mime_type"] = (
-                generation_config.responseMimeType
-            )
+            overrides["response_mime_type"] = generation_config.responseMimeType
         if generation_config.responseSchema is not None:
             response_schema = generation_config.responseSchema
-            generation_config_overrides["response_schema"] = (
+            overrides["response_schema"] = (
                 encode_response_schema_to_wire(response_schema)
                 if isinstance(response_schema, dict)
                 else response_schema
             )
         if generation_config.presencePenalty is not None:
-            generation_config_overrides["presence_penalty"] = (
-                generation_config.presencePenalty
-            )
+            overrides["presence_penalty"] = generation_config.presencePenalty
         if generation_config.frequencyPenalty is not None:
-            generation_config_overrides["frequency_penalty"] = (
-                generation_config.frequencyPenalty
-            )
+            overrides["frequency_penalty"] = generation_config.frequencyPenalty
         if generation_config.responseLogprobs is not None:
-            generation_config_overrides["response_logprobs"] = (
-                generation_config.responseLogprobs
-            )
+            overrides["response_logprobs"] = generation_config.responseLogprobs
         if generation_config.logprobs is not None:
-            generation_config_overrides["logprobs"] = generation_config.logprobs
+            overrides["logprobs"] = generation_config.logprobs
         if generation_config.seed is not None:
-            generation_config_overrides["seed"] = generation_config.seed
+            overrides["seed"] = generation_config.seed
         if generation_config.mediaResolution is not None:
             # 官方 REST 是字符串枚举，wire 槽位 17 只收 int（1/2/3）；
             # 字符串原样入 wire 会被上游拒绝或静默忽略
@@ -1755,7 +1051,7 @@ def normalize_gemini_request(
                 media_res = media_res.strip().upper().removeprefix("MEDIA_RESOLUTION_")
                 media_res = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}.get(media_res)
             if isinstance(media_res, (int, float)) and not isinstance(media_res, bool):
-                generation_config_overrides["media_resolution"] = int(media_res)
+                overrides["media_resolution"] = int(media_res)
             # 无法识别的形态按 drop 策略忽略（不透传非法值）
         if generation_config.thinkingConfig is not None:
             normalized_thinking = _normalize_gemini_thinking_config(
@@ -1767,30 +1063,28 @@ def normalize_gemini_request(
                     model, normalized_thinking
                 )
             if normalized_thinking is not None:
-                if generation_config_overrides is None:
-                    generation_config_overrides = {}
-                generation_config_overrides["thinking_config"] = normalized_thinking
+                overrides["thinking_config"] = normalized_thinking
             elif _user_explicitly_disabled_thinking(generation_config.thinkingConfig):
                 # 用户显式关闭思考 → 显式置 None，抑制 profile 注入的浏览器默认档
-                if generation_config_overrides is None:
-                    generation_config_overrides = {}
-                generation_config_overrides["thinking_config"] = None
+                overrides["thinking_config"] = None
             # 其余（空 thinkingConfig 等）不注入 → profile 浏览器默认档生效
         if generation_config.responseModalities is not None:
             image_output_mode = _normalize_gemini_modalities(
                 generation_config.responseModalities,
-                drop_unsupported=model_defaults.drop_unsupported_params,
+                drop_unsupported=defaults.drop_unsupported_params,
             )
             if image_output_mode is not None:
-                generation_config_overrides["image_output_mode"] = image_output_mode
+                overrides["image_output_mode"] = image_output_mode
         if generation_config.imageConfig is not None:
-            generation_config_overrides.update(
+            overrides.update(
                 _normalize_gemini_image_config(
                     generation_config.imageConfig,
-                    drop_unsupported=model_defaults.drop_unsupported_params,
+                    drop_unsupported=defaults.drop_unsupported_params,
                 )
             )
 
+    # reasoningEffort（generationConfig 优先，req 兜底）：仅当未显式给
+    # thinkingConfig 时生效，避免双重指定互相覆盖。
     effective_effort = (
         generation_config.reasoningEffort if generation_config else None
     ) or req.reasoningEffort
@@ -1802,16 +1096,50 @@ def normalize_gemini_request(
             # 模型档位兼容：等级不支持时自动升/降档，无思考能力则不注入
             snapped = _snap_thinking_level_to_supported(model, level)
             if snapped is not None:
-                if generation_config_overrides is None:
-                    generation_config_overrides = {}
-                generation_config_overrides["thinking_config"] = AistudioThinkingConfig(
+                overrides["thinking_config"] = AistudioThinkingConfig(
                     level=snapped, mode=1
                 ).to_wire()
         else:
             # reasoningEffort 显式为 none/off → 抑制 profile 默认档
-            if generation_config_overrides is None:
-                generation_config_overrides = {}
-            generation_config_overrides["thinking_config"] = None
+            overrides["thinking_config"] = None
+    return overrides
+
+
+def normalize_gemini_request(
+    req: GeminiGenerateContentRequest, requested_model: str
+) -> NormalizedGeminiRequest:
+    """Gemini 官方请求 → AIStudio wire 请求（编排层，具体域见各 _normalize_* 辅助）。"""
+    if not req.contents:
+        raise ValueError("contents is required")
+
+    model = (
+        requested_model
+        if requested_model.startswith("models/")
+        else f"models/{requested_model}"
+    )
+
+    contents = _normalize_contents(req)
+    system_instruction = _normalize_system_instruction(req)
+
+    # 末尾 model 轮（assistant prefill）兼容按模型分化（AIStudio2API
+    # normalizeTurns 移植）：原生 prefill 模型（白名单 + gemma-）透传；
+    # 其余模型剥离尾部 model 轮，正文前缀以续写提示词并入系统指令，
+    # 对话恒以 user 轮收尾（单空格占位轮已废弃）。
+    contents, system_instruction = _rewrite_model_tail_for_continuation(
+        contents,
+        system_instruction,
+        rewrite=not _model_supports_native_prefill(model),
+        prompt=_CONTINUATION_PROMPT,
+    )
+
+    model_defaults = resolve_model_defaults(model)
+    tools, function_name_restore, tool_config = _normalize_tools(
+        req, model, model_defaults
+    )
+    generation_config_overrides = _normalize_generation_overrides(
+        req, model, model_defaults
+    )
+    generation_config = req.generationConfig
 
     return NormalizedGeminiRequest(
         model=model,

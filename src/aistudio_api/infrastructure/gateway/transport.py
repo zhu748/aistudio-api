@@ -495,6 +495,36 @@ def _is_browser_rpc_target(url: str) -> bool:
     return match.group(1).lower().endswith(".clients6.google.com")
 
 
+def _prepare_wire_exchange(
+    *,
+    headers: dict[str, str],
+    body: str,
+    auth_user: str,
+    tier: str | None,
+    auth_file: str | None,
+    cookies: dict[str, str] | None,
+    proxy_url: str | None,
+    default_proxy: str | None,
+) -> tuple[dict[str, str], bytes, list[tuple[str, str]], str | None]:
+    """发送前奏三步：鉴权头重建 / 线缆头序重建 / 生效代理判定。
+
+    send_request 与 send_streaming_request 的前奏逐字相同，收敛于此；
+    返回 (clean_headers, body_bytes, wire_headers, effective_proxy)。
+    """
+    clean_headers = _ensure_authorization_header(
+        headers,
+        auth_user=auth_user,
+        tier=tier,
+        auth_file=auth_file,
+        cookies=cookies,
+    )
+    body_bytes = body.encode("utf-8")
+    # Firefox 线缆形态重建：有序头列表（含 te/accept-encoding/content-length）
+    wire_headers = _firefox_wire_header_list(clean_headers, len(body_bytes))
+    effective_proxy = default_proxy if proxy_url is None else proxy_url
+    return clean_headers, body_bytes, wire_headers, effective_proxy
+
+
 def _build_rpc_request(
     client: httpx.AsyncClient,
     url: str,
@@ -923,24 +953,24 @@ class HTTPStreamTransport:
     ) -> tuple[int, bytes]:
         """Execute non-streaming HTTP request directly."""
         t0 = time.perf_counter()
-        clean_headers = _ensure_authorization_header(
-            headers,
-            auth_user=auth_user,
-            tier=tier,
-            auth_file=auth_file,
-            cookies=cookies,
+        clean_headers, body_bytes, wire_headers, effective_proxy = (
+            _prepare_wire_exchange(
+                headers=headers,
+                body=body,
+                auth_user=auth_user,
+                tier=tier,
+                auth_file=auth_file,
+                cookies=cookies,
+                proxy_url=proxy_url,
+                default_proxy=self.proxy_url,
+            )
         )
-        body_bytes = body.encode("utf-8")
-        # Firefox 线缆形态重建：有序头列表（含 te/accept-encoding/content-length）
-        wire_headers = _firefox_wire_header_list(clean_headers, len(body_bytes))
         logger.debug(
             "发送请求: url=%s, body_len=%d, u/%s",
             url,
             len(body),
             auth_user,
         )
-
-        effective_proxy = self.proxy_url if proxy_url is None else proxy_url
         async with self._lease_client(effective_proxy) as client:
             # 真实浏览器行为：首个（及缓存过期后的）跨域 RPC 前先发 CORS 预检
             await self._ensure_cors_preflight(
@@ -1022,19 +1052,19 @@ class HTTPStreamTransport:
     ) -> AsyncGenerator[tuple[str, object], None]:
         """Stream HTTP response chunks directly."""
         t0 = time.perf_counter()
-        clean_headers = _ensure_authorization_header(
-            headers,
-            auth_user=auth_user,
-            tier=tier,
-            auth_file=auth_file,
-            cookies=cookies,
+        clean_headers, body_bytes, wire_headers, effective_proxy = (
+            _prepare_wire_exchange(
+                headers=headers,
+                body=body,
+                auth_user=auth_user,
+                tier=tier,
+                auth_file=auth_file,
+                cookies=cookies,
+                proxy_url=proxy_url,
+                default_proxy=self.proxy_url,
+            )
         )
-        body_bytes = body.encode("utf-8")
-        # Firefox 线缆形态重建：有序头列表（含 te/accept-encoding/content-length）
-        wire_headers = _firefox_wire_header_list(clean_headers, len(body_bytes))
         logger.debug("建立流式请求: url=%s, u/%s", url, auth_user)
-
-        effective_proxy = self.proxy_url if proxy_url is None else proxy_url
         async with self._lease_client(effective_proxy) as client:
             # 真实浏览器行为：首个（及缓存过期后的）跨域 RPC 前先发 CORS 预检
             await self._ensure_cors_preflight(

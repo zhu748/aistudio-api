@@ -39,3 +39,16 @@
 ## 代码分类现状结论
 - 分层总体清晰（api → application → infrastructure/domain）；主要债务是"文件职责过宽"与"样板复制"两类
 - 无浏览器反代逻辑、并发注释密度高是亮点；建议大重构按上述清单分批做、每批全量 pytest 守护
+
+## 路线图执行完成记录（2026-11-17 第二批）
+
+上一轮报告中的全部未执行项已落地，最终验证：ruff All checks passed / pyright 0 errors / pytest 1449 passed + 5 skipped。
+
+- **routes_system.py 拆分**（1519 → 261 行）：config.yaml/抗截断/API Key → `routes_config.py`（570 行）；WAA 签名器管理 → `routes_signer.py`（448 行）；日志与 SSE → `routes_logs.py`（271 行）；`update_global_proxy` 自 routes_operations 迁入 routes_config。URL 与鉴权零变更（ASGITransport 路由测试兜底）。
+- **yaml 读改写收敛**：`model_defaults.update_config_yaml_document(mutator, *, private=False)` 持锁读改写助手，收敛内部 5 处 + 路由层 4 处（create/delete/rename API Key、update_global_proxy 保 0600）。
+- **chat_service.py 拆分**（1834 → 1162 行）：schema wire 编码器 → 新 `schema_wire_codec.py`（778 行，重导出保持 import 路径）；`normalize_gemini_request` 450 → 55 行编排 + 4 域辅助（contents/system/tools/overrides）+ 2 内部辅助；`_THINKING_OFF_LABELS` 词表常量化。
+- **compat_service 收敛**（净减 44 行）：流适配器生命周期 `_stream_adapter_lifecycle` 统一三处；TaskGroup 并发 `_convert_items_concurrently`（MEDIA_CONCURRENCY=4）；`_file_block_to_part`、`_claude_usage_payload`、`_claude_base64_part` 提取；`_claude_stop_reason` 死参数删除；`_close_stream_quietly` 收敛到 anti_truncation。
+- **transport 前奏收敛**：`_prepare_wire_exchange` 统一 send_request / send_streaming_request 的鉴权头重建 + 线缆头序 + 代理判定前奏。
+- **小批次**：代理脱敏 `redaction.mask_proxy_url()` 三处收敛；account_rotator `_coerce_int/_coerce_float` 提升 + AccountStats 别名删除；status_map 常量化；routes_accounts `_failover_after_delete` / `_register_rotator_account` 收敛 + secrets/logger 规范化。
+
+测试同步调整：test_config_writes / test_log_stream / test_round6_audit_fixes / test_env_api_keys 的 patch 与 import 目标迁移至新模块（test_env_cookie_injection 的 healthz 留 routes_system）。

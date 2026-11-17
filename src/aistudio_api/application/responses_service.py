@@ -16,12 +16,10 @@
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import json
 import secrets
 import time
-from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterable, Callable
 
 from aistudio_api.api.response_models import (
     GeminiGenerateContentResponse,
@@ -40,12 +38,14 @@ from aistudio_api.application.api_service_gemini import _ERROR_TEXT_PREFIX
 from aistudio_api.application.compat_service import (
     _as_dict,
     _as_str,
+    _convert_items_concurrently,
+    _file_block_to_part,
     _media_part_from_url,
     _openai_tool_choice_to_config,
     _openai_tools_to_gemini,
-    _parse_data_url,
     _read_signature,
     _signature_extra,
+    _stream_adapter_lifecycle,
     normalize_reasoning_effort_word,
     resolve_compat_model,
 )
@@ -111,26 +111,12 @@ async def _parts_from_input_content(content: object) -> list[GeminiPart]:
     ——本项目无文件存储，仅 URL/data URL）/ ``input_file``（data URL）；
     其余类型（audio 等）忽略并打日志。
     """
-    from aistudio_api.api.schemas import GeminiInlineData
-
     if isinstance(content, str):
         return [GeminiPart(text=content)]
     if not isinstance(content, list):
         return []
     if len(content) > 1 and has_remote_media(content):
-        parts: list[GeminiPart] = []
-        for offset in range(0, len(content), 4):
-            try:
-                async with asyncio.TaskGroup() as group:
-                    tasks = [
-                        group.create_task(_parts_from_input_content([item]))
-                        for item in content[offset : offset + 4]
-                    ]
-            except* ValueError as exc:
-                raise ValueError(str(exc.exceptions[0])) from exc
-            for task in tasks:
-                parts.extend(task.result())
-        return parts
+        return await _convert_items_concurrently(content, _parts_from_input_content)
     parts: list[GeminiPart] = []
     for item in content:
         if not isinstance(item, dict):
@@ -153,22 +139,9 @@ async def _parts_from_input_content(content: object) -> list[GeminiPart]:
                 parts.append(await _media_part_from_url(url))
         elif part_type == "input_file":
             file_data = _as_str(item.get("file_data"))
-            if file_data.startswith("data:"):
-                parsed = _parse_data_url(file_data)
-                if parsed is not None:
-                    mime, data = parsed
-                    # input_file.filename 透传到 wire inlineData 槽位 5
-                    # （2026-11 AI Studio 真机抓包形态），空串视为未提供。
-                    filename = _as_str(item.get("filename")).strip()
-                    parts.append(
-                        GeminiPart(
-                            inlineData=GeminiInlineData(
-                                mimeType=mime,
-                                data=data,
-                                filename=filename or None,
-                            )
-                        )
-                    )
+            part = _file_block_to_part(file_data, item.get("filename"))
+            if part is not None:
+                parts.append(part)
         else:
             logger.debug("忽略不支持的 Responses content 类型: %s", part_type)
     return parts
@@ -980,12 +953,7 @@ async def responses_stream_adapter(
     """Gemini SSE → OpenAI Responses 语义事件流。"""
     response_id = _response_id()
     emitter = _ResponsesStreamEmitter(response_id, requested_model)
-    if register_failure is not None:
-        register_failure(emitter.error)
-    source_aclose: Callable[[], Awaitable[None]] | None = getattr(
-        source, "aclose", None
-    )
-    try:
+    async with _stream_adapter_lifecycle(source, emitter.error, register_failure):
         yield emitter.created()
         yield emitter.in_progress()
         from aistudio_api.application.compat_service import (
@@ -994,75 +962,71 @@ async def responses_stream_adapter(
             _iter_gemini_sse_frames,
         )
 
-        async for frame in _iter_gemini_sse_frames(source):
-            error_obj = frame.get("error")
-            if isinstance(error_obj, dict):
-                message = _as_str(error_obj.get("message")) or "Upstream error"
-                for event in emitter.error(message):
-                    yield event
-                return
-            candidate = _frame_candidate(frame)
-            finish = _as_str(candidate.get("finishReason"))
-            if finish:
-                emitter.finish_reason_raw = finish
-            usage_metadata = frame.get("usageMetadata")
-            if isinstance(usage_metadata, dict):
-                emitter.usage = _usage_payload_from_gemini(usage_metadata)
-            for part in _frame_parts(candidate):
-                function_call = part.get("functionCall")
-                if isinstance(function_call, dict):
-                    call_id = _as_str(function_call.get("id")) or _call_id()
-                    name = _as_str(function_call.get("name")) or "unknown"
-                    args = function_call.get("args")
-                    for event in emitter.function_call(
-                        call_id, name, args, _as_str(part.get("thoughtSignature"))
-                    ):
+        try:
+            async for frame in _iter_gemini_sse_frames(source):
+                error_obj = frame.get("error")
+                if isinstance(error_obj, dict):
+                    message = _as_str(error_obj.get("message")) or "Upstream error"
+                    for event in emitter.error(message):
                         yield event
-                    continue
-                inline = _as_dict(part.get("inlineData"))
-                if inline:
-                    # Responses 无原生图片 part：与 Chat 侧一致降级为
-                    # markdown data-URL 占位，避免静默空回
-                    mime = _as_str(inline.get("mimeType")) or "image/png"
-                    data = _as_str(inline.get("data"))
-                    if data:
-                        emitter._text_accumulated.append(
-                            f"\n\n![image](data:{mime};base64,{data})"
-                        )
-                        for event in emitter.text_delta(
-                            f"\n\n![image](data:{mime};base64,{data})"
+                    return
+                candidate = _frame_candidate(frame)
+                finish = _as_str(candidate.get("finishReason"))
+                if finish:
+                    emitter.finish_reason_raw = finish
+                usage_metadata = frame.get("usageMetadata")
+                if isinstance(usage_metadata, dict):
+                    emitter.usage = _usage_payload_from_gemini(usage_metadata)
+                for part in _frame_parts(candidate):
+                    function_call = part.get("functionCall")
+                    if isinstance(function_call, dict):
+                        call_id = _as_str(function_call.get("id")) or _call_id()
+                        name = _as_str(function_call.get("name")) or "unknown"
+                        args = function_call.get("args")
+                        for event in emitter.function_call(
+                            call_id, name, args, _as_str(part.get("thoughtSignature"))
                         ):
                             yield event
-                    continue
-                text = part.get("text")
-                if isinstance(text, str) and text:
-                    # 上游错误兜底文本（format_sse_error_text）不是正文：
-                    # 已输出错误事件的情况下不重复下发为 output_text
-                    if text.startswith(_ERROR_TEXT_PREFIX):
                         continue
-                    if part.get("thought") is True:
-                        emitter._reasoning_accumulated.append(text)
-                        for event in emitter.reasoning_delta(text):
-                            yield event
-                    else:
-                        emitter._text_accumulated.append(text)
-                        for event in emitter.text_delta(text):
-                            yield event
-    except Exception as exc:
-        logger.warning("Responses 流式转换异常: %s", exc)
-        record_result(
-            "error", error=f"Stream conversion failed: {type(exc).__name__}: {exc}"
-        )
-        for event in emitter.error(f"{type(exc).__name__}: {exc}"):
-            yield event
-        return
-    else:
+                    inline = _as_dict(part.get("inlineData"))
+                    if inline:
+                        # Responses 无原生图片 part：与 Chat 侧一致降级为
+                        # markdown data-URL 占位，避免静默空回
+                        mime = _as_str(inline.get("mimeType")) or "image/png"
+                        data = _as_str(inline.get("data"))
+                        if data:
+                            emitter._text_accumulated.append(
+                                f"\n\n![image](data:{mime};base64,{data})"
+                            )
+                            for event in emitter.text_delta(
+                                f"\n\n![image](data:{mime};base64,{data})"
+                            ):
+                                yield event
+                        continue
+                    text = part.get("text")
+                    if isinstance(text, str) and text:
+                        # 上游错误兜底文本（format_sse_error_text）不是正文：
+                        # 已输出错误事件的情况下不重复下发为 output_text
+                        if text.startswith(_ERROR_TEXT_PREFIX):
+                            continue
+                        if part.get("thought") is True:
+                            emitter._reasoning_accumulated.append(text)
+                            for event in emitter.reasoning_delta(text):
+                                yield event
+                        else:
+                            emitter._text_accumulated.append(text)
+                            for event in emitter.text_delta(text):
+                                yield event
+        except Exception as exc:
+            logger.warning("Responses 流式转换异常: %s", exc)
+            record_result(
+                "error", error=f"Stream conversion failed: {type(exc).__name__}: {exc}"
+            )
+            for event in emitter.error(f"{type(exc).__name__}: {exc}"):
+                yield event
+            return
         for event in emitter.finish():
             yield event
-    finally:
-        if callable(source_aclose):
-            with contextlib.suppress(Exception):
-                await source_aclose()
 
 
 __all__ = [

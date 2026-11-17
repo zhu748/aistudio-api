@@ -372,52 +372,6 @@ class ProxyTestRequest(BaseModel):
     proxy_url: str | None = None
 
 
-class GlobalProxyRequest(BaseModel):
-    proxy_url: str = ""
-
-
-@router.put("/proxies/global")
-async def update_global_proxy(req: GlobalProxyRequest) -> dict[str, object]:
-    import yaml
-
-    from aistudio_api.infrastructure.account.cookie_parser import normalize_proxy_url
-    from aistudio_api.infrastructure.gateway.model_defaults import (
-        _resolve_config_path,
-        config_file_write_lock,
-        invalidate_config_cache,
-    )
-    from aistudio_api.infrastructure.utils.common import atomic_write_text
-
-    proxy = normalize_proxy_url(req.proxy_url) if req.proxy_url.strip() else None
-    if req.proxy_url.strip() and proxy is None:
-        raise HTTPException(400, "代理地址无效")
-
-    def save() -> None:
-        with config_file_write_lock():
-            path = _resolve_config_path(None)
-            config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-            network = config.get("network")
-            if not isinstance(network, dict):
-                network = {}
-            config["network"] = {**network, "proxy_url": proxy or ""}
-            atomic_write_text(
-                path,
-                yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
-                private=True,
-            )
-            invalidate_config_cache()
-
-    await asyncio.to_thread(save)
-    settings.proxy_url = proxy
-    if runtime_state.client:
-        await runtime_state.client.session.set_default_proxy(proxy)
-    return {
-        "ok": True,
-        "global_proxy": redact_text(proxy or ""),
-        "note": "当前进程立即生效；重启时环境变量代理配置优先。",
-    }
-
-
 @router.post("/proxies/test")
 async def test_proxy(req: ProxyTestRequest) -> dict[str, object]:
     from aistudio_api.infrastructure.account.cookie_parser import normalize_proxy_url

@@ -740,9 +740,7 @@ def test_claude_stop_reason_refusal_beats_tool_use() -> None:
     from aistudio_api.application.compat_service import _claude_stop_reason
 
     def reason(finish: str, *, tool_use: bool) -> str:
-        return _claude_stop_reason(
-            finish, has_tool_use=tool_use, full_text="", stop_sequences=None
-        )[0]
+        return _claude_stop_reason(finish, has_tool_use=tool_use)[0]
 
     assert reason("SAFETY", tool_use=True) == "refusal"
     assert reason("PROHIBITED_CONTENT", tool_use=True) == "refusal"
