@@ -14,8 +14,8 @@ from typing import cast
 import pytest
 from fastapi import HTTPException
 
-from aistudio_api.api import routes_accounts
-from aistudio_api.api.routes_accounts import (
+from aistudio_api.api import routes_account_imports
+from aistudio_api.api.routes_account_imports import (
     BundleAccountItem,
     ImportBundleRequest,
     ImportCookiesRequest,
@@ -47,8 +47,10 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[AccountService
     async def _fake_email(*_args: object, **_kwargs: object) -> str:
         return "proxy@example.com"
 
-    monkeypatch.setattr(routes_accounts, "probe_account_benefit_tier", _fake_tier)
-    monkeypatch.setattr(routes_accounts, "probe_account_email", _fake_email)
+    monkeypatch.setattr(
+        routes_account_imports, "probe_account_benefit_tier", _fake_tier
+    )
+    monkeypatch.setattr(routes_account_imports, "probe_account_email", _fake_email)
     accounts_dir = tmp_path / "accounts"
     service = AccountService(AccountStore(accounts_dir=accounts_dir))
     return service, accounts_dir

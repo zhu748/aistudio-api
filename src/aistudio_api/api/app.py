@@ -32,6 +32,7 @@ from aistudio_api.infrastructure.utils.logger import (
 
 from .dependencies import require_api_key, require_web_auth
 from .request_middleware import RequestMiddleware
+from .routes_account_imports import router as account_imports_router
 from .routes_accounts import router as accounts_router
 from .routes_compat import router as compat_router
 from .routes_config import (
@@ -487,6 +488,12 @@ app.include_router(
     accounts_router, prefix="/api", dependencies=[Depends(require_web_auth)]
 )
 app.include_router(accounts_router, dependencies=[Depends(require_web_auth)])
+app.include_router(
+    account_imports_router,
+    prefix="/api",
+    dependencies=[Depends(require_web_auth)],
+)
+app.include_router(account_imports_router, dependencies=[Depends(require_web_auth)])
 app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
 app.include_router(models_router, dependencies=[Depends(require_api_key)])
 app.include_router(compat_router, dependencies=[Depends(require_api_key)])

@@ -11,6 +11,7 @@ import json
 from aistudio_api.domain.models import Candidate, GeneratedImage, ModelOutput
 from aistudio_api.infrastructure.gateway.wire_spec import (
     WIRE_FINISH_REASON_CONTINUING,
+    PartIndex,
 )
 from aistudio_api.infrastructure.utils.common import (
     decode_base64_images,
@@ -30,23 +31,43 @@ WIRE_CHUNK_USAGE_INDEX = 2  # Field 3 usage metadata array
 WIRE_RESPONSE_ID_INDEX = 7  # Field 8 response unique ID string
 
 # Candidate Part indexes inside content[0] ([parts, role]) (WIRE_SPECIFICATION.md §3.2)
-WIRE_PART_THOUGHT_LEAD_INDEX = 0  # Field 1 boolean thought flag (fallback)
-WIRE_PART_TEXT_INDEX = 1  # Field 2 text string
-WIRE_PART_INLINE_DATA_INDEX = 2  # Field 3 [mimeType, base64_data]
-WIRE_PART_FUNCTION_CALL_INDEX = 3  # Field 4 [name, args_struct, call_id]
-WIRE_PART_FUNCTION_RESPONSE_INDEX = 4  # Field 5 [name, response_struct, call_id]
-WIRE_PART_FILE_DATA_INDEX = 5  # Field 6 [file_id]
-WIRE_PART_EXECUTABLE_CODE_INDEX = 8  # Field 9 code execution script string
-WIRE_PART_CODE_EXECUTION_RESULT_INDEX = 9  # Field 10 code execution output string
-WIRE_PART_THOUGHT_FLAG_INDEX = 10  # Field 11 boolean thought flag (primary)
-WIRE_PART_FUNCTION_CALL_ALT_INDEX = 10  # Field 11 function call alternative slot
-WIRE_PART_FUNCTION_RESPONSE_ALT_INDEX = (
-    11  # Field 12 function response alternative slot
-)
-WIRE_PART_THOUGHT_ALT_FLAG_INDEX = (
-    12  # Field 13 integer 1 thought flag (AI Studio variant)
-)
-WIRE_PART_THOUGHT_SIGNATURE_INDEX = 14  # Field 15 thought cryptographic signature token
+# 单一真相源：wire_spec.PartIndex（wire_types 编码侧同源）；此处保留既有
+# WIRE_PART_*_INDEX 别名以免 wire_codec/解析调用点大改，取值与 PartIndex 严格一致。
+WIRE_PART_THOUGHT_LEAD_INDEX = int(
+    PartIndex.THOUGHT_LEAD
+)  # Field 1 boolean thought flag (fallback)
+WIRE_PART_TEXT_INDEX = int(PartIndex.TEXT)  # Field 2 text string
+WIRE_PART_INLINE_DATA_INDEX = int(
+    PartIndex.INLINE_DATA
+)  # Field 3 [mimeType, base64_data]
+WIRE_PART_FUNCTION_CALL_INDEX = int(
+    PartIndex.FUNCTION_CALL
+)  # Field 4 [name, args_struct, call_id]
+WIRE_PART_FUNCTION_RESPONSE_INDEX = int(
+    PartIndex.FUNCTION_RESPONSE
+)  # Field 5 [name, response_struct, call_id]
+WIRE_PART_FILE_DATA_INDEX = int(PartIndex.FILE_DATA)  # Field 6 [file_id]
+WIRE_PART_EXECUTABLE_CODE_INDEX = int(
+    PartIndex.EXECUTABLE_CODE
+)  # Field 9 code execution script string
+WIRE_PART_CODE_EXECUTION_RESULT_INDEX = int(
+    PartIndex.CODE_RESULT
+)  # Field 10 code execution output string
+WIRE_PART_THOUGHT_FLAG_INDEX = int(
+    PartIndex.THOUGHT_FLAG
+)  # Field 11 boolean thought flag (primary)
+WIRE_PART_FUNCTION_CALL_ALT_INDEX = int(
+    PartIndex.FUNCTION_CALL_ALT
+)  # Field 11 function call alternative slot
+WIRE_PART_FUNCTION_RESPONSE_ALT_INDEX = int(
+    PartIndex.FUNCTION_RESPONSE_ALT
+)  # Field 12 function response alternative slot
+WIRE_PART_THOUGHT_ALT_FLAG_INDEX = int(
+    PartIndex.THOUGHT_ALT_FLAG
+)  # Field 13 integer 1 thought flag (AI Studio variant)
+WIRE_PART_THOUGHT_SIGNATURE_INDEX = int(
+    PartIndex.THOUGHT_SIGNATURE
+)  # Field 15 thought cryptographic signature token
 
 # UsageMetadata indexes inside chunk[2] (WIRE_SPECIFICATION.md §7.3)
 WIRE_USAGE_PROMPT_TOKENS = 0  # Field 1 prompt token count

@@ -114,16 +114,21 @@ def test_parse_cookie_string_discards_transient_and_telemetry_cookies():
 async def test_import_bundle_flow(tmp_path, monkeypatch):
     from unittest.mock import AsyncMock
 
-    from aistudio_api.api import routes_accounts
-    from aistudio_api.api.routes_accounts import ImportBundleRequest, import_bundle
+    from aistudio_api.api import routes_account_imports
+    from aistudio_api.api.routes_account_imports import (
+        ImportBundleRequest,
+        import_bundle,
+    )
     from aistudio_api.application.account_service import AccountService
     from aistudio_api.infrastructure.account.account_store import AccountStore
 
     monkeypatch.setattr(
-        routes_accounts, "probe_account_benefit_tier", AsyncMock(return_value="Free")
+        routes_account_imports,
+        "probe_account_benefit_tier",
+        AsyncMock(return_value="Free"),
     )
     monkeypatch.setattr(
-        routes_accounts,
+        routes_account_imports,
         "probe_account_email",
         AsyncMock(return_value="mock@example.com"),
     )
@@ -355,7 +360,7 @@ async def test_probe_import_activates_first_account_and_registers_in_rotator(
     """Verify probe_and_import registers accounts in rotator and activates first account when registry was empty (PR #1 & Issue #7)."""
     from unittest.mock import AsyncMock, MagicMock
 
-    from aistudio_api.api.routes_accounts import (
+    from aistudio_api.api.routes_account_imports import (
         ProbeAndImportRequest,
         probe_and_import,
     )

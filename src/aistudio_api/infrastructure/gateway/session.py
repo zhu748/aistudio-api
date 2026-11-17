@@ -38,7 +38,7 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 from aistudio_api.infrastructure.utils.redaction import redact_text
 from aistudio_api.infrastructure.waa.signer import WaaSigner
 
-log = get_logger("session")
+logger = get_logger("session")
 
 
 # 真实页面行为：GenerateContent 发出后 ~2.2s，页面向 CountTokens 发一次
@@ -243,7 +243,7 @@ class GatewaySession:
                 proxy_url=target_proxy,
             )
             self._active_context = new_context
-            log.info(
+            logger.info(
                 "会话已切换: auth_file=%s, u/%s, tier=%s",
                 auth_file,
                 target_auth_user,
@@ -342,7 +342,7 @@ class GatewaySession:
                     new_cookies=active_ctx.cookies,
                 )
             except Exception as e:
-                log.debug("回写签名服务 Cookie 失败: %s", e)
+                logger.debug("回写签名服务 Cookie 失败: %s", e)
 
     def invalidate_proof_cache(self) -> int:
         """失效 WAA proof 复用缓存（403 重签路径钩子），返回清除条数。"""
@@ -389,14 +389,14 @@ class GatewaySession:
                     ctx=followup_ctx,
                 )
                 if status != 200:
-                    log.debug(
+                    logger.debug(
                         "页面行为 CountTokens 补发返回 HTTP %d（不影响主请求）",
                         status,
                     )
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.debug("页面行为 CountTokens 补发失败（不影响主请求）: %s", e)
+                logger.debug("页面行为 CountTokens 补发失败（不影响主请求）: %s", e)
 
         try:
             loop = asyncio.get_running_loop()
