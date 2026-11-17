@@ -357,6 +357,17 @@ async def lifespan(_app: FastAPI):
 
         env_probe_task = asyncio.create_task(_env_subaccount_probe())
 
+    # 出站保活（AISTUDIO_KEEPALIVE_URL，未配置时不启动、零开销，
+    # 见 infrastructure/outbound_keepalive.py）。
+    from aistudio_api.infrastructure.outbound_keepalive import (
+        outbound_keepalive_service,
+    )
+
+    try:
+        await outbound_keepalive_service.start()
+    except Exception as e:
+        logger.warning("保活服务启动失败（不影响主服务）: %s - %s", type(e).__name__, e)
+
     yield
     logger.info("正在关闭服务")
     bg_tasks = [t for t in (tier_task, rotate_task, env_probe_task) if t]
@@ -366,6 +377,8 @@ async def lifespan(_app: FastAPI):
     # 等待取消真正落地，避免残留 pending task 在事件循环关闭时告警
     if bg_tasks:
         await asyncio.gather(*bg_tasks, return_exceptions=True)
+    # 停止出站保活任务（幂等；未启动时为空操作）
+    await outbound_keepalive_service.stop()
     # 停止模型目录后台刷新（跨循环调用时仅清理句柄，内部已防挂死）
     await model_discovery.stop_background_refresh()
     if client:
@@ -381,8 +394,12 @@ async def lifespan(_app: FastAPI):
     # 统计与调度状态都改成了防抖写入（record 后 2s 才落盘）；若进程在最后一次
     # 记账后 2s 内退出，最后一次增量会丢失。关闭时显式刷新一次内存态。
     try:
-        if runtime_state._save_task is not None:
-            await runtime_state._save_task
+        pending_save = runtime_state._save_task
+        # 只 await 仍在运行的防抖任务：已取消/已完成的残留任务（如测试
+        # 事件循环销毁时被取消的旧任务）会把 CancelledError 抛进优雅关停
+        # 流程；无论如何后面都会同步补一次快照，这里跳过即可。
+        if pending_save is not None and not pending_save.done():
+            await pending_save
         await asyncio.to_thread(runtime_state.save_stats)
         pending_rotator = runtime_state.rotator
         if pending_rotator is not None:

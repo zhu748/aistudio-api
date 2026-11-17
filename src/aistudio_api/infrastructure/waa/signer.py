@@ -64,8 +64,8 @@ def signer_authorization(server_url: str) -> dict[str, str]:
 
 # Per-task storage: WaaSigner/RemoteProofSigner is shared across concurrent
 # requests. A plain instance attribute lets one request's proof headers be
-# overwritten by another task before generate_snapshot_with_headers reads them,
-# mismatching the proof with the headers and leaking cookies across accounts.
+# overwritten by another task before last_headers reads them, mismatching the
+# proof with the headers and leaking cookies across accounts.
 _LAST_HEADERS: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
     "aistudio_waa_last_headers", default=None
 )
@@ -526,26 +526,6 @@ class WaaSigner:
     def last_headers(self) -> dict[str, str]:
         """Get dynamic protocol headers returned by the last successful proof minting."""
         return self._remote_signer.last_headers
-
-    async def generate_snapshot_with_headers(
-        self,
-        contents: list[AistudioContent],
-        cookies: dict[str, str],
-        auth_user: str = "0",
-        tier: str = "Free",
-        model: str = "models/gemini-3.7-flash",
-        upstream_proxy: str | None = None,
-    ) -> tuple[str, dict[str, str]]:
-        """Generate fresh WAA proof token along with dynamic session headers."""
-        proof = await self.generate_snapshot(
-            contents=contents,
-            cookies=cookies,
-            auth_user=auth_user,
-            tier=tier,
-            model=model,
-            upstream_proxy=upstream_proxy,
-        )
-        return proof, dict(self._remote_signer.last_headers)
 
     async def generate_snapshot(
         self,

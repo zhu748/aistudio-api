@@ -862,25 +862,6 @@ async def handle_gemini_generate_content(
     ) from last_error
 
 
-def format_sse_event(
-    event_type: str,
-    text: object,
-    *,
-    model_version: str | None = None,
-    response_id: str | None = None,
-    thought_signature: str | None = None,
-) -> str | None:
-    """Format a single Gemini streaming event into SSE chunk string."""
-    payload = _event_payload(
-        event_type,
-        text,
-        model_version=model_version,
-        response_id=response_id,
-        thought_signature=thought_signature,
-    )
-    return _encode_sse(payload) if payload is not None else None
-
-
 def _encode_sse(payload: dict[str, object]) -> str:
     return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
 
@@ -946,24 +927,6 @@ def _event_payload(
     return payload
 
 
-def format_sse_usage(
-    final_usage: dict[str, object] | None,
-    *,
-    finish_reason: str = "STOP",
-    model_version: str | None = None,
-    response_id: str | None = None,
-) -> str:
-    """Format final completion usage metadata into SSE chunk string."""
-    return _encode_sse(
-        _usage_payload(
-            final_usage,
-            finish_reason=finish_reason,
-            model_version=model_version,
-            response_id=response_id,
-        )
-    )
-
-
 def _usage_payload(
     final_usage: dict[str, object] | None,
     *,
@@ -996,29 +959,12 @@ def _usage_payload(
     return payload
 
 
-def format_sse_error(exc: Exception) -> str:
-    """Format exception into standard Gemini SSE error chunk."""
-    return _encode_sse(_error_payload(exc))
-
-
 def _error_payload(exc: Exception) -> dict[str, object]:
     code, msg, status_str = classify_gemini_error_payload(exc)
     return {"error": {"code": code, "message": msg, "status": status_str}}
 
 
 _ERROR_TEXT_PREFIX = "[aistudio-api 请求失败"
-
-
-def format_sse_error_text(exc: Exception) -> str | None:
-    """把失败原因格式化为可见文本 part 的 SSE 事件。
-
-    背景：Chatbox 等客户端的 Gemini 流式解析器只读
-    ``candidates[].content.parts[].text``，会直接忽略 ``{"error": ...}`` 事件，
-    导致失败时表现为“空回啥都没有”。此事件把具体错误原因作为正常文本
-    part 下发，任何客户端都能看到，避免静默空回。
-    """
-    payload = _error_text_payload(exc)
-    return _encode_sse(payload) if payload is not None else None
 
 
 def _error_text_payload(exc: Exception) -> dict[str, object] | None:

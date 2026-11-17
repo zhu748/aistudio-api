@@ -344,20 +344,6 @@ class GatewaySession:
             except Exception as e:
                 log.debug("回写签名服务 Cookie 失败: %s", e)
 
-    async def generate_snapshot_with_headers(
-        self,
-        contents: list[AistudioContent],
-        ctx: SessionContext | None = None,
-        model: str = "models/gemini-3.7-flash",
-    ) -> tuple[str, dict[str, str]]:
-        """Generate fresh WAA proof token and dynamic session headers."""
-        proof = await self.generate_snapshot(
-            contents=contents,
-            ctx=ctx,
-            model=model,
-        )
-        return proof, dict(self.last_signer_headers)
-
     def invalidate_proof_cache(self) -> int:
         """失效 WAA proof 复用缓存（403 重签路径钩子），返回清除条数。"""
         return self._signer.invalidate_proof_cache()
