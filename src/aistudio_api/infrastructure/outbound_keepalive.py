@@ -44,9 +44,46 @@ _MAX_REDIRECTS = 5
 _METADATA_HOSTS = frozenset({"metadata.google.internal", "metadata.goog"})
 
 
+# 面板写入的运行时覆盖三元组（None = 未覆盖，走 env > yaml 默认链）。
+# 与签名服务器切换的 runtime_override 同款语义：进程内立即生效、重启
+# 后回退环境变量/配置文件默认值。写方为 routes_config 的 PUT 端点，
+# 读方为 _current_config / keepalive_private_targets_allowed。
+_runtime_override: tuple[str, int, bool] | None = None
+
+
 def keepalive_private_targets_allowed() -> bool:
-    """是否允许私网/环回保活目标（AISTUDIO_KEEPALIVE_ALLOW_PRIVATE，默认关）。"""
+    """是否允许私网/环回保活目标（运行时覆盖 > env > yaml 默认关）。"""
+    if _runtime_override is not None:
+        return _runtime_override[2]
     return settings.keepalive_allow_private
+
+
+def set_keepalive_runtime_override(
+    url: str, interval: int, allow_private: bool
+) -> None:
+    """面板保存写入的运行时覆盖（立即生效，重启后回退 env/yaml）。"""
+    global _runtime_override
+    _runtime_override = (
+        (url or "").strip(),
+        max(_MIN_INTERVAL_SECONDS, int(interval)),
+        bool(allow_private),
+    )
+
+
+def clear_keepalive_runtime_override() -> None:
+    """清除运行时覆盖（回退 env > yaml）。"""
+    global _runtime_override
+    _runtime_override = None
+
+
+def keepalive_runtime_override_active() -> bool:
+    """运行时覆盖是否在生效（面板「覆盖环境变量中」状态用）。"""
+    return _runtime_override is not None
+
+
+def keepalive_runtime_override() -> tuple[str, int, bool] | None:
+    """当前运行时覆盖三元组（未覆盖时 None；payload 表单回显用）。"""
+    return _runtime_override
 
 
 def _keepalive_host_allowed(host: str, allow_private: bool = False) -> bool:
@@ -109,7 +146,9 @@ class OutboundKeepAliveService:
         self._lifecycle_lock = asyncio.Lock()
 
     def _current_config(self) -> tuple[str, int]:
-        """读取当前生效配置（环境变量 > 内置默认）。"""
+        """读取当前生效配置（运行时覆盖 > 环境变量 > yaml 默认）。"""
+        if _runtime_override is not None:
+            return _runtime_override[0], _runtime_override[1]
         url = (settings.keepalive_url or "").strip()
         interval = settings.keepalive_interval
         return url, int(interval)

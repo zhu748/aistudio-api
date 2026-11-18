@@ -210,3 +210,185 @@ async def test_service_restart_picks_up_new_config(tmp_path, monkeypatch):
     )
     await service.restart()
     assert service.is_running is False
+
+
+# ---------------------------------------------------------------------------
+# 运行时覆盖语义（环境变量注入时面板保存 → 覆盖 env 立即生效）
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_runtime_override():
+    """隔离模块级运行时覆盖状态，防测试间泄漏。"""
+    import aistudio_api.infrastructure.outbound_keepalive as ok_module
+
+    ok_module._runtime_override = None
+    yield
+    ok_module._runtime_override = None
+
+
+def test_runtime_override_priority_over_settings():
+    """覆盖三元组优先于（import 时固化的）settings 默认链。"""
+    import aistudio_api.infrastructure.outbound_keepalive as ok_module
+
+    ok_module._runtime_override = ("https://override.example/healthz", 25, True)
+    svc = OutboundKeepAliveService()
+    assert svc._current_config() == ("https://override.example/healthz", 25)
+    assert ok_module.keepalive_private_targets_allowed() is True
+
+    ok_module._runtime_override = None
+    # 回退 settings 默认链（测试环境 yaml 中无 network 段 → 空 URL）
+    assert svc._current_config()[0] == ""
+    assert ok_module.keepalive_runtime_override_active() is False
+
+
+def test_set_and_clear_runtime_override():
+    """set/clear/active 三 API 的形状与钳制语义。"""
+    import aistudio_api.infrastructure.outbound_keepalive as ok_module
+
+    ok_module.set_keepalive_runtime_override(
+        url=" https://panel.example/healthz ", interval=2, allow_private=True
+    )
+    assert ok_module._runtime_override == (
+        "https://panel.example/healthz",
+        5,  # 低于下限 5 被钳制
+        True,
+    )
+    assert ok_module.keepalive_runtime_override_active() is True
+
+    ok_module.clear_keepalive_runtime_override()
+    assert ok_module._runtime_override is None
+    assert ok_module.keepalive_runtime_override_active() is False
+
+
+def test_env_prefill_and_injection_badges(tmp_path, monkeypatch):
+    """payload：env 注入字段预填 env 值并标注；未注入字段保持 yaml 值。"""
+    from aistudio_api.api.routes_config import _keepalive_payload
+
+    config = _write_config(
+        tmp_path,
+        "network:\n  keepalive_url: https://yaml.example/healthz\n"
+        "  keepalive_interval: 90\n  keepalive_allow_private: true\n",
+    )
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.gateway.model_defaults._resolve_config_path",
+        lambda p=None: config,
+    )
+    invalidate_config_cache()
+    monkeypatch.setenv("AISTUDIO_KEEPALIVE_URL", "https://env.example/healthz")
+    monkeypatch.setenv("AISTUDIO_KEEPALIVE_INTERVAL", "33")
+    monkeypatch.delenv("AISTUDIO_KEEPALIVE_ALLOW_PRIVATE", raising=False)
+
+    payload = _keepalive_payload()
+    # url/interval 被 env 注入 → 预填 env 值
+    assert payload["url"] == "https://env.example/healthz"
+    assert payload["interval"] == 33
+    # allow_private 未注入 → 保持 yaml 值
+    assert payload["allow_private"] is True
+    assert payload["env_overrides"] == {
+        "url": "AISTUDIO_KEEPALIVE_URL",
+        "interval": "AISTUDIO_KEEPALIVE_INTERVAL",
+    }
+    # yaml 原值仍完整回传（供前端展示落盘值）
+    assert payload["yaml_url"] == "https://yaml.example/healthz"
+    assert payload["yaml_interval"] == 90
+    assert payload["yaml_allow_private"] is True
+
+
+def test_payload_without_env_uses_yaml_values(tmp_path, monkeypatch):
+    """无 env 注入时 payload 纯 yaml 值（env_overrides 为空）。"""
+    from aistudio_api.api.routes_config import _keepalive_payload
+
+    config = _write_config(
+        tmp_path,
+        "network:\n  keepalive_url: https://yaml.example/healthz\n"
+        "  keepalive_interval: 120\n  keepalive_allow_private: false\n",
+    )
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.gateway.model_defaults._resolve_config_path",
+        lambda p=None: config,
+    )
+    invalidate_config_cache()
+    monkeypatch.delenv("AISTUDIO_KEEPALIVE_URL", raising=False)
+    monkeypatch.delenv("AISTUDIO_KEEPALIVE_INTERVAL", raising=False)
+    monkeypatch.delenv("AISTUDIO_KEEPALIVE_ALLOW_PRIVATE", raising=False)
+
+    payload = _keepalive_payload()
+    assert payload["url"] == "https://yaml.example/healthz"
+    assert payload["interval"] == 120
+    assert payload["allow_private"] is False
+    assert payload["env_overrides"] == {}
+
+
+def test_env_prefill_bool_and_int_parsing(monkeypatch):
+    """env 值解析口径与 Settings 一致（int 失败回退 60、bool 0/false 判假）。"""
+    from aistudio_api.api.routes_config import _keepalive_env_prefill
+
+    monkeypatch.setenv("AISTUDIO_KEEPALIVE_URL", " https://env.example/hz ")
+    monkeypatch.setenv("AISTUDIO_KEEPALIVE_INTERVAL", "not-a-number")
+    monkeypatch.setenv("AISTUDIO_KEEPALIVE_ALLOW_PRIVATE", "0")
+    prefill = _keepalive_env_prefill()
+    assert prefill["url"] == "https://env.example/hz"
+    assert prefill["interval"] == 60
+    assert prefill["allow_private"] is False
+
+    monkeypatch.setenv("AISTUDIO_KEEPALIVE_INTERVAL", " 45 ")
+    monkeypatch.setenv("AISTUDIO_KEEPALIVE_ALLOW_PRIVATE", "True")
+    prefill2 = _keepalive_env_prefill()
+    assert prefill2["interval"] == 45
+    assert prefill2["allow_private"] is True
+
+
+@pytest.mark.asyncio
+async def test_put_sets_override_and_restarts(tmp_path, monkeypatch):
+    """PUT /config/keepalive：写 yaml + 设运行时覆盖 + 重启服务（environ/env 注入下）。"""
+    import aistudio_api.api.routes_config as routes_config
+    import aistudio_api.infrastructure.outbound_keepalive as ok_module
+    from aistudio_api.infrastructure.outbound_keepalive import (
+        OutboundKeepAliveService,
+    )
+
+    config = _write_config(tmp_path, "api_keys: []\n")
+    monkeypatch.setattr(
+        "aistudio_api.infrastructure.gateway.model_defaults._resolve_config_path",
+        lambda p=None: config,
+    )
+    invalidate_config_cache()
+    # 环境变量注入（面板保存应覆盖它，而不是被 env 挡住）
+    monkeypatch.setenv("AISTUDIO_KEEPALIVE_URL", "https://env.example/healthz")
+    monkeypatch.setenv("AISTUDIO_KEEPALIVE_INTERVAL", "600")
+
+    # 隔离全局服务实例与全局覆盖状态
+    stub_service = OutboundKeepAliveService()
+    monkeypatch.setattr(ok_module, "outbound_keepalive_service", stub_service)
+    monkeypatch.setattr(
+        routes_config, "outbound_keepalive_service", stub_service, raising=False
+    )
+    restarted = []
+
+    async def fake_restart() -> None:
+        restarted.append(stub_service._current_config())
+
+    monkeypatch.setattr(stub_service, "restart", fake_restart)
+
+    req = routes_config.UpdateKeepaliveConfigRequest(
+        url="https://panel.example/healthz", interval=30, allow_private=False
+    )
+    result = await routes_config.update_keepalive_config(req)
+
+    # 覆盖已设为面板值（优先于 env 注入）
+    assert ok_module._runtime_override == (
+        "https://panel.example/healthz",
+        30,
+        False,
+    )
+    # 服务按覆盖值重启（_current_config 读覆盖，不是 env 的 600）
+    assert restarted and restarted[0] == ("https://panel.example/healthz", 30)
+    # payload 回显面板值 + yaml 落盘值
+    assert result["url"] == "https://panel.example/healthz"
+    assert result["yaml_url"] == "https://panel.example/healthz"
+    assert result["runtime_override_active"] is True
+    # yaml 已落盘
+    parsed = yaml.safe_load(config.read_text(encoding="utf-8"))
+    assert parsed["network"]["keepalive_url"] == "https://panel.example/healthz"
+    assert parsed["network"]["keepalive_interval"] == 30

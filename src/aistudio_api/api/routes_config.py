@@ -379,7 +379,7 @@ class UpdateKeepaliveConfigRequest(BaseModel):
 
 
 def _keepalive_env_override() -> dict[str, str]:
-    """环境变量覆盖展示（AISTUDIO_KEEPALIVE_* 存在时面板只读提示）。"""
+    """环境变量注入展示（AISTUDIO_KEEPALIVE_* 非空时面板标注「环境变量注入」）。"""
     overrides: dict[str, str] = {}
     if os.getenv("AISTUDIO_KEEPALIVE_URL", "").strip():
         overrides["url"] = "AISTUDIO_KEEPALIVE_URL"
@@ -390,24 +390,79 @@ def _keepalive_env_override() -> dict[str, str]:
     return overrides
 
 
+def _keepalive_env_prefill() -> dict[str, object]:
+    """按 Settings 同口径解析环境变量当前值（表单预填用）。
+
+    解析口径与 config.Settings 字段构造一致：URL 原样 strip、间隔
+    int 失败回退 60、布尔按 not in ("0","false","False") 判真。
+    """
+    raw_interval = os.getenv("AISTUDIO_KEEPALIVE_INTERVAL")
+    try:
+        interval = (
+            int(raw_interval.strip()) if raw_interval and raw_interval.strip() else 60
+        )
+    except ValueError:
+        interval = 60
+    allow_private = os.getenv("AISTUDIO_KEEPALIVE_ALLOW_PRIVATE")
+    return {
+        "url": os.getenv("AISTUDIO_KEEPALIVE_URL", "").strip(),
+        "interval": interval,
+        "allow_private": allow_private is not None
+        and allow_private not in ("0", "false", "False"),
+    }
+
+
 def _keepalive_payload() -> dict[str, object]:
-    """组装保活卡片数据：yaml 设置 + env 覆盖 + 服务运行态。"""
+    """组装保活卡片数据：表单值（env 注入优先预填）+ 注入标注 + 运行态。"""
     from aistudio_api.infrastructure.gateway.model_defaults import (
         get_keepalive_settings,
     )
     from aistudio_api.infrastructure.outbound_keepalive import (
+        keepalive_runtime_override_active,
         outbound_keepalive_service,
     )
 
     yaml_settings = get_keepalive_settings()
+    env_overrides = _keepalive_env_override()
+    env_prefill = _keepalive_env_prefill()
+    # 表单初值：运行时覆盖生效中（面板保存过）→ 覆盖值；否则环境变量
+    # 注入的字段预填 env 值（面板保存即覆盖）；未注入字段保持 yaml 值。
+    from aistudio_api.infrastructure.outbound_keepalive import (
+        keepalive_runtime_override,
+    )
+
+    override = keepalive_runtime_override()
+    if override is not None:
+        form = {
+            "url": override[0],
+            "interval": override[1],
+            "allow_private": override[2],
+        }
+    else:
+        form = {
+            "url": str(env_prefill["url"])
+            if "url" in env_overrides
+            else str(yaml_settings["url"]),
+            "interval": (
+                int(env_prefill["interval"])  # type: ignore[arg-type]
+                if "interval" in env_overrides
+                else int(yaml_settings["interval"])  # type: ignore[arg-type]
+            ),
+            "allow_private": (
+                bool(env_prefill["allow_private"])
+                if "allow_private" in env_overrides
+                else bool(yaml_settings["allow_private"])
+            ),
+        }
     service = outbound_keepalive_service
     return {
-        **yaml_settings,
+        **form,
+        "yaml_url": str(yaml_settings["url"]),
+        "yaml_interval": int(yaml_settings["interval"]),  # type: ignore[arg-type]
+        "yaml_allow_private": bool(yaml_settings["allow_private"]),
         "running": service.is_running,
-        "env_overrides": _keepalive_env_override(),
-        "effective_url": (settings.keepalive_url or "").strip(),
-        "effective_interval": int(settings.keepalive_interval),
-        "effective_allow_private": bool(settings.keepalive_allow_private),
+        "env_overrides": env_overrides,
+        "runtime_override_active": keepalive_runtime_override_active(),
     }
 
 
@@ -431,6 +486,7 @@ async def update_keepalive_config(
     )
     from aistudio_api.infrastructure.outbound_keepalive import (
         outbound_keepalive_service,
+        set_keepalive_runtime_override,
         validate_keepalive_url,
     )
 
@@ -450,7 +506,14 @@ async def update_keepalive_config(
         interval=req.interval,
         allow_private=req.allow_private,
     )
-    # 配置已写盘，按新配置重启保活任务（URL 清空时即为停止）。
+    # 运行时覆盖 > 环境变量：面板保存立即生效（含覆盖环境变量注入值），
+    # 重启后回退环境变量/配置文件。之后按新配置重启保活任务（URL 清空
+    # 时即为停止）。
+    set_keepalive_runtime_override(
+        url=url,
+        interval=req.interval,
+        allow_private=req.allow_private,
+    )
     await outbound_keepalive_service.restart()
     logger.info(
         "出站保活配置已更新: url=%s, interval=%ds, allow_private=%s",
