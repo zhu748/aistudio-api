@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -323,7 +322,14 @@ class AistudioPart:
 
     def to_wire(self) -> list[object]:
         if self.raw_wire is not None:
-            return copy.deepcopy(self.raw_wire)
+            # 历史轮回放 part：raw_wire 由 model_turns 注入（每次 prepare
+            # 从缓存的 JSON 字符串 loads 出全新树）或 normalize 构建一次后
+            # 在 403 重试间复用。全部调用方（encode/json.dumps/摘要计算）
+            # 均只读；原先的整树 deepcopy 在多模态请求（MB 级 base64）上
+            # 每次编码白付一次全量深拷贝。顶层浅拷贝保留「返回独立列表」
+            # 语义（调用方对顶层做 append/下标写不影响本 part），嵌套子
+            # 数组按只读契约共享。
+            return list(self.raw_wire)
         wire = JspbArray()
         if self.thought:
             wire[PartIndex.THOUGHT_ALT_FLAG] = 1

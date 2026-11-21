@@ -188,6 +188,11 @@ class RuntimeState:
         usage: dict[str, object] | None = None,
         finish_reason: str | None = None,
     ) -> None:
+        # 统计键归一化（去 models/ 前缀 + 小写）：成功路径记 normalized.model
+        # （带前缀），错误路径可能记原始 model_path（不带前缀），同一模型
+        # 会在 stats.json 中分裂成两条记录；面板 /stats 虽按 removeprefix
+        # 展示，但持久化与 _MAX_TRACKED_MODELS 配额均按原始键计算。
+        model = model.removeprefix("models/").lower()
         if (
             model not in self.model_stats
             and len(self.model_stats) >= _MAX_TRACKED_MODELS

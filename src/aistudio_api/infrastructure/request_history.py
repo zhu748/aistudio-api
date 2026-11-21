@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import threading
@@ -24,6 +25,12 @@ class RequestHistory:
         # 需 schema 解析与锁，串行在 self._lock 内放大排队）。
         self._schema_ready = False
         self._schema_lock = threading.Lock()
+        # 写路径长连接复用：所有写方法（insert/clear/recover）都持
+        # self._lock 串行执行，同一时刻只有一个线程在用这条连接；WAL
+        # 模式下读写分离，长连接与原先的每调用 connect/close 语义一致
+        # （每连接 PRAGMA 在获取时已设置）。线程池并发读（query/metrics/
+        # options/get）继续走各自的临时连接，不受写锁串行影响。
+        self._write_conn: sqlite3.Connection | None = None
 
     def _ensure_schema(self, connection: sqlite3.Connection) -> None:
         if self._schema_ready:
@@ -73,8 +80,37 @@ class RequestHistory:
         finally:
             connection.close()
 
+    @contextmanager
+    def _write_connect(self) -> Iterator[sqlite3.Connection]:
+        """写路径复用长连接（调用方必须已持有 self._lock）。
+
+        每请求 2 次 insert 原先各自 connect+PRAGMA+close（毫秒级系统调用
+        开销 × 高并发）；WAL 单写者模型下复用一条连接是等价且标准的做法。
+        check_same_thread=False：insert 经 asyncio.to_thread 进入不同工作
+        线程，self._lock 已保证同一时刻只有一个线程在用这条连接。
+        连接损坏（磁盘错误等）时丢弃重建，不影响正确性。
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.touch(mode=0o600, exist_ok=True)
+        conn = self._write_conn
+        if conn is None:
+            conn = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
+            self._write_conn = conn
+        try:
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA secure_delete=ON")
+            self._ensure_schema(conn)
+            with conn:
+                yield conn
+        except Exception:
+            # 连接级故障（文件被外部替换/磁盘错误）：丢弃坏连接，下次重建。
+            self._write_conn = None
+            with contextlib.suppress(Exception):
+                conn.close()
+            raise
+
     def insert(self, record: dict[str, object]) -> None:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._write_connect() as connection:
             connection.execute(
                 "INSERT OR REPLACE INTO requests VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
@@ -186,7 +222,7 @@ class RequestHistory:
         return json.loads(row[0]) if row else None
 
     def clear(self) -> int:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._write_connect() as connection:
             count = connection.execute(
                 "SELECT COUNT(*) FROM requests WHERE result != 'running'"
             ).fetchone()[0]
@@ -195,7 +231,7 @@ class RequestHistory:
 
     def recover_interrupted(self) -> int:
         """Called once at server startup, before accepting new requests."""
-        with self._lock, self._connect() as connection:
+        with self._lock, self._write_connect() as connection:
             rows = connection.execute(
                 "SELECT request_id, payload FROM requests WHERE result = 'running'"
             ).fetchall()

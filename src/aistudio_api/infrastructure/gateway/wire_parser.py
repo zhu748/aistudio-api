@@ -522,6 +522,9 @@ def parse_response_chunk(chunk: list[object]) -> Candidate:
                         data=b_data,
                         size=int(str(img.get("size", 0))),
                         thought_signature=part.thought_signature or "",
+                        # 保留上游原始 base64：出站编码直接复用，消除
+                        # b64decode→b64encode 全量往返。
+                        raw_b64=str(part.inline_data[1]),
                     )
                 )
             if part.thought:

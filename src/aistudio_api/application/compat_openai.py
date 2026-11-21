@@ -497,9 +497,11 @@ def _openai_reasoning_effort(req: OpenAIChatCompletionRequest) -> str | None:
         effort = normalize_reasoning_effort_word(req.reasoning_effort)
         if effort is not None:
             return effort
+        # 词表外（如客户端自定义档位词）：记 warning 后继续尝试后续形态
+        # （thinking / enable_thinking 等）。显式词表外值不构成"显式关闭"，
+        # 提前 return None 会把客户端同时携带的其它思考参数一并丢弃。
         if req.reasoning_effort.strip():
             logger.warning("忽略无法识别的 reasoning_effort: %r", req.reasoning_effort)
-        return None
 
     # 2) OpenRouter / 新版网关：reasoning: {"effort": ...}
     if isinstance(req.reasoning, dict):

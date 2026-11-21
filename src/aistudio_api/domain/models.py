@@ -11,6 +11,10 @@ class GeneratedImage:
     data: bytes
     size: int
     thought_signature: str = ""
+    # 上游 inlineData 的原始 base64：出站重新编码（SSE / 响应模型）时直接
+    # 复用，免去每张图一次 b64decode→b64encode 全量往返（流式图片生成
+    # 场景图片会随 chunk 反复过这一对编解码）。data 变更时置 None 失效。
+    raw_b64: str | None = field(default=None, repr=False)
 
 
 @dataclass

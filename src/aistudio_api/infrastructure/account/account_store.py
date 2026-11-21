@@ -446,6 +446,17 @@ class AccountStore:
         registry = self._load_registry()
         return list(registry.accounts.values())
 
+    def account_id_index(self) -> frozenset[str]:
+        """已注册账号 ID 集合（O(1) 成员判定用）。
+
+        registry.accounts 是键即账号 ID 的 dict；调用方（rotator 的
+        get_account_stats 等）此前用 any(a.id == x for a in list_accounts())
+        做存在性判定，在「模型数 × 账号数」的 /stats 聚合里退化为平方级。
+        返回 frozenset 防调用方误改。
+        """
+        registry = self._load_registry()
+        return frozenset(registry.accounts.keys())
+
     def _find_registered_account(
         self, registry: Registry, account_id: str
     ) -> AccountMeta | None:

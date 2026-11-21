@@ -661,6 +661,7 @@ class _ResponsesStreamEmitter:
         ]
 
     def reasoning_delta(self, text: str) -> list[str]:
+        self._reasoning_accumulated.append(text)
         return [
             *self._open_reasoning(),
             self.sse(
@@ -720,6 +721,7 @@ class _ResponsesStreamEmitter:
 
     def text_delta(self, text: str) -> list[str]:
         events = self._open_message()
+        self._text_accumulated.append(text)
         events.append(
             self.sse(
                 "response.output_text.delta",
@@ -991,13 +993,11 @@ async def responses_stream_adapter(
                     inline = _as_dict(part.get("inlineData"))
                     if inline:
                         # Responses 无原生图片 part：与 Chat 侧一致降级为
-                        # markdown data-URL 占位，避免静默空回
+                        # markdown data-URL 占位，避免静默空回（单次构造，
+                        # 累积由 text_delta 内部完成）
                         mime = _as_str(inline.get("mimeType")) or "image/png"
                         data = _as_str(inline.get("data"))
                         if data:
-                            emitter._text_accumulated.append(
-                                f"\n\n![image](data:{mime};base64,{data})"
-                            )
                             for event in emitter.text_delta(
                                 f"\n\n![image](data:{mime};base64,{data})"
                             ):
@@ -1010,11 +1010,9 @@ async def responses_stream_adapter(
                         if text.startswith(_ERROR_TEXT_PREFIX):
                             continue
                         if part.get("thought") is True:
-                            emitter._reasoning_accumulated.append(text)
                             for event in emitter.reasoning_delta(text):
                                 yield event
                         else:
-                            emitter._text_accumulated.append(text)
                             for event in emitter.text_delta(text):
                                 yield event
         except Exception as exc:
