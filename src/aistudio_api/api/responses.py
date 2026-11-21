@@ -68,6 +68,14 @@ def to_gemini_usage_metadata(
     )
 
 
+def _image_inline_data(image: GeneratedImage) -> GeminiInlineDataResponse:
+    """图片 → inlineData 响应模型；优先复用上游原始 base64，免全量重编码。"""
+    data = image.raw_b64
+    if data is None:
+        data = base64.b64encode(image.data).decode("ascii")
+    return GeminiInlineDataResponse(mimeType=image.mime, data=data)
+
+
 def to_gemini_parts(
     content: str,
     function_calls: list[dict[str, object]] | None = None,
@@ -85,10 +93,7 @@ def to_gemini_parts(
             GeminiPartResponse(
                 thought=True,
                 thoughtSignature=image.thought_signature or None,
-                inlineData=GeminiInlineDataResponse(
-                    mimeType=image.mime,
-                    data=base64.b64encode(image.data).decode("ascii"),
-                ),
+                inlineData=_image_inline_data(image),
             )
         )
     if content:
@@ -97,10 +102,7 @@ def to_gemini_parts(
         parts.append(
             GeminiPartResponse(
                 thoughtSignature=image.thought_signature or None,
-                inlineData=GeminiInlineDataResponse(
-                    mimeType=image.mime,
-                    data=base64.b64encode(image.data).decode("ascii"),
-                ),
+                inlineData=_image_inline_data(image),
             )
         )
     for function_call in function_calls or []:

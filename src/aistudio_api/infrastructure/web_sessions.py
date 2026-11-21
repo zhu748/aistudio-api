@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import secrets
@@ -79,13 +80,12 @@ def _load_locked() -> None:
 
 def _persist_locked() -> None:
     payload = {"version": 1, "sessions": _sessions}
-    try:
-        path = _store_path()
-        atomic_write_json(path, payload)
-        path.chmod(0o600)
-    except Exception:
-        # 持久化失败不阻断登录：会话退化为进程内存活（重启需重登）
-        pass
+    # private=True：令牌是可登录凭据，临时文件与最终文件均按 0600 收紧
+    # （与其余凭据文件同规），替换后无需二次 chmod——原先先写成默认
+    # 权限再 chmod，存在一瞬全局可读窗口。
+    # 持久化失败不阻断登录：会话退化为进程内存活（重启需重登）。
+    with contextlib.suppress(Exception):
+        atomic_write_json(_store_path(), payload, private=True)
 
 
 def issue_web_session(password: str) -> tuple[str, float]:

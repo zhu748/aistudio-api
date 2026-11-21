@@ -61,8 +61,9 @@ class RingBufferHandler(logging.Handler):
             if record.exc_info:
                 exc_text = self._format_exc_tail(record)
                 if exc_text:
-                    message = f"{message}\n{exc_text}"
-            message = redact_text(message)
+                    # 异常尾文本首次进入（getMessage 不会包含它），单独脱敏；
+                    # 主消息在首行已脱敏，不做第二遍全量扫描。
+                    message = f"{message}\n{redact_text(exc_text)}"
             # 进环形缓冲前截断（L7）：开启 dump 时单条转储约 8KB，日志环
             # 容量固定且逐条 SSE 广播，超长消息会成倍放大内存占用与广播
             # 流量；截断到 2KB 保留头部足以定位问题。

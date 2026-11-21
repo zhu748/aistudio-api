@@ -304,7 +304,8 @@ async def test_runtime_state_record_model_stats():
     )
     state.record("models/gemini-3.8-flash", "rate_limited")
 
-    item = state.model_stats["models/gemini-3.8-flash"]
+    # 统计键已归一化（去 models/ 前缀 + 小写），成功/错误路径不再分裂
+    item = state.model_stats["gemini-3.8-flash"]
     assert item.requests == 3
     assert item.errors == 1
     assert item.success == 1

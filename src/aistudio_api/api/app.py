@@ -632,6 +632,12 @@ async def spa_navigation_middleware(request: Request, call_next):
             "/rotation",
             "/config",
             "/api-keys",
+            # FastAPI 自带端点：浏览器访问 /docs、/redoc 时 Accept 含
+            # text/html，若不在白名单内会被 SPA 中间件劫持为 index.html，
+            # API 文档页与 openapi.json 直接失效。
+            "/docs",
+            "/redoc",
+            "/openapi.json",
         )
     )
     is_accounts_spa = request.url.path in ("/accounts", "/accounts/")

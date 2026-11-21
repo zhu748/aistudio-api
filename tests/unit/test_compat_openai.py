@@ -1081,3 +1081,37 @@ async def test_e2e_openai_validation_error_format(
         assert body["error"]["message"]
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_openai_reasoning_effort_unknown_falls_through() -> None:
+    """词表外 reasoning_effort 不切断降级链：继续尝试 thinking 等后续形态。
+
+    2026-11 第二轮协议层审查修复：客户端发送未收录档位词（如新版 SDK 的
+    "generalist"）且同时携带 thinking 形态时，旧实现 return None 会把两者
+    一并丢弃，表现为"思考强度传不过去"。
+    """
+    req = OpenAIChatCompletionRequest.model_validate(
+        {
+            "model": "gemini-3.8-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "generalist",
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+        }
+    )
+    gemini_req, _ = await openai_to_gemini_request(req)
+    assert gemini_req.generationConfig is not None
+    assert gemini_req.generationConfig.reasoningEffort == "medium"
+
+    # 词表内值优先级不变：reasoning_effort 命中时不看后续形态
+    req2 = OpenAIChatCompletionRequest.model_validate(
+        {
+            "model": "gemini-3.8-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+        }
+    )
+    gemini_req2, _ = await openai_to_gemini_request(req2)
+    assert gemini_req2.generationConfig is not None
+    assert gemini_req2.generationConfig.reasoningEffort == "high"

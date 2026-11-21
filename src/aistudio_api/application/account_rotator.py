@@ -686,9 +686,7 @@ class AccountRotator:
     def get_account_stats(self, account_id: str) -> AccountStats | None:
         """获取指定账号的统计对象。"""
         stats = self._stats.get(account_id)
-        if stats is None and any(
-            a.id == account_id for a in self._store.list_accounts()
-        ):
+        if stats is None and account_id in self._store.account_id_index():
             stats = AccountStats(account_id=account_id)
             self._stats[account_id] = stats
         return stats

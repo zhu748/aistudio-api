@@ -700,7 +700,10 @@ def _function_declaration_name(declaration: dict[str, object]) -> str | None:
 # 事件循环上。以声明紧凑 JSON 为键缓存结果紧凑 JSON，命中经 json.loads
 # 返回全新对象（调用方任意突变不污染缓存）；键超限直接重算，防单个巨型
 # 声明撑爆缓存内存。编码链是纯函数（sha256 截短名确定性），结果可安全复用。
-_DECLARATION_CACHE_MAX = 128
+# 上限 512：MCP 重度 Agent 单客户端即可携带 100+ 工具，多客户端共享网关时
+# 128 会触发「逐出一半 → 全量重编码 → 再逐出」抖动；512 条 × 键值均 256KB
+# 硬顶的组合上界可控（值与键同量级，实际 KB 级/条）。
+_DECLARATION_CACHE_MAX = 512
 _DECLARATION_CACHE_MAX_KEY_BYTES = 256 * 1024
 _declaration_cache: dict[str, str] = {}
 
