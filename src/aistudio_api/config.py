@@ -250,14 +250,56 @@ def discover_keepalive_url() -> str:
 
 
 def discover_keepalive_interval() -> int:
-    """解析保活间隔秒数（AISTUDIO_KEEPALIVE_INTERVAL，默认 60，下限 5）。"""
+    """解析保活间隔秒数（env > config.yaml network.keepalive_interval，默认 60，下限 5）。
+
+    与 URL 同源的 env > yaml 链：面板保存写入 yaml，重启后必须继续生效
+    （原先只读 env，面板保存的间隔重启后静默回退 60s）。
+    """
     raw = os.getenv("AISTUDIO_KEEPALIVE_INTERVAL")
-    if raw is None or not raw.strip():
-        return 60
+    if raw is not None and raw.strip():
+        try:
+            return int(raw.strip())
+        except ValueError:
+            pass
     try:
-        return int(raw.strip())
-    except ValueError:
-        return 60
+        config = yaml.safe_load(resolve_config_file().read_text(encoding="utf-8"))
+        network = config.get("network", {}) if isinstance(config, dict) else {}
+        if isinstance(network, dict) and "keepalive_interval" in network:
+            value = network["keepalive_interval"]
+            if isinstance(value, int | float) and not isinstance(value, bool):
+                return int(value)
+            if isinstance(value, str) and value.strip():
+                try:
+                    return int(value.strip())
+                except ValueError:
+                    pass
+    except (OSError, ValueError, yaml.YAMLError):
+        pass
+    return 60
+
+
+def discover_keepalive_allow_private() -> bool:
+    """解析保活目标是否允许私网地址（env > config.yaml，默认 False）。
+
+    与 interval 同源的 env > yaml 链：面板保存的 allow_private 重启后必须
+    继续生效，否则私网自保活目标（http://10.x.x.x/healthz）重启后校验
+    失败、保活任务静默不启动。
+    """
+    raw = os.getenv("AISTUDIO_KEEPALIVE_ALLOW_PRIVATE")
+    if raw is not None and raw.strip():
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    try:
+        config = yaml.safe_load(resolve_config_file().read_text(encoding="utf-8"))
+        network = config.get("network", {}) if isinstance(config, dict) else {}
+        if isinstance(network, dict) and "keepalive_allow_private" in network:
+            value = network["keepalive_allow_private"]
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on")
+    except (OSError, ValueError, yaml.YAMLError):
+        pass
+    return False
 
 
 def resolve_timezone() -> str:
@@ -300,7 +342,6 @@ class Settings:
     dump_requests: bool = _load_dump_requests_env()
     dump_to_file: bool = _load_dump_to_file_env()
     dump_dir: str = os.getenv("AISTUDIO_DUMP_DIR", "")
-    log_level: str = "INFO"
     allow_no_auth: bool = _load_bool_env("AISTUDIO_ALLOW_NO_AUTH", default=False)
     signer_secret: str = os.getenv("AISTUDIO_SIGNER_SECRET", "")
     signer_secret_url: str = os.getenv("AISTUDIO_SIGNER_SECRET_URL", "").rstrip("/")
@@ -343,9 +384,9 @@ class Settings:
     keepalive_interval: int = max(
         5, discover_keepalive_interval()
     )  # 秒，下限 5（见 outbound_keepalive._MIN_INTERVAL_SECONDS）
-    keepalive_allow_private: bool = _load_bool_env(
-        "AISTUDIO_KEEPALIVE_ALLOW_PRIVATE", default=False
-    )
+    # env > config.yaml network.keepalive_allow_private（与 URL/interval 同链，
+    # 面板保存的重启后继续生效）
+    keepalive_allow_private: bool = discover_keepalive_allow_private()
 
     @property
     def auth_enabled(self) -> bool:

@@ -34,6 +34,9 @@ export const useAccountsStore = defineStore('accounts', () => {
   const rowCache = new Map<string, AccountWithStats>()
 
   function sameFields(fresh: Record<string, unknown>, prev: Record<string, unknown>): boolean {
+    // 键数前置：只遍历 fresh 键检测不到「字段从有值变为消失」（prev 独有键），
+    // 后端一旦引入 exclude_none 类优化就会出现 429 徽标永久残留式 UI 停更。
+    if (Object.keys(fresh).length !== Object.keys(prev).length) return false
     for (const k of Object.keys(fresh)) {
       if (fresh[k] !== prev[k]) return false
     }
@@ -66,6 +69,8 @@ export const useAccountsStore = defineStore('accounts', () => {
 
   // 请求代次：轮询与操作后的 fetchAll 可能乱序返回，只让最新一次写状态。
   let fetchSeq = 0
+  // fetchAll 错误去重：同一错误文本只弹一次 toast，恢复后重新武装
+  let lastFetchError = ''
 
   async function fetchAll() {
     const seq = ++fetchSeq
@@ -80,10 +85,17 @@ export const useAccountsStore = defineStore('accounts', () => {
 
       if (accsRes.status === 'fulfilled') {
         accounts.value = accsRes.value
+        // 恢复后清零去重门：下次故障重新提示
+        lastFetchError = ''
       } else {
         const reasonMsg = accsRes.reason instanceof Error ? accsRes.reason.message : String(accsRes.reason)
         console.warn('获取账号列表失败，保留当前展示数据:', accsRes.reason)
-        useToastStore().error(`获取账号列表失败: ${reasonMsg}`)
+        // 去重门（与 statsError 同款）：服务故障期轮询退避封顶 60s，
+        // 每次都弹错会刷屏；同一错误只报一次，恢复后重新武装。
+        if (reasonMsg !== lastFetchError) {
+          lastFetchError = reasonMsg
+          useToastStore().error(`获取账号列表失败: ${reasonMsg}`)
+        }
       }
 
       if (activeRes.status === 'fulfilled') {

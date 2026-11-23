@@ -50,6 +50,8 @@ logging:
   dump_requests: false
   dump_to_file: false
   dump_dir: dumps
+  # 每类交换（成功/失败）保留的快照数；0 = 关闭。面板可写（设置 → 运行日志）。
+  upstream_snapshot_keep: 10
 
 rotator:
   max_retries: 5
@@ -73,7 +75,8 @@ paid_model_rules:
     contains: ["veo", "ultra", "antigravity", "carbon"]
     required_tiers: ["Ultra", "Ultra_20X"]
   pro_required:
-    contains: ["argon", "image", "imagen"]
+    # 2026-11-12 目录实测：omni/deep-research/lyria 同为付费门控模型
+    contains: ["argon", "image", "imagen", "omni", "deep-research", "lyria"]
     required_tiers: ["Pro", "Ultra", "Ultra_20X"]
 
 model_defaults:
@@ -92,6 +95,7 @@ model_defaults:
           - veo-
         contains:
           - veo
+          - omni
       disable_safety_settings: true
     - name: gemma_models
       match:

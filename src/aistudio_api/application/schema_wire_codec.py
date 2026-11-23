@@ -392,22 +392,43 @@ _RESPONSE_SCHEMA_NOTE = "The response must follow this JSON Schema: "
 
 # 声明侧：wire 无法表达、需附加完整 schema 到 description 的键
 # （AIStudio2API encodeFunctionDeclaration 的字符串包含判定，改为键遍历）
+# 对称性：与响应侧集合对齐（原先 exclusiveMaximum/uniqueItems/multipleOf
+# 声明侧静默丢失不触发兑底——exclusiveMaximum 被降级编码为 MAXIMUM 含边界，
+# 语义反转）；并补 patternProperties/dependent*/contains 系（两侧均漏）。
 _DECLARATION_LOSSY_KEYS = frozenset(
     {
         "additionalProperties",
         "additional_properties",
         "prefixItems",
         "prefix_items",
-        "exclusiveMinimum",
-        "exclusive_minimum",
         "propertyNames",
         "property_names",
+        "exclusiveMinimum",
+        "exclusive_minimum",
+        "exclusiveMaximum",
+        "exclusive_maximum",
+        "uniqueItems",
+        "unique_items",
+        "multipleOf",
+        "multiple_of",
+        "patternProperties",
+        "pattern_properties",
+        "dependentSchemas",
+        "dependent_schemas",
+        "dependentRequired",
+        "dependent_required",
+        "contains",
+        "minContains",
+        "min_contains",
+        "maxContains",
+        "max_contains",
         "$ref",
     }
 )
 
 # 结构化输出侧：jsonSchemaBeyondPlayground 的键集（additionalProperties
-# 仅真值时触发，单独判断）
+# 仅真值时触发，单独判断）；contains/dependent*/patternProperties 与声明
+# 侧同批补齐（wire 均无法表达）
 _RESPONSE_LOSSY_KEYS = frozenset(
     {
         "prefixItems",
@@ -420,6 +441,19 @@ _RESPONSE_LOSSY_KEYS = frozenset(
         "exclusive_maximum",
         "uniqueItems",
         "unique_items",
+        "multipleOf",
+        "multiple_of",
+        "patternProperties",
+        "pattern_properties",
+        "dependentSchemas",
+        "dependent_schemas",
+        "dependentRequired",
+        "dependent_required",
+        "contains",
+        "minContains",
+        "min_contains",
+        "maxContains",
+        "max_contains",
     }
 )
 

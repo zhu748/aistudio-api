@@ -245,6 +245,8 @@ async def _cookie_rotation_loop(
 ) -> None:
     """后台定时轮换账号滚动 Cookie (__Secure-1PSIDTS / SIDCC)，间隔 7 分钟。"""
 
+    # 连续失败计数：首次失败与每 5 次连续失败升级 warning（见下方 except）
+    _rotation_failures = 0
     from aistudio_api.infrastructure.account.cookie_parser import (
         compute_session_anchor,
         load_cookies_from_auth_file,
@@ -333,7 +335,30 @@ async def _cookie_rotation_loop(
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.debug("后台 Cookie 轮换巡检异常: %s", e)
+            # 持续性后台机制静默死亡不可接受：滚动凭据（__Secure-1PSIDTS）
+            # 在 ~7 天窗口内无法续期会让账号渐进失效，只记 debug 的话运维
+            # 只能从「账号批量过期」倒查。首次失败升级 warning，此后每 5 次
+            # 连续失败再报一次（避免代理抖动期刷屏）。
+            _rotation_failures += 1
+            if _rotation_failures == 1 or _rotation_failures % 5 == 0:
+                logger.warning(
+                    "后台 Cookie 轮换巡检异常（连续第 %d 次）: %s",
+                    _rotation_failures,
+                    e,
+                )
+            else:
+                logger.debug(
+                    "后台 Cookie 轮换巡检异常（连续第 %d 次）: %s",
+                    _rotation_failures,
+                    e,
+                )
+        else:
+            if _rotation_failures:
+                logger.info(
+                    "后台 Cookie 轮换巡检恢复（此前连续失败 %d 次）",
+                    _rotation_failures,
+                )
+            _rotation_failures = 0
         await asyncio.sleep(60.0)
 
 
@@ -370,42 +395,58 @@ async def lifespan(_app: FastAPI):
     client = AIStudioClient()
     runtime_state.client = client
 
-    account_store, account_service, rotator, env_report = await _init_core_services(
-        client
-    )
-    runtime_state.account_service = account_service
-    runtime_state.rotator = rotator
+    tier_task: asyncio.Task[None] | None = None
+    rotate_task: asyncio.Task[None] | None = None
+    env_probe_task: asyncio.Task[None] | None = None
+    try:
+        account_store, account_service, rotator, env_report = await _init_core_services(
+            client
+        )
+        runtime_state.account_service = account_service
+        runtime_state.rotator = rotator
 
-    tier_task = asyncio.create_task(_auto_refresh_tiers(account_store))
-    rotate_task = asyncio.create_task(
-        _cookie_rotation_loop(account_store, account_service, rotator, client)
-    )
-
-    # 模型目录（含思考档位/付费状态元数据）后台周期刷新：启动即预热，
-    # 此后每 60s 唤醒一次（真实拉网频率由 get_models 内部 600s TTL 控制，
-    # 失败按内部退避 ≤60s 在下一 tick 重试）。此前刷新是"被动周期"——
-    # 仅当 /v1beta/models、/v1/models 或管理端模型列表被请求时触发，
-    # 从不访问模型列表端点的客户端（模型名写死）会让聊天路径长期读到
-    # 静态保底快照，目录档位迁移（如 2026-11-15 hydrogen 5→6）随之漏过。
-    model_discovery.start_background_refresh()
-
-    # 新注入的环境变量账号：后台探活多登子账号 (u/1..u/N)
-    env_probe_task = None
-    if env_report.created_ids:
-        env_probe_task = asyncio.create_task(
-            _env_subaccount_probe(account_store, list(env_report.created_ids))
+        tier_task = asyncio.create_task(_auto_refresh_tiers(account_store))
+        rotate_task = asyncio.create_task(
+            _cookie_rotation_loop(account_store, account_service, rotator, client)
         )
 
-    # 出站保活（AISTUDIO_KEEPALIVE_URL，未配置时不启动、零开销，
-    # 见 infrastructure/outbound_keepalive.py）。
-    from aistudio_api.infrastructure.outbound_keepalive import (
-        outbound_keepalive_service,
-    )
+        # 模型目录（含思考档位/付费状态元数据）后台周期刷新：启动即预热，
+        # 此后每 60s 唤醒一次（真实拉网频率由 get_models 内部 600s TTL 控制，
+        # 失败按内部退避 ≤60s 在下一 tick 重试）。此前刷新是"被动周期"——
+        # 仅当 /v1beta/models、/v1/models 或管理端模型列表被请求时触发，
+        # 从不访问模型列表端点的客户端（模型名写死）会让聊天路径长期读到
+        # 静态保底快照，目录档位迁移（如 2026-11-15 hydrogen 5→6）随之漏过。
+        model_discovery.start_background_refresh()
 
-    try:
-        await outbound_keepalive_service.start()
-    except Exception as e:
-        logger.warning("保活服务启动失败（不影响主服务）: %s - %s", type(e).__name__, e)
+        # 新注入的环境变量账号：后台探活多登子账号 (u/1..u/N)
+        if env_report.created_ids:
+            env_probe_task = asyncio.create_task(
+                _env_subaccount_probe(account_store, list(env_report.created_ids))
+            )
+
+        # 出站保活（AISTUDIO_KEEPALIVE_URL，未配置时不启动、零开销，
+        # 见 infrastructure/outbound_keepalive.py）。
+        from aistudio_api.infrastructure.outbound_keepalive import (
+            outbound_keepalive_service,
+        )
+
+        try:
+            await outbound_keepalive_service.start()
+        except Exception as e:
+            logger.warning(
+                "保活服务启动失败（不影响主服务）: %s - %s", type(e).__name__, e
+            )
+    except BaseException:
+        # 启动段（后台任务创建之后）抛异常时 lifespan 不会进入 yield/finally，
+        # 已创建的后台任务与已初始化的服务将无人回收：这里显式走优雅关停
+        # 后重抛，保证与正常关停同一清理语义。
+        await _graceful_shutdown(
+            tier_task,
+            rotate_task,
+            env_probe_task,
+            client,
+        )
+        raise
 
     try:
         yield
@@ -419,8 +460,8 @@ async def lifespan(_app: FastAPI):
 
 
 async def _graceful_shutdown(
-    tier_task: asyncio.Task[None],
-    rotate_task: asyncio.Task[None],
+    tier_task: asyncio.Task[None] | None,
+    rotate_task: asyncio.Task[None] | None,
     env_probe_task: asyncio.Task[None] | None,
     client: AIStudioClient,
 ) -> None:
@@ -464,6 +505,16 @@ async def _graceful_shutdown(
         await asyncio.to_thread(runtime_state.save_stats)
         pending_rotator = runtime_state.rotator
         if pending_rotator is not None:
+            # rotator 自己的防抖 flush 任务同样先排干再补快照：飞行中的
+            # _flush_latest_state 慢写盘若不被等待，会与下面的同步快照
+            # 并发写同一 rotator_state.json（tmp+rename 完成顺序不定），
+            # 后完成的旧快照会覆盖含最后一批记账的新快照。
+            flush_task = getattr(pending_rotator, "_save_task", None)
+            if flush_task is not None and not flush_task.done():
+                try:
+                    await flush_task
+                except Exception as e:
+                    logger.debug("等待 rotator 防抖落盘失败: %s", e)
             await asyncio.to_thread(pending_rotator.save_state)
     except Exception as e:
         logger.debug("关闭时刷新统计/调度状态失败: %s", e)

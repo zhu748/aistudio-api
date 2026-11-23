@@ -200,7 +200,7 @@ uv run python3 main.py server --port 8080
 <details>
 <summary><b>【进阶可选】编译本地高性能签名服务</b></summary>
 
-前置要求：已安装 Go 1.22+ 与 zig（或 clang / gcc）：
+前置要求：已安装 Go 1.27+ 与 zig（或 clang / gcc；Go 版本以 waa-signer/go.mod 为准）：
 ```bash
 bash waa-signer/build.sh
 ```
@@ -404,6 +404,13 @@ Web 面板在「导入账号」「编辑账号」与「全局代理」处提供*
 | `AISTUDIO_DUMP_MAX_AGE_DAYS` | int | `7` | 详细转储文件最多保留天数 |
 | `AISTUDIO_DUMP_MAX_TOTAL_BYTES` | int | `268435456` | 详细转储目录最大总容量（默认 256 MiB） |
 | `AISTUDIO_SIGNER_SECRET` / `AISTUDIO_SIGNER_SECRET_URL` | string | `""` | 为对应签名节点配置 Bearer 共享密钥；仅发给匹配 URL 的节点 |
+| `AISTUDIO_AUTH_FILE` | string | `""` | 显式指定启动账号的 auth.json 路径（默认从 `AISTUDIO_ACCOUNTS_DIR` 自动发现） |
+| `AISTUDIO_TMP_DIR` | string | 系统临时目录 | 媒体转码等临时文件目录 |
+| `AISTUDIO_CORS_ALLOWED_ORIGINS` | string | `""` | 管理 API 的 CORS 白名单（逗号分隔的 origin 列表，默认同源策略） |
+| `AISTUDIO_IMPORT_ROOTS` | string | `""` | `import-bundle` 文件路径导入的额外允许目录（逗号分隔；默认仅允许数据目录） |
+| `AISTUDIO_WAA_PROOF_CACHE_TTL` | float | `300` | WAA proof 复用缓存的 TTL（秒） |
+| `AISTUDIO_ACCEPT_LANGUAGE` | string | 浏览器指纹 | 上游请求的 Accept-Language 覆盖（默认按指纹配置） |
+| `AISTUDIO_SIGNER_TIMEOUT` | float | 本地 95 / 远程 30 | 签名器 mint 请求的 HTTP 总超时（秒）；本地默认对齐 Go 侧 90s 冷启动预算 |
 
 #### 本地 WAA 签名器（waa-signer）环境变量
 

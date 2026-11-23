@@ -644,7 +644,7 @@ func (decoder *qpackDecoder) decode(ctx context.Context, block []byte, stream in
 		base = required + delta
 	}
 	if decoder.table.base < required {
-		if decoder.blocked > firefoxQPACKBlockedStreams {
+		if decoder.blocked >= firefoxQPACKBlockedStreams {
 			return nil, fmt.Errorf("QPACK 阻塞流超过 %d", firefoxQPACKBlockedStreams)
 		}
 		decoder.blocked++

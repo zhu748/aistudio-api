@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from aistudio_api.api.dependencies import get_account_service, get_runtime_state
@@ -26,6 +26,7 @@ from aistudio_api.infrastructure.account.cookie_parser import (
     probe_account_email,
 )
 from aistudio_api.infrastructure.utils.logger import get_logger
+from aistudio_api.infrastructure.utils.redaction import redact_text
 
 if TYPE_CHECKING:
     from aistudio_api.api.state import RuntimeState
@@ -34,6 +35,18 @@ if TYPE_CHECKING:
 logger = get_logger("routes.account_imports")
 
 router = APIRouter(prefix="/accounts")
+
+
+def _masked_proxy_for_request(
+    request: Request | None, proxy_url: str | None
+) -> str | None:
+    """API Key 回退会话掩码代理凭据（与账号列表同口径，见 routes_accounts）。"""
+    if proxy_url and request is not None:
+        from aistudio_api.api.dependencies import is_admin_password_session
+
+        if not is_admin_password_session(request):
+            return redact_text(proxy_url)
+    return proxy_url
 
 
 class ImportCookiesRequest(BaseModel):
@@ -92,6 +105,7 @@ class ImportBundleResponse(BaseModel):
 @router.post("/import-cookies", response_model=ImportCookiesResponse)
 async def import_cookies(
     req: ImportCookiesRequest,
+    request: Request,
     account_service: AccountService = Depends(get_account_service),
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> ImportCookiesResponse:
@@ -154,7 +168,7 @@ async def import_cookies(
                     ]
                 )
                 bundle_res = await import_bundle(
-                    bundle_req, account_service, runtime_state
+                    bundle_req, request, account_service, runtime_state
                 )
                 first_id = (
                     bundle_res.accounts[0].id if bundle_res.accounts else "bundle"
@@ -164,7 +178,7 @@ async def import_cookies(
                     name=f"已成功批量导入 {bundle_res.imported_count} 个账号",
                     cookie_count=bundle_res.imported_count,
                     auth_user="0",
-                    proxy_url=effective_proxy,
+                    proxy_url=_masked_proxy_for_request(request, effective_proxy),
                 )
 
             # Single account JSON export
@@ -258,13 +272,14 @@ async def import_cookies(
         cookie_count=cookie_count,
         auth_user=account.auth_user,
         tier=account.tier,
-        proxy_url=account.proxy_url,
+        proxy_url=_masked_proxy_for_request(request, account.proxy_url),
     )
 
 
 @router.post("/probe-import", response_model=ProbeAndImportResponse)
 async def probe_and_import(
     req: ProbeAndImportRequest,
+    request: Request,
     account_service: AccountService = Depends(get_account_service),
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> ProbeAndImportResponse:
@@ -295,7 +310,11 @@ async def probe_and_import(
     import secrets
 
     cid = f"cookie_{secrets.token_hex(4)}"
-    metas = account_service.batch_import_accounts(
+    # 批量导入逐账号的多文件写序列（save_account 是多文件原子写 + 兄弟
+    # Cookie 同步重读全部账号文件）下放线程池：M 个账号 ≈ M×(5-15ms)
+    # 同步 IO，留在事件循环会拖停所有在途 SSE 流（与另两条导入路径一致）。
+    metas = await asyncio.to_thread(
+        account_service.batch_import_accounts,
         probed_list=probed,
         storage_state=storage_state,
         prefix=prefix,
@@ -308,7 +327,9 @@ async def probe_and_import(
             rotator.add_account(meta.id)
             rotator.clear_cooldown(meta.id)
 
-    imported_accounts = [to_account_response(account) for account in metas]
+    imported_accounts = [
+        to_account_response(account, request=request) for account in metas
+    ]
 
     client_obj = getattr(runtime_state, "client", None)
     if not had_active_account and metas and client_obj is not None:
@@ -325,6 +346,7 @@ async def probe_and_import(
 @router.post("/import-bundle", response_model=ImportBundleResponse)
 async def import_bundle(
     req: ImportBundleRequest,
+    request: Request,
     account_service: AccountService = Depends(get_account_service),
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> ImportBundleResponse:
@@ -497,7 +519,7 @@ async def import_bundle(
         if rotator:
             rotator.add_account(account.id)
             rotator.clear_cooldown(account.id)
-        imported_accounts.append(to_account_response(account))
+        imported_accounts.append(to_account_response(account, request=request))
     if not had_active_account and imported_accounts:
         account_service.set_active_account(imported_accounts[0].id)
         client_obj = getattr(runtime_state, "client", None)

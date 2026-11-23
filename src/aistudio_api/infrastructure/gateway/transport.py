@@ -12,7 +12,7 @@ import math
 import re
 import ssl
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
@@ -287,6 +287,12 @@ def _persist_set_cookies(
     线程逐键就地变更（并发插入会触发 "dictionary changed size during
     iteration"，殃及无辜并发请求）；先在快照上合并，再一次性原子写回
     （单次 dict.update 为 C 级调用，读侧也先做快照，两者叠加后无撕裂窗口）。
+
+    新鲜度仲裁：磁盘只接受本次 Set-Cookie 实际返回的键（``updated``）。
+    原先把「请求开始时的快照 + 本次更新」全量写回——若期间后台 Cookie
+    轮换/403 重签已把其它滚动键推进到新值，旧快照会把它们回退（SIDCC/
+    3PSIDTS 回退 → 后续 401 风暴）。完整快照仍传给 update_account_cookies
+    用于会话锚点计算，但匹配到的账号只覆盖 updated 键。
     """
     if cookies is not None:
         snapshot = dict(cookies)
@@ -308,6 +314,7 @@ def _persist_set_cookies(
         AccountStore().update_account_cookies(
             auth_file=auth_file,
             new_cookies=target_map,
+            overwrite_keys=set(updated),
         )
     except Exception as e:
         logger.warning("持久化 Set-Cookie 失败: %s", e)
@@ -704,20 +711,36 @@ class HTTPStreamTransport:
         self._retired_clients.clear()
 
     async def retire_stale_clients(self, keep_proxy: str | None) -> None:
-        """退役除 keep_proxy 外的所有客户端池（面板切换全局代理时调用）。
+        """退役除 keep_proxy 外的所有客户端池（面板切换全局代理时调用）。"""
+        keep_key = resolve_proxy_url_cached(keep_proxy) or ""
+        await self._retire_clients_except({keep_key})
 
-        照抄 WaaSigner.reconfigure 的「retired + 延迟关闭」模式：立即从
-        池中摘除、延迟 aclose，让并发在途请求持有的引用能安全跑完，
-        而非滞留到进程退出（反复切代理会累积多个满配连接池）。
+    async def retire_clients_not_in_use(
+        self, keep_proxies: Iterable[str | None]
+    ) -> None:
+        """退役不在 keep 集合内的客户端池（账号代理变更后按在用代理集清理）。
+
+        账号级代理变更不会走 set_default_proxy，旧代理的满配连接池与
+        turn/sstp 桥接子进程会滞留到进程退出；变更后以「全局代理 +
+        全部账号代理」为保留集调用本方法回收其余池。直连键（空串）
+        恒保留：全局代理为空时所有请求都落在直连池上。
 
         保留键用 resolve_proxy_url_cached（无副作用）：桥接代理（turn/sstp）
         的客户端池以「已解析的本地 SOCKS5」为键，而冷启动解析会在此处
         触发子进程拉起，退役路径绝不能有这种副作用。
         """
-        keep_key = resolve_proxy_url_cached(keep_proxy) or ""
+        keep_keys = {resolve_proxy_url_cached(p) or "" for p in keep_proxies}
+        keep_keys.add("")
+        await self._retire_clients_except(keep_keys)
+
+    async def _retire_clients_except(self, keep_keys: set[str]) -> None:
+        """照抄 WaaSigner.reconfigure 的「retired + 延迟关闭」模式：立即从
+        池中摘除、延迟 aclose，让并发在途请求持有的引用能安全跑完，
+        而非滞留到进程退出（反复切代理会累积多个满配连接池）。
+        """
         retired: list[httpx.AsyncClient] = []
         async with self._get_client_lock():
-            for key in [k for k in self._clients if k != keep_key]:
+            for key in [k for k in self._clients if k not in keep_keys]:
                 retired.append(self._clients.pop(key))
             self._preflight_cache = {
                 key: expiry
@@ -1142,18 +1165,21 @@ class HTTPStreamTransport:
                         if len(head_sample) < 65536:
                             head_sample.extend(chunk[: 65536 - len(head_sample)])
                         yield ("chunk", chunk)
-                await asyncio.to_thread(
-                    save_upstream_exchange,
-                    url=url,
-                    wire_headers=list(req.headers.multi_items()),
-                    body=body,
-                    status=resp.status_code,
-                    response_sample=bytes(head_sample),
-                    response_headers=dict(resp.headers.multi_items()),
-                    response_http_version=resp.http_version,
-                    elapsed_ms=(time.perf_counter() - t0) * 1000,
-                    proxy_url=effective_proxy,
-                )
+                # 与非流式路径同款门禁前置：辅助 RPC 成功 / 成功快照保留
+                # 为 0 时跳过线程派发（此处是最热的 GenerateContent 流路径）。
+                if should_save_exchange(url, resp.status_code):
+                    await asyncio.to_thread(
+                        save_upstream_exchange,
+                        url=url,
+                        wire_headers=list(req.headers.multi_items()),
+                        body=body,
+                        status=resp.status_code,
+                        response_sample=bytes(head_sample),
+                        response_headers=dict(resp.headers.multi_items()),
+                        response_http_version=resp.http_version,
+                        elapsed_ms=(time.perf_counter() - t0) * 1000,
+                        proxy_url=effective_proxy,
+                    )
 
             except Exception as exc:
                 err_detail = (

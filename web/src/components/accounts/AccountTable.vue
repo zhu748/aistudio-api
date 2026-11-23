@@ -64,6 +64,16 @@ watch(
     detailsId.value = String(id || '')
   },
 )
+// 账号被删除（另一标签页/管理员）后 Modal 自动关闭，但 URL 中的
+// account_id 残留：刷新/分享该链接会发起一次注定为空的最近调用请求。
+// 列表非空才判定「已删除」——首帧列表未加载完时不能误清深链参数。
+watch(detailAccount, (acc) => {
+  if (!acc && props.accounts.length > 0 && route.query.account_id) {
+    const query = { ...route.query }
+    delete query.account_id
+    void router.replace({ query })
+  }
+})
 watch(
   detailsId,
   async (id) => {

@@ -45,6 +45,11 @@ export const THINKING_LEVEL_OPTIONS = [
   { value: 'LOW', label: '轻度思考 (LOW)', description: '兼顾速度与简单推理' },
   { value: 'MEDIUM', label: '中度思考 (MEDIUM)', description: '平衡模式' },
   { value: 'HIGH', label: '深度思考 (HIGH)', description: '复杂推理模型推荐' },
+  // 后端 ThinkingLevel 为六档 IntEnum（LOW=1…VERY_HIGH=5、EXTRA_HIGH=6），
+  // 面板原先只有四档：配置文件中的数字档位（如 level: 2）加载时无匹配项
+  // 显示为第一项（视觉谎报），且无法表达高档位/恢复默认。
+  { value: 'VERY_HIGH', label: '超深度思考 (VERY_HIGH)', description: '长链推理（后端档位 5）' },
+  { value: 'EXTRA_HIGH', label: '极致思考 (EXTRA_HIGH)', description: '最高档推理（后端档位 6，hydrogen 系 Extra High）' },
   { value: null, label: '遵循模型默认 (Null)', description: '遵循模型默认' },
 ]
 
@@ -198,7 +203,7 @@ export const CONFIG_SCHEMA: Record<string, FieldDefinition> = {
     category: 'generation',
     type: 'indexes',
     description: '请求发送给 Google 前，从内部 wire 数组中强制清空的字段下标。',
-    explanation: 'Google 部分生图模型若携带下标 7, 13, 17 会报错 400 Bad Request，清空这些下标可确保生图请求成功。',
+    explanation: '请求发送给 Google 前，从内部 wire 数组中强制清空的字段下标。部分生图模型携带特定下标（当前配置清空 3/4/5/6/13/16）会报错 400 Bad Request，清空这些下标可确保生图请求成功。',
     defaultValue: [],
     tags: ['高级项', '生图兼容'],
   },

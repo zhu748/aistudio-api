@@ -37,6 +37,7 @@ from aistudio_api.application.api_service_gemini import (
     GeminiStreamResponse,
     handle_gemini_generate_content,
 )
+from aistudio_api.application.compat_openai import _normalized_stop_sequences
 from aistudio_api.application.compat_service import (
     _openai_reasoning_effort,
     build_claude_message,
@@ -175,6 +176,8 @@ async def openai_chat_completions(
         include_usage = False
         if isinstance(req.stream_options, dict):
             include_usage = _truthy(req.stream_options.get("include_usage"))
+        # 响应侧停止词防御需要原始 stop（上游不执行 stopSequences 时截断）
+        stop_sequences = _normalized_stop_sequences(req.stop)
 
         logger.info(
             "OpenAI 兼容请求: model=%s → %s, stream=%s, 轮数=%d",
@@ -200,6 +203,7 @@ async def openai_chat_completions(
                         else response.body_iterator,
                         requested_model=req.model,
                         include_usage=include_usage,
+                        stop_sequences=stop_sequences,
                         register_failure=lambda handler: setattr(
                             http_request.state, "stream_failure", handler
                         ),
@@ -209,7 +213,11 @@ async def openai_chat_completions(
                 )
         elif isinstance(response, GeminiGenerateContentResponse):
             return JSONResponse(
-                content=build_openai_completion(response, requested_model=req.model)
+                content=build_openai_completion(
+                    response,
+                    requested_model=req.model,
+                    stop_sequences=stop_sequences,
+                )
             )
         raise HTTPException(
             500,

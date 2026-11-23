@@ -199,14 +199,16 @@ async function connectStream() {
       if (!isCurrent(seq)) return
       if (!res.ticket) {
         loadError.value = '无法获取日志流访问票据'
-        connState.value = 'idle'
+        scheduleTicketRetry(seq)
         return
       }
       params.set('ticket', res.ticket)
     } catch {
       if (!isCurrent(seq)) return
-      loadError.value = '无法获取日志流访问票据，请确认登录状态'
-      connState.value = 'idle'
+      // 后端重启窗口内票据端点不可达：与 SSE 断开同款退避重连，
+      // 原先直接放弃会让「实时」开关显示已暂停且不再自愈。
+      loadError.value = '无法获取日志流访问票据，5 秒后自动重试'
+      scheduleTicketRetry(seq)
       return
     }
   }
@@ -274,6 +276,20 @@ async function connectStream() {
 
 function isCurrent(seq: number): boolean {
   return seq === connectSeq
+}
+
+/** 票据获取失败后的退避重连（与 SSE 断开同款 5s 节奏；代次守卫防陈旧重连） */
+function scheduleTicketRetry(seq: number) {
+  if (!isCurrent(seq) || !live.value) {
+    connState.value = 'idle'
+    return
+  }
+  connState.value = 'retrying'
+  if (retryTimer) clearTimeout(retryTimer)
+  retryTimer = setTimeout(() => {
+    retryTimer = null
+    void connectStream()
+  }, 5000)
 }
 
 async function handleClear() {

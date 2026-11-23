@@ -5,7 +5,9 @@ export interface MatchRules {
 }
 
 export interface ThinkingConfig {
-  level?: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH'
+  // 后端 ThinkingLevel 六档 IntEnum：LOW=1/MEDIUM=2/HIGH=3/MINIMAL=4/
+  // VERY_HIGH=5/EXTRA_HIGH=6（hybrid7 真机判别：目录最高档已上移至 6）
+  level?: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | 'VERY_HIGH' | 'EXTRA_HIGH'
   mode?: number
 }
 

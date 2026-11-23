@@ -65,18 +65,10 @@ const filteredProfilesWithIndex = computed(() => {
     })
 })
 
-const filteredModels = computed(() => {
-  const allModels = parsedConfig.value.model_defaults?.models || {}
-  const kw = filterKeyword.value.trim().toLowerCase()
-  if (!kw) return allModels
-  const result: ModelOverrideMap = {}
-  for (const [key, val] of Object.entries(allModels)) {
-    if (key.toLowerCase().includes(kw)) {
-      result[key] = val
-    }
-  }
-  return result
-})
+// 全量 models 传给 ModelOverrideCard（卡片内部仅做展示层过滤）：
+// 过滤子集直接参与「增删改 → emit 全量替换」曾导致——过滤态下新增/
+// 删除/修改任一覆盖会把未匹配模型的规则全部静默清空（保存即丢失）。
+const allModelOverrides = computed(() => parsedConfig.value.model_defaults?.models || {})
 
 function parseYamlToState(content: string): boolean {
   try {
@@ -115,10 +107,16 @@ function syncStateToYaml(): string {
 watch(
   () => props.initialYaml,
   (val) => {
-    if (val !== undefined) {
-      rawYaml.value = val
-      parseYamlToState(val)
+    if (val === undefined) return
+    // dirty 守卫：顶栏「刷新」/其他标签页保存会把新 yaml 推下来，直接
+    // 重置会静默丢掉本地未保存的修改；保留编辑态，待用户保存或放弃后
+    // 下一次刷新自然生效（onBeforeRouteLeave 已守卫路由离开）。
+    if (hasUnsavedChanges.value) {
+      toast.warning('已保留本地未保存的修改（外部配置已更新，保存前请注意合并）')
+      return
     }
+    rawYaml.value = val
+    parseYamlToState(val)
   },
   { immediate: true }
 )
@@ -553,7 +551,8 @@ onBeforeRouteLeave(async (_to, _from, next) => {
 
       <!-- Section 2: Specific Model Overrides -->
       <ModelOverrideCard
-        :models="filteredModels"
+        :models="allModelOverrides"
+        :filter-keyword="filterKeyword"
         @update:models="updateModelsOverride"
       />
     </div>

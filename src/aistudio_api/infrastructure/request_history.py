@@ -200,16 +200,25 @@ class RequestHistory:
         # 只读查询不持进程级写锁（与 metrics 的 WAL 并发读语义一致）：
         # 大范围搜索（COUNT + json_extract LIKE 全表扫描）期间持锁会阻塞
         # 所有请求的 history insert；_ensure_schema 自带 _schema_lock。
+        # COUNT 与 SELECT 包进同一显式事务：两条独立 SELECT 各自快照，
+        # 并发 insert/清理期间 total 与本页 items 会漂移（分页观感错乱）。
         with self._connect() as connection:
-            total = connection.execute(
-                "SELECT COUNT(*) FROM requests" + where, params
-            ).fetchone()[0]
-            rows = connection.execute(
-                "SELECT payload FROM requests"
-                + where
-                + " ORDER BY started_at DESC, request_id DESC LIMIT ? OFFSET ?",
-                [*params, page_size, (page - 1) * page_size],
-            ).fetchall()
+            connection.execute("BEGIN DEFERRED")
+            try:
+                total = connection.execute(
+                    "SELECT COUNT(*) FROM requests" + where, params
+                ).fetchone()[0]
+                rows = connection.execute(
+                    "SELECT payload FROM requests"
+                    + where
+                    + " ORDER BY started_at DESC, request_id DESC LIMIT ? OFFSET ?",
+                    [*params, page_size, (page - 1) * page_size],
+                ).fetchall()
+            except BaseException:
+                with contextlib.suppress(sqlite3.Error):
+                    connection.rollback()
+                raise
+            connection.execute("COMMIT")
         return {
             "items": [json.loads(row[0]) for row in rows],
             "total": total,

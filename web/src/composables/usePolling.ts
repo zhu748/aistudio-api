@@ -25,6 +25,9 @@ interface ActiveTask {
   timer?: number
   paused: boolean
   running: boolean
+  /** 手动 run() 撞上在途执行时的补跑标记：完成后立即补一次，
+   *  原先直接 no-op 会让用户以为刷新了实际没有 */
+  rerunPending: boolean
   failureCount: number
 }
 
@@ -55,7 +58,12 @@ function setupGlobalVisibilityListener() {
 }
 
 async function runTask(task: ActiveTask) {
-  if (task.running || (typeof document !== 'undefined' && document.hidden)) return
+  if (typeof document !== 'undefined' && document.hidden) return
+  if (task.running) {
+    // 手动刷新撞上在途轮询：标记补跑而非静默丢弃
+    task.rerunPending = true
+    return
+  }
   task.running = true
   try {
     const result = await task.fn()
@@ -65,6 +73,10 @@ async function runTask(task: ActiveTask) {
     console.debug('[usePolling] task execution error (consecutive failures: %d):', task.failureCount, err)
   } finally {
     task.running = false
+    if (task.rerunPending) {
+      task.rerunPending = false
+      void runTask(task)
+    }
   }
 }
 
@@ -111,6 +123,7 @@ export function usePolling(
     maxBackoffMs,
     paused: false,
     running: false,
+    rerunPending: false,
     failureCount: 0,
   }
   activeTasks.add(task)

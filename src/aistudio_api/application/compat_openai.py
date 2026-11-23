@@ -52,6 +52,7 @@ from aistudio_api.application.compat_shared import (
     resolve_compat_model,
 )
 from aistudio_api.application.media_session import has_remote_media, media_session
+from aistudio_api.application.stream_utils import StopSequenceBuffer
 from aistudio_api.domain.tool_signatures import (
     SKIP_THOUGHT_SIGNATURE,
     lookup_function_signature as _lookup_function_signature,
@@ -248,6 +249,30 @@ def _openai_tool_choice_to_config(
                 }
         elif choice_type == "none":
             return {"functionCallingConfig": {"mode": "NONE"}}
+        elif choice_type == "allowed_tools":
+            # OpenAI 2025 新形态：限定可调用工具子集 → AUTO + allowedFunctionNames
+            # （Gemini AUTO 模式下同样生效）；原先落入 None 静默降级 AUTO，
+            # 限定集外的工具也会被模型调用。
+            names: list[str] = []
+            raw_tools = tool_choice.get("tools")
+            if not isinstance(raw_tools, list):
+                return None
+            for entry in raw_tools:
+                if isinstance(entry, dict):
+                    fn = _as_dict(entry.get("function"))
+                    name = _as_str(fn.get("name")) or _as_str(entry.get("name"))
+                else:
+                    name = _as_str(entry)
+                if name:
+                    names.append(name)
+            if names:
+                return {
+                    "functionCallingConfig": {
+                        "mode": "AUTO",
+                        "allowedFunctionNames": names,
+                    }
+                }
+            return None
         elif choice_type in ("auto", "any", "required"):
             mode_map = {"auto": "AUTO", "any": "ANY", "required": "ANY"}
             return {
@@ -318,6 +343,21 @@ async def openai_to_gemini_request(
             text = _openai_content_text(message.content)
             if text:
                 parts.append(GeminiPart(text=text))
+            # assistant 历史中的图片（图片输出模型回传的多模态对话）保留：
+            # 丢弃会让模型丢失自己上一轮产出的图片上下文（与 Claude 侧对齐）。
+            if isinstance(message.content, list):
+                for item in message.content:
+                    if not isinstance(item, dict) or item.get("type") != "image_url":
+                        continue
+                    image_url = _as_dict(item.get("image_url"))
+                    url = _as_str(image_url.get("url")).strip()
+                    if url:
+                        try:
+                            media_part = await _media_part_from_url(url)
+                        except Exception as e:
+                            logger.debug("assistant 历史图片块转换失败，已跳过: %s", e)
+                            continue
+                        parts.append(media_part)
             for tool_call in message.tool_calls or []:
                 function = _as_dict(tool_call.get("function"))
                 name = _as_str(function.get("name")) or "unknown"
@@ -563,8 +603,23 @@ def _openai_finish_reason(finish_reason: str | None, *, has_tool_calls: bool) ->
     return mapped or "stop"
 
 
+def _normalized_stop_sequences(stop: object) -> list[str]:
+    """OpenAI ``stop`` 参数 → 非空停止词列表（供请求编码与响应侧截断共用）。"""
+    if stop is None:
+        return []
+    if isinstance(stop, str):
+        stops: list[object] = [stop]
+    elif isinstance(stop, list):
+        stops = list(stop)
+    else:
+        return []
+    return [s for s in stops if isinstance(s, str) and s]
+
+
 def build_openai_completion(
-    response: GeminiGenerateContentResponse, requested_model: str
+    response: GeminiGenerateContentResponse,
+    requested_model: str,
+    stop_sequences: list[str] | None = None,
 ) -> dict[str, object]:
     """Gemini 完整响应 → OpenAI Chat Completion 对象。"""
     finish_reason_raw: str | None = None
@@ -576,16 +631,32 @@ def build_openai_completion(
     reasoning_parts: list[str] = []
     tool_calls: list[dict[str, object]] = []
     has_tool_calls = False
+    # 与 Claude 侧同源的双重防御：上游若不执行 stopSequences（或拒绝该
+    # 参数），停止词及其后的全部内容不得泄漏给客户端（Agent 客户端用
+    # stop 切分输出/观察边界，泄漏会打穿解析）。
+    stops = StopSequenceBuffer(stop_sequences)
+
+    def flush_pending() -> None:
+        tail = stops.feed("", final=True)
+        if tail:
+            text_parts.append(tail)
 
     for part in _iter_response_parts(response):
+        if stops.hit is not None:
+            # 停止词已命中：后续正文/图片/工具调用全部丢弃（与 Claude 侧
+            # build_claude_message 同语义——客户端不应看到停止词之后的产物）。
+            break
         text = getattr(part, "text", None)
         if isinstance(text, str) and text:
             if getattr(part, "thought", None) is True:
                 reasoning_parts.append(text)
             else:
-                text_parts.append(text)
+                filtered = stops.feed(text)
+                if filtered:
+                    text_parts.append(filtered)
         inline = getattr(part, "inlineData", None)
         if inline is not None:
+            flush_pending()
             text_parts.append(
                 f"\n\n![image](data:{inline.mimeType};base64,{inline.data})"
             )
@@ -595,6 +666,7 @@ def build_openai_completion(
         # 流式侧（已冲刷内容无法撤回）不对称，见回归测试
         # test_non_streaming_interrupted_calls_are_not_executable。
         if function_call is not None and finish_reason_raw in (None, "STOP"):
+            flush_pending()
             has_tool_calls = True
             call_id = function_call.id or f"call_{secrets.token_hex(12)}"
             args = function_call.args if function_call.args is not None else {}
@@ -610,6 +682,7 @@ def build_openai_completion(
                 }
             )
 
+    flush_pending()
     content_text = "".join(text_parts)
     message: dict[str, object] = {
         "role": "assistant",
@@ -631,8 +704,12 @@ def build_openai_completion(
             {
                 "index": 0,
                 "message": message,
-                "finish_reason": _openai_finish_reason(
-                    finish_reason_raw, has_tool_calls=has_tool_calls
+                "finish_reason": (
+                    "stop"
+                    if stops.hit is not None
+                    else _openai_finish_reason(
+                        finish_reason_raw, has_tool_calls=has_tool_calls
+                    )
                 ),
                 "logprobs": None,
             }
@@ -661,11 +738,15 @@ async def openai_stream_adapter(
     *,
     requested_model: str,
     include_usage: bool,
+    stop_sequences: list[str] | None = None,
     register_failure: Callable[[Callable[[str], list[str]]], None] | None = None,
 ) -> AsyncGenerator[str, None]:
     """Gemini SSE → OpenAI chat.completion.chunk SSE 流（含 data: [DONE]）。"""
     completion_id = f"chatcmpl-{secrets.token_hex(14)}"
     created = int(time.time())
+    # 与 Claude 流适配器同源的响应侧停止词防御：上游不执行 stopSequences
+    # 时，停止词及其后内容不得泄漏（Agent 客户端用 stop 切分输出/观察边界）。
+    stops = StopSequenceBuffer(stop_sequences)
 
     def _sse(payload: dict[str, object]) -> str:
         # separators：SSE 每帧省去 ", " 与 ": " 的空格（约 2-4% 字节/分配）
@@ -744,6 +825,8 @@ async def openai_stream_adapter(
                 for part in _frame_parts(candidate):
                     function_call = _as_dict(part.get("functionCall"))
                     if function_call:
+                        if stops.hit is not None:
+                            continue
                         has_tool_calls = True
                         call_id = _as_str(function_call.get("id")) or (
                             f"call_{secrets.token_hex(12)}"
@@ -779,19 +862,20 @@ async def openai_stream_adapter(
                         continue
                     inline = _as_dict(part.get("inlineData"))
                     if inline:
-                        mime = _as_str(inline.get("mimeType")) or "image/png"
-                        data = _as_str(inline.get("data"))
-                        if data:
-                            yield _sse(
-                                _chunk(
-                                    {
-                                        "content": (
-                                            f"\n\n![image](data:{mime};base64,{data})"
-                                        )
-                                    },
-                                    None,
+                        if stops.hit is None:
+                            mime = _as_str(inline.get("mimeType")) or "image/png"
+                            data = _as_str(inline.get("data"))
+                            if data:
+                                yield _sse(
+                                    _chunk(
+                                        {
+                                            "content": (
+                                                f"\n\n![image](data:{mime};base64,{data})"
+                                            )
+                                        },
+                                        None,
+                                    )
                                 )
-                            )
                         continue
                     text = part.get("text")
                     if isinstance(text, str) and text:
@@ -801,9 +885,14 @@ async def openai_stream_adapter(
                         if text.startswith(_ERROR_TEXT_PREFIX):
                             continue
                         if part.get("thought") is True:
-                            yield _sse(_chunk({"reasoning_content": text}, None))
-                        else:
-                            yield _sse(_chunk({"content": text}, None))
+                            if stops.hit is None:
+                                yield _sse(_chunk({"reasoning_content": text}, None))
+                            continue
+                        if stops.hit is not None:
+                            continue
+                        filtered = stops.feed(text)
+                        if filtered:
+                            yield _sse(_chunk({"content": filtered}, None))
         except Exception as exc:
             saw_error = True
             record_result(
@@ -818,8 +907,15 @@ async def openai_stream_adapter(
             yield "data: [DONE]\n\n"
             return
 
-        finish_reason = _openai_finish_reason(
-            finish_reason_raw, has_tool_calls=has_tool_calls
+        # 流正常结束：冲刷缓冲中可能成为停止词前缀的尾部（无命中时）。
+        if stops.hit is None:
+            tail = stops.feed("", final=True)
+            if tail:
+                yield _sse(_chunk({"content": tail}, None))
+        finish_reason = (
+            "stop"
+            if stops.hit is not None
+            else _openai_finish_reason(finish_reason_raw, has_tool_calls=has_tool_calls)
         )
         usage_payload = (
             _openai_usage_from_frame(usage_frame) if usage_frame is not None else None

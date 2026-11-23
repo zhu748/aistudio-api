@@ -163,11 +163,19 @@ def read_log_history(
             # total 退化为下界（实际值 >= 返回值），用 overflow 标记提示。
             overflow_seen = len(matched)
             break
-    # 外部工具追加/截断出的合法 JSON 行可能缺 ts_ms：兜底 0 而非让整个
-    # 历史日志端点 500。
-    matched.sort(
-        key=lambda item: int(str(item.get("ts_ms") or 0)), reverse=order != "asc"
-    )
+
+    # 外部工具追加/截断出的合法 JSON 行可能缺 ts_ms 或带畸形值（如 12.5
+    # 浮点/字符串）：兜底 0 而非让整个历史日志端点 500。
+    def _ts_sort_key(item: dict[str, object]) -> int:
+        raw_ts: object = item.get("ts_ms") or 0
+        if not isinstance(raw_ts, (int, float, str)):
+            return 0
+        try:
+            return int(float(raw_ts))
+        except (TypeError, ValueError):
+            return 0
+
+    matched.sort(key=_ts_sort_key, reverse=order != "asc")
     offset = (page - 1) * page_size
     return {
         "items": matched[offset : offset + page_size],

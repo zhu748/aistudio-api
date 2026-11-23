@@ -211,6 +211,9 @@ static bool FromJS(mz_context* mz, JSContext* cx, JS::HandleValue value, mz_valu
     out->kind = MZ_STRING;
     out->len = JS::GetDeflatedUTF8StringLength(linear);
     out->str = static_cast<char*>(malloc(out->len + 1));
+    if (!out->str) {
+      return false;  // OOM：空指针写会直接崩掉整个签名器进程
+    }
     JS::DeflateStringToUTF8Buffer(linear, mozilla::Span(out->str, out->len));
     out->str[out->len] = 0;
   } else {

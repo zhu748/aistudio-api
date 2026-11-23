@@ -124,6 +124,14 @@ async def _claude_blocks_to_parts(
                 url = _as_str(source.get("url")).strip()
                 if url:
                     parts.append(await _media_part_from_url(url))
+            elif source.get("type") == "file":
+                # Files API 引用（file_id）不支持：静默丢弃会让客户端误以为
+                # 文档已附上，至少留一条可排查的日志。
+                logger.warning(
+                    "Claude document source type=file（Files API file_id）"
+                    "不被支持，已丢弃该块：file_id=%s",
+                    _as_str(source.get("file_id")) or "(空)",
+                )
         elif block_type == "tool_use":
             name = _as_str(block.get("name")) or "unknown"
             tool_input = block.get("input")

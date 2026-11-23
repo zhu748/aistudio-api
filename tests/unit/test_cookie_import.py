@@ -1,10 +1,25 @@
 import pytest
+from starlette.requests import Request
 
 from aistudio_api.infrastructure.account.cookie_parser import (
     build_makersuite_headers,
     filter_minimal_cookies,
     parse_cookie_string,
 )
+
+
+def _admin_request() -> Request:
+    """直接调用 handler 用的最小请求存根（配合 autouse 管理员会话补丁）。"""
+    return Request({"type": "http", "method": "POST", "headers": [], "path": "/"})
+
+
+@pytest.fixture(autouse=True)
+def _admin_password_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """直接调用路径视为管理密码会话（与路由层 API Key 掩码回归测试互补）。"""
+    monkeypatch.setattr(
+        "aistudio_api.api.dependencies.is_admin_password_session",
+        lambda request: True,
+    )
 
 
 def test_parse_cookie_string_skips_host_only_cookies():
@@ -154,7 +169,7 @@ async def test_import_bundle_flow(tmp_path, monkeypatch):
     }"""
 
     req = ImportBundleRequest(content=bundle_content)
-    res = await import_bundle(req, account_service=svc)
+    res = await import_bundle(req, _admin_request(), account_service=svc)
 
     assert res.imported_count == 2
     assert len(res.accounts) == 2
@@ -394,6 +409,7 @@ async def test_probe_import_activates_first_account_and_registers_in_rotator(
 
     response = await probe_and_import(
         ProbeAndImportRequest(cookies="SAPISID=test-value"),
+        _admin_request(),
         account_service=account_service,
         runtime_state=runtime_state,
     )

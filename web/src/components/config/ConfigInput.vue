@@ -11,7 +11,7 @@ interface Props {
   schemaKey?: string
 }
 
-withDefaults(defineProps<Props>(), {
+const props = withDefaults(defineProps<Props>(), {
   description: '',
   placeholder: '',
   type: 'text',
@@ -28,6 +28,13 @@ function handleInput(e: Event) {
   const raw = target.value
   if (raw === '') {
     emit('update:modelValue', null)
+    return
+  }
+  // number 型输入按类型转换：原先恒 emit 字符串，复用方若不做
+  // parseInt 兜底会把 "45" 直接写进 yaml（后端 pydantic 才拦下）。
+  if (props.type === 'number') {
+    const num = Number(raw)
+    emit('update:modelValue', Number.isFinite(num) ? num : raw)
   } else {
     emit('update:modelValue', raw)
   }

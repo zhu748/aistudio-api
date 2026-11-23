@@ -313,7 +313,10 @@ def _stop_signer_daemon_locked() -> None:
             logger.info("停止本地 WAA 签名服务 (PID %d)", proc.pid)
             proc.terminate()
             try:
-                proc.wait(timeout=1.0)
+                # Go 侧 SIGTERM 处理是 server.Shutdown(5s) + 池排空
+                # （main.go），原先 1s 即 SIGKILL 会硬杀在途 mint 的 VM
+                # 拆除与状态目录写入；对齐 5s 优雅预算，超时才 kill。
+                proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=0.5)

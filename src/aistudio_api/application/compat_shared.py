@@ -62,6 +62,29 @@ _OPENAI_FAMILY_RE = re.compile(
 # Claude 家族（含 Bedrock/Vertex 的 "anthropic.claude-" / "us.anthropic.claude-"）
 _CLAUDE_FAMILY_RE = re.compile(r"(?:^|\.)claude", re.IGNORECASE)
 
+# 聚合网关（OpenRouter / Cline / Bedrock 自定义端点等）常用的 provider 前缀：
+# "anthropic/claude-sonnet-4-5" 这类名字剥前缀后再走映射/家族回退，否则
+# 原样透传上游必然 404（家族正则只认 ^ 或 . 边界，不认 / 边界）。
+_PROVIDER_PREFIXES = (
+    "anthropic/",
+    "openai/",
+    "google/",
+    "gcp/",
+    "meta/",
+    "mistral/",
+    "mistralai/",
+    "qwen/",
+    "deepseek/",
+    "zhipu/",
+    "moonshot/",
+    "moonshotai/",
+    "grok/",
+    "x-ai/",
+    "xai/",
+    "amazon/",
+    "openrouter/",
+)
+
 # 魔数嗅探：无 Content-Type / 无 data URL mime 时的兜底识别
 _MAGIC_SNIFFERS: tuple[tuple[bytes, str], ...] = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),
@@ -71,9 +94,11 @@ _MAGIC_SNIFFERS: tuple[tuple[bytes, str], ...] = (
     (b"%PDF-", "application/pdf"),
 )
 
+# RFC 3986：scheme 大小写不敏感（"DATA:image/png;base64,..." 同样合法）；
+# 参数允许带引号（;name="x";base64,...）。
 _DATA_URL_RE = re.compile(
-    r"^data:(?P<mime>[\w.+-]+/[\w.+-]+)?(?:;[\w=-]+)*;base64,(?P<data>.+)$",
-    re.DOTALL,
+    r"^data:(?P<mime>[\w.+-]+/[\w.+-]+)?(?:;[\w=-]+|;\"[^\"]*\")*;base64,(?P<data>.+)$",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -298,6 +323,14 @@ def resolve_compat_model(requested: str, *, channel: str) -> str:
     clean = (requested or "").strip().removeprefix("models/")
     if not clean:
         raise ValueError("model is required")
+    # provider 前缀剥离（OpenRouter / Cline 等聚合客户端）：仅认白名单前缀，
+    # 避免误伤含斜杠的自定义模型名；剥完为空则回退原名。
+    for prefix in _PROVIDER_PREFIXES:
+        if clean.lower().startswith(prefix):
+            stripped = clean[len(prefix) :]
+            if stripped:
+                clean = stripped
+            break
     compat = get_compat_settings()
     mapping = _as_dict(compat.get(f"{channel}_model_mapping"))
     lowered = clean.lower()

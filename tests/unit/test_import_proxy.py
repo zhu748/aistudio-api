@@ -13,6 +13,7 @@ from typing import cast
 
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request
 
 from aistudio_api.api import routes_account_imports
 from aistudio_api.api.routes_account_imports import (
@@ -29,6 +30,20 @@ from aistudio_api.application.account_service import AccountService
 from aistudio_api.infrastructure.account.account_store import AccountStore
 
 _COOKIE = "SID=sid_value; SAPISID=sapisid_value; HSID=hsid_value"
+
+
+def _admin_request() -> Request:
+    """直接调用 handler 用的最小请求存根（配合下方 autouse 管理员会话补丁）。"""
+    return Request({"type": "http", "method": "POST", "headers": [], "path": "/"})
+
+
+@pytest.fixture(autouse=True)
+def _admin_password_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """直接调用路径视为管理密码会话（与路由层 API Key 掩码回归测试互补）。"""
+    monkeypatch.setattr(
+        "aistudio_api.api.dependencies.is_admin_password_session",
+        lambda request: True,
+    )
 
 
 class _StubRuntimeState:
@@ -69,6 +84,7 @@ async def test_import_cookies_accepts_explicit_proxy(env) -> None:
             cookies=_COOKIE,
             proxy_url="socks5://user:pass@127.0.0.1:1080",
         ),
+        _admin_request(),
         account_service=service,
         runtime_state=_STUB_RUNTIME,
     )
@@ -82,6 +98,7 @@ async def test_import_cookies_parses_proxy_from_pasted_text(env) -> None:
     service, accounts_dir = env
     res = await import_cookies(
         ImportCookiesRequest(cookies=f"{_COOKIE}\n1.2.3.4:1080:user:pass"),
+        _admin_request(),
         account_service=service,
         runtime_state=_STUB_RUNTIME,
     )
@@ -96,6 +113,7 @@ async def test_import_cookies_rejects_bad_explicit_proxy(env) -> None:
     with pytest.raises(HTTPException) as exc_info:
         await import_cookies(
             ImportCookiesRequest(cookies=_COOKIE, proxy_url="not a proxy"),
+            _admin_request(),
             account_service=service,
             runtime_state=_STUB_RUNTIME,
         )
@@ -118,6 +136,7 @@ async def test_probe_import_applies_proxy_to_all_accounts(env, monkeypatch) -> N
 
     res = await probe_and_import(
         ProbeAndImportRequest(cookies=f"127.0.0.1:7890+{_COOKIE}"),
+        _admin_request(),
         account_service=service,
         runtime_state=_STUB_RUNTIME,
     )
@@ -152,6 +171,7 @@ async def test_import_bundle_supports_per_item_proxy(env) -> None:
                 ),
             ]
         ),
+        _admin_request(),
         account_service=service,
     )
     assert res.imported_count == 2
