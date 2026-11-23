@@ -68,6 +68,7 @@ from aistudio_api.infrastructure.gateway.client import (
 from aistudio_api.infrastructure.gateway.wire_spec import (
     WIRE_FINISH_REASON_CONTINUING,
 )
+from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 from aistudio_api.infrastructure.request_context import (
     current_request,
     record_attempt_error,
@@ -730,6 +731,7 @@ async def handle_gemini_generate_content(
         _acc = _svc.get_active_account() if _svc else None
         serving_account_id = _acc.id if _acc else None
         auth_manager.serving_account_id = serving_account_id
+        dispatched = False
         try:
             # 归一化与抗截断注入只随请求变化、与重试尝试无关（prepare 会
             # 原地改写 normalized：contents 注入指令 / tools 追加声明）。
@@ -746,6 +748,9 @@ async def handle_gemini_generate_content(
                 attempt + 1,
                 total_attempts,
             )
+            # 上游请求即将派出：此后任意时刻的取消都视为「上游已受理」
+            # （与流式断连兜底同语义），记账兜底见下方 CancelledError 分支。
+            dispatched = True
             output = await client.generate_content(
                 model=normalized.model,
                 contents=normalized.contents,
@@ -827,6 +832,25 @@ async def handle_gemini_generate_content(
                     GeminiPartResponse(text=diagnostic)
                 )
             return response_obj
+        except asyncio.CancelledError:
+            # 客户端断开（_DeferredResponse 断连）/保活 504 取消任务：
+            # CancelledError 不是 Exception 子类，原先直接穿透——上游请求
+            # 已派出（配额大概率已消耗）却一次都不记账，账号余量持续高估。
+            # 与流式断连兑底（_record_stream_disconnect）对称补记一次 success
+            # （无 usage 帧可用，usage=None），随后照常传播取消。
+            if dispatched and normalized is not None:
+                with contextlib.suppress(Exception):
+                    record_rotator_event(
+                        "success",
+                        model=normalized.model,
+                        usage=None,
+                        account_id=serving_account_id,
+                    )
+                    logger.info(
+                        "非流式请求被取消（上游已受理），已补记调度账: model=%s",
+                        normalized.model,
+                    )
+            raise
         except Exception as exc:
             last_error = exc
             observation = current_request.get()
@@ -1606,9 +1630,15 @@ async def handle_gemini_count_tokens(
         await ensure_active_account(attempt, model=clean_model)
         try:
             normalized = normalize_gemini_request(normalized_req, clean_model)
+            # 系统指令计入统计：CountTokens body 无独立系统指令槽，把
+            # system_instruction 作为额外 content 前插（角色词不计入 token
+            # 总数，计数与 generateContent 的实际消耗一致）。
+            count_contents: list[AistudioContent] = list(normalized.contents)
+            if normalized.system_instruction is not None:
+                count_contents.insert(0, normalized.system_instruction)
             total = await client.count_tokens(
                 model=normalized.model,
-                contents=normalized.contents,
+                contents=count_contents,
             )
             logger.info(
                 "countTokens 完成: model=%s, total=%d",

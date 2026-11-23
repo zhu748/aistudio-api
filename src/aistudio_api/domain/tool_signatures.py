@@ -110,18 +110,28 @@ class ThoughtSignatureCache:
             self._signatures.move_to_end(key)
             while len(self._signatures) > self._MAX_ENTRIES:
                 self._signatures.popitem(last=False)
+            # 首次变脏时定死落盘路径：若推迟到退出钩子（atexit）才解析，
+            # 测试 monkeypatch 的 env 可能已还原，退出 flush 会写到真实
+            # 仓库 data/（跨运行状态串扰，已实测发生过）。此刻解析拿到的
+            # 是「当前生效」的 data 目录，与后续 save/atexit 一致。
+            try:
+                if self._path is None:
+                    self._path = self._resolve_path()
+            except Exception:
+                self._path = None
             self._dirty = True
             now = time.monotonic()
-            if now - self._last_save >= self._SAVE_DEBOUNCE_SECONDS:
-                self._save_locked()
+            if (
+                now - self._last_save >= self._SAVE_DEBOUNCE_SECONDS
+                and self._save_locked()
+            ):
                 self._last_save = now
                 self._dirty = False
 
     def flush(self) -> None:
         """落盘窗口内累积的脏数据（优雅关停或退出钩子调用）。"""
         with self._lock:
-            if self._dirty:
-                self._save_locked()
+            if self._dirty and self._save_locked():
                 self._dirty = False
             self._last_save = time.monotonic()
 
@@ -173,10 +183,13 @@ class ThoughtSignatureCache:
             # 首次运行 / 文件损坏：从空缓存开始即可
             pass
 
-    def _save_locked(self) -> None:
+    def _save_locked(self) -> bool:
+        """落盘当前缓存，返回是否成功（失败时调用方须保留 _dirty 标记，
+        否则退出兑底 flush 会因「已落盘」误判跳过补写——瞬时磁盘故障
+        窗口内的签名将永久丢失）。"""
         path = self._resolve_path()
         if path is None:
-            return
+            return False
         try:
             from aistudio_api.infrastructure.utils.common import atomic_write_json
 
@@ -186,6 +199,7 @@ class ThoughtSignatureCache:
                 private=True,
                 compact=True,
             )
+            return True
         except (OSError, ValueError) as exc:
             if not self._load_error_logged:
                 self._load_error_logged = True
@@ -198,6 +212,7 @@ class ThoughtSignatureCache:
                     )
                 except Exception:
                     pass
+            return False
 
     def _resolve_path(self) -> Path | None:
         if self._path is not None:

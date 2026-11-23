@@ -197,7 +197,29 @@ def isolate_test_config(monkeypatch, _shared_test_env):
     monkeypatch.setenv("AISTUDIO_ACCOUNTS_DIR", str(accounts_dir))
     monkeypatch.setenv("AISTUDIO_STATS_FILE", str(stats_file))
     monkeypatch.setenv("AISTUDIO_ROTATOR_STATE_FILE", str(rotator_file))
+    # 凭据类 env 清零：开发 shell / .env 携带的 AISTUDIO_API_KEY(S) 等
+    # 会让精确断言（frozenset 相等）被单数别名变量击穿。
+    for var in (
+        "AISTUDIO_API_KEY",
+        "AISTUDIO_API_KEYS",
+        "AISTUDIO_WEB_PASSWORD",
+        "AISTUDIO_PROXY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    # Settings 单例在 import 期已用旧环境构造完毕：其 data_dir / stats_file
+    # / rotator_state_file / accounts_dir / auth_file 字段仍指向真实仓库
+    # 路径（凡读 settings.* 的代码未被 env 隔离，与 resolve_*() 双真相源）。
+    # 直接覆盖字段，使两套真相源收敛到同一临时目录。
+    monkeypatch.setattr(settings, "data_dir", str(data_dir))
+    monkeypatch.setattr(settings, "stats_file", str(stats_file))
+    monkeypatch.setattr(settings, "rotator_state_file", str(rotator_file))
+    monkeypatch.setattr(settings, "accounts_dir", str(accounts_dir))
+    monkeypatch.setattr(settings, "auth_file", None)
     yield
+    # 注意：不能整目录清空——request_history() 单例持有指向 requests.sqlite3
+    # 的长连接，删除文件后后续测试的读写会落在已删除的 inode 上。stats/
+    # rotator 状态文件是唯一会影响跨测试语义的持久状态；accounts/ 与
+    # requests.sqlite3 留在 session 级 tmp 目录由 pytest 自动回收。
     if stats_file.exists():
         stats_file.unlink()
     if rotator_file.exists():

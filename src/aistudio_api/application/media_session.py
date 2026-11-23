@@ -87,4 +87,10 @@ async def media_session() -> AsyncIterator[None]:
     finally:
         current_media.reset(token)
         if session.client is not None:
-            await session.client.aclose()
+            # shield：媒体下载若被移入 anyio 取消作用域（task group），
+            # finally 里的首个 await 会被 level-cancellation 打断，连接池
+            # 就泄漏给 GC 了；与 transport 层关停同款保护（5s 预算）。
+            import anyio
+
+            with anyio.move_on_after(5, shield=True):
+                await session.client.aclose()

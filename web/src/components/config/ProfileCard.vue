@@ -72,7 +72,25 @@ function updateGenerationConfig<K extends keyof NonNullable<ModelProfileItem['ge
   updateField('generation_config_defaults', nextGen)
 }
 
-function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | null) {
+// 后端 ThinkingLevel 同时接受数字档位（yaml 中如 level: 2，实际枚举
+// LOW=1/MEDIUM=2/HIGH=3/MINIMAL=4/VERY_HIGH=5/EXTRA_HIGH=6）；面板下拉
+// 用名称匹配，数字值需先归一化否则显示为第一项（视觉谎报）。
+const THINKING_LEVEL_NAMES: Record<number, string> = {
+  1: 'LOW',
+  2: 'MEDIUM',
+  3: 'HIGH',
+  4: 'MINIMAL',
+  5: 'VERY_HIGH',
+  6: 'EXTRA_HIGH',
+}
+
+function normalizeThinkingLevel(value: unknown): string | null {
+  if (value === null || value === undefined || value === '') return null
+  if (typeof value === 'number') return THINKING_LEVEL_NAMES[value] ?? null
+  return String(value)
+}
+
+function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | 'VERY_HIGH' | 'EXTRA_HIGH' | null) {
   const currentGen = props.profile.generation_config_defaults || {}
   const currentThinking = currentGen.thinking_config || { mode: 1 }
   if (level === null) {
@@ -249,7 +267,7 @@ function updateThinkingConfig(level: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | nul
           />
 
           <ConfigSelect
-            :model-value="profile.generation_config_defaults?.thinking_config?.level"
+            :model-value="normalizeThinkingLevel(profile.generation_config_defaults?.thinking_config?.level)"
             label="思考强度等级"
             :options="THINKING_LEVEL_OPTIONS"
             schema-key="generation.thinking_level"

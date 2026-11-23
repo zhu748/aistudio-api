@@ -9,7 +9,7 @@ import itertools
 import json
 import os
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -212,6 +212,16 @@ class GatewaySession:
         await self._transport.retire_stale_clients(proxy)
         await self._signer.reconfigure(proxy_url=proxy or "")
 
+    async def retire_unused_clients(self, keep_proxies: Iterable[str | None]) -> None:
+        """账号级代理变更后按「在用代理集」退役客户端池。
+
+        账号代理变更不走 set_default_proxy（全局代理未变），旧代理的满配
+        连接池与 turn/sstp 桥接子进程会滞留到进程退出；由路由层以
+        「全局代理 + 全部账号代理」为保留集调用本方法回收其余池。
+        """
+        self._ensure_open()
+        await self._transport.retire_clients_not_in_use(keep_proxies)
+
     async def transition_to_account(
         self, auth_file: str | None, force_refresh: bool = False
     ) -> SessionContext:
@@ -339,24 +349,27 @@ class GatewaySession:
         parsed = parse_raw_cookies(raw_cookie)
         if not parsed:
             return
-        changed = False
+        changed_keys: set[str] = set()
         for k in ROTATING_SESSION_COOKIE_NAMES:
             val = parsed.get(k)
             if val and active_ctx.cookies.get(k) != val:
                 active_ctx.cookies[k] = val
-                changed = True
-        if changed and active_ctx.auth_file:
+                changed_keys.add(k)
+        if changed_keys and active_ctx.auth_file:
             try:
                 from aistudio_api.infrastructure.account.account_store import (
                     AccountStore,
                 )
 
                 # update_account_cookies 含 stat+原子写(fsync)，
-                # 必须经线程池执行，禁止阻塞事件循环（transport 同款约束）
+                # 必须经线程池执行，禁止阻塞事件循环（transport 同款约束）。
+                # 只覆盖本次签名器实际刷新的键：ctx 中其余键可能已被并发
+                # 轮换推进，全量回写会把滚动凭据回退到旧值。
                 await asyncio.to_thread(
                     AccountStore().update_account_cookies,
                     auth_file=active_ctx.auth_file,
                     new_cookies=active_ctx.cookies,
+                    overwrite_keys=changed_keys,
                 )
             except Exception as e:
                 logger.debug("回写签名服务 Cookie 失败: %s", e)

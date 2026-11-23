@@ -12,6 +12,7 @@ import json
 
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request
 
 from aistudio_api.api import routes_account_imports
 from aistudio_api.api.routes_account_imports import (
@@ -20,6 +21,19 @@ from aistudio_api.api.routes_account_imports import (
 )
 from aistudio_api.application.account_service import AccountService
 from aistudio_api.infrastructure.account.account_store import AccountStore
+
+
+def _admin_request() -> Request:
+    """直接调用 handler 用的最小请求存根（配合 autouse 管理员会话补丁）。"""
+    return Request({"type": "http", "method": "POST", "headers": [], "path": "/"})
+
+
+@pytest.fixture(autouse=True)
+def _admin_password_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "aistudio_api.api.dependencies.is_admin_password_session",
+        lambda request: True,
+    )
 
 
 @pytest.fixture()
@@ -66,6 +80,7 @@ async def test_file_path_outside_allowed_roots_is_rejected(
     with pytest.raises(HTTPException) as exc_info:
         await import_bundle(
             ImportBundleRequest(file_path=str(secret)),
+            _admin_request(),
             account_service=AccountService(store),
         )
     assert exc_info.value.status_code == 400
@@ -83,6 +98,7 @@ async def test_non_json_suffix_is_rejected(tmp_path, monkeypatch) -> None:
     with pytest.raises(HTTPException) as exc_info:
         await import_bundle(
             ImportBundleRequest(file_path=str(target)),
+            _admin_request(),
             account_service=AccountService(AccountStore(accounts_dir=tmp_path / "a")),
         )
     assert exc_info.value.status_code == 400
@@ -99,6 +115,7 @@ async def test_missing_file_does_not_leak_path(tmp_path, monkeypatch) -> None:
     with pytest.raises(HTTPException) as exc_info:
         await import_bundle(
             ImportBundleRequest(file_path=str(missing)),
+            _admin_request(),
             account_service=AccountService(AccountStore(accounts_dir=tmp_path / "a")),
         )
     assert exc_info.value.status_code == 400
@@ -116,7 +133,9 @@ async def test_registered_root_file_is_imported(tmp_path, monkeypatch, service) 
     monkeypatch.setenv("AISTUDIO_IMPORT_ROOTS", str(allowed_root))
 
     res = await import_bundle(
-        ImportBundleRequest(file_path=str(target)), account_service=service
+        ImportBundleRequest(file_path=str(target)),
+        _admin_request(),
+        account_service=service,
     )
     assert res.imported_count == 1
     assert res.accounts[0].name == "From File"

@@ -54,6 +54,8 @@ snapshot_*.log
 docs/
 *.md
 !README.md
+# THIRD_PARTY_NOTICES.md 需随包打入镜像（pyproject package-data 已声明）
+!src/aistudio_api/THIRD_PARTY_NOTICES.md
 
 # Development scripts
 scripts/

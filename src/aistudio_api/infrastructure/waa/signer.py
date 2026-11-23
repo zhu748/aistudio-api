@@ -106,6 +106,29 @@ def extract_content_digest(contents: list[AistudioContent]) -> tuple[str, str]:
     return prompt, content_hash
 
 
+def _resolve_signer_timeout(server_url: str) -> float:
+    """按节点类型解析 mint 请求的 HTTP 总超时（秒）。
+
+    Go 侧 /v1/proof/mint 的处理预算是 90s（冷启动含 loadPage 网络往返 +
+    SpiderMonkey bootstrap，慢代理下可到 30-90s）。原先固定 30s：冷启动
+    落在 30~90s 区间的本地签名器会被 Python 侧先掐断（Go 收到断连取消
+    冷启动、进度全丢），重试又从零开始 → 2 次耗尽后本地签名器永久不可用。
+
+    - ``AISTUDIO_SIGNER_TIMEOUT`` 显式覆盖（下限 5s）
+    - 本地节点（is_local_signer_url）：默认 95s，覆盖 Go 的 90s 预算
+    - 远程节点：保持 30s（公网延迟可控，超时通常意味着节点真不可用）
+    """
+    raw = os.getenv("AISTUDIO_SIGNER_TIMEOUT")
+    if raw and raw.strip():
+        try:
+            return max(5.0, float(raw.strip()))
+        except ValueError:
+            pass
+    from aistudio_api.infrastructure.waa.daemon import is_local_signer_url
+
+    return 95.0 if is_local_signer_url(server_url) else 30.0
+
+
 class RemoteProofSigner:
     """Signs requests using external WAA proof server (aistudio-pg-bridge / spinsnow)."""
 
@@ -113,11 +136,13 @@ class RemoteProofSigner:
         self,
         server_url: str = DEFAULT_PROOF_SERVER_URL,
         proxy_url: str | None = None,
-        timeout: float = 30.0,
+        timeout: float | None = None,
     ) -> None:
         self.server_url = server_url.rstrip("/")
         self.proxy_url = proxy_url or None
-        self.timeout = timeout
+        self.timeout = (
+            _resolve_signer_timeout(server_url) if timeout is None else timeout
+        )
         self._client: httpx.AsyncClient | None = None
         self._closed = False
         # 惰性建池互斥：进程级单例被首批并发签名请求共享，

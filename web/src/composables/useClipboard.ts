@@ -12,11 +12,49 @@ export function useClipboard() {
   // 先复制的那个「已复制」高亮会永久残留。
   let timer: ReturnType<typeof setTimeout> | undefined
 
-  async function copy(text: string, key: string | number, message = '已复制到剪贴板') {
+  /**
+   * 非安全上下文兜底：管理面板常以 http://<服务器IP>:8080 访问，
+   * navigator.clipboard 在非 secure context 下是 undefined（不是权限问题），
+   * 退化为隐藏 textarea + execCommand('copy')。
+   */
+  function legacyCopy(text: string): boolean {
     try {
-      await navigator.clipboard.writeText(text)
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.setAttribute('readonly', '')
+      ta.style.position = 'fixed'
+      ta.style.opacity = '0'
+      document.body.appendChild(ta)
+      ta.focus()
+      ta.select()
+      const ok = document.execCommand('copy')
+      ta.remove()
+      return ok
     } catch {
-      toast.error('复制失败，浏览器可能拒绝了剪贴板权限')
+      return false
+    }
+  }
+
+  async function copy(text: string, key: string | number, message = '已复制到剪贴板') {
+    let ok = false
+    let unsupportedContext = false
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      try {
+        await navigator.clipboard.writeText(text)
+        ok = true
+      } catch {
+        ok = false
+      }
+    } else {
+      unsupportedContext = true
+    }
+    if (!ok) ok = legacyCopy(text)
+    if (!ok) {
+      toast.error(
+        unsupportedContext
+          ? '复制失败：当前为 HTTP 环境，请改用 HTTPS 或 localhost 访问面板后复制'
+          : '复制失败，浏览器可能拒绝了剪贴板权限',
+      )
       return
     }
     copied.value = key

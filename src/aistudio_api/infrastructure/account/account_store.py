@@ -861,11 +861,19 @@ class AccountStore:
         auth_file: str | Path | None = None,
         new_cookies: dict[str, str],
         rotated_at: float | None = None,
+        overwrite_keys: set[str] | None = None,
     ) -> list[str]:
         """将更新后的 Cookie 写回目标账号及其同源多登兄弟账号 (u/0..u/N) 的 auth.json。
 
         全程持锁（3.4）：同锚点兄弟账号的读盘-合并-写回序列若不互斥，
         并发回写会互相覆盖导致轮换 Cookie 丢失、后续请求 403。
+
+        新鲜度仲裁（overwrite_keys）：默认 None 表示 new_cookies 全量参与
+        覆盖（轮换/导入等持有新鲜全量集的调用方）。传集合时只有集合内的
+        键允许覆盖磁盘——响应路径回写（_persist_set_cookies / 签名器同步）
+        持有的是「请求开始时快照 + 本次 Set-Cookie」，快照中未更新的键
+        可能已被并发轮换推进，全量回写会把滚动凭据回退到旧值。
+        new_cookies 仍用于会话锚点计算与目标识别，不受该参数影响。
         """
         if not new_cookies:
             return []
@@ -876,6 +884,7 @@ class AccountStore:
                 auth_file=auth_file,
                 new_cookies=new_cookies,
                 rotated_at=rotated_at,
+                overwrite_keys=overwrite_keys,
             )
 
     def _update_account_cookies_locked(
@@ -885,6 +894,7 @@ class AccountStore:
         auth_file: str | Path | None,
         new_cookies: dict[str, str],
         rotated_at: float | None,
+        overwrite_keys: set[str] | None = None,
     ) -> list[str]:
         from aistudio_api.infrastructure.account.cookie_parser import (
             compute_session_anchor,
@@ -901,7 +911,12 @@ class AccountStore:
                     target_id = cand_id
                 elif p.is_file():
                     cur = load_cookies_from_auth_file(p)
-                    merged = {**cur, **{k: v for k, v in new_cookies.items() if v}}
+                    delta = {
+                        k: v
+                        for k, v in new_cookies.items()
+                        if v and (overwrite_keys is None or k in overwrite_keys)
+                    }
+                    merged = {**cur, **delta}
                     if merged != cur:
                         _atomic_write_json(
                             p,
@@ -949,6 +964,8 @@ class AccountStore:
             merged = dict(cur_cookies)
             cookie_changed = False
             for k, v in new_cookies.items():
+                if overwrite_keys is not None and k not in overwrite_keys:
+                    continue
                 if v and merged.get(k) != v:
                     merged[k] = v
                     cookie_changed = True

@@ -26,7 +26,7 @@ flowchart TD
         RoutesGemini["routes_gemini.py<br/>Gemini v1beta 兼容接口"]
         RoutesModels["routes_models.py<br/>模型发现与能力查询"]
         RoutesAccounts["routes_accounts.py<br/>账号与 Cookie 管理"]
-        RoutesSystem["routes_system.py<br/>系统监控与配置热重载"]
+        RoutesSystem["routes_system / routes_config / routes_signer / routes_logs<br/>系统监控与配置热重载"]
     end
 
     subgraph AppLayer ["2. Application 应用服务层"]
@@ -88,7 +88,10 @@ flowchart TD
 | `routes_gemini.py` | 对外暴露 `/v1beta/models/{model}:generateContent` 和 `:streamGenerateContent` 端点 |
 | `routes_models.py` | 动态向上游拉取并缓存可用模型列表（如 `gemini-3.7-flash`、`gemini-3.8-flash` 等） |
 | `routes_accounts.py` | 提供 Cookie 单条/Bundle文件导入、多账号递归探活（`u/0`, `u/1`...）、手动激活与删除接口 |
-| `routes_system.py` | 监控指标查询、在线编辑与热重载 `config.yaml` 规则 |
+| `routes_system.py` | 监控指标查询与健康检查 |
+| `routes_config.py` | 在线编辑与热重载 `config.yaml`、API Key 与全局代理管理 |
+| `routes_signer.py` | WAA 签名器节点管理与本地守护控制 |
+| `routes_logs.py` | 运行日志查询与 SSE 实时日志流 |
 | `dependencies.py` | 统一 API Key 鉴权拦截（支持 Query 参数 `?key=`、Header `x-goog-api-key`、`x-api-key` 或 `Bearer`） |
 
 ### 2.2 应用服务层 (`src/aistudio_api/application/`)
@@ -111,7 +114,9 @@ flowchart TD
 ### 2.4 基础设施层 (`src/aistudio_api/infrastructure/`)
 
 - **WAA 签名子系统 (`waa/`)**：
-  - `signer.py`：提供 `extract_content_digest` 内容哈希计算、`RemoteProofSigner` 证明请求客户端以及 `WaaSigner` 门面。支持在 `config.yaml` 中配置多签名服务节点（本地 Go 原生引擎 `waa-signer` 或远程 NodeVM 签名服务），纯手动切换，并自动将签名服务绑定的特征 `User-Agent` 与特征请求头同步到外层 HTTP 传输中。
+  - `signer.py`：提供 `extract_content_digest` 内容哈希计算、`RemoteProofSigner` 证明请求客户端（本地节点默认 95s / 远程 30s 超时，`AISTUDIO_SIGNER_TIMEOUT` 可覆盖）以及 `WaaSigner` 门面。支持在 `config.yaml` 中配置多签名服务节点（本地 Go 原生引擎 `waa-signer` 或远程 NodeVM 签名服务），纯手动切换，并自动将签名服务绑定的特征 `User-Agent` 与特征请求头同步到外层 HTTP 传输中。
+  - `daemon.py`：本地 `waa-signer` 子进程守护（按需拉起、健康监测、`is_local_signer_url` 判定与优雅关停）。
+  - `health.py`：签名器健康熔断记账（半开探测语义，产出被接受即解除熔断）。
 - **网关与编解码子系统 (`gateway/`)**：
   - `client.py`：`AIStudioClient` 统一门面，组装请求签名、HTTP 发送、流式生成与会话生命周期。
   - `session.py`：`GatewaySession` 与 `SessionContext` 核心，管理内存态账号上下文切换、WAA 快照签名生成与 HTTP 传输路由。

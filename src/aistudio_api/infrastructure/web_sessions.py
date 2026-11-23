@@ -38,6 +38,7 @@ class _SessionMeta(TypedDict):
 
 _lock = threading.Lock()
 _loaded = False
+_load_failed = False
 _sessions: dict[str, _SessionMeta] = {}
 
 
@@ -50,19 +51,20 @@ def password_fingerprint(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()[:16]
 
 
-def _load_locked() -> None:
-    global _loaded
-    if _loaded:
-        return
-    _loaded = True
+def _read_store_sessions() -> dict[str, _SessionMeta] | None:
+    """读取磁盘会话表；IO/解析失败返回 None（调用方不得当成空表）。"""
+    path = _store_path()
+    if not path.is_file():
+        return {}
     try:
-        raw = json.loads(_store_path().read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return
+        return None
     entries = raw.get("sessions") if isinstance(raw, dict) else None
     if not isinstance(entries, dict):
-        return
+        return {}
     now = time.time()
+    loaded: dict[str, _SessionMeta] = {}
     for token, meta in entries.items():
         if not isinstance(token, str) or not isinstance(meta, dict):
             continue
@@ -72,13 +74,42 @@ def _load_locked() -> None:
             continue
         if expires <= now:
             continue
-        _sessions[token] = {
+        loaded[token] = {
             "expires_at": float(expires),
             "fingerprint": fingerprint,
         }
+    return loaded
+
+
+def _load_locked() -> None:
+    global _loaded, _load_failed
+    if _loaded:
+        return
+    _loaded = True
+    loaded = _read_store_sessions()
+    if loaded is None:
+        # 启动期 IO 抖动（权限/瞬时错误）：不能把内存态当空表——后续首次
+        # 签发会话的 _persist_locked 会用只含新令牌的表覆盖原文件，全部
+        # 已签发的 30 天会话永久作废。标记失败，持久化前强制重读。
+        _load_failed = True
+        return
+    _sessions.update(loaded)
 
 
 def _persist_locked() -> None:
+    global _load_failed
+    if _load_failed:
+        # 首次加载失败后内存态不完整：直接覆盖写会销毁磁盘上未读入的
+        # 会话。重读一次（磁盘可能已恢复），磁盘态与内存态（含本次刚
+        # 签发的新会话，后者优先）合并；仍读不到则放弃本次持久化，新
+        # 会话退化为进程内存活（重启需重登），好过静默注销全部旧会话。
+        reloaded = _read_store_sessions()
+        if reloaded is None:
+            return
+        reloaded.update(_sessions)
+        _sessions.clear()
+        _sessions.update(reloaded)
+        _load_failed = False
     payload = {"version": 1, "sessions": _sessions}
     # private=True：令牌是可登录凭据，临时文件与最终文件均按 0600 收紧
     # （与其余凭据文件同规），替换后无需二次 chmod——原先先写成默认

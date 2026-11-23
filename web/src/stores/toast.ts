@@ -14,6 +14,10 @@ export const useToastStore = defineStore('toast', () => {
 
   function show(message: string, type: ToastItem['type'] = 'info', duration = 3000) {
     const id = ++counter
+    // 堆积上限：批量操作失败 + 轮询错误叠加时避免 toast 无限刷屏
+    if (toasts.value.length >= 5) {
+      toasts.value.shift()
+    }
     toasts.value.push({ id, message, type, duration })
 
     if (duration > 0) {

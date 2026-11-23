@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import type { ModelOverrideMap, ModelOverrideItem, ThinkingConfig } from './types.ts'
 import {
   TOOL_SUGGESTIONS,
@@ -17,7 +17,11 @@ import Button from '@/components/ui/Button.vue'
 import { Plus, Trash2, ChevronDown, ChevronRight, Layers, Cpu, Wrench } from 'lucide-vue-next'
 
 const props = defineProps<{
+  /** 全量覆盖表：变更操作基于它构造 next 后整体 emit（过滤仅作展示层，
+   *  过滤子集参与变更曾会把未匹配模型的规则全部静默清空） */
   models: ModelOverrideMap
+  /** 展示层过滤关键词（由父级搜索框传入，仅影响列表渲染） */
+  filterKeyword?: string
 }>()
 
 const emit = defineEmits<{
@@ -27,6 +31,19 @@ const emit = defineEmits<{
 const { confirm } = useConfirm()
 const newModelName = ref('')
 const expandedMap = ref<Record<string, boolean>>({})
+
+/** 展示层过滤：仅决定列表渲染哪些键；所有变更操作仍基于全量 props.models */
+const visibleModels = computed(() => {
+  const kw = (props.filterKeyword || '').trim().toLowerCase()
+  if (!kw) return props.models || {}
+  const result: ModelOverrideMap = {}
+  for (const [key, val] of Object.entries(props.models || {})) {
+    if (key.toLowerCase().includes(kw)) {
+      result[key] = val
+    }
+  }
+  return result
+})
 
 function toggleExpand(modelKey: string) {
   expandedMap.value[modelKey] = !expandedMap.value[modelKey]
@@ -102,6 +119,24 @@ function updateModelThinkingConfig(modelKey: string, level: string | null) {
   }
   emit('update:models', next)
 }
+
+// 后端 ThinkingLevel 同时接受数字档位（LOW=1/MEDIUM=2/HIGH=3/MINIMAL=4/
+// VERY_HIGH=5/EXTRA_HIGH=6）：下拉用名称匹配，数字值先归一化，
+// 否则 yaml 里的 level: 2 会显示为第一项（视觉谎报）。
+const THINKING_LEVEL_NAMES: Record<number, string> = {
+  1: 'LOW',
+  2: 'MEDIUM',
+  3: 'HIGH',
+  4: 'MINIMAL',
+  5: 'VERY_HIGH',
+  6: 'EXTRA_HIGH',
+}
+
+function normalizeThinkingLevel(value: unknown): string | null {
+  if (value === null || value === undefined || value === '') return null
+  if (typeof value === 'number') return THINKING_LEVEL_NAMES[value] ?? null
+  return String(value)
+}
 </script>
 
 <template>
@@ -137,11 +172,11 @@ function updateModelThinkingConfig(modelKey: string, level: string | null) {
 
     <!-- Override List -->
     <div
-      v-if="Object.keys(models || {}).length"
+      v-if="Object.keys(visibleModels).length"
       class="space-y-3"
     >
       <div
-        v-for="(override, modelKey) in models"
+        v-for="(override, modelKey) in visibleModels"
         :key="modelKey"
         class="bg-white border border-slate-200/90 rounded-xl shadow-2xs"
       >
@@ -218,7 +253,7 @@ function updateModelThinkingConfig(modelKey: string, level: string | null) {
               />
 
               <ConfigSelect
-                :model-value="override.generation_config_defaults?.thinking_config?.level"
+                :model-value="normalizeThinkingLevel(override.generation_config_defaults?.thinking_config?.level)"
                 label="思考强度等级"
                 :options="THINKING_LEVEL_OPTIONS"
                 schema-key="generation.thinking_level"

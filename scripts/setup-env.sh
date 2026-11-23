@@ -73,7 +73,7 @@ if [ ! -f "${SIGNER_BIN}" ]; then
     if is_termux; then
         log "  (Termux 环境可通过 'pkg install -y golang zig' 一键就绪编译器)"
     else
-        log "  (需要 Go 1.22+ 以及 zig 或 clang/gcc 编译器)"
+        log "  (需要 Go 1.27+ 以及 zig 或 clang/gcc 编译器)"
     fi
     log "  [提示] 若跳过编译，系统启动时将自动降级至远程签名节点 (spinsnow)。"
     log "=================================================================="

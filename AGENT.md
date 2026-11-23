@@ -183,11 +183,18 @@ aistudio-api/
 │   ├── api/                       # HTTP 接口层 (FastAPI)
 │   │   ├── app.py                 # 应用生命周期与静态托管
 │   │   ├── dependencies.py        # API Key 与 Token 鉴权注入
+│   │   ├── request_middleware.py  # 请求观测/限流/历史持久化中间件
+│   │   ├── keepalive.py           # 流式心跳与非流式延迟响应 (_DeferredResponse)
 │   │   ├── routes_gemini.py       # /v1beta/models/*:generateContent 路由
-│   │   ├── routes_compat.py       # /v1/chat/completions 与 /v1/messages OpenAI/Claude 兼容路由
+│   │   ├── routes_compat.py       # /v1/chat/completions、/v1/messages 与 /v1/responses 兼容路由
 │   │   ├── routes_models.py       # /v1beta/models 模型发现路由
 │   │   ├── routes_accounts.py     # 账号管理与探活路由
-│   │   ├── routes_system.py       # 监控指标、日志配置与 config.yaml 热重载路由
+│   │   ├── routes_account_imports.py # Cookie 导入/探活批量/凭据 Bundle 端点族
+│   │   ├── routes_config.py       # config.yaml 热重载、API Key 与全局代理
+│   │   ├── routes_signer.py       # WAA 签名器节点管理与本地守护控制
+│   │   ├── routes_logs.py         # 运行日志查询与 SSE 实时日志流
+│   │   ├── routes_operations.py   # 请求历史/快照等运维查询
+│   │   ├── routes_system.py       # 监控指标与健康检查路由
 │   │   ├── state.py               # 运行时全局单例容器 (RuntimeState)
 │   │   ├── schemas.py             # API 请求与校验模型
 │   │   ├── schemas_compat.py      # OpenAI / Claude 兼容层请求模型
@@ -197,16 +204,23 @@ aistudio-api/
 │   │   ├── account_rotator.py     # 黏性账号调度器 (按模型记录 429 与太平洋午夜重置)
 │   │   ├── account_service.py     # 账号存储与激活上下文协调
 │   │   ├── api_service_gemini.py  # Gemini 请求生命周期与流式处理
-│   │   ├── compat_service.py      # OpenAI / Claude ↔ Gemini 协议双向转换 (含 SSE 流式与模型映射)
+│   │   ├── compat_service.py      # 兼容层门面 (re-export，实现见下列四模块)
+│   │   ├── compat_openai.py       # OpenAI Chat Completions 请求/响应/流式转换
+│   │   ├── compat_claude.py       # Claude Messages 全族转换
+│   │   ├── compat_shared.py       # 兼容层共享：媒体/签名/并发/SSE 帧解析/模型解析
+│   │   ├── compat_errors.py       # 上游错误 → OpenAI/Claude 错误类型映射
+│   │   ├── responses_service.py   # OpenAI Responses API (input/items → Gemini)
+│   │   ├── schema_wire_codec.py   # JSON Schema → AI Studio wire 编码 (含降级链)
 │   │   ├── account_orchestrator.py# _switch_lock 切号互斥与故障转移编排
 │   │   └── chat_service.py        # 消息规范化与多模态数据处理
 │   ├── domain/                    # 领域模型与异常定义
 │   │   ├── errors.py              # 业务异常定义 (AuthError, UsageLimitExceeded, TransportError 等)
-│   │   └── models.py              # 领域数据结构 (Candidate, ModelOutput 等)
-│   ├── infrastructure/            # 基础设施层
+│   │   ├── models.py              # 领域数据结构 (Candidate, ModelOutput 等)
+│   │   └── tool_signatures.py     # 思考签名缓存（去抖落盘 + atexit 兑底）
+│   ├── infrastructure/            # 基础设施层（详略同源码树）
 │   │   ├── account/               # Cookie 解析、SAPISIDHASH 计算与凭据存储 (account_store, cookie_parser)
-│   │   ├── proxy_bridge.py       # TURN/SSTP 桥接子进程池与统一代理解析入口 (resolve_proxy_url)
-│   │   ├── waa/                   # WAA 证明令牌签名客户端 (signer)
+│   │   ├── proxy_bridge.py        # TURN/SSTP 桥接子进程池与统一代理解析入口 (resolve_proxy_url)
+│   │   ├── waa/                   # WAA 证明令牌签名客户端 (signer / daemon 子进程管理 / health 熔断记账)
 │   │   └── gateway/               # 会话管理 (session)、HTTP/2 传输层 (transport)、模型发现 (model_discovery)、Wire 编解码与流式管道
 ├── proxybridge/                  # 独立 Go TURN/TURNS/SSTP → 本地 SOCKS5 桥接器 (aistudio-proxy-bridge)
 │   ├── build.sh                  # 纯 Go 一键构建脚本（无 CGO 依赖）

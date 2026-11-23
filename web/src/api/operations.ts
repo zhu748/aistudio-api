@@ -153,12 +153,27 @@ export const operationsApi = {
     }>(`/api/requests/${encodeURIComponent(id)}/upstream`)
   },
   async upstreamBlob(id: string) {
-    const response = await fetch(
-      `/api/requests/${encodeURIComponent(id)}/upstream?download=1`,
-      { headers: await authHeaders() },
-    )
-    if (!response.ok) throw new Error(`下载失败 (HTTP ${response.status})`)
-    return response.blob()
+    // 超时兑底：后端挂起时 fetch 永不 settle，调用方的下载 loading 态会
+    // 永久转圈；AbortController 60s 超时与常规请求超时口径一致。
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 60_000)
+    try {
+      const response = await fetch(
+        `/api/requests/${encodeURIComponent(id)}/upstream?download=1`,
+        { headers: await authHeaders(), signal: controller.signal },
+      )
+      if (!response.ok) throw new Error(`下载失败 (HTTP ${response.status})`)
+      return await response.blob()
+    } catch (err: unknown) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        // ES2020 lib 无 Error cause 形参，用 Object.assign 携带（满足
+        // preserve-caught-error：症状错误保留原因链）
+        throw Object.assign(new Error('下载超时（60 秒），请稍后重试'), { cause: err })
+      }
+      throw err
+    } finally {
+      clearTimeout(timeout)
+    }
   },
   upstreamSnapshotStats() {
     return request<{

@@ -81,9 +81,13 @@ async function loadConfig() {
 async function handleSave() {
   saving.value = true
   try {
+    // 前端 clamp（后端 pydantic ge=5/le=86400 同口径）：min/max 只是
+    // HTML 属性，手输越界值原先直接提交等 422。
+    const clampedInterval = Math.min(86400, Math.max(5, Math.floor(Number(interval.value) || 60)))
+    if (clampedInterval !== interval.value) interval.value = clampedInterval
     absorbResponse(await systemApi.updateKeepaliveConfig({
       url: keepaliveUrl.value,
-      interval: interval.value,
+      interval: clampedInterval,
       allow_private: allowPrivate.value,
     }))
     toast.success(

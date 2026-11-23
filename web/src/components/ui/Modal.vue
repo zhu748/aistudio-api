@@ -3,6 +3,10 @@ import { watch, onMounted, onUnmounted, ref, nextTick, useId } from 'vue'
 import { X } from 'lucide-vue-next'
 import { setModalScroll } from '@/composables/modalScroll.ts'
 
+// 模块级打开栈：嵌套 Modal（业务弹层 + ConfirmDialog）同时打开时，
+// Esc 只关最顶层——原先每个实例都响应，一次 Esc 会连环关闭全部弹层。
+const escStack: string[] = []
+
 interface Props {
   modelValue: boolean
   title?: string
@@ -31,6 +35,10 @@ function closeModal() {
 
 function handleKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape' && props.modelValue) {
+    // 只有栈顶实例响应 Esc（后打开的在栈顶）；stopImmediatePropagation
+    // 防止同层其他监听器（如 ConfirmDialog）重复处理。
+    if (escStack[escStack.length - 1] !== titleId) return
+    e.stopImmediatePropagation()
     closeModal()
   }
   if (e.key === 'Tab' && props.modelValue && panel.value) {
@@ -57,6 +65,8 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeydown)
+  const idx = escStack.indexOf(titleId)
+  if (idx >= 0) escStack.splice(idx, 1)
   setModalScroll(titleId, false)
 })
 
@@ -65,9 +75,14 @@ watch(
   (val) => {
     setModalScroll(titleId, val)
     if (val) {
+      const idx = escStack.indexOf(titleId)
+      if (idx >= 0) escStack.splice(idx, 1)
+      escStack.push(titleId)
       previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
       void nextTick(() => panel.value?.focus())
     } else {
+      const idx = escStack.indexOf(titleId)
+      if (idx >= 0) escStack.splice(idx, 1)
       if (previousFocus?.isConnected) previousFocus.focus()
     }
   },

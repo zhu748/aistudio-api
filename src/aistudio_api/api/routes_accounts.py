@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Path as FastApiPath
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    HTTPException,
+    Path as FastApiPath,
+    Request,
+)
 from pydantic import BaseModel
 
 from aistudio_api.api.dependencies import (
@@ -18,6 +26,7 @@ from aistudio_api.infrastructure.account.cookie_parser import (
     probe_account_email,
 )
 from aistudio_api.infrastructure.utils.common import mask_email
+from aistudio_api.infrastructure.utils.redaction import redact_text
 
 if TYPE_CHECKING:
     from aistudio_api.api.state import RuntimeState
@@ -44,12 +53,26 @@ class AccountResponse(BaseModel):
     proxy_url: str | None = None
 
 
-def to_account_response(account: AccountMeta) -> AccountResponse:
+def to_account_response(
+    account: AccountMeta, *, request: Request | None = None
+) -> AccountResponse:
+    """AccountMeta → 响应模型。
+
+    传入 ``request`` 时按会话级别掩码代理内嵌凭据：API Key 回退会话
+    只应看到脱敏地址（与 GET /config、/api/proxies 同一信任边界），
+    管理密码会话保持明文便于面板复制。不传（测试/内部调用）保持原样。
+    """
     cid = getattr(account, "cookie_id", None) or (
         f"cookie_{account.created_at[:16]}"
         if getattr(account, "created_at", None)
         else f"cookie_{account.id}"
     )
+    proxy_url = getattr(account, "proxy_url", None)
+    if proxy_url and request is not None:
+        from aistudio_api.api.dependencies import is_admin_password_session
+
+        if not is_admin_password_session(request):
+            proxy_url = redact_text(proxy_url)
     return AccountResponse(
         id=account.id,
         name=account.name,
@@ -62,7 +85,7 @@ def to_account_response(account: AccountMeta) -> AccountResponse:
         enabled=getattr(account, "enabled", True),
         group=getattr(account, "group", "default") or "default",
         notes=getattr(account, "notes", "") or "",
-        proxy_url=getattr(account, "proxy_url", None),
+        proxy_url=proxy_url,
     )
 
 
@@ -122,26 +145,29 @@ class ApplyPresetResponse(BaseModel):
 @router.get("", response_model=list[AccountResponse])
 @router.get("/", response_model=list[AccountResponse])
 async def list_accounts(
+    request: Request,
     account_service: AccountService = Depends(get_account_service),
 ) -> list[AccountResponse]:
     """列出所有账号。"""
     accounts = account_service.list_accounts()
-    return [to_account_response(a) for a in accounts]
+    return [to_account_response(a, request=request) for a in accounts]
 
 
 @router.get("/active", response_model=AccountResponse)
 async def get_active_account(
+    request: Request,
     account_service: AccountService = Depends(get_account_service),
 ) -> AccountResponse:
     """获取当前活跃账号。"""
     account = account_service.get_active_account()
     if account is None:
         raise HTTPException(status_code=404, detail="没有活跃账号")
-    return to_account_response(account)
+    return to_account_response(account, request=request)
 
 
 @router.post("/{account_id}/activate", response_model=AccountResponse)
 async def activate_account(
+    request: Request,
     account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
     account_service: AccountService = Depends(get_account_service),
     runtime_state: RuntimeState = Depends(get_runtime_state),
@@ -159,11 +185,12 @@ async def activate_account(
         runtime_state.rotator.add_account(account.id)
         runtime_state.rotator.clear_cooldown(account.id)
     logger.info("激活账号: id=%s, name=%s", account.id, account.name)
-    return to_account_response(account)
+    return to_account_response(account, request=request)
 
 
 @router.post("/{account_id}/detect-email", response_model=AccountResponse)
 async def detect_account_email(
+    request: Request,
     account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
     account_service: AccountService = Depends(get_account_service),
 ) -> AccountResponse:
@@ -206,11 +233,12 @@ async def detect_account_email(
     acc = account_service.get_account(account_id)
     if not acc:
         raise HTTPException(status_code=404, detail="账号不存在")
-    return to_account_response(acc)
+    return to_account_response(acc, request=request)
 
 
 @router.post("/{account_id}/detect-tier", response_model=AccountResponse)
 async def detect_account_tier(
+    request: Request,
     account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
     account_service: AccountService = Depends(get_account_service),
 ) -> AccountResponse:
@@ -240,7 +268,7 @@ async def detect_account_tier(
     acc = account_service.get_account(account_id)
     if not acc:
         raise HTTPException(status_code=404, detail="账号不存在")
-    return to_account_response(acc)
+    return to_account_response(acc, request=request)
 
 
 @router.post("/{account_id}/rotate-cookies")
@@ -348,6 +376,7 @@ async def delete_cookie_group(
 
 @router.put("/{account_id}", response_model=AccountResponse)
 async def update_account(
+    request: Request,
     account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
     req: UpdateAccountRequest = Body(...),
     account_service: AccountService = Depends(get_account_service),
@@ -357,11 +386,12 @@ async def update_account(
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
     logger.info("账号名称已更新: id=%s, name=%s", account.id, req.name)
-    return to_account_response(account)
+    return to_account_response(account, request=request)
 
 
 @router.post("/{account_id}/toggle", response_model=AccountResponse)
 async def toggle_account(
+    request: Request,
     account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
     req: ToggleAccountRequest = Body(default_factory=ToggleAccountRequest),
     account_service: AccountService = Depends(get_account_service),
@@ -379,11 +409,12 @@ async def toggle_account(
         await try_switch_account(failed_account_id=account_id)
 
     logger.info("账号状态已切换: id=%s, enabled=%s", account.id, account.enabled)
-    return to_account_response(account)
+    return to_account_response(account, request=request)
 
 
 @router.put("/{account_id}/group", response_model=AccountResponse)
 async def update_account_group(
+    request: Request,
     account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
     req: UpdateGroupRequest = Body(...),
     account_service: AccountService = Depends(get_account_service),
@@ -393,11 +424,12 @@ async def update_account_group(
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
     logger.info("账号分组已更新: id=%s, group=%s", account.id, account.group)
-    return to_account_response(account)
+    return to_account_response(account, request=request)
 
 
 @router.put("/{account_id}/notes", response_model=AccountResponse)
 async def update_account_notes(
+    request: Request,
     account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
     req: UpdateNotesRequest = Body(...),
     account_service: AccountService = Depends(get_account_service),
@@ -406,7 +438,7 @@ async def update_account_notes(
     account = account_service.update_account_notes(account_id, req.notes)
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
-    return to_account_response(account)
+    return to_account_response(account, request=request)
 
 
 class UpdateProxyRequest(BaseModel):
@@ -415,6 +447,7 @@ class UpdateProxyRequest(BaseModel):
 
 @router.put("/{account_id}/proxy", response_model=AccountResponse)
 async def update_account_proxy(
+    request: Request,
     account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
     req: UpdateProxyRequest = Body(...),
     account_service: AccountService = Depends(get_account_service),
@@ -444,12 +477,23 @@ async def update_account_proxy(
         target_file = account_service.get_account_auth_path(account_id)
         if target_file and active_file == str(target_file):
             await client.session.transition_to_account(active_file, force_refresh=True)
+    # 旧代理的客户端池与 turn/sstp 桥接子进程退役：账号级代理变更不走
+    # set_default_proxy（全局代理未变），以「全局代理 + 全部账号代理」为
+    # 保留集回收其余池（延迟关闭，在途请求安全排空）。
+    if client is not None:
+        from aistudio_api.config import settings
+
+        keep_proxies: set[str | None] = {settings.proxy_url}
+        for acc in account_service.list_accounts():
+            keep_proxies.add(getattr(acc, "proxy_url", None))
+        with contextlib.suppress(Exception):
+            await client.session.retire_unused_clients(keep_proxies)
     logger.info(
         "更新账号代理: id=%s, proxy=%s",
         account_id,
         redact_text(account.proxy_url or "(全局)"),
     )
-    return to_account_response(account)
+    return to_account_response(account, request=request)
 
 
 @router.get("/groups/list", response_model=list[str])
