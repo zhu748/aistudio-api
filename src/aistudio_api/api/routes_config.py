@@ -82,6 +82,14 @@ def _mask_yaml_api_keys(yaml_content: str) -> str:
                     server["headers"] = dict.fromkeys(headers, "***")
                 if server.get("auth_token_env"):
                     server["auth_token_env"] = "***"
+    # 全局出站代理可能内嵌 user:pass 凭据（update_global_proxy 按 0600
+    # 私密落盘）：非管理密码会话读 /config 时必须同等级掩码，否则任意
+    # API Key 持有者可读出代理账密。
+    network = parsed.get("network")
+    if isinstance(network, dict):
+        proxy_url = network.get("proxy_url")
+        if isinstance(proxy_url, str) and proxy_url.strip():
+            network["proxy_url"] = redact_text(proxy_url)
     try:
         return yaml.dump(
             parsed, allow_unicode=True, sort_keys=False, default_flow_style=False

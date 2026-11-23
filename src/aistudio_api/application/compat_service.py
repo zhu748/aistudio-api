@@ -46,6 +46,7 @@ from aistudio_api.application.compat_openai import (
 from aistudio_api.application.compat_shared import (
     MEDIA_CONCURRENCY,
     _as_dict,
+    _as_int,
     _as_str,
     _convert_items_concurrently,
     _file_block_to_part,
@@ -64,6 +65,7 @@ from aistudio_api.application.compat_shared import (
 __all__ = [
     "MEDIA_CONCURRENCY",
     "_as_dict",
+    "_as_int",
     "_as_str",
     "_claude_stop_reason",
     "_claude_thinking_to_level",

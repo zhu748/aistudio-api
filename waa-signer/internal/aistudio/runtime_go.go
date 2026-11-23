@@ -819,7 +819,7 @@ func (runtime *goWAARuntime) State() camoufoxnative.State {
 	}
 }
 
-// Close 结束 VM 生命周期
+// Close 结束 VM 生命周期并释放空闲 HTTP 连接
 func (runtime *goWAARuntime) Close() error {
 	runtime.vmMu.Lock()
 	defer runtime.vmMu.Unlock()
@@ -831,5 +831,6 @@ func (runtime *goWAARuntime) Close() error {
 		runtime.vm.Close()
 		runtime.vm = nil
 	}
+	runtime.client.CloseIdleConnections()
 	return nil
 }

@@ -69,15 +69,20 @@ class StreamingGateway:
         capture = (
             request.model_turn.capture() if request.model_turn is not None else None
         )
-        # 真实页面行为：GenerateContent 发出 2.2s 后补一次 CountTokens
+        # 真实页面行为：GenerateContent 发出约 2.2s 后补一次 CountTokens
         # （当前用户轮次；Go 签名器 SendProtected 同源行为）。page_prompt
         # 在 prepare_request 已从 typed contents 提取，无需重新解析 body。
+        # 延迟到首个 2xx 数据块后再调度：429/403/立即断连的失败尝试
+        # （含账号轮换重试）不应对同一受限账号再补一发 CountTokens，
+        # 限流风暴下会放大上游压力（非流式 generate_content 已是
+        # "确认 200 后才调度"的对称语义）。
+        counttokens_scheduler = None
         if request.url.rstrip("/").endswith("/GenerateContent"):
             scheduler = getattr(
                 self._session, "schedule_browser_counttokens_followup", None
             )
             if callable(scheduler):
-                scheduler(request.ctx, model, request.page_prompt)
+                counttokens_scheduler = scheduler
         parser = IncrementalJSONStreamParser()
         utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
         latest_usage: dict[str, object] | None = None
@@ -188,6 +193,14 @@ class StreamingGateway:
                             : HEAD_SAMPLE_LIMIT - len(head_sample)
                         ]
                     if status_code == 200:
+                        # 首个 2xx 数据块到达：此刻才调度浏览器行为补发
+                        # （上游确认服务中，补发不再路空；首块一般远早于
+                        # 2.2s 的补发时刻，时序仍贴近真实页面）。
+                        if counttokens_scheduler is not None:
+                            counttokens_scheduler(
+                                request.ctx, model, request.page_prompt
+                            )
+                            counttokens_scheduler = None
                         # 非 200 的错误体无需逐块解析（解析器只为正常流服务，
                         # 白扫 64KB 错误页纯浪费 CPU，且理论上可能把凑巧结构
                         # 下发为事件）；错误分类走末尾的 raw_response 路径。

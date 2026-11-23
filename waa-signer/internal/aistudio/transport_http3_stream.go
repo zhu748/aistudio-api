@@ -239,7 +239,7 @@ func (body *http3Body) Read(buffer []byte) (int, error) {
 			if _, err := io.ReadFull(body.reader, payload); err != nil {
 				return 0, body.readError(err)
 			}
-			fields, err := body.decoder.decode(context.Background(), payload, int64(body.stream.StreamID()))
+			fields, err := body.decoder.decode(body.response.Request.Context(), payload, int64(body.stream.StreamID()))
 			if err != nil {
 				return 0, err
 			}

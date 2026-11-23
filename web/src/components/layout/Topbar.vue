@@ -107,7 +107,7 @@ const activeNodeLabel = computed(() => {
         @click="emit('openTokenModal')"
       >
         <Key class="w-3.5 h-3.5 text-slate-500" />
-        <span class="hidden sm:inline">密码</span>
+        <span class="hidden sm:inline">会话</span>
       </button>
     </div>
   </header>

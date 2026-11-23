@@ -8,11 +8,11 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/Mag1cFall/AIStudio2API/internal/atomicwrite"
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 )
 
@@ -165,7 +165,7 @@ func WriteStorageState(filePath string, state StorageState) error {
 		return fmt.Errorf("编码 storage state: %w", err)
 	}
 	data = append(data, '\n')
-	return atomicWriteFile(filePath, data, 0o600)
+	return atomicwrite.WriteFile(filePath, data, 0o600)
 }
 
 // Validate 校验 storage state 的浏览器字段
@@ -399,39 +399,4 @@ func sameSiteText(value http.SameSite) string {
 	default:
 		return "Lax"
 	}
-}
-
-func atomicWriteFile(filePath string, data []byte, mode os.FileMode) error {
-	target, err := filepath.Abs(filePath)
-	if err != nil {
-		return fmt.Errorf("解析文件路径: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return fmt.Errorf("创建文件目录: %w", err)
-	}
-	temporary, err := os.CreateTemp(filepath.Dir(target), "."+filepath.Base(target)+"-*.tmp")
-	if err != nil {
-		return fmt.Errorf("创建临时文件: %w", err)
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(mode); err != nil {
-		temporary.Close()
-		return fmt.Errorf("设置文件权限: %w", err)
-	}
-	if _, err := temporary.Write(data); err != nil {
-		temporary.Close()
-		return fmt.Errorf("写入临时文件: %w", err)
-	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return fmt.Errorf("同步临时文件: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("关闭临时文件: %w", err)
-	}
-	if err := os.Rename(temporaryPath, target); err != nil {
-		return fmt.Errorf("替换文件: %w", err)
-	}
-	return nil
 }

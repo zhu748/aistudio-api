@@ -35,6 +35,7 @@ from aistudio_api.infrastructure.proxy_bridge import (
 from aistudio_api.infrastructure.utils.logger import get_logger
 from aistudio_api.infrastructure.utils.upstream_dump import (
     save_upstream_exchange,
+    should_save_exchange,
 )
 
 logger = get_logger("transport")
@@ -649,10 +650,26 @@ class HTTPStreamTransport:
     ) -> None:
         """把 Set-Cookie 持久化调度为后台任务（失败仅记日志，不影响请求流）。"""
         task = asyncio.create_task(
-            asyncio.to_thread(_persist_set_cookies, set_cookies, auth_file, cookies)
+            self._cookie_persist_worker(set_cookies, auth_file, cookies)
         )
         self._pending_cookie_tasks.add(task)
         task.add_done_callback(self._pending_cookie_tasks.discard)
+
+    async def _cookie_persist_worker(
+        self,
+        set_cookies: list[str],
+        auth_file: str | None,
+        cookies: dict[str, str] | None,
+    ) -> None:
+        """后台落盘任务体：worker 级兑底，异常不再静默丢失。"""
+        try:
+            await asyncio.to_thread(
+                _persist_set_cookies, set_cookies, auth_file, cookies
+            )
+        except Exception as exc:
+            # 派发后无人 await 的任务异常只会进 "Task exception was never
+            # retrieved"，滚动凭据丢失无任何可见日志。
+            logger.warning("后台 Set-Cookie 持久化失败: %s", exc)
 
     async def _flush_cookie_persist(self) -> None:
         """关停前排空后台 Cookie 持久化任务，避免滚动凭据丢失。"""
@@ -1008,19 +1025,22 @@ class HTTPStreamTransport:
                     len(content),
                 )
                 # 交换快照：成功与失败均采集（函数内部按 RPC 类型与保留策略
-                # 决定落盘形态；httpx 最末请求头 multi_items 保真实线缆顺序）
-                await asyncio.to_thread(
-                    save_upstream_exchange,
-                    url=url,
-                    wire_headers=list(request.headers.multi_items()),
-                    body=body,
-                    status=resp.status_code,
-                    response_sample=content,
-                    response_headers=dict(resp.headers.multi_items()),
-                    response_http_version=resp.http_version,
-                    elapsed_ms=elapsed_ms,
-                    proxy_url=effective_proxy,
-                )
+                # 决定落盘形态；httpx 最末请求头 multi_items 保真实线缆顺序）。
+                # 门禁前置：辅助 RPC 成功 / 成功快照保留为 0 时无需构建
+                # 头列表与派发线程（空跑 to_thread 约 78µs + 头拷贝分配）。
+                if should_save_exchange(url, resp.status_code):
+                    await asyncio.to_thread(
+                        save_upstream_exchange,
+                        url=url,
+                        wire_headers=list(request.headers.multi_items()),
+                        body=body,
+                        status=resp.status_code,
+                        response_sample=content,
+                        response_headers=dict(resp.headers.multi_items()),
+                        response_http_version=resp.http_version,
+                        elapsed_ms=elapsed_ms,
+                        proxy_url=effective_proxy,
+                    )
                 return resp.status_code, content
             except Exception as exc:
                 err_detail = (
@@ -1096,18 +1116,21 @@ class HTTPStreamTransport:
                             remaining -= len(sample)
                             if not remaining:
                                 break
-                    await asyncio.to_thread(
-                        save_upstream_exchange,
-                        url=url,
-                        wire_headers=list(req.headers.multi_items()),
-                        body=body,
-                        status=resp.status_code,
-                        response_sample=bytes(error_sample),
-                        response_headers=dict(resp.headers.multi_items()),
-                        response_http_version=resp.http_version,
-                        elapsed_ms=(time.perf_counter() - t0) * 1000,
-                        proxy_url=effective_proxy,
-                    )
+                    # 同非流式路径的门禁前置（错误快照恒保留，此判断仅对
+                    # 理论上不会出现的 2xx 走到此处时省一次空跑派发）。
+                    if should_save_exchange(url, resp.status_code):
+                        await asyncio.to_thread(
+                            save_upstream_exchange,
+                            url=url,
+                            wire_headers=list(req.headers.multi_items()),
+                            body=body,
+                            status=resp.status_code,
+                            response_sample=bytes(error_sample),
+                            response_headers=dict(resp.headers.multi_items()),
+                            response_http_version=resp.http_version,
+                            elapsed_ms=(time.perf_counter() - t0) * 1000,
+                            proxy_url=effective_proxy,
+                        )
                     return
 
                 # 成功流：边转发边积累头部样本（仅形态比对用途，硬限 64KiB，

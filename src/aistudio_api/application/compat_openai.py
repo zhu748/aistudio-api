@@ -28,6 +28,7 @@ from aistudio_api.api.schemas import (
     GeminiTool,
 )
 from aistudio_api.api.schemas_compat import OpenAIChatCompletionRequest
+from aistudio_api.application.api_service_gemini import _ERROR_TEXT_PREFIX
 from aistudio_api.application.compat_errors import (
     _GEMINI_TO_OPENAI_FINISH,
     _OPENAI_ERROR_TYPE,
@@ -589,6 +590,10 @@ def build_openai_completion(
                 f"\n\n![image](data:{inline.mimeType};base64,{inline.data})"
             )
         function_call = getattr(part, "functionCall", None)
+        # 异常终结（MAX_TOKENS/SAFETY/未知枚举）下丢弃工具调用：截断的
+        # 并行调用集合可能不完整，执行部分调用集有副作用风险——有意与
+        # 流式侧（已冲刷内容无法撤回）不对称，见回归测试
+        # test_non_streaming_interrupted_calls_are_not_executable。
         if function_call is not None and finish_reason_raw in (None, "STOP"):
             has_tool_calls = True
             call_id = function_call.id or f"call_{secrets.token_hex(12)}"
@@ -663,7 +668,12 @@ async def openai_stream_adapter(
     created = int(time.time())
 
     def _sse(payload: dict[str, object]) -> str:
-        return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+        # separators：SSE 每帧省去 ", " 与 ": " 的空格（约 2-4% 字节/分配）
+        return (
+            "data: "
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            + "\n\n"
+        )
 
     def _chunk(
         delta: dict[str, object], finish_reason: str | None
@@ -785,6 +795,11 @@ async def openai_stream_adapter(
                         continue
                     text = part.get("text")
                     if isinstance(text, str) and text:
+                        # 上游错误兑底文本（_error_text_payload）不是正文：
+                        # 随后的结构化错误帧已携带同等信息，重复下发会混进
+                        # assistant content（与 Responses 适配器同款过滤）。
+                        if text.startswith(_ERROR_TEXT_PREFIX):
+                            continue
                         if part.get("thought") is True:
                             yield _sse(_chunk({"reasoning_content": text}, None))
                         else:

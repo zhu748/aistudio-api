@@ -690,6 +690,10 @@ extern "C" bool mz_call_function(mz_context* mz, uint32_t fn, uint32_t thisv, co
   JSContext* cx = mz->cx;
   JS::RootedValue callee(cx, Slot(mz, fn));
   if (!callee.isObject()) {
+    if (mz->slots.empty() || !mz->slots.front().get().isObject()) {
+      Capture(mz);
+      return false;
+    }
     JS::RootedObject global(cx, &mz->slots.front().get().toObject());
     JSAutoRealm ar(cx, global);
     JS_ReportErrorASCII(cx, "callee is not an object");

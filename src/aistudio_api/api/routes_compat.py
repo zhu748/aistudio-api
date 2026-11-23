@@ -76,7 +76,7 @@ def _truthy(value: object) -> bool:
         return value
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on", "y", "t")
-    return value is True
+    return False
 
 
 def _shrink_media_payloads(node: object) -> object:

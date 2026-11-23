@@ -121,7 +121,16 @@ func readSOCKSGreeting(conn net.Conn) ([]byte, bool) {
 // error just drops the connection.
 func refuseOverloaded(conn net.Conn) {
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, ok := readSOCKSGreeting(conn); !ok {
+	methods, ok := readSOCKSGreeting(conn)
+	if !ok {
+		return
+	}
+	found := false
+	for _, method := range methods {
+		found = found || method == 0
+	}
+	if !found {
+		conn.Write([]byte{5, 255})
 		return
 	}
 	if _, err := conn.Write([]byte{5, 0}); err != nil {

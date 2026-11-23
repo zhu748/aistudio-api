@@ -37,6 +37,7 @@ const toast = useToastStore()
 let es: EventSource | null = null
 let retryTimer: ReturnType<typeof setTimeout> | null = null
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
+let levelTimer: ReturnType<typeof setTimeout> | null = null
 let connectSeq = 0
 
 const levelOptions = [
@@ -135,7 +136,34 @@ function appendEntries(incoming: LogEntry[]) {
   if (autoScroll.value && order.value === 'asc') scrollToEnd()
 }
 
+// SSE log 事件批量缓冲：逐条 appendEntries 会让 visibleLogs computed 每条都
+// 重算（全量 filter+reverse）并触发上千行 v-for 重新 diff，高频日志下主线程
+// 会被渲染打爆。这里攒批 ~100ms 后一次性 appendEntries；断流/卸载前先冲刷
+// 余量，保证日志不丢且与后续 snapshot 顺序不乱。
+const FLUSH_INTERVAL_MS = 100
+const pendingEntries: LogEntry[] = []
+let flushTimer: ReturnType<typeof setTimeout> | null = null
+
+function flushPendingEntries() {
+  if (flushTimer) {
+    clearTimeout(flushTimer)
+    flushTimer = null
+  }
+  if (!pendingEntries.length) return
+  appendEntries(pendingEntries.splice(0, pendingEntries.length))
+}
+
+function queueLogEntry(entry: LogEntry) {
+  pendingEntries.push(entry)
+  if (flushTimer === null) {
+    flushTimer = setTimeout(flushPendingEntries, FLUSH_INTERVAL_MS)
+  }
+}
+
 function closeStream() {
+  // 先冲刷缓冲余量：重连 snapshot 会整体替换 entries，未提交的旧流日志
+  // 必须先落地，否则会在 snapshot 之后被追加造成乱序。
+  flushPendingEntries()
   connectSeq += 1
   if (es) {
     es.close()
@@ -206,7 +234,7 @@ async function connectStream() {
   source.addEventListener('log', (ev) => {
     if (!isCurrent(seq)) return
     const entry = parseEventData<LogEntry>(ev)
-    if (entry) appendEntries([entry])
+    if (entry) queueLogEntry(entry)
   })
   source.addEventListener('ping', (ev) => {
     if (!isCurrent(seq)) return
@@ -251,6 +279,12 @@ function isCurrent(seq: number): boolean {
 async function handleClear() {
   try {
     const res = await systemApi.clearLogs()
+    // 丢弃已缓冲未提交的旧日志并取消定时冲刷，避免清空后又被余量回填
+    pendingEntries.length = 0
+    if (flushTimer) {
+      clearTimeout(flushTimer)
+      flushTimer = null
+    }
     entries.value = []
     total.value = res.total ?? 0
     toast.success('环形日志缓冲区已清空')
@@ -264,13 +298,37 @@ function handleRefresh() {
   void connectStream()
 }
 
+// 页面隐藏时挂起 SSE（无人观看的日志渲染只是白白消耗 CPU 与带宽），
+// 恢复可见时重连。与 onerror 自动重连互不打架：closeStream 会顺带清掉
+// retryTimer 与在途连接（connectSeq 失配即作废），「由隐藏而挂起」只
+// 有本处理函数会置位，重新可见时也只在该标志置位时恢复连接。
+let pausedByHidden = false
+
+function handleVisibilityChange() {
+  if (document.hidden) {
+    if (!live.value || historical.value) return
+    // 没有活动流、待重连或在途连接时不需挂起（避免误吞 live 开关语义）
+    if (!es && !retryTimer && connState.value !== 'connecting') return
+    pausedByHidden = true
+    closeStream()
+    connState.value = 'idle'
+  } else if (pausedByHidden) {
+    pausedByHidden = false
+    void connectStream()
+  }
+}
+
 watch(historical, (value) => {
   if (value) {
     closeStream()
     connState.value = 'idle'
   } else void connectStream()
 })
-watch(level, () => void connectStream())
+watch(level, () => {
+  closeStream()
+  if (levelTimer) clearTimeout(levelTimer)
+  levelTimer = setTimeout(() => void connectStream(), 300)
+})
 let filterTimer: ReturnType<typeof setTimeout> | null = null
 watch([category, requestFilter, modelFilter, accountFilter], () => {
   closeStream()
@@ -302,6 +360,7 @@ watch(searchInput, (val) => {
 })
 
 onMounted(() => {
+  document.addEventListener('visibilitychange', handleVisibilityChange)
   void connectStream()
 })
 usePageRefresh(async () => {
@@ -313,6 +372,8 @@ onUnmounted(() => {
   closeStream()
   if (debounceTimer) clearTimeout(debounceTimer)
   if (filterTimer) clearTimeout(filterTimer)
+  if (levelTimer) clearTimeout(levelTimer)
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
 })
 </script>
 

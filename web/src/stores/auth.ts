@@ -98,12 +98,6 @@ export const useAuthStore = defineStore('auth', () => {
     token.value = ''
   }
 
-  function updateToken(newToken: string) {
-    const trimmed = newToken.trim()
-    setToken(trimmed)
-    token.value = trimmed
-  }
-
   return {
     authEnabled,
     token,
@@ -115,6 +109,5 @@ export const useAuthStore = defineStore('auth', () => {
     login,
     restoreSession,
     logout,
-    updateToken,
   }
 })

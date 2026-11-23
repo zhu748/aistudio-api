@@ -440,6 +440,7 @@ func (runtime *Runtime) snapshotWith(ctx context.Context, digest mozjs.Value) (s
 		callback, err := handleOf(state.invoke(runtime.bind, 0, mozjs.Object(runtime.deliver), mozjs.Number(id)))
 		if err != nil {
 			delete(runtime.results, id)
+			state.release(err)
 			finish("", err)
 			return
 		}
@@ -447,6 +448,7 @@ func (runtime *Runtime) snapshotWith(ctx context.Context, digest mozjs.Value) (s
 		options, err := handleOf(state.invoke(runtime.options, 0, digest))
 		if err != nil {
 			delete(runtime.results, id)
+			state.release(err)
 			finish("", err)
 			return
 		}

@@ -140,6 +140,27 @@ def _merge_key_sets(
     return config_keys | env_keys
 
 
+# API Key 回退会话（未设管理密码的部署形态）禁入的敏感写路径前缀：
+# - /config、/api-keys：写 config.yaml 可自签新 Key 完成权限提升；
+# - /api/proxies：改全局出站代理可把全部上游/签名流量重定向到自控
+#   节点（窃取账号凭据）；
+# - /api/logs、/api/requests：清空日志/请求历史销毁审计痕迹；
+# - /accounts、/api/accounts：账号增删/导入/切换改变凭据面；
+# - /rotation：调度干预（清冷却/强切账号）。
+# POST /api/logs/stream-ticket（SSE 票据签发）与 detect-email/tier
+# （幂等探测）例外放行，见 require_web_auth 内的例外判定。
+_APIKEY_SESSION_WRITE_PREFIXES = (
+    "/config",
+    "/api-keys",
+    "/api/proxies",
+    "/api/logs",
+    "/api/requests",
+    "/accounts",
+    "/api/accounts",
+    "/rotation",
+)
+
+
 # ---------------------------------------------------------------------------
 # 面板实时日志流（SSE）短时一次性票据
 # ---------------------------------------------------------------------------
@@ -279,9 +300,13 @@ def require_web_auth(request: Request) -> None:
             for candidate in _encoded_keys(_all_configured_api_keys())
         ):
             req_method = getattr(request, "method", "GET")
+            path = request.url.path.rstrip("/")
             if req_method in ("POST", "PUT", "DELETE", "PATCH") and (
-                request.url.path.rstrip("/").startswith("/config")
-                or request.url.path.rstrip("/").startswith("/api-keys")
+                path.startswith(_APIKEY_SESSION_WRITE_PREFIXES)
+                # SSE 票据签发只读（EventSource 无法带 Header 的通道补偿）
+                and path != "/api/logs/stream-ticket"
+                # 幂等探测端点不改状态（与 activate/update 等真写操作区分）
+                and not path.endswith(("/detect-email", "/detect-tier"))
             ):
                 raise HTTPException(
                     status_code=403,

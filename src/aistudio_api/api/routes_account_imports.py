@@ -213,12 +213,18 @@ async def import_cookies(
                 if not detected_email:
                     with contextlib.suppress(Exception):
                         detected_email = await probe_account_email(
-                            cookie_dict, auth_user=req.auth_user or "0"
+                            cookie_dict,
+                            auth_user=req.auth_user or "0",
+                            # 探活走账号绑定出口，避免粘贴「代理+Cookie」
+                            # 导入时探活走全局出口触发风控（与批量导入一致）。
+                            proxy_url=effective_proxy,
                         )
                 if not detected_tier:
                     with contextlib.suppress(Exception):
                         probed = await probe_account_benefit_tier(
-                            cookie_dict, auth_user=req.auth_user or "0"
+                            cookie_dict,
+                            auth_user=req.auth_user or "0",
+                            proxy_url=effective_proxy,
                         )
                         if probed and probed != "Free":
                             detected_tier = probed
@@ -376,6 +382,12 @@ async def import_bundle(
             (Path.cwd() / "data").resolve(),
             (project_root / "data").resolve(),
         ]
+        # 自定义数据目录部署（AISTUDIO_DATA_DIR，PaaS/测试常见）下，用户
+        # 把导出 JSON 放在真实数据目录内也应可导入。
+        with contextlib.suppress(Exception):
+            from aistudio_api.config import resolve_data_dir
+
+            allowed_roots.append(resolve_data_dir().resolve())
         env_roots = os.getenv("AISTUDIO_IMPORT_ROOTS", "")
         for raw_root in env_roots.split(os.pathsep):
             if raw_root.strip():
@@ -450,12 +462,19 @@ async def import_bundle(
                     if not acc_email:
                         with contextlib.suppress(Exception):
                             acc_email = await probe_account_email(
-                                cookie_dict, auth_user=acc_auth_user
+                                cookie_dict,
+                                auth_user=acc_auth_user,
+                                # 探活走账号绑定出口（与面板单号探活一致），
+                                # 粘贴「代理+Cookie」导入时避免探活走全局
+                                # 出口触发风控。
+                                proxy_url=effective_proxy,
                             )
                     if not acc_tier:
                         with contextlib.suppress(Exception):
                             probed = await probe_account_benefit_tier(
-                                cookie_dict, auth_user=acc_auth_user
+                                cookie_dict,
+                                auth_user=acc_auth_user,
+                                proxy_url=effective_proxy,
                             )
                             if probed and probed != "Free":
                                 acc_tier = probed

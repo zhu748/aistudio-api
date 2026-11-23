@@ -27,6 +27,7 @@ from aistudio_api.api.schemas import (
     GeminiTool,
 )
 from aistudio_api.api.schemas_compat import ClaudeMessagesRequest
+from aistudio_api.application.api_service_gemini import _ERROR_TEXT_PREFIX
 from aistudio_api.application.compat_errors import (
     _CLAUDE_ERROR_TYPE,
     _CLAUDE_REFUSAL_FINISH,
@@ -339,7 +340,11 @@ async def claude_to_gemini_request(
     if req.max_tokens is not None:
         generation_config["maxOutputTokens"] = req.max_tokens
     if req.stop_sequences:
-        generation_config["stopSequences"] = list(req.stop_sequences)
+        # 过滤空串停止词：空 stopSequences 条目会被上游 400 拒绝
+        # （与 OpenAI 侧 stop 处理一致）
+        stop_list = [s for s in req.stop_sequences if isinstance(s, str) and s]
+        if stop_list:
+            generation_config["stopSequences"] = stop_list
     thinking_level = _claude_thinking_to_level(req.thinking)
     if thinking_level is not None:
         generation_config["thinkingConfig"] = {"thinkingLevel": thinking_level}
@@ -448,6 +453,10 @@ def build_claude_message(
                 }
             )
         function_call = getattr(part, "functionCall", None)
+        # 异常终结（MAX_TOKENS/SAFETY/未知枚举）下丢弃工具调用：截断的
+        # 并行调用集合可能不完整，执行部分调用集有副作用风险——有意与
+        # 流式侧（已冲刷内容无法撤回）不对称，见回归测试
+        # test_non_streaming_interrupted_calls_are_not_executable。
         if function_call is not None and finish_reason_raw in (None, "STOP"):
             has_tool_use = True
             call_id = function_call.id or f"toolu_{secrets.token_hex(12)}"
@@ -522,8 +531,11 @@ class _ClaudeStreamEmitter:
         self.thinking_signature = ""
 
     def sse(self, event: str, payload: dict[str, object]) -> str:
+        # separators：SSE 每帧省去 ", " 与 ": " 的空格（约 2-4% 字节/分配）
         return (
-            f"event: {event}\ndata: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+            f"event: {event}\ndata: "
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            + "\n\n"
         )
 
     def message_start(self) -> str:
@@ -657,7 +669,9 @@ class _ClaudeStreamEmitter:
                     "index": self.index,
                     "delta": {
                         "type": "input_json_delta",
-                        "partial_json": json.dumps(args, ensure_ascii=False),
+                        "partial_json": json.dumps(
+                            args, ensure_ascii=False, separators=(",", ":")
+                        ),
                     },
                 },
             )
@@ -824,6 +838,12 @@ async def claude_stream_adapter(
                             if isinstance(signature, str):
                                 emitter.thinking_signature = signature
                         else:
+                            # 上游错误兑底文本（_error_text_payload）不是
+                            # 正文：随后的结构化错误事件已携带同等信息，重复
+                            # 下发会混进 assistant 正文（与 Responses 适配器
+                            # 同款过滤）。
+                            if text.startswith(_ERROR_TEXT_PREFIX):
+                                continue
                             # stop sequence 命中后丢弃后续正文（Claude 语义是
                             # 文本在 stop sequence 处截断，不透传其后内容）；
                             # 命中点在本帧中间时，命中点之前的文本仍需下发

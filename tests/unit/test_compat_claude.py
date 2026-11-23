@@ -631,8 +631,8 @@ async def test_e2e_claude_streaming(
         assert "text/event-stream" in response.headers["content-type"]
         text = response.text
         assert "event: message_start" in text
-        assert '"text": "Streamed "' in text
-        assert '"text": "answer"' in text
+        assert '"text":"Streamed "' in text
+        assert '"text":"answer"' in text
         assert "event: message_delta" in text
         assert "event: message_stop" in text
     finally:

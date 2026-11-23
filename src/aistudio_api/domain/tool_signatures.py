@@ -8,10 +8,13 @@ Missing signatures must never cause tool calls or their results to be deleted.
 
 from __future__ import annotations
 
+import atexit
 import base64
+import contextlib
 import hashlib
 import json
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 
@@ -58,6 +61,13 @@ class ThoughtSignatureCache:
     """
 
     _MAX_ENTRIES = 2048
+    # 记住签名后的落盘去抖：缓存最多 2048 条（数百 KB～MB 级 JSON），
+    # 每次全量序列化 + 原子重写是同步 I/O，remember 跑在事件循环线程的
+    # 热路径上（每个 tool_calls 帧一次），串行锁 + 重复落盘会把并发请求
+    # 的停顿叠到数百 ms。窗口内多次 remember 只在首次落盘，其余置脏；
+    # 进程退出时 atexit 兜底刷盘（窗口内丢的签名仅退化为 SKIP 字面量，
+    # 非关键数据）。
+    _SAVE_DEBOUNCE_SECONDS = 2.0
 
     def __init__(self, path=None) -> None:
         self._path = Path(path) if path is not None else None
@@ -65,6 +75,9 @@ class ThoughtSignatureCache:
         self._signatures: OrderedDict[str, str] = OrderedDict()
         self._loaded = False
         self._load_error_logged = False
+        self._dirty = False
+        self._last_save = 0.0
+        atexit.register(self._atexit_flush)
 
     # -- 公共接口 ----------------------------------------------------------
 
@@ -97,7 +110,26 @@ class ThoughtSignatureCache:
             self._signatures.move_to_end(key)
             while len(self._signatures) > self._MAX_ENTRIES:
                 self._signatures.popitem(last=False)
-            self._save_locked()
+            self._dirty = True
+            now = time.monotonic()
+            if now - self._last_save >= self._SAVE_DEBOUNCE_SECONDS:
+                self._save_locked()
+                self._last_save = now
+                self._dirty = False
+
+    def flush(self) -> None:
+        """落盘窗口内累积的脏数据（优雅关停或退出钩子调用）。"""
+        with self._lock:
+            if self._dirty:
+                self._save_locked()
+                self._dirty = False
+            self._last_save = time.monotonic()
+
+    def _atexit_flush(self) -> None:
+        """进程退出兑底：丢窗口内未落盘的脏数据。"""
+        # 解释器关闭阶段（模块可能已半拆）：签名缓存非关键数据，静默放弃
+        with contextlib.suppress(Exception):
+            self.flush()
 
     def lookup(
         self, call_id: str | None, name: str | None, arguments: object
@@ -148,7 +180,12 @@ class ThoughtSignatureCache:
         try:
             from aistudio_api.infrastructure.utils.common import atomic_write_json
 
-            atomic_write_json(path, {"by_call": dict(self._signatures)}, private=True)
+            atomic_write_json(
+                path,
+                {"by_call": dict(self._signatures)},
+                private=True,
+                compact=True,
+            )
         except (OSError, ValueError) as exc:
             if not self._load_error_logged:
                 self._load_error_logged = True

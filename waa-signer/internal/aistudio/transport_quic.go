@@ -60,13 +60,16 @@ func newQUICResumption() *quicResumption {
 
 // lookup 按 utls loadSession 的判定返回 host 会话恢复时 pre_shared_key 扩展的长度（0 表示不恢复），票据允许 0-RTT 且记得服务端设置时 settings 非 nil
 func (resumption *quicResumption) lookup(host string) (int, *[2]uint64) {
-	session, _ := resumption.sessions.Get(host)
+	session, ok := resumption.sessions.Get(host)
+	if !ok || session == nil {
+		return 0, nil
+	}
 	ticket, state, err := session.ResumptionState()
 	if err != nil || state == nil {
 		return 0, nil
 	}
 	raw, err := state.Bytes()
-	if err != nil || time.Now().After(time.Unix(int64(binary.BigEndian.Uint64(raw[len(raw)-12:])), 0)) {
+	if err != nil || len(raw) < 12 || time.Now().After(time.Unix(int64(binary.BigEndian.Uint64(raw[len(raw)-12:])), 0)) {
 		return 0, nil
 	}
 	binder := 32
