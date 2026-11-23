@@ -62,7 +62,13 @@ async function handleRefresh() {
   }
 }
 onMounted(() => {
-  void accountsStore.fetchAll()
+  // 首帧去重：控制面板/账号池等视图挂载时已通过 usePolling(immediate) 拉起
+  // fetchAll（子组件先于本布局 mounted，此时 loading 必为 true），布局层仅在
+  // 没有进行中且没有任何数据时兜底拉取一次——否则直接落在 /logs、/settings
+  // 等不拉账号的页面时，侧边栏账号徽标与顶栏激活节点会一直空着。
+  if (!accountsStore.loading && !accountsStore.accounts.length) {
+    void accountsStore.fetchAll()
+  }
 })
 </script>
 

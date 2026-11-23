@@ -570,6 +570,11 @@ async def handle_attempt_exception(
     if isinstance(exc, RequestError):
         clean_msg = clean_upstream_error_message(str(exc))
         status_code = exc.status if exc.status > 0 else 500
+        if status_code == 204:
+            # 204 是"无内容"的可达信号而非可序列化的错误状态：响应体禁止
+            # 携带 body（RFC 9110），带 detail 的 HTTPException(204) 会产出
+            # 非法响应。按上游异常终结统一归一为 502 上抛。
+            status_code = 502
         error_type = (
             "bad_request"
             if status_code == 400
@@ -867,7 +872,12 @@ async def handle_gemini_generate_content(
 
 
 def _encode_sse(payload: dict[str, object]) -> str:
-    return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+    # separators：SSE 每帧省去 ", " 与 ": " 的空格（高频 token 流可观）
+    return (
+        "data: "
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        + "\n\n"
+    )
 
 
 def _event_payload(
@@ -900,7 +910,9 @@ def _event_payload(
             part.model_dump(mode="json", exclude_none=True)
             for part in to_gemini_parts("", function_calls=fc_list)
         ]
-        if thought_signature and parts:
+        # pending_signature 只作兑底：part 自带签名时不得覆盖（覆盖会让
+        # 客户端收到的签名与签名缓存记住的不一致，破坏思考链回传）。
+        if thought_signature and parts and not parts[0].get("thoughtSignature"):
             parts[0]["thoughtSignature"] = thought_signature
     elif event_type == "images":
         img_list = text if isinstance(text, list) else []
@@ -908,7 +920,7 @@ def _event_payload(
             part.model_dump(mode="json", exclude_none=True)
             for part in to_gemini_parts("", images=img_list)
         ]
-        if thought_signature and parts:
+        if thought_signature and parts and not parts[0].get("thoughtSignature"):
             parts[0]["thoughtSignature"] = thought_signature
     elif event_type == "reasoning_images":
         r_img_list = text if isinstance(text, list) else []
@@ -916,7 +928,7 @@ def _event_payload(
             part.model_dump(mode="json", exclude_none=True)
             for part in to_gemini_parts("", reasoning_images=r_img_list)
         ]
-        if thought_signature and parts:
+        if thought_signature and parts and not parts[0].get("thoughtSignature"):
             parts[0]["thoughtSignature"] = thought_signature
     else:
         return None
@@ -1451,13 +1463,14 @@ def _build_gemini_streaming_response(
                     anti_stream = restore_anti_truncation_stream(
                         upstream_events, at_ctx
                     )
+                    attempt_frames = _stream_attempt_frames(
+                        anti_stream,
+                        state,
+                        normalized.model,
+                        stream_start_time,
+                    )
                     try:
-                        async for frame in _stream_attempt_frames(
-                            anti_stream,
-                            state,
-                            normalized.model,
-                            stream_start_time,
-                        ):
+                        async for frame in attempt_frames:
                             has_yielded_any = True
                             yield frame
                         auth_manager.current_prepared = None
@@ -1465,7 +1478,10 @@ def _build_gemini_streaming_response(
                         break
                     finally:
                         # 正常完成 / 异常重试 / 客户端断连都走这里，确定性
-                        # 释放上游连接（关闭包装器会连带关闭内层流）。
+                        # 释放上游连接（关闭包装器会连带关闭内层流）；帧层
+                        # 包装生成器同样确定性收尾，不依赖事件循环的
+                        # 异步生成器终结器延迟回收。
+                        await _close_stream_quietly(attempt_frames)
                         await _close_stream_quietly(anti_stream)
                 except Exception as exc:
                     last_stream_error = exc
@@ -1570,14 +1586,21 @@ async def handle_gemini_count_tokens(
     """
     clean_model = sanitize_model_path(model_path)
     effective_contents = req.contents
-    if not effective_contents and req.generateContentRequest is not None:
-        effective_contents = req.generateContentRequest.contents
+    system_instruction = None
+    if req.generateContentRequest is not None:
+        if not effective_contents:
+            effective_contents = req.generateContentRequest.contents
+        # generateContentRequest 形态携带的系统提示也计入 token 统计
+        # （丢弃会让计数偏小，与 generateContent 实际消耗不一致）。
+        system_instruction = req.generateContentRequest.systemInstruction
     if not effective_contents:
         raise HTTPException(
             400, detail={"message": "contents is required", "type": "bad_request"}
         )
 
-    normalized_req = GeminiGenerateContentRequest(contents=effective_contents)
+    normalized_req = GeminiGenerateContentRequest(
+        contents=effective_contents, systemInstruction=system_instruction
+    )
 
     for attempt in range(2):
         await ensure_active_account(attempt, model=clean_model)
@@ -1602,6 +1625,14 @@ async def handle_gemini_count_tokens(
             raise HTTPException(
                 status_code,
                 detail={"message": msg, "status": status_str, "type": "auth_error"},
+            ) from exc
+        except ValueError as exc:
+            # normalize_gemini_request 对全空轮（无系统提示且无有效内容）
+            # 抛 ValueError：与 generateContent 路径的 400 语义对齐，而非
+            # 让它穿透成 FastAPI 500。
+            raise HTTPException(
+                400,
+                detail={"message": str(exc), "type": "bad_request"},
             ) from exc
         except RequestError as exc:
             clean_msg = clean_upstream_error_message(str(exc))

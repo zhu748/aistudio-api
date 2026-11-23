@@ -640,9 +640,18 @@ def _encode_tool_parameters(
         parameters = encode_schema_to_wire(normalized, include_required=True)
     except ValueError as exc:
         encoding_error = exc
-        parameters = encode_schema_to_wire(
-            _tool_schema_shape(normalized), include_required=True
-        )
+        try:
+            parameters = encode_schema_to_wire(
+                _tool_schema_shape(normalized), include_required=True
+            )
+        except ValueError:
+            # shape 仍编码失败（复杂度超限的深嵌套 schema：shape 保留全部
+            # 递归层级，与原 schema 同超限）：降级为仅声明 object 类型的
+            # 最小 wire——完整 schema 原文已随降级附加到 description，
+            # 不再让整轮请求 400（docstring 承诺的彻底降级链）。
+            parameters = encode_schema_to_wire(
+                {"type": "object"}, include_required=True
+            )
     if (
         encoding_error is not None
         or strict
@@ -665,7 +674,12 @@ def encode_response_schema_to_wire(schema: dict[str, object]) -> list[object]:
         wire = encode_schema_to_wire(schema)
     except ValueError as exc:
         encoding_error = exc
-        wire = encode_schema_to_wire(_tool_schema_shape(schema))
+        try:
+            wire = encode_schema_to_wire(_tool_schema_shape(schema))
+        except ValueError:
+            # 同 _encode_tool_parameters：shape 仍超限时彻底降级为仅声明
+            # object 类型的最小 wire，完整 schema 附加到根 description。
+            wire = encode_schema_to_wire({"type": "object"})
     if (
         encoding_error is not None
         or _schema_has_lossy_keys(schema, response=True)

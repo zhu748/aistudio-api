@@ -189,10 +189,11 @@ func (p *WorkerPool) getEntry(key string) (*workerEntry, error) {
 			for k, e := range p.entries {
 				e.mu.Lock()
 				recentlyUsed := e.worker != nil && time.Since(e.lastUsed) < time.Minute
+				busy := e.worker != nil && e.worker.State().Phase == aistudio.WorkerBusy
 				empty := e.worker == nil
 				lu := e.lastUsed
 				e.mu.Unlock()
-				if recentlyUsed {
+				if recentlyUsed || busy {
 					continue
 				}
 				if empty || idleEntry == nil || lu.Before(oldest) {

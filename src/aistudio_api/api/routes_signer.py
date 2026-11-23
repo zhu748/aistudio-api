@@ -35,6 +35,20 @@ class TestSignerServerRequest(BaseModel):
     url: str
 
 
+def _mask_signer_server_fields(
+    server: dict[str, object], *, mask_sensitive: bool
+) -> dict[str, object]:
+    """按会话级别掩码签名服务器敏感字段（GET 列表 / switch / reset 共用）。"""
+    item = dict(server)
+    if mask_sensitive:
+        headers = item.get("headers")
+        if isinstance(headers, dict) and headers:
+            item["headers"] = dict.fromkeys(headers, "***")
+        if item.get("auth_token_env"):
+            item["auth_token_env"] = "***"
+    return item
+
+
 @protected_router.get("/config/signer-servers")
 async def get_signer_servers(request: Request) -> dict[str, object]:
     """获取所有配置的 WAA 签名服务器列表及当前激活项。
@@ -74,13 +88,7 @@ async def get_signer_servers(request: Request) -> dict[str, object]:
     for s in servers:
         if isinstance(s, dict):
             s_id = str(s.get("id") or "").strip()
-            item = dict(s)
-            if mask_sensitive:
-                headers = item.get("headers")
-                if isinstance(headers, dict) and headers:
-                    item["headers"] = dict.fromkeys(headers, "***")
-                if item.get("auth_token_env"):
-                    item["auth_token_env"] = "***"
+            item = _mask_signer_server_fields(s, mask_sensitive=mask_sensitive)
             item["is_active"] = s_id == active_id
             item["is_env_default"] = bool(env_override) and s_id == env_override
             # 兼容旧字段：面板不再将其渲染为“锁定”，仅表示环境变量默认节点
@@ -110,7 +118,9 @@ async def get_signer_health_state() -> dict[str, object]:
 
 
 @protected_router.post("/config/signer-servers/switch")
-async def switch_signer_server(req: SwitchSignerServerRequest) -> dict[str, object]:
+async def switch_signer_server(
+    req: SwitchSignerServerRequest, request: Request
+) -> dict[str, object]:
     """纯手动切换当前激活的 WAA 签名服务器（即时生效并持久化）。
 
     - 写入运行时覆盖层：即便 ``AISTUDIO_WAA_SERVER`` 环境变量指定了
@@ -183,9 +193,16 @@ async def switch_signer_server(req: SwitchSignerServerRequest) -> dict[str, obje
         if env_override and env_override != active.get("id")
         else "",
     )
+    # 响应中的激活节点与 GET 列表同口径掩码：原样回传会把自定义 headers
+    # （含共享密钥）与 auth_token_env 泄漏给非管理密码会话。
+    from aistudio_api.api.dependencies import is_admin_password_session
+
+    active_view = _mask_signer_server_fields(
+        active, mask_sensitive=not is_admin_password_session(request)
+    )
     return {
         "ok": switched,
-        "active_server": active,
+        "active_server": active_view,
         "runtime_override": runtime_override or None,
         "note": note,
         "error": error,
@@ -193,7 +210,7 @@ async def switch_signer_server(req: SwitchSignerServerRequest) -> dict[str, obje
 
 
 @protected_router.post("/config/signer-servers/reset")
-async def reset_signer_server() -> dict[str, object]:
+async def reset_signer_server(request: Request) -> dict[str, object]:
     """清除运行时覆盖，恢复“环境变量 > 配置文件”的默认优先级。
 
     面板切换写入的运行时覆盖消失后：
@@ -240,9 +257,15 @@ async def reset_signer_server() -> dict[str, object]:
         active.get("id"),
         f"（环境变量默认 {env_override}）" if env_override else "（配置文件默认）",
     )
+    # 同 switch：响应与 GET 列表同口径掩码
+    from aistudio_api.api.dependencies import is_admin_password_session
+
+    active_view = _mask_signer_server_fields(
+        active, mask_sensitive=not is_admin_password_session(request)
+    )
     return {
         "ok": startup_error is None,
-        "active_server": active,
+        "active_server": active_view,
         "runtime_override": get_runtime_waa_override(),
         "changed": True,
         "error": startup_error,

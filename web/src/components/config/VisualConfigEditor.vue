@@ -94,17 +94,22 @@ function parseYamlToState(content: string): boolean {
   }
 }
 
-function syncStateToYaml(): string {
+/** 纯序列化：只生成 YAML 字符串，不写 rawYaml（供 dirty 判定等只读场景，避免 computed 副作用）。 */
+function serializeState(): string {
   try {
-    const dumped = YAML.stringify(parsedConfig.value, {
+    return YAML.stringify(parsedConfig.value, {
       indent: 2,
     })
-    rawYaml.value = dumped
-    return dumped
   } catch (err) {
     console.error('序列化 YAML 失败:', err)
     return rawYaml.value
   }
+}
+
+function syncStateToYaml(): string {
+  const dumped = serializeState()
+  rawYaml.value = dumped
+  return dumped
 }
 
 watch(
@@ -330,7 +335,10 @@ function syncYamlScroll() {
 }
 
 const hasUnsavedChanges = computed(() => {
-  const current = activeTab.value === 'visual' ? syncStateToYaml() : rawYaml.value
+  // 可视化模式下用无副作用的序列化对比（不回写 rawYaml）：
+  // computed 内部写状态违反单向数据流，且序列化结果可能悄悄
+  // 改变用户在 YAML 页签中看到的未保存草稿内容。
+  const current = activeTab.value === 'visual' ? serializeState() : rawYaml.value
   return Boolean(props.initialYaml && current.trim() !== props.initialYaml.trim())
 })
 

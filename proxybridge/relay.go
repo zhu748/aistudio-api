@@ -23,7 +23,7 @@ var (
 	relayHalfCloseIdle = 5 * time.Minute
 	// 从未搬运过任何字节的连接回收窗口：真实客户端在 SOCKS 应答后立即
 	// 发送请求，长时间零字节即死连接。
-	relayFirstByteIdle = 10 * time.Minute
+	relayFirstByteIdle = 3 * time.Minute
 	// 看门狗轮询间隔。
 	relayIdleCheck = 15 * time.Second
 )

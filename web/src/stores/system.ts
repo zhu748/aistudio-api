@@ -13,6 +13,9 @@ export const useSystemStore = defineStore('system', () => {
   const customUntil = ref('')
   const rotationError = ref<string | null>(null)
   let statsSequence = 0
+  // 与 statsSequence 同款：轮换状态会被布局/视图轮询与操作后刷新并发触发，
+  // 乱序返回时旧响应不得覆盖新状态。
+  let rotationSequence = 0
   const rotation = ref<RotationStatusResponse | null>(null)
   const loading = ref(false)
   // 最近一次统计请求的错误；持续失败时只提示一次，避免轮询刷屏
@@ -64,14 +67,19 @@ export const useSystemStore = defineStore('system', () => {
   }
 
   async function fetchRotation() {
+    const sequence = ++rotationSequence
     try {
-      rotation.value = await systemApi.getRotation()
+      const response = await systemApi.getRotation()
+      if (sequence !== rotationSequence) return false
+      rotation.value = response
       rotationError.value = null
       return true
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : '获取轮换状态失败'
-      if (rotationError.value === null) useToastStore().error(msg)
-      rotationError.value = msg
+      if (sequence === rotationSequence) {
+        if (rotationError.value === null) useToastStore().error(msg)
+        rotationError.value = msg
+      }
       return false
     }
   }

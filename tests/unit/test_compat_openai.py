@@ -187,8 +187,8 @@ async def test_openai_streaming_include_usage_accepts_truthy_string(
         text = response.text
         assert "data: [DONE]" in text
         # 字符串 'true' 也应触収独立的 usage 尾块（choices 为空）
-        assert '"total_tokens": 5' in text
-        assert '"choices": []' in text
+        assert '"total_tokens":5' in text
+        assert '"choices":[]' in text
     finally:
         app.dependency_overrides.clear()
 
@@ -1032,10 +1032,10 @@ async def test_e2e_openai_streaming(
         assert "text/event-stream" in response.headers["content-type"]
         text = response.text
         assert "data: [DONE]" in text
-        assert '"content": "Streamed "' in text
-        assert '"content": "reply"' in text
-        assert '"reasoning_content": "pondering"' in text
-        assert '"total_tokens": 6' in text
+        assert '"content":"Streamed "' in text
+        assert '"content":"reply"' in text
+        assert '"reasoning_content":"pondering"' in text
+        assert '"total_tokens":6' in text
     finally:
         app.dependency_overrides.clear()
 

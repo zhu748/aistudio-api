@@ -106,9 +106,13 @@ class StopSequenceBuffer:
         if self.hit is not None:
             return ""
         text = self.pending + text
-        matches = [
-            (text.find(value), value) for value in self.sequences if value in text
-        ]
+        matches: list[tuple[int, str]] = []
+        for value in self.sequences:
+            # 单次 find：原先 ``if value in text`` + ``text.find(value)``
+            # 对同一序列做两次 C 级扫描，序列数多时每帧翻倍浪费。
+            index = text.find(value)
+            if index >= 0:
+                matches.append((index, value))
         if matches:
             index, self.hit = min(matches, key=lambda match: match[0])
             self.pending = ""

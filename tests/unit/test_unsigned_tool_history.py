@@ -387,6 +387,9 @@ def test_signature_cache_bounds_and_reloads_lru(monkeypatch, tmp_path):
     cache.remember("b", "f", {}, SIGNATURE)
     assert cache.lookup("a", "f", {}) == SIGNATURE
     cache.remember("c", "f", {}, SIGNATURE)
+    # 落盘走 2s 去抖（热路径性能：不再每 remember 全量重写），显式
+    # flush 后再重载验证 LRU 淘汰边界（本测试关注点）。
+    cache.flush()
     reloaded = tool_signatures.ThoughtSignatureCache(path)
     assert reloaded.lookup("a", "f", {}) == SIGNATURE
     assert reloaded.lookup("b", "f", {}) is None

@@ -201,6 +201,21 @@ def _prune_success_snapshots(folder: Path, keep: int, *, force: bool = False) ->
     return removed
 
 
+def should_save_exchange(url: str, status: int) -> bool:
+    """事件循环侧的廉价门禁：本次交换是否需要派发快照落盘线程。
+
+    与 save_upstream_exchange 内部的跳过条件同源（辅助 RPC 成功无诊断
+    价值、成功快照保留为 0 时全跳过），供调用方在构建 header 列表/字典
+    与 to_thread 派发之前判断，避免每请求约 78µs 的空跑线程派发。
+    """
+    if not 200 <= status < 300:
+        # 失败快照无条件保留（错误现场诊断价值最高，不受 keep 限制）。
+        return True
+    if _rpc_name_from_url(url) != _MODEL_RPC_NAME:
+        return False
+    return upstream_snapshot_keep() > 0
+
+
 def save_upstream_exchange(
     *,
     url: str,

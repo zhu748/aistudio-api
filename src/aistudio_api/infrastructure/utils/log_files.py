@@ -163,7 +163,11 @@ def read_log_history(
             # total 退化为下界（实际值 >= 返回值），用 overflow 标记提示。
             overflow_seen = len(matched)
             break
-    matched.sort(key=lambda item: int(str(item["ts_ms"])), reverse=order != "asc")
+    # 外部工具追加/截断出的合法 JSON 行可能缺 ts_ms：兜底 0 而非让整个
+    # 历史日志端点 500。
+    matched.sort(
+        key=lambda item: int(str(item.get("ts_ms") or 0)), reverse=order != "asc"
+    )
     offset = (page - 1) * page_size
     return {
         "items": matched[offset : offset + page_size],

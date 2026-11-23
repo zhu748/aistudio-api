@@ -109,6 +109,10 @@ class GatewaySession:
         self._transition_lock_loop: asyncio.AbstractEventLoop | None = None
         # 页面行为后台任务（GenerateContent 后 +2.2s CountTokens 补发）
         self._background_followups: set[asyncio.Task[None]] = set()
+        # 无凭据降级态的短负缓存时间戳：auth_file 为空时 ensure_ready 每
+        # 次都全量重转（2×to_thread + 切换锁 + INFO 刷屏），负缓存内直接
+        # 复用上次的空上下文（transport 同场景有 _empty_cookie_cache 防线）。
+        self._degraded_transition_at = 0.0
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_active_waa_server,
         )
@@ -181,7 +185,20 @@ class GatewaySession:
         self._ensure_open()
         if self.is_ready and self._active_context is not None:
             return self._active_context
-        return await self.transition_to_account(self._auth_file, force_refresh=False)
+        # 无凭据降级态短负缓存（5s）：重复全量重转只会再次产出同一个
+        # 空上下文，期间所有并发请求排队在切换锁上放大延迟并刷 INFO。
+        # switch_auth / set_ready_context 直接改 _auth_file，负缓存条件
+        # 随之失效，新账号立即可用。
+        if (
+            self._auth_file is None
+            and self._active_context is not None
+            and time.monotonic() - self._degraded_transition_at < 5.0
+        ):
+            return self._active_context
+        ctx = await self.transition_to_account(self._auth_file, force_refresh=False)
+        if self._auth_file is None:
+            self._degraded_transition_at = time.monotonic()
+        return ctx
 
     async def switch_auth(self, auth_file: str | None) -> None:
         """Atomic account switch."""

@@ -284,27 +284,32 @@ class AccountStore:
             return cls._instances[resolved_dir]
 
     def __init__(self, accounts_dir: Path | None = None) -> None:
-        if getattr(self, "_initialized", False):
-            return
-        self._accounts_dir = (accounts_dir or _resolve_accounts_dir()).absolute()
-        self._registry_path = self._accounts_dir / "registry.json"
-        self._presets_path = self._accounts_dir / "presets.json"
-        self._registry: Registry | None = None
-        self._presets: dict[str, AccountPreset] | None = None
-        # RLock：update_account_cookies 等复合读改写序列需要全程持锁，
-        # 而序列内部还要调用同样加锁的 _load_registry/_save_registry，
-        # 同线程重入必须被允许（3.4）。
-        self._lock = threading.RLock()
-        # 一旦检测到损坏的 registry.json 即置位：隔离后文件不再存在，后续
-        # _load_registry 若只靠 exists() 判断就会静默返回空注册表，进而把
-        # {"accounts": {}} 写回磁盘。该标志让「拒绝静默清空」在所有后续调用
-        # 中持续生效，直到人工恢复文件并重启。
-        self._corrupt_registry: bool = False
-        # presets.json 同款损坏标记：隔离后拒绝静默回退/覆盖（见 _load_presets）
-        self._corrupt_presets: bool = False
-        self._ensure_dirs()
-        self._ensure_default_presets()
-        self._initialized = True
+        # __init__ 与 __new__ 分离导致并发首次构造时两个线程可交错执行
+        # 初始化（_initialized 在末尾才置位）：目录清扫与默认预设写盘虽幂等，
+        # 但与“线程安全单例”声明不符。整段初始化纳入同一把单例锁
+        # （__new__ 返回后才调用 __init__，此处拿锁不死锁）。
+        with type(self)._singleton_lock:
+            if getattr(self, "_initialized", False):
+                return
+            self._accounts_dir = (accounts_dir or _resolve_accounts_dir()).absolute()
+            self._registry_path = self._accounts_dir / "registry.json"
+            self._presets_path = self._accounts_dir / "presets.json"
+            self._registry: Registry | None = None
+            self._presets: dict[str, AccountPreset] | None = None
+            # RLock：update_account_cookies 等复合读改写序列需要全程持锁，
+            # 而序列内部还要调用同样加锁的 _load_registry/_save_registry，
+            # 同线程重入必须被允许（3.4）。
+            self._lock = threading.RLock()
+            # 一旦检测到损坏的 registry.json 即置位：隔离后文件不再存在，后续
+            # _load_registry 若只靠 exists() 判断就会静默返回空注册表，进而把
+            # {"accounts": {}} 写回磁盘。该标志让「拒绝静默清空」在所有后续调用
+            # 中持续生效，直到人工恢复文件并重启。
+            self._corrupt_registry: bool = False
+            # presets.json 同款损坏标记：隔离后拒绝静默回退/覆盖（见 _load_presets）
+            self._corrupt_presets: bool = False
+            self._ensure_dirs()
+            self._ensure_default_presets()
+            self._initialized = True
         # 清扫上次 SIGKILL/掉电可能残留的原子写临时文件（含完整凭据，3.13）。
         # 临时文件命名规则为 ``<stem>.tmp.<pid>_<ns>``（with_suffix 会替换
         # 原后缀，registry.json → registry.tmp.123_456），因此根目录与各

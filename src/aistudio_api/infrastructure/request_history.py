@@ -197,7 +197,10 @@ class RequestHistory:
             clauses.append("json_extract(payload, '$.elapsed_ms') >= ?")
             params.append(min_elapsed_ms)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        with self._lock, self._connect() as connection:
+        # 只读查询不持进程级写锁（与 metrics 的 WAL 并发读语义一致）：
+        # 大范围搜索（COUNT + json_extract LIKE 全表扫描）期间持锁会阻塞
+        # 所有请求的 history insert；_ensure_schema 自带 _schema_lock。
+        with self._connect() as connection:
             total = connection.execute(
                 "SELECT COUNT(*) FROM requests" + where, params
             ).fetchone()[0]
@@ -215,6 +218,9 @@ class RequestHistory:
         }
 
     def get(self, request_id: str) -> dict[str, object] | None:
+        # 单行主键查询持锁开销可忽略，且锁原先提供了「请求起始记录
+        # insert → 面板查询」的时序保证（running 请求立即可查），
+        # 去锁会让并发读者看到 insert 提交前的空窗。
         with self._lock, self._connect() as connection:
             row = connection.execute(
                 "SELECT payload FROM requests WHERE request_id = ?", (request_id,)
@@ -295,7 +301,8 @@ class RequestHistory:
             return summarize((dict(row) for row in rows), since=since, until=until)
 
     def options(self) -> dict[str, object]:
-        with self._lock, self._connect() as connection:
+        # 只读，不持写锁（同 query）
+        with self._connect() as connection:
             return {
                 "models": [
                     row[0]

@@ -37,6 +37,7 @@ from aistudio_api.api.schemas_compat import OpenAIResponsesRequest
 from aistudio_api.application.api_service_gemini import _ERROR_TEXT_PREFIX
 from aistudio_api.application.compat_service import (
     _as_dict,
+    _as_int,
     _as_str,
     _convert_items_concurrently,
     _file_block_to_part,
@@ -510,8 +511,12 @@ def build_responses_object(
         finish_reason_raw = candidates[0].finishReason
 
     builder = _ResponsesOutputBuilder()
+    # 异常终结下丢弃工具调用（截断的并行调用集合可能不完整，有意与
+    # 流式侧不对称）：见回归测试 test_non_streaming_interrupted_calls_
+    # are_not_executable。
+    builder_allow_tools = finish_reason_raw in (None, "STOP")
     for part in _iter_response_parts(response):
-        builder.add_part(part, allow_tools=finish_reason_raw in (None, "STOP"))
+        builder.add_part(part, allow_tools=builder_allow_tools)
 
     incomplete_reason = _incomplete_reason(finish_reason_raw)
     status = "incomplete" if incomplete_reason else "completed"
@@ -583,9 +588,10 @@ class _ResponsesStreamEmitter:
     def sse(self, event_type: str, payload: dict[str, object]) -> str:
         self.seq += 1
         frame = {"type": event_type, "sequence_number": self.seq, **payload}
+        # separators：SSE 每帧省去 ", " 与 ": " 的空格（约 2-4% 字节/分配）
         return (
             f"event: {event_type}\ndata: "
-            + json.dumps(frame, ensure_ascii=False)
+            + json.dumps(frame, ensure_ascii=False, separators=(",", ":"))
             + "\n\n"
         )
 
@@ -884,7 +890,7 @@ class _ResponsesStreamEmitter:
                 self.item_order[pos] = (index, final_item)
                 return
 
-    def error(self, message: str) -> list[str]:
+    def error(self, message: str, code: int = 500) -> list[str]:
         if self.saw_error:
             return []
         self.saw_error = True
@@ -895,6 +901,10 @@ class _ResponsesStreamEmitter:
             "".join(self._reasoning_accumulated), "incomplete"
         )
         events += self._close_message("".join(self._text_accumulated), "incomplete")
+        # 错误码语义对齐：Codex CLI 等客户端按 code 决定退避策略
+        # （429 → rate_limit_error 等），与 OpenAI/Claude 适配器同源映射。
+        from aistudio_api.application.compat_errors import _OPENAI_ERROR_TYPE
+
         events.append(
             self.sse(
                 "response.failed",
@@ -904,7 +914,7 @@ class _ResponsesStreamEmitter:
                             status="failed", output=self._ordered_output()
                         ),
                         "error": {
-                            "code": "server_error",
+                            "code": _OPENAI_ERROR_TYPE.get(code, "server_error"),
                             "message": message,
                         },
                     }
@@ -968,8 +978,9 @@ async def responses_stream_adapter(
             async for frame in _iter_gemini_sse_frames(source):
                 error_obj = frame.get("error")
                 if isinstance(error_obj, dict):
+                    code = _as_int(error_obj.get("code")) or 500
                     message = _as_str(error_obj.get("message")) or "Upstream error"
-                    for event in emitter.error(message):
+                    for event in emitter.error(message, code):
                         yield event
                     return
                 candidate = _frame_candidate(frame)

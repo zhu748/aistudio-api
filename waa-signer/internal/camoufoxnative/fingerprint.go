@@ -14,6 +14,8 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/Mag1cFall/AIStudio2API/internal/atomicwrite"
+
 	"github.com/brainplusplus/go-browserforge/fingerprints"
 	bfheaders "github.com/brainplusplus/go-browserforge/headers"
 )
@@ -237,7 +239,7 @@ func writeAccountCamoufoxConfig(path string, saved savedFingerprint) error {
 	if err != nil {
 		return fmt.Errorf("编码账户 Camoufox 指纹: %w", err)
 	}
-	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+	if err := atomicwrite.WriteFile(path, encoded, 0o600); err != nil {
 		return fmt.Errorf("写入账户 Camoufox 指纹: %w", err)
 	}
 	return nil

@@ -261,9 +261,18 @@ class IncrementalJSONStreamParser:
                     self._chunk_size = 0
                     self.chunk_start = None
                     start = None
-                    # A structurally closed chunk must already be valid JSON.
-                    # Only finish() may repair an actual EOF-truncated fragment.
-                    parsed = json.loads(chunk)
+                    # A structurally closed chunk is normally valid JSON, but
+                    # a middlebox may inject bare control chars inside strings
+                    # (still balanced). _close_json_fragment has the escaping
+                    # capability, so fall back to repair before giving up;
+                    # only finish() may repair an actual EOF-truncated fragment.
+                    try:
+                        parsed = json.loads(chunk)
+                    except ValueError:
+                        repaired = _repair_truncated_json(chunk)
+                        if not isinstance(repaired, list):
+                            raise
+                        parsed = repaired
                     if isinstance(parsed, list):
                         yield parsed
         if start is not None:

@@ -206,7 +206,7 @@ function handleLogout() {
       >
         <div class="flex items-center gap-2">
           <Key class="w-3.5 h-3.5 text-slate-400" />
-          <span>控制台密钥</span>
+          <span>登录会话</span>
         </div>
         <span class="text-[10px] text-slate-400 font-mono">管理</span>
       </button>
