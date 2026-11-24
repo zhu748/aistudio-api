@@ -22,6 +22,7 @@ from aistudio_api.api.dependencies import (
 from aistudio_api.infrastructure.account.account_store import AccountMeta
 from aistudio_api.infrastructure.account.cookie_parser import (
     load_cookies_from_auth_file,
+    normalize_benefit_tier,
     probe_account_benefit_tier,
     probe_account_email,
 )
@@ -184,6 +185,11 @@ async def activate_account(
     if runtime_state.rotator:
         runtime_state.rotator.add_account(account.id)
         runtime_state.rotator.clear_cooldown(account.id)
+    # 目录按活跃账号凭据/层级拉取：切换后立即失效缓存，下一次 get_models
+    # （含 60s 后台 tick）以新账号重拉，付费门控不再用切换前目录。
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    model_discovery.invalidate_cache()
     logger.info("激活账号: id=%s, name=%s", account.id, account.name)
     return to_account_response(account, request=request)
 
@@ -229,6 +235,10 @@ async def detect_account_email(
 
     if detected_tier:
         account_service.update_account_tier(account_id, detected_tier)
+        # 层级变化影响目录拉取的 tier 头与付费门控：立即失效目录缓存。
+        from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+        model_discovery.invalidate_cache()
         logger.info("更新账号订阅等级: id=%s, tier=%s", account_id, detected_tier)
     acc = account_service.get_account(account_id)
     if not acc:
@@ -263,12 +273,70 @@ async def detect_account_tier(
 
     if detected_tier:
         account_service.update_account_tier(account_id, detected_tier)
+        # 层级变化影响目录拉取的 tier 头与付费门控：立即失效目录缓存。
+        from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+        model_discovery.invalidate_cache()
         logger.info("更新账号订阅等级: id=%s, tier=%s", account_id, detected_tier)
 
     acc = account_service.get_account(account_id)
     if not acc:
         raise HTTPException(status_code=404, detail="账号不存在")
     return to_account_response(acc, request=request)
+
+
+class UpdateTierRequest(BaseModel):
+    tier: str
+
+
+# 与 cookie_parser._CANONICAL_TIERS 同键集：手动端点对未知输入显式 400，
+# 而非像 normalize_benefit_tier 一样静默落 Free（拼写错误会把 Pro 号降级）。
+_TIER_INPUTS: frozenset[str] = frozenset({"free", "plus", "pro", "ultra", "ultra_20x"})
+
+
+@router.put("/{account_id}/tier", response_model=AccountResponse)
+async def update_account_tier_manual(
+    request: Request,
+    account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
+    req: UpdateTierRequest = Body(...),
+    account_service: AccountService = Depends(get_account_service),
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> AccountResponse:
+    """手动设置账号的订阅权益等级 (Free / Plus / Pro / Ultra / Ultra_20X)。
+
+    自动探测失败会落 Free（fail-soft），误标 Pro 号会被付费门控拦截；
+    本端点是面板/API 侧唯一的纠正入口（上游 DeconstructedCube a78e54b
+    同款端点，校验语义收紧为未知输入 400）。
+    """
+    acc = account_service.get_account(account_id)
+    if not acc:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    raw_tier = req.tier.strip().lower()
+    if raw_tier not in _TIER_INPUTS:
+        raise HTTPException(
+            status_code=400,
+            detail="无效的订阅等级，允许值: Free / Plus / Pro / Ultra / Ultra_20X",
+        )
+    clean_tier = normalize_benefit_tier(req.tier)
+    account_service.update_account_tier(account_id, clean_tier)
+    # 活跃账号层级变化同步内存上下文，避免在途/后续请求仍带旧 tier 头
+    gateway_session = runtime_state.client.session if runtime_state.client else None
+    active = account_service.get_active_account()
+    if (
+        gateway_session is not None
+        and active is not None
+        and active.id == account_id
+        and gateway_session.active_context is not None
+    ):
+        gateway_session.active_context.tier = clean_tier
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    model_discovery.invalidate_cache()
+    logger.info("手动更新账号订阅等级: id=%s, tier=%s", account_id, clean_tier)
+    updated = account_service.get_account(account_id)
+    if not updated:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    return to_account_response(updated, request=request)
 
 
 @router.post("/{account_id}/rotate-cookies")

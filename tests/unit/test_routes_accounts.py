@@ -138,3 +138,69 @@ async def test_api_accounts_active_endpoint():
         assert "no-store" in resp.headers.get("Cache-Control", "")
         data = resp.json()
         assert data["id"] == "acc_1"
+
+
+# ───────────── 手动纠正订阅等级 PUT /accounts/{id}/tier（上游 a78e54b 同款） ─────────────
+
+
+@pytest.mark.asyncio
+async def test_update_account_tier_manual_normalizes_and_invalidates_catalog(
+    monkeypatch,
+):
+    """PUT tier：别名归一化（pro→Pro / ultra_20x→Ultra_20X）、失效目录缓存、
+    活跃账号同步内存上下文 tier。"""
+    from unittest.mock import MagicMock
+
+    from aistudio_api.infrastructure.gateway import (
+        model_discovery as model_discovery_module,
+    )
+
+    invalidate_mock = MagicMock()
+    monkeypatch.setattr(
+        model_discovery_module.model_discovery, "invalidate_cache", invalidate_mock
+    )
+    mock_svc = runtime_state.account_service
+    mock_svc.get_account.return_value = AccountMeta(
+        id="acc_1",
+        name="Test Account 1",
+        email="test1@gmail.com",
+        created_at="2026-10-17T00:00:00Z",
+        auth_user="0",
+        cookie_id="cookie_1",
+        tier="Free",
+    )
+    async with _client() as client:
+        for raw, canonical in (("pro", "Pro"), ("ultra_20x", "Ultra_20X")):
+            resp = await client.put("/accounts/acc_1/tier", json={"tier": raw})
+            assert resp.status_code == 200
+            mock_svc.update_account_tier.assert_called_with("acc_1", canonical)
+    assert invalidate_mock.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_update_account_tier_manual_rejects_unknown_tier():
+    """未知等级显式 400（normalize_benefit_tier 的静默落 Free 会把误拼的
+    Pro 号降级成 Free，手动端点不允许这种静默行为）。"""
+    mock_svc = runtime_state.account_service
+    mock_svc.get_account.return_value = AccountMeta(
+        id="acc_1",
+        name="Test Account 1",
+        email="test1@gmail.com",
+        created_at="2026-10-17T00:00:00Z",
+    )
+    async with _client() as client:
+        for bad in ("garbage", "", "utlra"):
+            resp = await client.put("/accounts/acc_1/tier", json={"tier": bad})
+            assert resp.status_code == 400
+    mock_svc.update_account_tier.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_account_tier_manual_404_for_missing_account():
+    """账号不存在时 404，且不触碰层级存储。"""
+    mock_svc = runtime_state.account_service
+    mock_svc.get_account.return_value = None
+    async with _client() as client:
+        resp = await client.put("/accounts/acc_1/tier", json={"tier": "pro"})
+        assert resp.status_code == 404
+    mock_svc.update_account_tier.assert_not_called()

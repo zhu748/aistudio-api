@@ -1017,6 +1017,18 @@ class ModelDiscoveryService:
         if bound_loop is not None and bound_loop is asyncio.get_running_loop():
             await asyncio.gather(task, return_exceptions=True)
 
+    def invalidate_cache(self) -> None:
+        """账号/层级变更后立即使目录缓存失效（下一次 get_models 重新拉网）。
+
+        目录按活跃账号的 Cookie/authUser/层级拉取（get_models 无参路径读
+        活跃账号），导入、激活或层级纠正后旧缓存仍可吃满 600s TTL——期间
+        付费门控/思考档位/配额族用的是切换前的目录（上游
+        DeconstructedCube a78e54b 同款机制）。置空 _last_fetched_at 让下一
+        次 get_models（含 60s 后台 tick）立即重拉；拉取失败仍走 ≤60s 退避
+        并以旧缓存兜底，不影响请求路径。仅做一次 float 赋值，无需持锁。
+        """
+        self._last_fetched_at = 0.0
+
     async def get_model_by_id(
         self, model_id: str, session: GatewaySession | None = None
     ) -> Mapping[str, object] | None:

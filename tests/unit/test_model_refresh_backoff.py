@@ -71,3 +71,38 @@ async def test_stop_background_refresh_without_start_is_noop():
     service = module.ModelDiscoveryService()
     await service.stop_background_refresh()
     assert service._refresh_task is None
+
+
+# ───────────── 账号/层级变更后目录缓存失效（上游 a78e54b 同款机制） ─────────────
+
+
+async def test_invalidate_cache_forces_immediate_refetch(monkeypatch):
+    """invalidate_cache：账号导入/激活/层级变更后，下一次 get_models 立即重拉，
+    不再吃满 600s TTL（否则付费门控最长 10 分钟用切换前的目录）。"""
+    now = [1000.0]
+    monkeypatch.setattr(module.time, "time", lambda: now[0])
+    service = module.ModelDiscoveryService(cache_ttl_seconds=600)
+    fetch = AsyncMock(return_value=[{"id": "m1"}])
+    monkeypatch.setattr(service, "_fetch_via_http", fetch)
+
+    await service.get_models(cookies={"SAPISID": "test"})
+    assert fetch.await_count == 1
+    # TTL 内的正常调用不再拉网
+    await service.get_models(cookies={"SAPISID": "test"})
+    assert fetch.await_count == 1
+
+    # 模拟账号/层级变更：invalidate 后 TTL 内也立即重拉
+    service.invalidate_cache()
+    assert service._last_fetched_at == 0.0
+    await service.get_models(cookies={"SAPISID": "test"})
+    assert fetch.await_count == 2
+
+    # 缓存仍作为兜底：拉网失败路径不受 invalidate 影响（退避语义不变）
+    fetch.reset_mock(return_value=True, side_effect=True)
+    fetch.return_value = [{"id": "m2"}]
+    service.invalidate_cache()
+    results = await asyncio.gather(
+        *(service.get_models(cookies={"SAPISID": "test"}) for _ in range(10))
+    )
+    assert all(result for result in results)
+    assert fetch.await_count == 1  # 并发请求合并为一次拉网

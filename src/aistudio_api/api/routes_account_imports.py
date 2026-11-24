@@ -266,6 +266,11 @@ async def import_cookies(
         not had_active_account or (active_acc and active_acc.id == account.id)
     ):
         await account_service.activate_account(account.id, gateway_session)
+    # 目录按活跃账号凭据/层级拉取：导入/激活后立即失效缓存（≤600s 旧目录
+    # 窗口内付费门控会用切换前的目录，上游 a78e54b 同款机制）。
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    model_discovery.invalidate_cache()
     return ImportCookiesResponse(
         account_id=account.id,
         name=account.name,
@@ -336,6 +341,10 @@ async def probe_and_import(
         gateway_session = client_obj.session
         if gateway_session is not None:
             await account_service.activate_account(metas[0].id, gateway_session)
+    # 同 import_cookies：导入/激活改变活跃账号凭据与层级，立即失效目录缓存。
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    model_discovery.invalidate_cache()
     logger.info("Cookie 探活完成: 导入账号数=%d", len(imported_accounts))
     return ProbeAndImportResponse(
         imported_count=len(imported_accounts),
@@ -527,6 +536,11 @@ async def import_bundle(
             await account_service.activate_account(
                 imported_accounts[0].id, client_obj.session
             )
+    # 同 import_cookies：导入/激活改变活跃账号凭据与层级，立即失效目录缓存。
+    if imported_accounts:
+        from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+        model_discovery.invalidate_cache()
     logger.info("批量导入完成: 导入账号数=%d", len(imported_accounts))
     return ImportBundleResponse(
         imported_count=len(imported_accounts),
