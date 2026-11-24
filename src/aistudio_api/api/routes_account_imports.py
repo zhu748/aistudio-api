@@ -159,7 +159,18 @@ async def import_cookies(
                             auth_user=str(
                                 a.get("auth_user") or a.get("authUser") or "0"
                             ),
-                            tier=str(a.get("tier") or a.get("g1Tier") or "Free"),
+                            # g1Tier 为导出器原始枚举（TIER0/1/2）：与下方单账号
+                            # 分支同款翻译，否则 "TIER1" 直落 registry 会被
+                            # normalize_benefit_tier 按未知键降级为 Free。
+                            tier=(
+                                str(a.get("tier") or "")
+                                or {
+                                    "TIER1": "Pro",
+                                    "TIER2": "Ultra",
+                                    "TIER0": "Free",
+                                }.get(str(a.get("g1Tier") or "").upper(), "")
+                                or str(a.get("g1Tier") or "Free")
+                            ),
                             proxy_url=str(a.get("proxy_url") or effective_proxy or "")
                             or None,
                         )

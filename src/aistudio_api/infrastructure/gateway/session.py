@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import inspect
-import itertools
 import json
 import os
 import time
@@ -59,7 +58,6 @@ class SessionContext:
     tier: str = "Free"
     cookies: dict[str, str] = field(default_factory=dict)
     proxy_url: str | None = None
-    context_id: int = field(default_factory=itertools.count(1).__next__)
     created_at: float = field(default_factory=time.time)
 
     def is_usable(self) -> bool:
@@ -391,8 +389,9 @@ class GatewaySession:
         同样携带该行为（pageCountTokensDelay）。主链路在此复刻：
         fire-and-forget 后台任务，失败仅记日志，绝不影响主请求。
 
-        计时基准为网络发送时刻（Go 同为 SendProtected 入口起算）；
-        梯梯重试的每次实际发送都会各自补一次（Go 同语义）。
+        计时基准为收到首个成功信号的时刻（流式在首个 2xx 数据块后、非流式
+        在完整 200 响应校验后调度，见 streaming.py / client.py 实现处注释）；
+        失败尝试不补发——429/403 重试链不应对同一受限账号放大上游压力。
         """
         if self._closed or not _BROWSER_COUNTTOKENS_FOLLOWUP or not page_prompt:
             return

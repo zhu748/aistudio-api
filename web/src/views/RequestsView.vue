@@ -139,7 +139,7 @@ async function exportRows() {
   try {
     const response = await operationsApi.exportRequests(params())
     downloadJson(response.items, `requests-${new Date().toISOString().slice(0, 10)}.json`)
-    toast.success(`已导出 ${response.items.length} / ${response.total} 条记录，单次上限 10000 条`)
+    toast.success(`已导出 ${response.items.length} / ${response.total} 条记录，单次上限 5000 条`)
   } catch (err) {
     toast.error(err instanceof Error ? err.message : '导出失败')
   } finally {

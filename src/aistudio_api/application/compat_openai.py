@@ -827,6 +827,13 @@ async def openai_stream_adapter(
                     if function_call:
                         if stops.hit is not None:
                             continue
+                        # 被停止词缓冲扣留的部分前缀属于此前的正文：必须先于
+                        # 工具调用下发（与 Claude 侧 compat_claude 及非流式
+                        # flush_pending 对齐），否则该前缀要等流终结才冲刷，
+                        # 排到工具/图片内容之后破坏 content 顺序。
+                        tail = stops.feed("", final=True)
+                        if tail:
+                            yield _sse(_chunk({"content": tail}, None))
                         has_tool_calls = True
                         call_id = _as_str(function_call.get("id")) or (
                             f"call_{secrets.token_hex(12)}"
@@ -863,6 +870,11 @@ async def openai_stream_adapter(
                     inline = _as_dict(part.get("inlineData"))
                     if inline:
                         if stops.hit is None:
+                            # 同 functionCall 分支：先冲刷停止词缓冲中的部分
+                            # 前缀，保持其在最终 content 字符串中的位置。
+                            tail = stops.feed("", final=True)
+                            if tail:
+                                yield _sse(_chunk({"content": tail}, None))
                             mime = _as_str(inline.get("mimeType")) or "image/png"
                             data = _as_str(inline.get("data"))
                             if data:

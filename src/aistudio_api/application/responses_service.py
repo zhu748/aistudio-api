@@ -577,7 +577,6 @@ class _ResponsesStreamEmitter:
         self.item_order: list[tuple[int, dict[str, object]]] = []
         self.reasoning_item_id: str | None = None
         self.message_item_id: str | None = None
-        self.function_items: dict[str, dict[str, object]] = {}
         self.finish_reason_raw: str | None = None
         self.usage: dict[str, int] | None = None
         self.saw_error = False
@@ -760,7 +759,6 @@ class _ResponsesStreamEmitter:
             "name": name,
             "arguments": arguments,
         }
-        self.function_items[item_id] = item
         self.item_order.append((fc_index, dict(item)))
         return [
             self.sse(

@@ -33,12 +33,40 @@ export const useAccountsStore = defineStore('accounts', () => {
   // 配额网格的整棵组件树全量重渲染。字段值均为原始类型，浅比较即可。
   const rowCache = new Map<string, AccountWithStats>()
 
-  function sameFields(fresh: Record<string, unknown>, prev: Record<string, unknown>): boolean {
+  // rotation 响应每次轮询都是新对象：其中 5 个嵌套 Record 字段必须按值
+  // 递归比较（限深 3 层：today_models 为 模型 → 字段 → 原始值），否则
+  // 引用不等会让行缓存永不命中。
+  const NESTED_ROW_FIELDS = [
+    'model_requests',
+    'model_rate_limited',
+    'model_drip_mode',
+    'model_cooldowns',
+    'today_models',
+  ]
+
+  function sameValue(a: unknown, b: unknown, depth: number): boolean {
+    if (a === b) return true
+    if (depth <= 0 || typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) {
+      return false
+    }
+    const ra = a as Record<string, unknown>
+    const rb = b as Record<string, unknown>
+    const ka = Object.keys(ra)
+    if (ka.length !== Object.keys(rb).length) return false
+    for (const k of ka) {
+      if (!sameValue(ra[k], rb[k], depth - 1)) return false
+    }
+    return true
+  }
+
+  function sameRow(fresh: Record<string, unknown>, prev: Record<string, unknown>): boolean {
     // 键数前置：只遍历 fresh 键检测不到「字段从有值变为消失」（prev 独有键），
     // 后端一旦引入 exclude_none 类优化就会出现 429 徽标永久残留式 UI 停更。
     if (Object.keys(fresh).length !== Object.keys(prev).length) return false
     for (const k of Object.keys(fresh)) {
-      if (fresh[k] !== prev[k]) return false
+      if (fresh[k] === prev[k]) continue
+      if (!NESTED_ROW_FIELDS.includes(k)) return false
+      if (!sameValue(fresh[k], prev[k], 3)) return false
     }
     return true
   }
@@ -47,18 +75,15 @@ export const useAccountsStore = defineStore('accounts', () => {
     const nextCache = new Map<string, AccountWithStats>()
     const rows = accounts.value.map((a) => {
       const rot = rotationAccounts.value[a.id] || {}
-      const rotFields = rot as unknown as Record<string, unknown>
+      // 比较对象是「合并后的 row」与 prev：原先拿账号响应（12 键）与
+      // 合并产物（约 29 键）比键数恒不等，缓存永不命中，8s 轮询每次
+      // 全量重建几百账号 × 配额网格的整棵组件树。
+      const row = { ...a, ...rot } as AccountWithStats
       const prev = rowCache.get(a.id)
-      const prevFields = prev as unknown as Record<string, unknown>
-      if (
-        prev &&
-        sameFields(a as unknown as Record<string, unknown>, prevFields) &&
-        sameFields(rotFields, prevFields)
-      ) {
+      if (prev && sameRow(row as unknown as Record<string, unknown>, prev as unknown as Record<string, unknown>)) {
         nextCache.set(a.id, prev)
         return prev
       }
-      const row = { ...a, ...rot } as AccountWithStats
       nextCache.set(a.id, row)
       return row
     })

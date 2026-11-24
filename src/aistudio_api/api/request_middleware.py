@@ -115,8 +115,8 @@ class RequestMiddleware:
                 raw_path = urllib.parse.quote(path, safe="/%").encode("ascii")
             scope = {**scope, "path": path, "raw_path": raw_path}
         model_call = scope["method"] == "POST" and (
-            path.startswith("/v1beta/")
-            or path in ("/v1/chat/completions", "/v1/messages", "/v1/responses")
+            path.startswith(("/v1beta/", "/v1/messages"))
+            or path in ("/v1/chat/completions", "/v1/responses")
         )
         # Management payloads can contain cookies, complete config and credentials.
         dump_enabled = model_call and (
@@ -128,7 +128,7 @@ class RequestMiddleware:
             protocol="gemini"
             if path.startswith("/v1beta/")
             else "claude"
-            if path == "/v1/messages"
+            if path.startswith("/v1/messages")
             else "openai"
             if model_call
             else "",

@@ -168,9 +168,15 @@ async def update_config_yaml(req: ConfigYamlUpdateRequest) -> dict[str, object]:
         # 注意：此处为「用户原文整写」语义（PUT /config/yaml 是面板编辑器的保存框，
         # 必须逐字保留用户提交的原文含注释），不走 update_config_yaml_document 的
         # 解析-再序列化路径，否则注释与格式会被 yaml.dump 重排抹掉。
-        with config_file_write_lock():
-            atomic_write_text(config_yaml_path, req.yaml_content)
-            invalidate_config_cache()
+        # 写盘（fsync + rename）是同步 I/O：与 API Key 端点同款下放线程池，
+        # 避免保存期间拖停在途模型请求/SSE 流（写锁为 threading.Lock，
+        # 跨线程语义不变）。
+        def _persist_yaml() -> None:
+            with config_file_write_lock():
+                atomic_write_text(config_yaml_path, req.yaml_content)
+                invalidate_config_cache()
+
+        await asyncio.to_thread(_persist_yaml)
 
         if isinstance(parsed, dict) and "logging" in parsed:
             raw_logging = parsed["logging"]
@@ -240,7 +246,10 @@ async def update_logging_config(req: LoggingConfigRequest) -> dict[str, object]:
     if req.dump_dir is not None:
         set_dump_dir(req.dump_dir)
 
-    update_configured_logging_settings(
+    # 同 create_api_key：config.yaml 读-解析-落盘（fsync）全套同步 I/O 下放
+    # 线程池，避免面板保存期间冻结在途模型请求/SSE 流。
+    await asyncio.to_thread(
+        update_configured_logging_settings,
         level=req.level,
         dump_requests=req.dump_requests,
         dump_to_file=req.dump_to_file,
@@ -338,7 +347,9 @@ async def update_anti_truncation_config(
     )
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
-    update_anti_truncation_settings(
+    # 同 create_api_key：config.yaml 持久化全套同步 I/O 下放线程池。
+    await asyncio.to_thread(
+        update_anti_truncation_settings,
         enabled=req.enabled,
         tool_name=req.tool_name,
         variants_enabled=req.variants_enabled,
@@ -509,7 +520,9 @@ async def update_keepalive_config(
             status_code=400,
             detail="保活 URL 必须是包含主机名的合法 http(s) 地址",
         )
-    update_keepalive_settings(
+    # 同 create_api_key：config.yaml 持久化全套同步 I/O 下放线程池。
+    await asyncio.to_thread(
+        update_keepalive_settings,
         url=url,
         interval=req.interval,
         allow_private=req.allow_private,

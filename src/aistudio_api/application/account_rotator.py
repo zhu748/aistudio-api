@@ -263,7 +263,10 @@ class AccountStats:
         now = time.time()
         if self.session_expired:
             return False
-        current_la = get_pacific_date_key(now)
+        # 走默认缓存路径：选路时每账号每模型都会调用本方法，显式 ts 的
+        # 精确换算（时区转换 ~3µs）在热路径上纯属浪费；缓存命中是单次
+        # 浮点比较。_check_date_reset 语义不变（仍按当日键就地翻日）。
+        current_la = get_pacific_date_key()
         self._check_date_reset(current_la)
 
         if model:
@@ -370,6 +373,9 @@ class AccountStats:
             m_stats.drip_mode = True
             cooldown_duration = cd_drip
 
+        # 冷却下限 60s，但永不超过太平洋午夜配额刷新时刻（max 保持对
+        # cooldown_seconds 的钳制语义；DST 日午夜可达 23/25h，取 min 防
+        # 冷却穿透重置点导致整日误锁）。
         effective_cooldown = min(cooldown_duration, max(60.0, cooldown_seconds))
         m_stats.cooldown_until = now + effective_cooldown
 
@@ -707,6 +713,9 @@ class AccountRotator:
 
         result: dict[str, dict[str, object]] = {}
         current_la = get_pacific_date_key()
+        # 循环外取一次时钟：原先每账号每模型调用两次 time.time()（比较 +
+        # 取整各一次），面板透视拉取一次即数十次系统调用，纯属浪费。
+        now = time.time()
 
         for account in self._store.list_accounts():
             stats = self._stats.get(account.id, AccountStats(account_id=account.id))
@@ -723,8 +732,8 @@ class AccountRotator:
                 today_total_tokens += m_stats.total_tokens
                 quota = resolve_tier_quota(tier_str, m_key)
                 rem_cd = (
-                    max(0, int(m_stats.cooldown_until - time.time()))
-                    if m_stats.cooldown_until > time.time()
+                    max(0, int(m_stats.cooldown_until - now))
+                    if m_stats.cooldown_until > now
                     else 0
                 )
                 if rem_cd > 0:

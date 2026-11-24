@@ -280,7 +280,8 @@ async def upsert_signer_server(req: UpsertSignerServerRequest) -> dict[str, obje
     )
 
     server_data = req.model_dump(exclude_none=True)
-    saved = upsert_waa_server(server_data)
+    # 同 switch 端点：config.yaml 读-解析-落盘（fsync）同步 I/O 下放线程池。
+    saved = await asyncio.to_thread(upsert_waa_server, server_data)
     logger.info(
         "保存 WAA 签名服务器配置: id=%s, name=%s",
         saved.get("id"),
@@ -296,7 +297,8 @@ async def delete_signer_server(server_id: str) -> dict[str, bool]:
         delete_waa_server,
     )
 
-    success = delete_waa_server(server_id)
+    # 同 upsert：config.yaml 持久化同步 I/O 下放线程池。
+    success = await asyncio.to_thread(delete_waa_server, server_id)
     if not success:
         raise HTTPException(404, detail="未找到该签名服务器")
     logger.info("删除 WAA 签名服务器: id=%s", server_id)
