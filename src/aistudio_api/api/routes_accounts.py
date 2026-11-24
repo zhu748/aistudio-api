@@ -185,11 +185,8 @@ async def activate_account(
     if runtime_state.rotator:
         runtime_state.rotator.add_account(account.id)
         runtime_state.rotator.clear_cooldown(account.id)
-    # 目录按活跃账号凭据/层级拉取：切换后立即失效缓存，下一次 get_models
-    # （含 60s 后台 tick）以新账号重拉，付费门控不再用切换前目录。
-    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
-
-    model_discovery.invalidate_cache()
+    # 目录缓存失效已收敛到 AccountService.activate_account（覆盖 rotator
+    # 自动换号等全部切号入口），路由层不再重复调用。
     logger.info("激活账号: id=%s, name=%s", account.id, account.name)
     return to_account_response(account, request=request)
 
@@ -234,11 +231,9 @@ async def detect_account_email(
         logger.info("更新账号邮箱: id=%s, email=%s", account_id, mask_email(email))
 
     if detected_tier:
+        # 层级变化影响目录拉取的 tier 头与付费门控，目录缓存失效已收敛到
+        # AccountService.update_account_tier。
         account_service.update_account_tier(account_id, detected_tier)
-        # 层级变化影响目录拉取的 tier 头与付费门控：立即失效目录缓存。
-        from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
-
-        model_discovery.invalidate_cache()
         logger.info("更新账号订阅等级: id=%s, tier=%s", account_id, detected_tier)
     acc = account_service.get_account(account_id)
     if not acc:
@@ -272,11 +267,8 @@ async def detect_account_tier(
             logger.debug("探测账号 %s 订阅等级失败: %s", account_id, e)
 
     if detected_tier:
+        # 目录缓存失效已收敛到 AccountService.update_account_tier。
         account_service.update_account_tier(account_id, detected_tier)
-        # 层级变化影响目录拉取的 tier 头与付费门控：立即失效目录缓存。
-        from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
-
-        model_discovery.invalidate_cache()
         logger.info("更新账号订阅等级: id=%s, tier=%s", account_id, detected_tier)
 
     acc = account_service.get_account(account_id)
@@ -329,9 +321,7 @@ async def update_account_tier_manual(
         and gateway_session.active_context is not None
     ):
         gateway_session.active_context.tier = clean_tier
-    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
-
-    model_discovery.invalidate_cache()
+    # 目录缓存失效已收敛到 AccountService.update_account_tier。
     logger.info("手动更新账号订阅等级: id=%s, tier=%s", account_id, clean_tier)
     updated = account_service.get_account(account_id)
     if not updated:

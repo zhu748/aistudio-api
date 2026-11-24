@@ -144,21 +144,12 @@ async def test_api_accounts_active_endpoint():
 
 
 @pytest.mark.asyncio
-async def test_update_account_tier_manual_normalizes_and_invalidates_catalog(
-    monkeypatch,
-):
-    """PUT tier：别名归一化（pro→Pro / ultra_20x→Ultra_20X）、失效目录缓存、
-    活跃账号同步内存上下文 tier。"""
-    from unittest.mock import MagicMock
+async def test_update_account_tier_manual_normalizes_tier():
+    """PUT tier：别名归一化（pro→Pro / ultra_20x→Ultra_20X）。
 
-    from aistudio_api.infrastructure.gateway import (
-        model_discovery as model_discovery_module,
-    )
-
-    invalidate_mock = MagicMock()
-    monkeypatch.setattr(
-        model_discovery_module.model_discovery, "invalidate_cache", invalidate_mock
-    )
+    目录缓存失效已收敛到 AccountService.update_account_tier（路由层以
+    mock 服务注入，服务层失效不在此处断言，见 test_account_service_catalog）。
+    """
     mock_svc = runtime_state.account_service
     mock_svc.get_account.return_value = AccountMeta(
         id="acc_1",
@@ -174,7 +165,6 @@ async def test_update_account_tier_manual_normalizes_and_invalidates_catalog(
             resp = await client.put("/accounts/acc_1/tier", json={"tier": raw})
             assert resp.status_code == 200
             mock_svc.update_account_tier.assert_called_with("acc_1", canonical)
-    assert invalidate_mock.call_count == 2
 
 
 @pytest.mark.asyncio

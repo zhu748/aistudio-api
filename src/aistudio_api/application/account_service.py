@@ -42,8 +42,13 @@ class AccountService:
         return self._store.get_active_account()
 
     def set_active_account(self, account_id: str) -> None:
-        """设置当前活跃账号。"""
+        """设置当前活跃账号（不切换会话时的轻量路径，如导入链路）。"""
         self._store.set_active_account(account_id)
+        # 活跃账号变更 → 目录按活跃账号凭据/层级拉取，立即失效缓存（与
+        # activate_account 同理；activate 也调用本方法，幂等无开销）。
+        from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+        model_discovery.invalidate_cache()
 
     async def activate_account(
         self,
@@ -63,6 +68,13 @@ class AccountService:
         self._store.set_active_account(account_id)
         await session.switch_auth(str(auth_path))
         await session.ensure_ready()
+        # 活跃账号变更 → 目录按活跃账号凭据/层级拉取，立即失效缓存，
+        # 下一次 get_models（含 60s 后台 tick）以新账号重拉。收敛到服务层
+        # 以覆盖全部切号入口：路由激活、导入链路、rotator 自动换号
+        # （403 处理/会话过期/限流），避免只拦显式端点漏掉自动路径。
+        from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+        model_discovery.invalidate_cache()
         logger.info("切换活跃账号: %s (%s)", account_id, account.name)
         return account
 
@@ -84,7 +96,16 @@ class AccountService:
 
     def update_account_tier(self, account_id: str, tier: str) -> bool:
         """更新账号的订阅权益等级 (Free / Pro / Ultra / Plus)。"""
-        return self._store.update_account_tier(account_id, tier)
+        updated = self._store.update_account_tier(account_id, tier)
+        if updated:
+            # 层级变化影响目录拉取的 tier 头与付费门控视角，立即失效目录
+            # 缓存（与 activate_account 同理，收敛到服务层覆盖全部调用点）。
+            from aistudio_api.infrastructure.gateway.model_discovery import (
+                model_discovery,
+            )
+
+            model_discovery.invalidate_cache()
+        return updated
 
     def update_account_cookies(
         self,
