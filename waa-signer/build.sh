@@ -116,6 +116,9 @@ if [ ! -f "$DEPS_DIR/lib/libjs_static.a" ]; then
 fi
 
 # 检查编译器
+# EXTLDFLAGS 按目标平台区分（上游 DeconstructedCube 1f3d6fa）：GNU ld 的
+# --strip-all 在 macOS 经典 ld 上不存在，会直接链接失败；darwin 用
+# -Wl,-S,-x（strip debug 符号）替代。zig 交叉编译同理按目标平台选择。
 if command -v zig >/dev/null 2>&1; then
   case "$TARGET_GOOS" in
     linux)   ZIG_TARGET="${ZIG_ARCH}-linux-musl" ;;
@@ -124,15 +127,26 @@ if command -v zig >/dev/null 2>&1; then
   esac
   CC_CMD="zig cc -target ${ZIG_TARGET}"
   CXX_CMD="zig c++ -target ${ZIG_TARGET}"
-  EXTLDFLAGS="-static -Wl,--strip-all"
+  case "$TARGET_GOOS" in
+    darwin) EXTLDFLAGS="-Wl,-S,-x" ;;
+    *)       EXTLDFLAGS="-static -Wl,--strip-all" ;;
+  esac
 elif command -v clang >/dev/null 2>&1; then
   CC_CMD="clang"
   CXX_CMD="clang++"
-  EXTLDFLAGS="-Wl,--strip-all"
+  if [ "$TARGET_GOOS" = "darwin" ]; then
+    EXTLDFLAGS="-Wl,-S,-x"
+  else
+    EXTLDFLAGS="-Wl,--strip-all"
+  fi
 elif command -v gcc >/dev/null 2>&1; then
   CC_CMD="gcc"
   CXX_CMD="g++"
-  EXTLDFLAGS="-Wl,--strip-all"
+  if [ "$TARGET_GOOS" = "darwin" ]; then
+    EXTLDFLAGS="-Wl,-S,-x"
+  else
+    EXTLDFLAGS="-Wl,--strip-all"
+  fi
 else
   echo "错误: 未找到 zig, clang 或 gcc 编译器。请先安装 (例如: pkg install zig 或 apt install clang)" >&2
   exit 1

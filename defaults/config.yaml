@@ -76,7 +76,7 @@ paid_model_rules:
     required_tiers: ["Ultra", "Ultra_20X"]
   pro_required:
     # 2026-11-12 目录实测：omni/deep-research/lyria 同为付费门控模型
-    contains: ["argon", "image", "imagen", "omni", "deep-research", "lyria"]
+    contains: ["argon", "neon", "image", "imagen", "omni", "deep-research", "lyria"]
     required_tiers: ["Pro", "Ultra", "Ultra_20X"]
 
 model_defaults:
@@ -183,7 +183,7 @@ tier_quotas:
   Pro:
     argon_models:
       match:
-        contains: ["argon", "carbon"]
+        contains: ["argon", "neon", "carbon"]
       daily_limit: 50
     flash_models:
       match:
@@ -209,7 +209,7 @@ tier_quotas:
   Ultra:
     argon_models:
       match:
-        contains: ["argon", "carbon"]
+        contains: ["argon", "neon", "carbon"]
       daily_limit: 250
     flash_models:
       match:
@@ -239,7 +239,7 @@ tier_quotas:
   Ultra_20X:
     argon_models:
       match:
-        contains: ["argon", "carbon"]
+        contains: ["argon", "neon", "carbon"]
       daily_limit: 1000
     flash_models:
       match:

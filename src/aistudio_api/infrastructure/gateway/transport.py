@@ -10,7 +10,9 @@ import asyncio
 import contextlib
 import math
 import re
+import socket
 import ssl
+import struct
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Iterable
 from contextlib import asynccontextmanager
@@ -216,6 +218,127 @@ def _shared_ssl_context() -> ssl.SSLContext:
     if _ssl_context is None:
         _ssl_context = ssl.create_default_context()
     return _ssl_context
+
+
+# ---------------------------------------------------------------------------
+# HTTP/2 PING / TCP 保活（移植自上游 DeconstructedCube/aistudio-api 同名机制）
+# ---------------------------------------------------------------------------
+# 上游长思考/长工具调用无数据时，每 25s 发送一次端到端 HTTP/2 PING 帧
+# （穿透代理与 NAT），防止中间代理或 Google GFE 在 60s~120s 静默期强制
+# 断连导致 502。httpcore 使用 hyper-h2 但长静默读期间从不主动发 PING，
+# 故按 25s 切片网络读并在 _write_lock 保护下经 TLS 流写 PING 帧，端到端
+# 重置应用层空闲计时器（无后台任务与线程安全隐患）。
+H2_PING_INTERVAL_SECONDS = 25.0
+_h2_ping_installed = False
+
+
+def _build_keepalive_socket_options() -> list[tuple[int, int, int]]:
+    """为长寿命流构建可移植的 TCP SO_KEEPALIVE 套接字选项。"""
+    opts: list[tuple[int, int, int]] = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    keepidle = getattr(socket, "TCP_KEEPIDLE", None) or getattr(
+        socket, "TCP_KEEPALIVE", None
+    )
+    if isinstance(keepidle, int):
+        opts.append((socket.IPPROTO_TCP, keepidle, 30))
+    keepintvl = getattr(socket, "TCP_KEEPINTVL", None)
+    if isinstance(keepintvl, int):
+        opts.append((socket.IPPROTO_TCP, keepintvl, 10))
+    keepcnt = getattr(socket, "TCP_KEEPCNT", None)
+    if isinstance(keepcnt, int):
+        opts.append((socket.IPPROTO_TCP, keepcnt, 6))
+    return opts
+
+
+def _install_http2_ping_keepalive() -> None:
+    """向 httpcore.AsyncHTTP2Connection 注入 RFC 9113 HTTP/2 PING 保活。
+
+    把网络读按 H2_PING_INTERVAL_SECONDS 切片：切片读超时（且未到请求
+    deadline、连接未终止）时发一帧 PING 并继续读。已有读取异常、写异常
+    或连接终止标记时照常抛出，行为对正常连接零影响。
+    """
+    global _h2_ping_installed
+    if _h2_ping_installed:
+        return
+    try:
+        import httpcore  # pyright: ignore[reportUnusedImport]
+        from httpcore._async import http2 as hc_http2
+    except Exception:
+        _h2_ping_installed = True
+        return
+
+    conn_cls = getattr(hc_http2, "AsyncHTTP2Connection", None)
+    if conn_cls is None or getattr(conn_cls, "_aistudio_h2_ping_installed", False):
+        _h2_ping_installed = True
+        return
+
+    async def _read_incoming_data_with_ping(
+        self: object, request: httpcore.Request
+    ) -> list[object]:
+        timeouts = request.extensions.get("timeout", {})
+        total_timeout = timeouts.get("read", None)
+        write_timeout = timeouts.get("write", 30.0)
+
+        read_exc = getattr(self, "_read_exception", None)
+        if read_exc is not None:
+            raise read_exc
+
+        deadline = (
+            time.monotonic() + float(total_timeout)
+            if total_timeout is not None
+            else None
+        )
+        ping_seq = int(getattr(self, "_aistudio_ping_seq", 0))
+
+        try:
+            while True:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise httpcore.ReadTimeout("Timed out reading HTTP/2 stream")
+                    slice_timeout: float | None = min(
+                        remaining, H2_PING_INTERVAL_SECONDS
+                    )
+                else:
+                    slice_timeout = H2_PING_INTERVAL_SECONDS
+
+                try:
+                    data = await self._network_stream.read(  # type: ignore[attr-defined]
+                        self.READ_NUM_BYTES,  # type: ignore[attr-defined]
+                        slice_timeout,
+                    )
+                except httpcore.ReadTimeout:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise
+                    if (
+                        getattr(self, "_connection_terminated", None) is not None
+                        or getattr(self, "_write_exception", None) is not None
+                    ):
+                        raise
+                    ping_seq += 1
+                    self._aistudio_ping_seq = ping_seq  # type: ignore[attr-defined]
+                    opaque = struct.pack("!Q", ping_seq & 0xFFFFFFFFFFFFFFFF)
+                    async with self._write_lock:  # type: ignore[attr-defined]
+                        self._h2_state.ping(opaque)  # type: ignore[attr-defined]
+                        outgoing = self._h2_state.data_to_send()  # type: ignore[attr-defined]
+                        if outgoing:
+                            await self._network_stream.write(  # type: ignore[attr-defined]
+                                outgoing, write_timeout
+                            )
+                    continue
+
+                if data == b"":
+                    raise httpcore.RemoteProtocolError("Server disconnected")
+                break
+        except Exception as exc:
+            self._read_exception = exc  # type: ignore[attr-defined]
+            self._connection_error = True  # type: ignore[attr-defined]
+            raise exc
+
+        return list(self._h2_state.receive_data(data))  # type: ignore[attr-defined]
+
+    conn_cls._read_incoming_data = _read_incoming_data_with_ping  # type: ignore[method-assign]
+    conn_cls._aistudio_h2_ping_installed = True
+    _h2_ping_installed = True
 
 
 # 空 Cookie 的短 TTL 负缓存：账号 Cookie 加载失败/为空时，避免每个请求
@@ -526,7 +649,11 @@ def _prepare_wire_exchange(
         auth_file=auth_file,
         cookies=cookies,
     )
-    body_bytes = body.encode("utf-8")
+    # errors="replace"：客户端 JSON 可能携带孤立 UTF-16 代理项（Python str
+    # 允许存在，如 emoji 截断/SDK 透传脏数据），严格编码会抛
+    # UnicodeEncodeError 直接 500。替换为 U+FFFD 保请求可用（上游
+    # DeconstructedCube 036e618 同款防御）。
+    body_bytes = body.encode("utf-8", errors="replace")
     # Firefox 线缆形态重建：有序头列表（含 te/accept-encoding/content-length）
     wire_headers = _firefox_wire_header_list(clean_headers, len(body_bytes))
     effective_proxy = default_proxy if proxy_url is None else proxy_url
@@ -778,6 +905,20 @@ class HTTPStreamTransport:
         self._retired_close_tasks.add(task)
         task.add_done_callback(self._retired_close_tasks.discard)
 
+    async def _reset_stale_client(self, client: httpx.AsyncClient) -> None:
+        """连接级故障后立即废弃池化客户端（移植自上游同名机制）。
+
+        ConnectError/ConnectTimeout/PoolTimeout/RemoteProtocolError 意味着
+        连接池本身已不可用：留在池里会让后续请求继续命中同一坏池（代理
+        换网/上游断连后一连串失败直到池过期）。复用 _retire_clients_except
+        的「立即摘池 + 延迟关闭」模式：在途流持有的引用仍能安全跑完，
+        并发请求不会因一次连接失败被中断。
+        """
+        stale_keys = [k for k, c in self._clients.items() if c is client]
+        if not stale_keys:
+            return
+        await self._retire_clients_except(set(self._clients) - set(stale_keys))
+
     @asynccontextmanager
     async def _lease_client(
         self, proxy_url: str | None
@@ -831,20 +972,34 @@ class HTTPStreamTransport:
             client = self._clients.get(key)
             if client is not None and not client.is_closed:
                 return client
-            client = httpx.AsyncClient(
-                timeout=httpx.Timeout(
-                    self.timeout, connect=15.0, write=120.0, pool=30.0
-                ),
-                proxy=effective,
-                trust_env=False,
-                http2=_http2_enabled(),
+            if _http2_enabled():
+                _install_http2_ping_keepalive()
+            # 显式构造 AsyncHTTPTransport：socket_options（TCP 保活）只在
+            # transport 上接受（AsyncClient 不暴露该参数）；其余语义
+            # （verify 共享 SSLContext / http2 降级 / limits）与原直建
+            # AsyncClient 完全一致。
+            transport = httpx.AsyncHTTPTransport(
                 verify=_shared_ssl_context(),
+                http1=True,
+                http2=_http2_enabled(),
+                proxy=effective,
                 limits=httpx.Limits(
                     max_keepalive_connections=self._FIREFOX_MAX_CONNECTIONS,
                     max_connections=self._FIREFOX_MAX_CONNECTIONS
                     if _http2_enabled()
                     else self._H1_FALLBACK_MAX_CONNECTIONS,
                 ),
+                # TCP 保活（SO_KEEPALIVE + idle 30s/间隔 10s×6）：与 HTTP/2
+                # PING 互补——H2 PING 穿透中间设备的应用层空闲计时器，TCP
+                # 保活兜底操作系统级连接表项回收（长思考流可静默 >120s）。
+                socket_options=_build_keepalive_socket_options(),
+            )
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    self.timeout, connect=15.0, write=120.0, pool=30.0
+                ),
+                trust_env=False,
+                transport=transport,
             )
             self._clients[key] = client
             return client
@@ -1069,6 +1224,18 @@ class HTTPStreamTransport:
                 err_detail = (
                     f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
                 )
+                if isinstance(
+                    exc,
+                    (
+                        httpx.ConnectTimeout,
+                        httpx.ConnectError,
+                        httpx.PoolTimeout,
+                        httpx.RemoteProtocolError,
+                    ),
+                ):
+                    # 连接级故障：废弃坏池，避免后续请求继续命中不可用连接。
+                    with contextlib.suppress(Exception):
+                        await self._reset_stale_client(client)
                 logger.error(
                     "HTTP 请求失败: url=%s, proxy=%s, error=%s",
                     url,
@@ -1185,6 +1352,18 @@ class HTTPStreamTransport:
                 err_detail = (
                     f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
                 )
+                if isinstance(
+                    exc,
+                    (
+                        httpx.ConnectTimeout,
+                        httpx.ConnectError,
+                        httpx.PoolTimeout,
+                        httpx.RemoteProtocolError,
+                    ),
+                ):
+                    # 连接级故障：废弃坏池，避免后续请求继续命中不可用连接。
+                    with contextlib.suppress(Exception):
+                        await self._reset_stale_client(client)
                 logger.warning(
                     "流式传输异常: url=%s, proxy=%s, error=%s",
                     url,

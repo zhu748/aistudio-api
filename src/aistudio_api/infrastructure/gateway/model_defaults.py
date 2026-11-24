@@ -467,11 +467,34 @@ def effective_generation_config_overrides(
 
 
 def _coerce_thinking_level(value: object) -> ThinkingLevel:
+    """config.yaml thinking level 值的宽松解析（别名 + 档位吸附前置容错）。
+
+    与 chat_service._REASONING_EFFORT_TO_LEVEL 语义一致：max/xhigh 等
+    客户端词汇按档位吸附链路解析；无法识别的值抛 ValueError（400），
+    不再漏出 KeyError（上游 DeconstructedCube 036e618/8a91908 同款）。
+    """
     if isinstance(value, ThinkingLevel):
         return value
-    if isinstance(value, int):
+    if isinstance(value, int) and not isinstance(value, bool):
         return ThinkingLevel(value)
-    return ThinkingLevel[str(value).strip().upper()]
+    label = str(value).strip().upper()
+    # 目录最高档 2026-11-15 上移至 6（EXTRA_HIGH）：max/xhigh 同指 6 档，
+    # 与 chat_service._REASONING_EFFORT_TO_LEVEL 对齐。
+    aliases = {
+        "MIN": ThinkingLevel.MINIMAL,
+        "MINIMUM": ThinkingLevel.MINIMAL,
+        "MAX": ThinkingLevel.EXTRA_HIGH,
+        "MAXIMUM": ThinkingLevel.EXTRA_HIGH,
+        "XHIGH": ThinkingLevel.EXTRA_HIGH,
+        "EXTRA_HIGH": ThinkingLevel.EXTRA_HIGH,
+    }
+    if label in aliases:
+        return aliases[label]
+    if label.isdigit():
+        return ThinkingLevel(int(label))
+    if label in ThinkingLevel.__members__:
+        return ThinkingLevel[label]
+    raise ValueError(f"Unsupported thinking_level: {value!r}")
 
 
 def _coerce_media_resolution(value: object) -> int:
@@ -720,7 +743,7 @@ _FALLBACK_DEFAULT_CONFIG: dict[str, object] = {
             "required_tiers": ["Ultra", "Ultra_20X"],
         },
         "pro_required": {
-            "contains": ["argon", "image", "imagen"],
+            "contains": ["argon", "neon", "image", "imagen"],
             "required_tiers": ["Pro", "Ultra", "Ultra_20X"],
         },
     },
@@ -737,7 +760,7 @@ _FALLBACK_DEFAULT_CONFIG: dict[str, object] = {
         },
         "Pro": {
             "argon_models": {
-                "match": {"contains": ["argon", "carbon"]},
+                "match": {"contains": ["argon", "neon", "carbon"]},
                 "daily_limit": 50,
             },
             "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 150},
@@ -750,7 +773,7 @@ _FALLBACK_DEFAULT_CONFIG: dict[str, object] = {
         },
         "Ultra": {
             "argon_models": {
-                "match": {"contains": ["argon", "carbon"]},
+                "match": {"contains": ["argon", "neon", "carbon"]},
                 "daily_limit": 250,
             },
             "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 1500},
@@ -764,7 +787,7 @@ _FALLBACK_DEFAULT_CONFIG: dict[str, object] = {
         },
         "Ultra_20X": {
             "argon_models": {
-                "match": {"contains": ["argon", "carbon"]},
+                "match": {"contains": ["argon", "neon", "carbon"]},
                 "daily_limit": 1000,
             },
             "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 5000},

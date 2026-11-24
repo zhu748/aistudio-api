@@ -45,41 +45,63 @@ async def test_http2_disabled_when_h2_missing(monkeypatch):
 
 
 async def test_client_created_with_http1_when_h2_missing(monkeypatch):
-    """h2 缺失时创建的 AsyncClient 必须是 http2=False（降级而非抛错）。"""
-    captured: dict[str, object] = {}
+    """h2 缺失时创建的传输必须 http2=False（降级而非抛错）。
+
+    socket_options 迁入 AsyncHTTPTransport 后，HTTP/2 开关随传输构造
+    传递；AsyncClient 仅承载 timeout/trust_env/transport。
+    """
+    captured_client: dict[str, object] = {}
+    captured_transport: dict[str, object] = {}
+
+    class FakeAsyncHTTPTransport:
+        def __init__(self, **kwargs: object) -> None:
+            captured_transport.update(kwargs)
 
     class FakeAsyncClient:
         is_closed = False
 
         def __init__(self, **kwargs: object) -> None:
-            captured.update(kwargs)
+            captured_client.update(kwargs)
 
     monkeypatch.setattr(transport_mod.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(
+        transport_mod.httpx, "AsyncHTTPTransport", FakeAsyncHTTPTransport
+    )
     monkeypatch.setattr(transport_mod, "_h2_available", False)
 
     transport = HTTPStreamTransport(proxy_url=None, timeout=30.0)
     await transport._get_client()
 
-    assert captured["http2"] is False
+    assert captured_transport["http2"] is False
+    assert "transport" in captured_client
 
 
 async def test_client_created_with_http2_when_h2_present(monkeypatch):
-    """h2 可用时客户端保持 http2=True（正常环境不回退）。"""
-    captured: dict[str, object] = {}
+    """h2 可用时传输保持 http2=True（正常环境不回退）。"""
+    captured_client: dict[str, object] = {}
+    captured_transport: dict[str, object] = {}
+
+    class FakeAsyncHTTPTransport:
+        def __init__(self, **kwargs: object) -> None:
+            captured_transport.update(kwargs)
 
     class FakeAsyncClient:
         is_closed = False
 
         def __init__(self, **kwargs: object) -> None:
-            captured.update(kwargs)
+            captured_client.update(kwargs)
 
     monkeypatch.setattr(transport_mod.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(
+        transport_mod.httpx, "AsyncHTTPTransport", FakeAsyncHTTPTransport
+    )
     monkeypatch.setattr(transport_mod, "_h2_available", True)
 
     transport = HTTPStreamTransport(proxy_url=None, timeout=30.0)
     await transport._get_client()
 
-    assert captured["http2"] is True
+    assert captured_transport["http2"] is True
+    assert "transport" in captured_client
 
 
 async def test_missing_h2_warning_visible_in_panel_log_buffer(monkeypatch):

@@ -101,6 +101,13 @@ _EXTRA_GUARANTEED_MODELS = [
         "description": "Gemini 4 Argon flagship reasoning model",
     },
     {
+        # Pro 旗舰（与 argon 同档 Pro+，上游 2026-11 新增；线上目录实测
+        # paid=2 / accessModes=[1,3]——见上游 DeconstructedCube 6c2575d）
+        "id": "gemini-4-neon",
+        "displayName": "Gemini 4 Neon",
+        "description": "Gemini 4 Neon flagship reasoning model",
+    },
+    {
         "id": "gemini-4-carbon",
         "displayName": "Gemini 4 Carbon",
         "description": "Gemini 4 Carbon flagship reasoning model",
@@ -192,6 +199,26 @@ _FALLBACK_MODELS = [
         "id": "gemini-4-argon",
         "displayName": "Gemini 4 Argon",
         "description": "Gemini 4 Argon",
+        "category": "flagship",
+        "inputTokenLimit": 1048576,
+        "outputTokenLimit": 32768,
+        "unknownFlag13": 1,
+        "unknownFlag45": 1,
+        "defaultThinkingLevel": 2,
+        "thinkingLevels": [1, 2, 3],
+        "paid": True,
+        "accessModes": [1, 3],
+        "is_image_model": False,
+        "is_video_model": False,
+        "is_audio_model": False,
+    },
+    {
+        # 2026-11 上游目录新增 Pro 旗舰（与 argon 同档 Pro+）：paid[77]=2 /
+        # accessModes=[1,3]，付费定位与配额档均按 argon 同类处理（上游
+        # DeconstructedCube 6c2575d 同步）。线上目录可用时以实测数据为准。
+        "id": "gemini-4-neon",
+        "displayName": "Gemini 4 Neon",
+        "description": "Gemini 4 Neon",
         "category": "flagship",
         "inputTokenLimit": 1048576,
         "outputTokenLimit": 32768,

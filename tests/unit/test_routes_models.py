@@ -124,11 +124,12 @@ async def test_model_discovery_falls_back_to_auth_file_cookies(tmp_path, monkeyp
     service._fetch_via_http = AsyncMock(return_value=fake_http_models)
 
     models = await service.get_models(session=mock_session, force_refresh=True)
-    # 上游模型全部保留，且本地补充模型（hydrogen/argon/carbon）被合并进列表
+    # 上游模型全部保留，且本地补充模型（hydrogen/argon/neon/carbon）被合并进列表
     assert {str(m["id"]) for m in models} == {
         "dynamic-gemini-test",
         "gemini-4-hydrogen",
         "gemini-4-argon",
+        "gemini-4-neon",
         "gemini-4-carbon",
     }
     assert service._fetch_via_http.called
@@ -179,11 +180,13 @@ async def test_model_discovery_merges_extra_models_into_upstream_list():
     models = await service.get_models(cookies={"SAPISID": "test"}, force_refresh=True)
     ids = [str(m["id"]) for m in models]
     # 2026-11：本地补充模型新增 gemini-4-carbon（旗舰）与
-    # gemini-4-hydrogen（免费 4 系列，同日线上目录实测）
+    # gemini-4-hydrogen（免费 4 系列，同日线上目录实测）；
+    # gemini-4-neon（Pro 旗舰，2026-11 上游目录新增，与 argon 同档）
     assert ids == [
         "gemini-3.7-flash",
         "gemini-4-hydrogen",
         "gemini-4-argon",
+        "gemini-4-neon",
         "gemini-4-carbon",
     ]
 
@@ -277,6 +280,11 @@ async def test_gemini_4_series_tier_gating_per_model():
     # argon：Pro+（既有行为保持）
     assert service.get_required_tiers("gemini-4-argon") == ["Pro", "Ultra", "Ultra_20X"]
     assert service.is_model_allowed_for_tier("gemini-4-argon", "Free") is False
+    # neon：Pro+（2026-11 上游目录新增，与 argon 同档付费定位与配额）
+    assert service.is_paid_model("gemini-4-neon") is True
+    assert service.get_required_tiers("gemini-4-neon") == ["Pro", "Ultra", "Ultra_20X"]
+    assert service.is_model_allowed_for_tier("gemini-4-neon", "Free") is False
+    assert service.is_model_allowed_for_tier("gemini-4-neon", "Pro") is True
     # carbon：Ultra-only（目录 accessModes=[1,4]：含 4 不含 3）
     assert service.is_paid_model("gemini-4-carbon") is True
     assert service.get_required_tiers("gemini-4-carbon") == ["Ultra", "Ultra_20X"]

@@ -102,7 +102,10 @@ def extract_content_digest(contents: list[AistudioContent]) -> tuple[str, str]:
             else:
                 hash_parts.append("")
     prompt = " ".join(hash_parts)
-    content_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    # errors="replace"：text 内的孤立 UTF-16 代理项会让严格编码抛
+    # UnicodeEncodeError（签名前奏即崩，请求 500）。摘要仅需稳定字节串，
+    # 替换为 U+FFFD 后 hash 仍确定（上游 DeconstructedCube 036e618 同款）。
+    content_hash = hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest()
     return prompt, content_hash
 
 
@@ -433,7 +436,9 @@ class WaaSigner:
         credentials = json.dumps(
             filter_minimal_cookies(cookies), sort_keys=True, separators=(",", ":")
         )
-        anchor = hashlib.sha256(credentials.encode("utf-8")).hexdigest()
+        anchor = hashlib.sha256(
+            credentials.encode("utf-8", errors="replace")
+        ).hexdigest()
         return (
             content_hash,
             str(auth_user),
