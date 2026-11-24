@@ -74,6 +74,14 @@ Free 账号实测，**两个槽位到底是"模型固有门槛"还是"相对抓�
   脚本：`/home/z/my-project/scripts/test_thinking_levels.py`（签名服务可用
   时直发 5/6 裁决）、`/home/z/my-project/scripts/parse_capture_1124.py`
   （解析 Reqable HAR 提取 UI 档位→wire 映射）。
+- **运行时归一化（2026-11-24 修复）**：cookie 拉取本身无误，但目录值若
+  直接入缓存，snap 吸附会把用户请求的 EXTRA_HIGH(6) 降档到 VERY_HIGH(5)
+  → wire 400（线上拉取覆盖缓存后必现的活隐患，此前仅静态快照是 wire
+  口径）。已在缓存唯一入口 `_merge_extra_models` 统一做「显示枚举 →
+  wire 枚举」翻译（thinkingLevels / defaultThinkingLevel 中 5 → 6，仅当
+  6 不存在，幂等），线上拉取与静态保底两条路径都经过此处。回归测试：
+  `test_merge_translates_catalog_display_levels_to_wire`、
+  `test_snap_keeps_extra_high_after_live_catalog_ingest`。
 
 ## 复现
 

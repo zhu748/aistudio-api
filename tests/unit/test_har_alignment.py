@@ -39,6 +39,7 @@ from aistudio_api.infrastructure.gateway.model_discovery import (
     _EXTRA_GUARANTEED_MODELS,
     _FALLBACK_MODELS,
     ModelDiscoveryService,
+    _merge_extra_models,
     model_discovery,
 )
 from aistudio_api.infrastructure.gateway.wire_codec import encode_request_body
@@ -598,6 +599,77 @@ def test_snap_wire_with_extra_high_level():
         None,
         3,
     ]
+
+
+def test_merge_translates_catalog_display_levels_to_wire():
+    """目录入口「显示枚举 → wire 枚举」归一化（2026-11-24 定谳回归）。
+
+    线上 ListModels 回报显示口径 [1,2,3,5]（显示层 Extra High = 5），
+    wire 层实发 6（11-15 抓包 6→200 / 5→400；11-24 复抓 UI 四档实发
+    6/3/2/1）。未归一化时缓存 [1,2,3,5] 会让 snap 把用户请求的
+    EXTRA_HIGH(6) 降档到 VERY_HIGH(5) → 上游 400。
+    """
+    merged = _merge_extra_models(
+        [
+            {
+                "id": "gemini-4-hydrogen",
+                "displayName": "Gemini 4 Hydrogen",
+                "defaultThinkingLevel": 3,
+                "thinkingLevels": [1, 2, 3, 5],
+            }
+        ]
+    )
+    info = next(m for m in merged if m.get("id") == "gemini-4-hydrogen")
+    assert info["thinkingLevels"] == [1, 2, 3, 6]
+    assert info["defaultThinkingLevel"] == 3  # 3 两空间同值，不动
+
+    # 幂等：已是 wire 空间的静态快照（[1,2,3,6]）原样保留
+    merged_wire = _merge_extra_models(
+        [{"id": "gemini-4-hydrogen", "thinkingLevels": [1, 2, 3, 6]}]
+    )
+    info_wire = next(m for m in merged_wire if m.get("id") == "gemini-4-hydrogen")
+    assert info_wire["thinkingLevels"] == [1, 2, 3, 6]
+
+    # 显示默认档 5（若上游把默认切到 Extra High）同样翻译为 wire 6
+    merged_default = _merge_extra_models(
+        [{"id": "gemini-4-hydrogen", "defaultThinkingLevel": 5}]
+    )
+    info_default = next(m for m in merged_default if m.get("id") == "gemini-4-hydrogen")
+    assert info_default["defaultThinkingLevel"] == 6
+
+
+def test_snap_keeps_extra_high_after_live_catalog_ingest(monkeypatch):
+    """端到端回归：线上目录（显示口径）入缓存后，EXTRA_HIGH(6) 不被降档。
+
+    模拟 cookie 拉取成功覆盖缓存的真实路径：显示口径 [1,2,3,5] 经
+    _merge_extra_models 归一化为 [1,2,3,6] 后，snap 对 6 原样放行；
+    遗留数值直传 5 依「同距优先升档」升到 6（不落已被上游移除的 5）。
+    """
+    live = _merge_extra_models(
+        [
+            {
+                "id": "gemini-4-hydrogen",
+                "displayName": "Gemini 4 Hydrogen",
+                "thinkingLevels": [1, 2, 3, 5],
+            }
+        ]
+    )
+    monkeypatch.setattr(model_discovery, "_cached_models", live)
+    try:
+        assert (
+            snap_thinking_level_to_supported(
+                "gemini-4-hydrogen", ThinkingLevel.EXTRA_HIGH
+            )
+            is ThinkingLevel.EXTRA_HIGH
+        )
+        assert (
+            snap_thinking_level_to_supported(
+                "gemini-4-hydrogen", ThinkingLevel.VERY_HIGH
+            )
+            is ThinkingLevel.EXTRA_HIGH
+        )
+    finally:
+        monkeypatch.setattr(model_discovery, "_cached_models", [])
 
 
 def test_parse_thinking_level_extra_high_variants():

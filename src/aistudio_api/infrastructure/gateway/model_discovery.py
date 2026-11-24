@@ -115,10 +115,62 @@ _EXTRA_GUARANTEED_MODELS = [
 ]
 
 
+def _translate_display_thinking_levels_to_wire(
+    models: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """目录思考档「显示枚举 → wire 枚举」归一化（2026-11-24 定谳）。
+
+    ListModels 元数据是显示层枚举口径（UI 选择器空间）：最高档 Extra
+    High 在显示空间记作 5，而 wire 层实发 6——2026-11-15 真机抓包：
+    6 → 200（双样本）、5 → 400 "Thinking level EXTRA_HIGH is not
+    supported"；2026-11-24 复核抓包：UI 四档实发 wire 6/3/2/1，目录仍
+    回报 [1,2,3,5]。两套编号在 snap 吸附处交汇：若把目录值直接当 wire
+    档位，缓存 [1,2,3,5] 会把用户请求的 EXTRA_HIGH(6) 降档到 VERY_HIGH(5)
+    → 上游 400。故在目录入口统一翻译 5 → 6（仅当 6 尚不存在，避免重复；
+    其余档位两空间同值 1/2/3/4 恒等）。对已是 wire 空间的静态快照幂等。
+    详见 docs/CATALOG_TIER_SEMANTICS_2026-11-24.md。
+    """
+    for info in models:
+        raw_levels = info.get("thinkingLevels")
+        if isinstance(raw_levels, list) and raw_levels:
+            numeric = [
+                x
+                for x in raw_levels
+                if isinstance(x, (int, float)) and not isinstance(x, bool)
+            ]
+            has_display_top = any(int(x) == 5 for x in numeric)
+            has_wire_top = any(int(x) == 6 for x in numeric)
+            if has_display_top and not has_wire_top:
+                info["thinkingLevels"] = [
+                    6
+                    if (
+                        isinstance(x, (int, float))
+                        and not isinstance(x, bool)
+                        and int(x) == 5
+                    )
+                    else x
+                    for x in raw_levels
+                ]
+        raw_default = info.get("defaultThinkingLevel")
+        if (
+            isinstance(raw_default, (int, float))
+            and not isinstance(raw_default, bool)
+            and int(raw_default) == 5
+        ):
+            info["defaultThinkingLevel"] = 6
+    return models
+
+
 def _merge_extra_models(
     models: list[dict[str, object]],
 ) -> list[dict[str, object]]:
-    """将本地补充模型合并进模型列表（按 id 与别名去重，上游已存在则跳过）。"""
+    """将本地补充模型合并进模型列表（按 id 与别名去重，上游已存在则跳过）。
+
+    入口统一做思考档「显示枚举 → wire 枚举」归一化（目录元数据 5 → wire
+    6，见 _translate_display_thinking_levels_to_wire）——线上拉取与静态
+    保底两条缓存路径都经过此处，snap 吸附读到的永远是 wire 口径。
+    """
+    models = _translate_display_thinking_levels_to_wire(models)
     known_ids: set[str] = set()
     for item in models:
         raw_id = str(item.get("id") or item.get("name") or "")
