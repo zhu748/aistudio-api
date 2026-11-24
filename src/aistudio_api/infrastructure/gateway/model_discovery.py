@@ -216,16 +216,19 @@ _FALLBACK_MODELS = [
         # 2026-11 上游目录新增 Pro 旗舰（与 argon 同档 Pro+）：paid[77]=2 /
         # accessModes=[1,3]，付费定位与配额档均按 argon 同类处理（上游
         # DeconstructedCube 6c2575d 同步）。线上目录可用时以实测数据为准。
+        # 2026-11-24 线上目录复核：输出上限 65536（高于 argon 的 32768，
+        # 与 hydrogen 同档）；思考档目录回报 [1,2,3,5] 但 hydrogen 系
+        # wire 实测最高档为 6（见 hydrogen 条注释），neon 同步用 6。
         "id": "gemini-4-neon",
         "displayName": "Gemini 4 Neon",
         "description": "Gemini 4 Neon",
         "category": "flagship",
         "inputTokenLimit": 1048576,
-        "outputTokenLimit": 32768,
+        "outputTokenLimit": 65536,
         "unknownFlag13": 1,
         "unknownFlag45": 1,
-        "defaultThinkingLevel": 2,
-        "thinkingLevels": [1, 2, 3],
+        "defaultThinkingLevel": 3,
+        "thinkingLevels": [1, 2, 3, 6],
         "paid": True,
         "accessModes": [1, 3],
         "is_image_model": False,
@@ -260,7 +263,8 @@ _FALLBACK_MODELS = [
         # [83]=1。思考档 2026-11-15 Reqable 真机抓包复核：UI「Extra High」
         # 档发送 [1,null,null,6] → 200（双样本），对 5 上游报 400
         # "EXTRA_HIGH is not supported"——最高档已由 5 上移至 6，
-        # 默认 HIGH(3) 不变。
+        # 默认 HIGH(3) 不变。2026-11-24 线上目录 ListModels 思考档回报
+        # [1,2,3,5] 与 wire 实测冲突，以 wire 实测（6）为准。
         "id": "gemini-4-hydrogen",
         "displayName": "Gemini 4 Hydrogen",
         "description": "Gemini 4 Hydrogen",
@@ -305,6 +309,10 @@ _FALLBACK_MODELS = [
             "learnlm-1.5-pro-experimental",
         ],
         "paid": False,
+        # 2026-11-24 线上目录复核：上游补标 accessModes=[1]（Paid API key
+        # 通道标记，网页端无门槛——门控语义见 get_required_tiers：
+        # modes 仅 [1] 不构成订阅门槛）。
+        "accessModes": [1],
         "is_image_model": False,
         "is_video_model": False,
         "is_audio_model": False,
@@ -393,20 +401,6 @@ _FALLBACK_MODELS = [
         "is_audio_model": False,
     },
     {
-        "id": "gemini-3.5-live-translate-preview",
-        "displayName": "Gemini 3.5 Live Translate Preview",
-        "description": "Gemini 3.5 Live Translate Preview",
-        "category": "live",
-        "inputTokenLimit": 16384,
-        "outputTokenLimit": 32768,
-        "defaultThinkingLevel": None,
-        "thinkingLevels": [],
-        "paid": False,
-        "is_image_model": False,
-        "is_video_model": False,
-        "is_audio_model": False,
-    },
-    {
         "id": "gemini-3.1-flash-lite",
         "displayName": "Gemini 3.1 Flash Lite",
         "description": "Gemini 3.1 Flash Lite",
@@ -416,7 +410,12 @@ _FALLBACK_MODELS = [
         "defaultThinkingLevel": 4,
         "thinkingLevels": [4, 1, 2, 3],
         "aliases": ["gemini-3.1-flash-lite-preview"],
+        # 2026-11-24 线上目录复核：已转 Pro+ 门槛（paid[77]=None /
+        # accessModes[82,87]=[1,3]，原快照无门槛标记已漂移——上游未标
+        # paid 槽位但 accessModes 明确给 [1,3]，等级判定以 modes 为准）。
+        # 冷启动门控据此拦截 Free 账号请求。
         "paid": False,
+        "accessModes": [1, 3],
         "is_image_model": False,
         "is_video_model": False,
         "is_audio_model": False,
@@ -431,7 +430,8 @@ _FALLBACK_MODELS = [
         "unknownFlag13": 1,
         "defaultThinkingLevel": 3,
         "thinkingLevels": [4, 1, 2, 3],
-        "aliases": ["gemini-2.0-flash", "gemini-2.0-flash-001"],
+        # 2026-11-24 线上目录复核：新增别名 gemini-3.5-flash。
+        "aliases": ["gemini-3.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-001"],
         "paid": True,
         "accessModes": [1, 3],
         "is_image_model": False,
@@ -521,7 +521,9 @@ _FALLBACK_MODELS = [
         "paid": False,
         "is_image_model": False,
         "is_video_model": False,
-        "is_audio_model": True,
+        # 2026-11-24 线上目录复核：[81] 音频标记清零（转写能力以
+        # capabilityCodes 为准）。
+        "is_audio_model": False,
     },
     {
         "id": "gemini-2.5-flash-image",
@@ -596,78 +598,6 @@ _FALLBACK_MODELS = [
         "defaultThinkingLevel": 3,
         "thinkingLevels": [4, 1, 2, 3],
         "aliases": ["featured-robotics", "gemini-robotics-er-1.6-preview"],
-        "paid": False,
-        "is_image_model": False,
-        "is_video_model": False,
-        "is_audio_model": False,
-    },
-    {
-        "id": "gemini-3.8-live",
-        "displayName": "Gemini 3.8 Live",
-        "description": "Gemini 3.8 Live",
-        "category": "live",
-        "inputTokenLimit": 131072,
-        "outputTokenLimit": 65536,
-        "defaultThinkingLevel": None,
-        "thinkingLevels": [],
-        "aliases": ["talker-only"],
-        "paid": False,
-        "is_image_model": False,
-        "is_video_model": False,
-        "is_audio_model": False,
-    },
-    {
-        "id": "gemini-3.8-live-extended-thinking",
-        "displayName": "Gemini 3.8 Live Extended Thinking",
-        "description": "Gemini 3.8 Live Extended Thinking",
-        "category": "live",
-        "inputTokenLimit": 131072,
-        "outputTokenLimit": 65536,
-        "defaultThinkingLevel": 1,
-        "thinkingLevels": [1, 2, 3],
-        "aliases": ["thinker-talker"],
-        "paid": False,
-        "is_image_model": False,
-        "is_video_model": False,
-        "is_audio_model": False,
-    },
-    {
-        "id": "gemini-3.1-flash-live-preview",
-        "displayName": "Gemini 3.1 Flash Live Preview",
-        "description": "Gemini 3.1 Flash Live Preview",
-        "category": "live",
-        "inputTokenLimit": 131072,
-        "outputTokenLimit": 65536,
-        "defaultThinkingLevel": 4,
-        "thinkingLevels": [4, 1, 2, 3],
-        "paid": False,
-        "is_image_model": False,
-        "is_video_model": False,
-        "is_audio_model": False,
-    },
-    {
-        "id": "gemini-3.5-transcribe-live",
-        "displayName": "Gemini 3.5 Transcribe Live",
-        "description": "Gemini 3.5 Transcribe Live",
-        "category": "audio",
-        "inputTokenLimit": 131072,
-        "outputTokenLimit": 65536,
-        "defaultThinkingLevel": None,
-        "thinkingLevels": [],
-        "paid": False,
-        "is_image_model": False,
-        "is_video_model": False,
-        "is_audio_model": True,
-    },
-    {
-        "id": "gemini-robotics-er-2-streaming-preview",
-        "displayName": "Gemini Robotics-ER 2 Streaming Preview",
-        "description": "Gemini Robotics-ER 2 Streaming Preview",
-        "category": "robotics",
-        "inputTokenLimit": 131072,
-        "outputTokenLimit": 65536,
-        "defaultThinkingLevel": 3,
-        "thinkingLevels": [4, 1, 2, 3],
         "paid": False,
         "is_image_model": False,
         "is_video_model": False,
@@ -789,8 +719,10 @@ _FALLBACK_MODELS = [
         "aliases": ["omni-featured"],
         "paid": True,
         "accessModes": [1, 3],
+        # 2026-11-24 线上目录复核：目录 [80] 视频标记已清零（上游
+        # Omni 定位收敛，视频能力以 capabilityCodes 为准）。
         "is_image_model": False,
-        "is_video_model": True,
+        "is_video_model": False,
         "is_audio_model": False,
     },
     {
@@ -812,8 +744,9 @@ _FALLBACK_MODELS = [
         ],
         "paid": True,
         "accessModes": [1, 3],
+        # 2026-11-24 线上目录复核：同 omni-1.2，目录 [80] 视频标记清零。
         "is_image_model": False,
-        "is_video_model": True,
+        "is_video_model": False,
         "is_audio_model": False,
     },
     {
@@ -854,13 +787,6 @@ class ModelDiscoveryService:
         self._cache_ttl = cache_ttl_seconds
         self._cached_models: list[dict[str, object]] = []
         self._last_fetched_at: float = 0.0
-        # 目录抓取视角：最近一次成功拉网所用账号的层级。ListModels 的
-        # paid/accessModes 槽位语义未做跨账号交叉验证（可能是模型固有门槛，
-        # 也可能是相对抓取账号的可用性视图——2026-11 快照即以 Free 号实测，
-        # 见 _FALLBACK_MODELS 注释）；付费/等级判定用它做视角一致性检查，
-        # 视角不一致时结论降级到绝对源（静态快照 + config.yaml 规则）。
-        # None = 尚未拉网（缓存为空，仅静态快照可用，无歧义问题）。
-        self._catalog_fetch_tier: str | None = None
         # 后台目录刷新任务（生命周期由 app lifespan 的 start/stop 管理）。
         # _refresh_bound_loop 记录任务所属事件循环：跨循环 stop 时只
         # cancel 不 await（防在陌生循环上等待引发挂死/异常）。
@@ -959,9 +885,6 @@ class ModelDiscoveryService:
                         merged = _merge_extra_models(models)
                         self._cached_models = merged
                         self._last_fetched_at = time.time()
-                        # 记录抓取视角：目录结论的可信范围绑定到该层级
-                        # （视角一致性检查见 _catalog_view_matches）。
-                        self._catalog_fetch_tier = effective_tier or "Free"
                         logger.info("已更新上游模型列表: count=%d", len(merged))
                         return merged
                 except Exception as e:
@@ -1087,53 +1010,14 @@ class ModelDiscoveryService:
                 return model_info
         return None
 
-    @staticmethod
-    def _match_static_catalog(clean_id: str) -> Mapping[str, object] | None:
-        """在绝对源（静态快照 + 本地补充模型）中按 id/别名匹配模型元数据。
-
-        静态快照是账号无关的实测元数据，与目录抓取视角无歧义，用作视角
-        不一致时的降级数据源。
-        """
-        for model_info in (*_FALLBACK_MODELS, *_EXTRA_GUARANTEED_MODELS):
-            raw_id = str(model_info.get("id") or model_info.get("name") or "")
-            if raw_id.removeprefix("models/").lower() == clean_id:
-                return model_info
-            raw_aliases = model_info.get("aliases")
-            if isinstance(raw_aliases, list) and clean_id in [
-                str(a).removeprefix("models/").lower() for a in raw_aliases
-            ]:
-                return model_info
-        return None
-
-    def _catalog_view_matches(self, viewer_tier: str | None) -> bool:
-        """目录结论是否可信于当前请求者的层级视角。
-
-        ListModels 的 paid/accessModes 槽位语义未做跨账号交叉验证——既可能
-        是模型固有门槛（账号无关），也可能是相对抓取账号的可用性视图。
-        为不依赖该歧义：抓取账号层级与请求者层级不一致时，付费/等级结论
-        降级到绝对源（静态快照 + config.yaml 规则）；一致或抓取视角未知
-        （尚未拉网，缓存为空）时维持目录优先的现状。invalidate_cache 刻意
-        不清 _catalog_fetch_tier：失效后旧缓存仍兜底，此时旧视角标记让
-        降级逻辑在重拉窗口内保持生效，避免切换间隙漏放行。
-        """
-        fetch_tier = self._catalog_fetch_tier
-        if fetch_tier is None:
-            return True
-        return (fetch_tier or "Free").strip().lower() == (
-            viewer_tier or "Free"
-        ).strip().lower()
-
     def is_model_allowed_for_tier(self, model_id: str, tier: str | None) -> bool:
         """根据 config.yaml 付费规则以及缓存的 ListModels accessModes 判断指定订阅等级是否可访问该模型。"""
-        req_tiers = self.get_required_tiers(model_id, viewer_tier=tier)
+        req_tiers = self.get_required_tiers(model_id)
         if req_tiers:
             norm_tier = (tier or "Free").strip()
             return norm_tier in req_tiers
 
         info = self.get_cached_model_info(model_id)
-        if info and not self._catalog_view_matches(tier):
-            # 抓取视角 ≠ 请求者层级：目录结论降级到静态快照（绝对源）。
-            info = self._match_static_catalog(model_id.removeprefix("models/").lower())
         if not info:
             return True
         raw_modes = info.get("accessModes")
@@ -1154,24 +1038,21 @@ class ModelDiscoveryService:
         # 如果 accessModes 只包含 1 (Paid API key) 且不含 3/4，对所有网页端等级放行尝试
         return all(m not in (3, 4) for m in raw_modes)
 
-    def is_paid_model(self, model_id: str, viewer_tier: str | None = None) -> bool:
+    def is_paid_model(self, model_id: str) -> bool:
         """判定目标模型是否为付费模型（上游 ListModels 目录数据优先，config.yaml 仅兜底）。
 
-        优先级（2026-11-12 上游实测交叉验证，随模型列表同一次拉取 600s 刷新）：
+        优先级（2026-11-12 上游实测交叉验证，随模型列表同一次拉取 600s 刷新；
+        2026-11-24 复核：Free 与 Pro 账号拉到的 ListModels 逐字段一致，
+        paid/accessModes 是模型固有门槛、与抓取账号层级无关，见
+        docs/CATALOG_TIER_SEMANTICS_2026-11-24.md）：
         1. 目录明确结论：paid=True（ListModels 槽位 [77]==2）、accessModes 含
            3/4（订阅门槛）或能力码 20（视频路由）→ 付费；paid=False 且无
            门槛 → 免费。上游结论直接生效，config.yaml 关键词规则不再覆盖。
         2. 上游无该模型（未知 ID / 兼并条目未带 paid）→ 才回落 config.yaml
            paid_model_rules 的 contains/prefixes/exact 匹配。
-
-        viewer_tier：请求者账号层级。目录抓取账号层级与之不一致时，目录
-        结论（相对抓取账号的视图，语义未跨账号验证）降级为静态快照结论，
-        仍不明确再落 config.yaml 规则——两个切换方向都不会因旧目录漏放行。
         """
         clean_m = model_id.removeprefix("models/").lower()
         info = self.get_cached_model_info(clean_m)
-        if info and not self._catalog_view_matches(viewer_tier):
-            info = self._match_static_catalog(clean_m)
         if info:
             if info.get("paid") is True:
                 return True
@@ -1219,33 +1100,29 @@ class ModelDiscoveryService:
                 return True
         return False
 
-    def get_required_tier(self, model_id: str, viewer_tier: str | None = None) -> str:
+    def get_required_tier(self, model_id: str) -> str:
         """获取目标模型所需的最低账号层级（兼容现有单层级调用）。"""
-        tiers = self.get_required_tiers(model_id, viewer_tier=viewer_tier)
+        tiers = self.get_required_tiers(model_id)
         if not tiers:
             return "Free"
         return tiers[0]
 
-    def get_required_tiers(
-        self, model_id: str, viewer_tier: str | None = None
-    ) -> list[str]:
+    def get_required_tiers(self, model_id: str) -> list[str]:
         """获取目标模型所允许调用的账号层级列表（上游 accessModes 优先，config.yaml 兜底）。
 
-        语义（2026-11-12 上游 ListModels 实测交叉验证，随模型列表 600s 刷新）：
+        语义（2026-11-12 上游 ListModels 实测交叉验证，随模型列表 600s 刷新；
+        2026-11-24 复核：Free 与 Pro 账号拉到的 ListModels 逐字段一致，
+        accessModes 是模型固有门槛、与抓取账号层级无关，见
+        docs/CATALOG_TIER_SEMANTICS_2026-11-24.md）：
         - accessModes [1,3] → Pro 及以上（Pro/Ultra/Ultra_20X）
         - accessModes [1,4] → 仅 Ultra 系（Ultra/Ultra_20X）
         - paid=False 且无 modes → 免费模型，任何等级可用（返回空列表）
         - modes 仅 [1]（Paid API key，如 antigravity）或 paid=True 无
           modes → 上游未给网页端等级标记 → 回落 config.yaml 规则
         - 模型不在目录 → config.yaml 规则，仍无匹配 → 空列表
-
-        viewer_tier：请求者账号层级，与目录抓取视角不一致时降级到静态
-        快照（绝对源），见 _catalog_view_matches。
         """
         clean_m = model_id.removeprefix("models/").lower()
         info = self.get_cached_model_info(clean_m)
-        if info and not self._catalog_view_matches(viewer_tier):
-            info = self._match_static_catalog(clean_m)
         modes: list[int] = []
         if info:
             raw_modes = info.get("accessModes")

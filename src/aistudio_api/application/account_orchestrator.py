@@ -55,14 +55,7 @@ async def try_switch_account(
     if model and not required_tiers:
         from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
-        # 以当前活跃账号层级为视角：目录抓取账号与其不一致时，等级结论
-        # 降级到绝对源（见 model_discovery._catalog_view_matches），避免
-        # 换号候选按切换前目录的等级要求过滤。
-        _svc = runtime_state.account_service
-        _cur = _svc.get_active_account() if _svc else None
-        tiers = model_discovery.get_required_tiers(
-            model, viewer_tier=(getattr(_cur, "tier", None) or "Free")
-        )
+        tiers = model_discovery.get_required_tiers(model)
         if tiers:
             required_tiers = tuple(tiers)
 
@@ -220,14 +213,10 @@ async def ensure_active_account(attempt: int, model: str | None = None) -> None:
 
         from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
-        # 请求者视角：目录抓取账号层级与当前活跃账号不一致时，付费/等级
-        # 结论自动降级到绝对源（静态快照 + config 规则），见
-        # model_discovery._catalog_view_matches——Pro 目录切 Free 账号、
-        # Free 目录切 Pro 账号都不会因旧目录误判。
-        cur_tier = (current.tier if current else None) or "Free"
-        if model_discovery.is_paid_model(model, viewer_tier=cur_tier):
-            req_tier = model_discovery.get_required_tier(model, viewer_tier=cur_tier)
-            req_tiers = model_discovery.get_required_tiers(model, viewer_tier=cur_tier)
+        if model_discovery.is_paid_model(model):
+            req_tier = model_discovery.get_required_tier(model)
+            req_tiers = model_discovery.get_required_tiers(model)
+            cur_tier = (current.tier if current else None) or "Free"
             allowed_tiers = (
                 set(req_tiers)
                 if req_tiers

@@ -23,13 +23,11 @@ def _isolate_catalog_singleton():
     """保护模块级单例的目录状态（测试直接读写，结束后恢复）。"""
     saved = (
         model_discovery._cached_models,
-        model_discovery._catalog_fetch_tier,
         model_discovery._last_fetched_at,
     )
     yield
     (
         model_discovery._cached_models,
-        model_discovery._catalog_fetch_tier,
         model_discovery._last_fetched_at,
     ) = saved
 
