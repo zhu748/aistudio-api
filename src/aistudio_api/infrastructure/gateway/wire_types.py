@@ -63,11 +63,15 @@ class ThinkingLevel(IntEnum):
     MEDIUM = 2
     HIGH = 3
     MINIMAL = 4
-    # 2026-11 上游 ListModels 目录曾实测 gemini-4-hydrogen thinkingLevels=
-    # [1,2,3,5]（默认档 3）。2026-11-15 Reqable 真机抓包（双样本 200）：
-    # UI「Extra High」档现发送 [1,null,null,6]，同日对 5 档上游报 400
-    # "Thinking level EXTRA_HIGH is not supported"——目录最高档已上移至 6，
-    # 5 不再受支持。VERY_HIGH(5) 仅为数值直传与吸附排序保留。
+    # 目录与 wire 双口径并存（勿拿目录 thinkingLevels 直发 wire）：
+    # ListModels 目录回报 hydrogen/neon thinkingLevels=[1,2,3,5]（2026-11
+    # 两次拉取一致、Free/Pro 账号一致），但 UI 档位到 wire 值的映射实测为
+    # xhigh→6 / high→3 / medium→2 / low→1——"5" 只是显示层枚举，wire 层
+    # 根本不发。2026-11-15 Reqable 真机抓包：发 6 → 200（双样本）、发 5 →
+    # 400 "Thinking level EXTRA_HIGH is not supported"；2026-11-24 21:27
+    # 复核抓包：UI xhigh 发 [1,null,null,6] 上游按容量类错误处理（503/429，
+    # 已过参数校验），low/medium/high 发 1/2/3。VERY_HIGH(5) 仅为数值直传
+    # 与吸附排序保留。详见 docs/CATALOG_TIER_SEMANTICS_2026-11-24.md。
     VERY_HIGH = 5
     EXTRA_HIGH = 6
 

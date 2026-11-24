@@ -51,23 +51,29 @@ Free 账号实测，**两个槽位到底是"模型固有门槛"还是"相对抓�
    - omni-1.1/1.2 目录 [80] 视频标记清零、3.5-transcribe [81] 音频标记
      清零、3.8-flash 新增 accessModes=[1]（Paid API key 通道标记，无门槛语义）。
 
-## 未决：hydrogen/neon 思考档 5 vs 6（两套口径冲突）
+## 思考档 5 vs 6：目录显示枚举 vs wire 发送值（2026-11-24 真机定谳）
 
 - 2026-11-24 两次拉取（间隔数小时）：线上目录 `thinkingLevels=[1,2,3,5]`。
 - 2026-11-15 Reqable 真机抓包：wire 发 `[1,null,null,6]` → 200（双样本）；
   发 5 → 400 "Thinking level EXTRA_HIGH is not supported"。
+- **2026-11-24 21:27 Reqable 真机抓包（用户上传，150 条 HAR）**：UI 四档位
+  xhigh / high / medium / low 对 hydrogen 实发 wire `[1,null,null,6/3/2/1]`。
+  xhigh 的 6 → 503、high 的 3 → 503、medium/low 的 2/1 → 429——全是容量/
+  限流类错误（已过参数校验），当日无 200 是上游过载所致，与档位合法性
+  无关；若 6 非法会像 11-15 的 5 那样报 400 参数错误。
+- **定谳**：目录的 `[1,2,3,5]` 是显示层枚举口径（"5" 对应 UI 的 Extra
+  High），UI 实际发送值是 6；wire 层只认 6、拒绝 5。目录拉取本身无误，
+  但**不能拿目录 thinkingLevels 直接当 wire 值发**——snap 吸附与请求编码
+  以 wire 口径 [1,2,3,6] 为准。
 - 槽位 [47]（`[[5,1],[1,6],[5,6],[5,3],[6,3]]` 形状的表）经跨模型对比
   排除"wire↔目录档位翻译表"假设：不同 levels 的模型共享同一张 47 表，
   nano-banana 的 47 表含不在其 levels 里的 7——它是 UI 档位选择器的选项
   矩阵，不是函数映射。
-- 当日尝试真机裁决（用 RemoteProofSigner 铸 proof 直发 5/6 档）：远程签名
-  服务对沙箱不可用（直连 403、经代理 502），本地 Go 签名器需 go 工具链 +
-  SpiderMonkey 依赖包（沙箱无 go）。**无法当场重放请求裁定。**
-- 处置：快照维持 **[1,2,3,6]**（wire 真机 200/400 双向证据 > 目录元数据，
-  且 snap 吸附方向正确：目录值 [1,2,3,5] 会把 EXTRA_HIGH(6) 用户请求降档
-  到 5——若上游真不支持 5 则直接 400）。运行时目录仍以线上数据为准
-  （600s TTL 自动刷新，上游改口径会自然收敛）。下次真机抓包可用脚本
-  `/home/z/my-project/scripts/test_thinking_levels.py` 直接复核。
+- 处置：快照维持 **[1,2,3,6]**（11-15 的 200/400 双向证据 + 11-24 的 UI
+  实发 6 复核）。运行时目录仍以线上数据为准（600s TTL 自动刷新）。复核
+  脚本：`/home/z/my-project/scripts/test_thinking_levels.py`（签名服务可用
+  时直发 5/6 裁决）、`/home/z/my-project/scripts/parse_capture_1124.py`
+  （解析 Reqable HAR 提取 UI 档位→wire 映射）。
 
 ## 复现
 
