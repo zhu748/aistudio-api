@@ -77,7 +77,10 @@ paid_model_rules:
     contains: ["veo", "ultra", "antigravity", "carbon"]
     required_tiers: ["Ultra", "Ultra_20X"]
   pro_required:
-    contains: ["argon", "image", "imagen"]
+    # 与生产 config.yaml 的 pro_required.contains 保持一致（neon 为
+    # 2026-11 上游新增 Pro+ 模型，夹具缺项会让依赖 config 兜底的
+    # 测试在生产/夹具间行为分叉）。
+    contains: ["argon", "neon", "image", "imagen", "omni", "deep-research", "lyria"]
     required_tiers: ["Pro", "Ultra", "Ultra_20X"]
 rotator:
   max_retries: 5

@@ -565,3 +565,145 @@ async def test_auth_403_penalty_is_recorded_once_per_request():
         if call.args and call.args[0] == "auth_error"
     ]
     assert len(auth_error_calls) == 1
+
+
+# ───────────── 跨层级目录门控：Pro 号刷出的目录 ≠ Free 账号可用 ─────────────
+
+
+def _use_catalog(monkeypatch, models):
+    """注入一份目录快照（模拟某账号刷出的 ListModels 视图）。"""
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    monkeypatch.setattr(model_discovery, "_cached_models", models)
+
+
+def _free_account() -> AccountMeta:
+    return AccountMeta(
+        id="acc_free",
+        name="Free Account",
+        email="free@gmail.com",
+        created_at="2026-01-01",
+        tier="Free",
+    )
+
+
+def _pro_account() -> AccountMeta:
+    return AccountMeta(
+        id="acc_pro",
+        name="Pro Account",
+        email="pro@gmail.com",
+        created_at="2026-01-01",
+        tier="Pro",
+    )
+
+
+@pytest.mark.asyncio
+async def test_pro_catalog_neon_blocked_for_free_active_account(monkeypatch):
+    """Pro 账号刷出的目录里 neon 可用，切到 Free 活跃账号后请求 neon：
+    门控以请求时的活跃账号 tier 为准（目录元数据描述的是模型的订阅门槛，
+    与刷目录的账号无关）→ 换号失败则 403，绝不放行 Free 账号去上游。"""
+    from unittest.mock import AsyncMock
+
+    from fastapi import HTTPException
+
+    from aistudio_api.application import account_orchestrator as orch
+
+    # Pro 视图目录：neon 带 paid + accessModes [1,3]（Pro+ 门槛）
+    _use_catalog(
+        monkeypatch,
+        [
+            {
+                "id": "gemini-4-neon",
+                "displayName": "Gemini 4 Neon",
+                "paid": True,
+                "accessModes": [1, 3],
+            }
+        ],
+    )
+    mock_service = MagicMock(spec=AccountService)
+    mock_service.get_active_account.return_value = _free_account()
+    mock_rotator = MagicMock(spec=AccountRotator)
+    orig = (runtime_state.account_service, runtime_state.rotator)
+    runtime_state.account_service = mock_service
+    runtime_state.rotator = mock_rotator
+    try:
+        switch = AsyncMock(return_value=False)
+        monkeypatch.setattr(orch, "try_switch_account", switch)
+        with pytest.raises(HTTPException) as exc_info:
+            await ensure_active_account(attempt=0, model="gemini-4-neon")
+        assert exc_info.value.status_code == 403
+        assert exc_info.value.detail["type"] == "permission_denied"
+        # 换号要求来自目录 accessModes [1,3]（而非 config 兜底）
+        switch.assert_awaited_once_with(
+            model="gemini-4-neon",
+            required_tiers=("Pro", "Ultra", "Ultra_20X"),
+        )
+    finally:
+        runtime_state.account_service, runtime_state.rotator = orig
+
+
+@pytest.mark.asyncio
+async def test_unknown_catalog_entry_still_blocks_free_via_config_rules(
+    monkeypatch,
+):
+    """目录条目缺 paid/accessModes（上游未给标记）：is_paid_model 回落
+    config.yaml 关键词规则（neon → pro_required），Free 同样被拦。"""
+    from unittest.mock import AsyncMock
+
+    from fastapi import HTTPException
+
+    from aistudio_api.application import account_orchestrator as orch
+
+    _use_catalog(
+        monkeypatch,
+        [{"id": "gemini-4-neon", "displayName": "Gemini 4 Neon"}],
+    )
+    mock_service = MagicMock(spec=AccountService)
+    mock_service.get_active_account.return_value = _free_account()
+    mock_rotator = MagicMock(spec=AccountRotator)
+    orig = (runtime_state.account_service, runtime_state.rotator)
+    runtime_state.account_service = mock_service
+    runtime_state.rotator = mock_rotator
+    try:
+        switch = AsyncMock(return_value=False)
+        monkeypatch.setattr(orch, "try_switch_account", switch)
+        with pytest.raises(HTTPException) as exc_info:
+            await ensure_active_account(attempt=0, model="gemini-4-neon")
+        assert exc_info.value.status_code == 403
+        switch.assert_awaited_once()
+        assert switch.await_args.kwargs["required_tiers"] == (
+            "Pro",
+            "Ultra",
+            "Ultra_20X",
+        )
+    finally:
+        runtime_state.account_service, runtime_state.rotator = orig
+
+
+@pytest.mark.asyncio
+async def test_pro_catalog_neon_allows_pro_active_account(monkeypatch):
+    """同一份 Pro 目录 + Pro 活跃账号：neon 正常放行，不触发换号。
+
+    层级满足时付费分支直接放行，随后走常规可用性检查（is_account_available
+    正常调用），但不发生账号切换。"""
+    from unittest.mock import AsyncMock
+
+    from aistudio_api.application import account_orchestrator as orch
+
+    mock_service = MagicMock(spec=AccountService)
+    mock_service.get_active_account.return_value = _pro_account()
+    mock_rotator = MagicMock(spec=AccountRotator)
+    mock_rotator.is_account_available.return_value = True
+    orig = (runtime_state.account_service, runtime_state.rotator)
+    runtime_state.account_service = mock_service
+    runtime_state.rotator = mock_rotator
+    try:
+        switch = AsyncMock(return_value=False)
+        monkeypatch.setattr(orch, "try_switch_account", switch)
+        await ensure_active_account(attempt=0, model="gemini-4-neon")
+        mock_rotator.is_account_available.assert_called_once_with(
+            "acc_pro", model="gemini-4-neon"
+        )
+        switch.assert_not_awaited()
+    finally:
+        runtime_state.account_service, runtime_state.rotator = orig
