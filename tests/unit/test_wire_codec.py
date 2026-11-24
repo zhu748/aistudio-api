@@ -491,3 +491,77 @@ def test_inline_data_filename_roundtrip():
     assert _wire_inline_filename("   ") is None
     assert _wire_inline_filename(123) is None
     assert len(_wire_inline_filename("x" * 1000) or "") == 255
+
+
+def test_normalize_standard_base64_variants():
+    """URL-safe / 无 padding Base64 归一（上游 wire 只认标准字母表）。
+
+    移植自上游 DeconstructedCube/aistudio-api 同名函数（经 Mooece/
+    ais-pg-upgrade 补丁复核）：OpenAI 兼容层与 thought_signature 回放
+    可能透传 URL-safe（-/_）或缺 padding 的 Base64。
+    """
+    from aistudio_api.infrastructure.gateway.wire_types import (
+        _normalize_standard_base64,
+    )
+
+    # 标准且已 padding 的长值：仅去内嵌空白
+    standard = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbg=="
+    assert _normalize_standard_base64(f" {standard} ") == standard
+
+    # URL-safe 字母表 → 标准字母表（+ /）；inline 媒体默认不补 padding
+    # （上游同款语义：b64decode 可读无 padding 值，仅字母表须换写）
+    urlsafe = standard.replace("+", "-").replace("/", "_").rstrip("=")
+    unpadded_standard = standard.rstrip("=")
+    assert _normalize_standard_base64(urlsafe) == unpadded_standard
+
+    # 无 URL-safe 字符但缺 padding 的长值：默认不动（inline 媒体按原样）
+    unpadded_std = standard.rstrip("=")
+    assert _normalize_standard_base64(unpadded_std) == unpadded_std
+    # pad_standard 模式（thought_signature 用）补齐
+    assert _normalize_standard_base64(
+        unpadded_std, pad_standard=True
+    ) == standard
+
+    # 短值（<16 字符）不归一：文件名等非编码字段不误伤
+    assert _normalize_standard_base64("short-value") == "short-value"
+
+    # 非法 Base64（URL-safe 换写后校验失败）：原样返回交由后续层拒绝
+    invalid = "not~valid!base64-" + "x" * 16
+    assert _normalize_standard_base64(invalid) == invalid
+
+
+def test_inline_data_urlsafe_base64_normalized_on_wire():
+    """inlineData 载荷经归一化后落 wire：URL-safe 输入转标准字母表。"""
+    from aistudio_api.infrastructure.gateway.wire_types import AistudioPart
+
+    standard = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbg=="
+    urlsafe = standard.replace("+", "-").replace("/", "_").rstrip("=")
+    part = AistudioPart(inline_data=("image/png", urlsafe))
+    wire = part.to_wire()[2]
+    assert wire[1] == standard.rstrip("=")  # 字母表已换写，padding 不补
+
+
+def test_thought_signature_skip_sentinel_and_padding_on_wire():
+    """thought_signature：SKIP 哨兵原样直发；真实签名归一（补 padding）。"""
+    from aistudio_api.domain.tool_signatures import SKIP_THOUGHT_SIGNATURE
+    from aistudio_api.infrastructure.gateway.wire_types import (
+        AistudioPart,
+        PartIndex,
+    )
+
+    # 哨兵字面量原样直发（协议约定，非 Base64，不可被归一破坏）
+    sentinel = AistudioPart(thought_signature=SKIP_THOUGHT_SIGNATURE)
+    assert sentinel.to_wire()[PartIndex.THOUGHT_SIGNATURE] == SKIP_THOUGHT_SIGNATURE
+
+    # 真实签名缺 padding：补齐后落 wire（历史回放兼容）
+    signed = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZn"
+    part = AistudioPart(thought_signature=signed)
+    wire_sig = part.to_wire()[PartIndex.THOUGHT_SIGNATURE]
+    assert wire_sig == signed + "=" * ((-len(signed)) % 4)
+
+    # 已完整的签名原样保留
+    complete = signed + "=" * ((-len(signed)) % 4)
+    assert (
+        AistudioPart(thought_signature=complete).to_wire()[PartIndex.THOUGHT_SIGNATURE]
+        == complete
+    )

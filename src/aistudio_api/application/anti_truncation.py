@@ -51,6 +51,11 @@ DEFAULT_TOOL_NAME = "router_emit"
 # 注意 ``-at`` 是 ``-at-stream`` 的后缀后缀，解析时必须先长后短。
 STREAM_VARIANT_SUFFIX = "-at-stream"
 BUFFER_VARIANT_SUFFIX = "-at"
+# 中文括号别名后缀（Mooece/ais-pg-upgrade 补丁同款，酒馆等客户端在模型名
+# 里写 ``<model>[防截断]`` 选中）：语义等价 ``-at``——非流式缓冲 + 强制
+# 抗截断。仍受「基础模型须命中面板选中列表」约束，避免误吞本名就含
+# 该字样的模型；匹配前同样先长后短（互不为彼此后缀，顺序无歧义）。
+ALIAS_VARIANT_SUFFIX = "[防截断]"
 
 
 @dataclass(frozen=True)
@@ -101,6 +106,7 @@ def resolve_model_variant(
     for suffix, buffered in (
         (STREAM_VARIANT_SUFFIX, False),
         (BUFFER_VARIANT_SUFFIX, True),
+        (ALIAS_VARIANT_SUFFIX, True),
     ):
         if clean.endswith(suffix):
             base = clean[: -len(suffix)]
@@ -934,6 +940,7 @@ async def _restore_anti_truncation_stream_inner(
 
 
 __all__ = [
+    "ALIAS_VARIANT_SUFFIX",
     "BUFFER_VARIANT_SUFFIX",
     "DEFAULT_TOOL_NAME",
     "STREAM_VARIANT_SUFFIX",

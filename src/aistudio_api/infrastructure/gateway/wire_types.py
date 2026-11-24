@@ -2,11 +2,43 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 from dataclasses import dataclass, field
 from enum import IntEnum
 
+from aistudio_api.domain.tool_signatures import SKIP_THOUGHT_SIGNATURE
+
 from .wire_spec import GenerationConfigIndex, JspbArray, PartIndex
+
+
+def _normalize_standard_base64(value: str, *, pad_standard: bool = False) -> str:
+    """归一化 URL-safe（可选补 padding 的标准）Base64 到标准字母表。
+
+    移植自上游 DeconstructedCube/aistudio-api 同名函数（经 Mooece/
+    ais-pg-upgrade 补丁复核确认）：部分客户端（OpenAI 兼容层 /
+    thought_signature 回放）会产出 URL-safe 或缺 padding 的 Base64；
+    AI Studio JSPB wire 槽位只认标准字母表。归一化策略：< 16 字符的
+    短值原样返回（文件名等非编码字段不误伤）；仅当确实含 URL-safe
+    字符时才换写回标准字母表并补齐 padding，再经 validate=True 全量
+    校验，非法值原样返回交由后续层拒绝。
+    """
+    cleaned = "".join(value.split())
+    if len(cleaned) < 16:
+        return value
+    has_urlsafe = "-" in cleaned or "_" in cleaned
+    if not has_urlsafe and (not pad_standard or len(cleaned) % 4 == 0):
+        return cleaned
+    standard = cleaned.replace("-", "+").replace("_", "/")
+    pad_len = (-len(standard)) % 4
+    if pad_len:
+        standard += "=" * pad_len
+    try:
+        base64.b64decode(standard, validate=True)
+        return standard
+    except Exception:
+        return value
+
 
 # Playground GenerateContent / CountTokens 接口接受的最长函数名字节数
 # （AIStudio2API maxWireFunctionNameLength 同源）。
@@ -338,7 +370,15 @@ class AistudioPart:
         if self.thought:
             wire[PartIndex.THOUGHT_ALT_FLAG] = 1
         if self.thought_signature:
-            wire[PartIndex.THOUGHT_SIGNATURE] = self.thought_signature
+            # SKIP 哨兵字面量原样直发（上游协议约定，非 Base64）；真实签名
+            # 经 pad_standard 归一（历史回放的签名可能缺 padding）。
+            wire[PartIndex.THOUGHT_SIGNATURE] = (
+                self.thought_signature
+                if self.thought_signature == SKIP_THOUGHT_SIGNATURE
+                else _normalize_standard_base64(
+                    self.thought_signature, pad_standard=True
+                )
+            )
         # wire 各槽位正交：同一 part 可同时携带 text 与 inline_data /
         # function_call（如"图片+图注"）。旧实现的提前 return 会把
         # self.text 静默丢弃，故所有载荷写入后统一在末尾落 text。
@@ -346,7 +386,9 @@ class AistudioPart:
             wire[PartIndex.FILE_DATA] = [self.file_id]
         if self.inline_data:
             mime, b64 = self.inline_data
-            inline_wire = JspbArray([mime, b64])
+            # 多模态载荷：OpenAI 兼容层可能透传 URL-safe / 无 padding 的
+            # Base64（上游 wire 只认标准字母表），编码前统一归一。
+            inline_wire = JspbArray([mime, _normalize_standard_base64(b64)])
             filename = _wire_inline_filename(self.inline_filename)
             if filename is not None:
                 # 槽位 5 = filename；2-4 由 JspbArray 自动补 null，

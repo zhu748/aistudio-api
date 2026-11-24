@@ -17,6 +17,7 @@ from starlette.requests import Request
 from aistudio_api.api.app import app
 from aistudio_api.api.routes_gemini import _parse_anti_truncation_header
 from aistudio_api.application.anti_truncation import (
+    ALIAS_VARIANT_SUFFIX,
     BUFFER_VARIANT_SUFFIX,
     STREAM_VARIANT_SUFFIX,
     get_selected_variant_models,
@@ -116,6 +117,32 @@ def test_resolve_plain_model_returns_none(variant_config):
 def test_resolve_disabled_returns_none(disabled_config):
     assert resolve_model_variant("gemini-3.7-flash-at") is None
     assert resolve_model_variant("gemini-3.7-flash-at-stream") is None
+
+
+def test_resolve_alias_variant(variant_config):
+    """``[防截断]`` 中文括号别名后缀（Mooece 补丁同款）：等价 ``-at``
+    缓冲变体，酒馆等客户端按模型名末尾选中即强制抗截断。"""
+    result = resolve_model_variant(f"gemini-3.7-flash{ALIAS_VARIANT_SUFFIX}")
+    assert result is not None
+    assert result.model_path == "gemini-3.7-flash"
+    assert result.anti_truncation is True
+    assert result.buffered is True
+
+
+def test_resolve_alias_variant_with_prefix(variant_config):
+    result = resolve_model_variant(f"models/gemini-3-pro-preview{ALIAS_VARIANT_SUFFIX}")
+    assert result is not None
+    assert result.model_path == "models/gemini-3-pro-preview"
+    assert result.buffered is True
+
+
+def test_resolve_alias_unselected_base_returns_none(variant_config):
+    """别名后缀同样受「基础模型须命中面板选中列表」约束，不误吞。"""
+    assert resolve_model_variant(f"other-model{ALIAS_VARIANT_SUFFIX}") is None
+
+
+def test_resolve_alias_disabled_returns_none(disabled_config):
+    assert resolve_model_variant(f"gemini-3.7-flash{ALIAS_VARIANT_SUFFIX}") is None
 
 
 def test_selected_models_normalized(variant_config):

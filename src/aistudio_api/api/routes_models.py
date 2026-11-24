@@ -95,7 +95,12 @@ def _to_gemini_model(model_data: Mapping[str, object]) -> GeminiModelResponse:
 def _to_variant_model(
     model_data: Mapping[str, object], *, buffered: bool
 ) -> GeminiModelResponse:
-    """在基础模型上叠加抗截断变体后缀与展示名。"""
+    """在基础模型上叠加抗截断变体后缀与展示名。
+
+    buffered 变体的请求侧同时接受 ``-at`` 与 ``[防截断]`` 两种后缀
+    （resolve_model_variant 解析层兼容，酒馆等客户端按中文括号选中，
+    Mooece/ais-pg-upgrade 补丁同款别名），列表仍只暴露 ASCII 后缀
+    保持公共响应 schema 稳定。"""
     base = _to_gemini_model(model_data)
     clean_id = str(model_data.get("id") or model_data.get("name") or "").removeprefix(
         "models/"
@@ -105,7 +110,7 @@ def _to_variant_model(
             update={
                 "name": f"models/{clean_id}{BUFFER_VARIANT_SUFFIX}",
                 "displayName": f"{base.displayName}（非流式抗截断）",
-                "description": f"{base.description}（抗截断传输：缓冲上游，整体还原后单条下发）",
+                "description": f"{base.description}（抗截断传输：缓冲上游，整体还原后单条下发；请求侧亦接受 [防截断] 后缀别名）",
             }
         )
     return base.model_copy(
