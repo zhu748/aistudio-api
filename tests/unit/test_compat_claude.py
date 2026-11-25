@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import AsyncGenerator
 from typing import Any, cast
@@ -22,6 +23,8 @@ from aistudio_api.api.response_models import (
     GeminiUsageMetadata,
 )
 from aistudio_api.api.schemas_compat import ClaudeMessagesRequest
+from aistudio_api.application.compat_claude import _claude_blocks_to_parts
+from aistudio_api.application.compat_errors import _read_claude_signature
 from aistudio_api.application.compat_service import (
     _claude_tools_to_gemini,
     build_claude_message,
@@ -747,3 +750,149 @@ def test_claude_stop_reason_refusal_beats_tool_use() -> None:
     assert reason("STOP", tool_use=True) == "tool_use"
     assert reason("STOP", tool_use=False) == "end_turn"
     assert reason("MAX_TOKENS", tool_use=False) == "max_tokens"
+
+
+# ---------------------------------------------------------------------------
+# thought_signature 保真回归（2026-11-25 审计）
+# ---------------------------------------------------------------------------
+
+_SIGNATURE = base64.b64encode(b"upstream-signature-fixture-0123456789").decode()
+
+
+def test_build_claude_message_trailing_signature_carrier_restored() -> None:
+    """纯文本轮的尾部空文本签名载体必须回填 thinking 块。
+
+    wire 抓包形态（WIRE_SPECIFICATION.md §6.5）：思考摘要 + 文本 + 尾部
+    空文本签名 part。旧实现只读非空 text part，载体 part 被静默跳过，
+    thinking 块只能带占位签名，客户端回传后思考链签名丢失。
+    """
+    response = _gemini_response(
+        [
+            GeminiPartResponse(text="Thinking hard", thought=True),
+            GeminiPartResponse(text="The answer"),
+            GeminiPartResponse(text="", thoughtSignature=_SIGNATURE),
+        ]
+    )
+    message = cast(dict[str, Any], build_claude_message(response, "m", None))
+    thinking_block = message["content"][0]
+    assert thinking_block["type"] == "thinking"
+    restored = _read_claude_signature(thinking_block["signature"])
+    assert restored == _SIGNATURE
+
+
+def test_build_claude_message_trailing_carrier_keeps_real_part_signature() -> None:
+    """thought part 自带真实签名时载体不覆盖（防御 to_gemini_parts 之外的形态）。"""
+    part_sig = base64.b64encode(b"part-level-signature").decode()
+    response = _gemini_response(
+        [
+            GeminiPartResponse(
+                text="Thinking hard", thought=True, thoughtSignature=part_sig
+            ),
+            GeminiPartResponse(text="", thoughtSignature=_SIGNATURE),
+        ]
+    )
+    message = cast(dict[str, Any], build_claude_message(response, "m", None))
+    thinking_block = message["content"][0]
+    assert _read_claude_signature(thinking_block["signature"]) == part_sig
+
+
+@pytest.mark.asyncio
+async def test_claude_stream_late_signature_backfills_closed_thinking() -> None:
+    """流式迟到签名（尾部空文本 part 晚于正文到达）必须补发 signature_delta。
+
+    Anthropic SDK（含 Claude Code）按索引应用 signature_delta 且为赋值
+    语义、不校验块是否已 stop：finish() 前对已关闭的 thinking 块补发真实
+    签名，客户端最终拿到的就是真实值而非占位值。
+    """
+    frames = [
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "Thinking hard", "thought": True}],
+                    }
+                }
+            ]
+        },
+        {
+            "candidates": [
+                {"content": {"role": "model", "parts": [{"text": "The answer"}]}}
+            ]
+        },
+        # 尾部独立签名帧（无 text/thought 标志）—— wire 抓包形态
+        {
+            "candidates": [
+                {"content": {"role": "model", "parts": [{"thoughtSignature": _SIGNATURE}]}}
+            ]
+        },
+    ]
+    parsed: list[dict[str, Any]] = []
+    async for sse in claude_stream_adapter(
+        _sse_frames(frames), requested_model="m", stop_sequences=None
+    ):
+        data_line = next(line for line in sse.splitlines() if line.startswith("data: "))
+        parsed.append(json.loads(data_line.removeprefix("data: ")))
+
+    signature_deltas = [
+        event["delta"]["signature"]
+        for event in parsed
+        if event["type"] == "content_block_delta"
+        and event["delta"]["type"] == "signature_delta"
+        and event["index"] == 0
+    ]
+    # 关闭时的占位 + finish 前的迟到真实值；SDK 赋值语义取最后到达者
+    assert len(signature_deltas) >= 2
+    assert _read_claude_signature(signature_deltas[-1]) == _SIGNATURE
+    # 补发必须发生在 message_delta 之前，事件流仍以 message_stop 收尾
+    message_delta_idx = next(
+        i for i, event in enumerate(parsed) if event["type"] == "message_delta"
+    )
+    late_idx = max(
+        i
+        for i, event in enumerate(parsed)
+        if event["type"] == "content_block_delta"
+        and event["delta"]["type"] == "signature_delta"
+    )
+    assert late_idx < message_delta_idx
+    assert parsed[-1]["type"] == "message_stop"
+
+
+@pytest.mark.asyncio
+async def test_claude_late_signature_round_trips_to_upstream() -> None:
+    """端到端：迟到签名恢复后，客户端原样回传 thinking 块能还原真实签名。"""
+    frames = [
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "Thinking hard", "thought": True}],
+                    }
+                }
+            ]
+        },
+        {
+            "candidates": [
+                {"content": {"role": "model", "parts": [{"thoughtSignature": _SIGNATURE}]}}
+            ]
+        },
+    ]
+    signature = ""
+    async for sse in claude_stream_adapter(
+        _sse_frames(frames), requested_model="m", stop_sequences=None
+    ):
+        if "signature_delta" in sse:
+            event = json.loads(
+                next(l for l in sse.splitlines() if l.startswith("data: ")).removeprefix(
+                    "data: "
+                )
+            )
+            signature = event["delta"]["signature"]
+
+    parts = await _claude_blocks_to_parts(
+        [{"type": "thinking", "thinking": "Thinking hard", "signature": signature}],
+        tool_name_by_id={},
+    )
+    assert parts[0].thought is True
+    assert parts[0].thoughtSignature == _SIGNATURE

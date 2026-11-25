@@ -432,6 +432,11 @@ def build_claude_message(
 
     blocks: list[dict[str, object]] = []
     has_tool_use = False
+    # 尾部空文本签名载体 part 携带的签名（to_gemini_parts 保留的 wire 抓包
+    # 形态：纯文本轮的 thought 签名挂在最后一个空 text part，而非 thought
+    # part 本体）。Claude 协议中只有 thinking 块有 signature 字段，收尾时
+    # 回填最后一个 thinking 块，否则客户端回传时思考链签名丢失。
+    trailing_signature: str | None = None
 
     for part in _iter_response_parts(response):
         text = getattr(part, "text", None)
@@ -477,6 +482,17 @@ def build_claude_message(
                     "input": _coerce_tool_args(function_call.args),
                 }
             )
+        elif (
+            not text
+            and function_call is None
+            and inline is None
+            and isinstance(getattr(part, "thoughtSignature", None), str)
+            and getattr(part, "thoughtSignature", None)
+        ):
+            # 空文本纯签名 part（尾部签名载体）：thought part 自身不带签名时
+            # 签名在这里到达。记录最后出现的值（Gemini 语义：最后一 part 的
+            # 签名是整轮的权威签名）。
+            trailing_signature = part.thoughtSignature
 
     stops = StopSequenceBuffer(stop_sequences)
     filtered: list[dict[str, object]] = []
@@ -501,6 +517,15 @@ def build_claude_message(
             filtered.append(block)
     flush_pending()
     blocks = filtered
+    if trailing_signature is not None:
+        for block in reversed(blocks):
+            if block.get("type") != "thinking":
+                continue
+            # 仅占位/空签名被回填：thinking part 自带真实签名（信封形态）时
+            # 不覆盖（to_gemini_parts 保证两者互斥，此处为防御性判定）。
+            if _read_claude_signature(_as_str(block.get("signature"))) is None:
+                block["signature"] = _claude_signature(trailing_signature)
+            break
     if stops.hit is not None:
         stop_reason, stop_seq = "stop_sequence", stops.hit
     else:
@@ -537,6 +562,13 @@ class _ClaudeStreamEmitter:
         # 在 stop sequence 处截断文本，透传其后内容会让客户端拿到多余文本）
         self.stop_hit: str | None = None
         self.thinking_signature = ""
+        # 最近一个 thinking 块的索引与迟到签名：上游把纯文本轮的真实签名
+        # 放在流末尾的尾部空文本 part（晚于全部正文到达），此时 thinking 块
+        # 已按占位签名关闭。Anthropic SDK（含 Claude Code）按索引应用
+        # signature_delta 且为赋值语义、不校验块是否已 stop——finish() 前
+        # 对该块补发真实签名即可覆盖先前下发的占位值。
+        self.thinking_index: int | None = None
+        self.late_signature: str | None = None
 
     def sse(self, event: str, payload: dict[str, object]) -> str:
         # separators：SSE 每帧省去 ", " 与 ": " 的空格（约 2-4% 字节/分配）
@@ -602,6 +634,7 @@ class _ClaudeStreamEmitter:
         block: dict[str, object]
         if kind == "thinking":
             self.thinking_signature = ""
+            self.thinking_index = self.index
             block = {"type": "thinking", "thinking": "", "signature": ""}
         else:
             block = {"type": "text", "text": ""}
@@ -741,6 +774,24 @@ class _ClaudeStreamEmitter:
         events = self._close_events()
         if self.saw_error:
             return events
+        # 迟到签名回填：thinking 块已带占位签名关闭（或仍处于打开状态但
+        # 尚无签名），真实签名在正文之后才到达。此时补发 signature_delta
+        # 覆盖占位值（SDK 赋值语义，最后到达者生效）。
+        if self.late_signature is not None and self.thinking_index is not None:
+            events.append(
+                self.sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": self.thinking_index,
+                        "delta": {
+                            "type": "signature_delta",
+                            "signature": _claude_signature(self.late_signature),
+                        },
+                    },
+                )
+            )
+            self.late_signature = None
         # stop sequence 已在流中命中：直接用命中值（full_text 已被截断，
         # 重扫文本判定必然失败）
         if self.stop_hit is not None:
@@ -861,10 +912,14 @@ async def claude_stream_adapter(
                                 continue
                             for event in emitter.text_delta(text):
                                 yield event
-                    elif emitter.open_kind == "thinking" and isinstance(
-                        part.get("thoughtSignature"), str
-                    ):
-                        emitter.thinking_signature = str(part["thoughtSignature"])
+                    elif isinstance(part.get("thoughtSignature"), str):
+                        if emitter.open_kind == "thinking":
+                            emitter.thinking_signature = str(part["thoughtSignature"])
+                        elif emitter.thinking_index is not None:
+                            # 迟到签名：thinking 块已关闭（上游把纯文本轮的
+                            # 真实签名放在正文之后的尾部空文本 part）。记录到
+                            # finish() 统一补发，见 _ClaudeStreamEmitter 注释。
+                            emitter.late_signature = str(part["thoughtSignature"])
         except Exception as exc:
             logger.warning("Claude 流式转换异常: %s", exc)
             record_result(
