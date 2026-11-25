@@ -989,25 +989,48 @@ class ModelDiscoveryService:
                     else None
                 )
                 if not auth_file:
-                    try:
-                        from aistudio_api.infrastructure.account.account_store import (
-                            AccountStore,
-                        )
+                    # AccountStore 首次构造即全量读 registry.json 并逐个同步
+                    # 账号 auth.json（多文件磁盘 IO）；auth.json 读取同为磁盘
+                    # IO（600s TTL 刷新即此路径）。事件循环内同步执行会卡住
+                    # 在途流式请求——与 session.py 的凭据 IO 约束一致，统一下
+                    # 放线程池（AccountStore 内部自带锁）。
+                    def _load_active_credentials() -> (
+                        tuple[str | None, str, str, str | None] | None
+                    ):
+                        try:
+                            from aistudio_api.infrastructure.account.account_store import (
+                                AccountStore,
+                            )
 
-                        store = AccountStore()
-                        active = store.get_active_account()
-                        if active:
+                            store = AccountStore()
+                            active = store.get_active_account()
+                            if not active:
+                                return None
                             auth_path = store.get_auth_path_optional(
                                 active.id, require_exists=True
                             )
-                            auth_file = str(auth_path) if auth_path else None
-                            effective_auth_user = active.auth_user or "0"
-                            effective_proxy = active.proxy_url
-                            effective_tier = getattr(active, "tier", "Free") or "Free"
-                    except Exception:
-                        pass
+                            return (
+                                str(auth_path) if auth_path else None,
+                                active.auth_user or "0",
+                                getattr(active, "tier", "Free") or "Free",
+                                active.proxy_url,
+                            )
+                        except Exception:
+                            return None
+
+                    loaded = await asyncio.to_thread(_load_active_credentials)
+                    if loaded is not None:
+                        (
+                            auth_file,
+                            effective_auth_user,
+                            effective_tier,
+                            effective_proxy,
+                        ) = loaded
                 if auth_file:
-                    effective_cookies = load_cookies_from_auth_file(auth_file) or None
+                    effective_cookies = (
+                        await asyncio.to_thread(load_cookies_from_auth_file, auth_file)
+                        or None
+                    )
                     if session is not None and hasattr(
                         session, "get_current_auth_user"
                     ):

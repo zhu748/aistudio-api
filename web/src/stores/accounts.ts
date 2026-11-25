@@ -30,7 +30,7 @@ export const useAccountsStore = defineStore('accounts', () => {
 
   // 按 id 复用行对象引用（P8）：轮询每 8s 全量替换数组时，若账号数据与其
   // 调度统计均未变化，复用上一次的对象引用，避免几百账号 × 每账号模型
-  // 配额网格的整棵组件树全量重渲染。字段值均为原始类型，浅比较即可。
+  // 配额网格的整棵组件树全量重渲染。5 个嵌套统计字段按值递归比较，其余浅比较。
   const rowCache = new Map<string, AccountWithStats>()
 
   // rotation 响应每次轮询都是新对象：其中 5 个嵌套 Record 字段必须按值

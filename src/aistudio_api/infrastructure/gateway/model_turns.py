@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from aistudio_api.domain.tool_signatures import SKIP_THOUGHT_SIGNATURE
 
 from .wire_codec import AistudioWireCodec
-from .wire_parser import parse_response_part
+from .wire_parser import parse_response_part, wire_size_estimate
 from .wire_spec import PartIndex
 from .wire_types import AistudioContent, AistudioPart
 
@@ -145,7 +145,9 @@ class ModelTurnCapture:
                 self._disabled = True
                 self.parts.clear()
                 return
-            self._size += len(_json(wire).encode())
+            # 尺寸用廉价估计（流式每 chunk 走此路径）：精确上限由 store()
+            # 的整树 _json 复核兜底。
+            self._size += wire_size_estimate(wire)
             if self._size > _MAX_TURN_BYTES or len(self.parts) >= _MAX_TURN_PARTS:
                 self._disabled = True
                 self.parts.clear()

@@ -578,6 +578,27 @@ def parse_response_chunk(chunk: list[object]) -> Candidate:
     return candidate
 
 
+def wire_size_estimate(value: object) -> int:
+    """JSON 序列化长度的廉价近似（per-part 热路径调用，避免整树 dumps）。
+
+    回放/轮次预算都是数量级正确的软上限：字符串按字符数、容器按少量
+    结构开销累计即可；ModelTurnHistory.store 另有整树 _json 的精确复核。
+    """
+    if isinstance(value, str):
+        return len(value) + 2
+    if isinstance(value, dict):
+        return sum(len(k) + 4 + wire_size_estimate(v) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return 2 + sum(wire_size_estimate(item) + 1 for item in value)
+    if value is None or isinstance(value, bool):
+        return 4
+    if isinstance(value, int):
+        return 8
+    if isinstance(value, float):
+        return 16
+    return 32
+
+
 def parse_text_output(raw: str) -> ModelOutput:
     output = ModelOutput(raw_response=raw)
 
@@ -615,7 +636,9 @@ def parse_text_output(raw: str) -> ModelOutput:
             merged.raw_parts.clear()
         if retain_parts:
             for wire in parsed.raw_parts:
-                replay_bytes += len(json.dumps(wire, ensure_ascii=False).encode())
+                # 回放预算只需数量级正确的界（4MB 软上限）：廉价估计
+                # 替代每 part 整树 dumps，大响应省数倍 CPU。
+                replay_bytes += wire_size_estimate(wire)
                 if (
                     replay_bytes > _MAX_REPLAY_BYTES
                     or len(merged.raw_parts) >= _MAX_REPLAY_PARTS
@@ -696,4 +719,5 @@ __all__ = [
     "parse_response_part",
     "parse_text_output",
     "parse_usage_metadata",
+    "wire_size_estimate",
 ]

@@ -38,6 +38,28 @@ logger = get_logger("waa.daemon")
 _daemon_proc: subprocess.Popen[bytes] | None = None
 _daemon_lock = threading.Lock()
 _PR_SET_PDEATHSIG = 1
+_PDEATHSIG_SIGNAL = int(signal.SIGTERM)
+
+# preexec_fn 在 fork 出的子进程中执行，CPython 官方文档警告：多线程进程
+# 中该回调一旦触发需持锁的分配（如 dlopen）就可能死锁——fork 瞬间其他
+# 线程持有的锁不会释放。因此 libc 句柄与 prctl 签名在模块导入期解析
+# 完毕，子进程内只剩纯整数的已解析函数调用；旧实现在子进程内
+# CDLL(None) 触发 dlopen（需持动态加载器锁），正是文档所指危险形态。
+_LIBC: ctypes.CDLL | None = None
+if sys.platform == "linux":
+    try:
+        _libc_handle = ctypes.CDLL(None)
+        _libc_handle.prctl.argtypes = [
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        ]
+        _libc_handle.prctl.restype = ctypes.c_int
+        _LIBC = _libc_handle
+    except Exception:
+        _LIBC = None
 
 
 def _relay_signer_logs(proc: subprocess.Popen[bytes]) -> None:
@@ -64,16 +86,19 @@ def _set_parent_death_signal(expected_parent_pid: int) -> None:
 
     在 prctl 之前校验 getppid：若 fork 与 prctl 之间父进程已死亡（经典
     PDEATHSIG 竞态），子进程已被 init 收养，立即退出而不是成为孤儿。
+
+    子进程内只允许纯 syscall 与导入期已解析的整数调用（见模块级 _LIBC
+    注释）：os.getppid 无分配，prctl 走预解析句柄，杜绝 fork-with-threads
+    死锁窗口。
     """
-    if sys.platform != "linux":
+    if _LIBC is None:
         return
     try:
         if os.getppid() != expected_parent_pid:
             # 原父进程已死亡且我们已被收养——直接退出，避免孤儿进程
             os._exit(1)
-        libc = ctypes.CDLL(None)
         # prctl(PR_SET_PDEATHSIG, SIGTERM)
-        libc.prctl(_PR_SET_PDEATHSIG, signal.SIGTERM)
+        _LIBC.prctl(_PR_SET_PDEATHSIG, _PDEATHSIG_SIGNAL, 0, 0, 0)
     except Exception:
         pass
 
