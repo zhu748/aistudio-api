@@ -22,6 +22,7 @@ from aistudio_api.api.response_models import (
     StatsResponse,
     StatsTotalsResponse,
 )
+from aistudio_api.infrastructure.gateway.transport import get_upstream_keepalive_status
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -161,12 +162,14 @@ async def get_rotation_status(
             "mode": "sticky",
             "message": "调度器未初始化",
             "accounts": {},
+            "upstream_keepalive": get_upstream_keepalive_status(),
         }
 
     return {
         "enabled": True,
         "mode": "sticky",
         "accounts": rotator.get_all_stats(),
+        "upstream_keepalive": get_upstream_keepalive_status(),
     }
 
 

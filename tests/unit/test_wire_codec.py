@@ -518,9 +518,7 @@ def test_normalize_standard_base64_variants():
     unpadded_std = standard.rstrip("=")
     assert _normalize_standard_base64(unpadded_std) == unpadded_std
     # pad_standard 模式（thought_signature 用）补齐
-    assert _normalize_standard_base64(
-        unpadded_std, pad_standard=True
-    ) == standard
+    assert _normalize_standard_base64(unpadded_std, pad_standard=True) == standard
 
     # 短值（<16 字符）不归一：文件名等非编码字段不误伤
     assert _normalize_standard_base64("short-value") == "short-value"

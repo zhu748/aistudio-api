@@ -43,10 +43,20 @@ export interface AccountRotationStats {
   model_drip_mode?: Record<string, boolean>
 }
 
+export interface UpstreamKeepaliveStatus {
+  enabled: boolean
+  installed: boolean
+  interval_seconds: number
+  pings_sent: number
+  acks_received: number
+  last_error: string | null
+}
+
 export interface RotationStatusResponse {
   enabled: boolean
   mode: string
   accounts: Record<string, AccountRotationStats>
+  upstream_keepalive?: UpstreamKeepaliveStatus
   message?: string
 }
 

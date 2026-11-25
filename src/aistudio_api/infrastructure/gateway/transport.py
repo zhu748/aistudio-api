@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import math
+import os
 import re
 import socket
 import ssl
@@ -17,6 +19,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import TypedDict
 
 import anyio
 import httpx
@@ -221,15 +224,65 @@ def _shared_ssl_context() -> ssl.SSLContext:
 
 
 # ---------------------------------------------------------------------------
-# HTTP/2 PING / TCP 保活（移植自上游 DeconstructedCube/aistudio-api 同名机制）
+# HTTP/2 PING / TCP 保活（移植自上游 DeconstructedCube/aistudio-api 同名机制，
+# 间隔可配 + 计数可观测 + 安装自检 + ACK 不重置业务超时 增强适配自
+# Mooece/ais-pg-upgrade 补丁）
 # ---------------------------------------------------------------------------
-# 上游长思考/长工具调用无数据时，每 25s 发送一次端到端 HTTP/2 PING 帧
-# （穿透代理与 NAT），防止中间代理或 Google GFE 在 60s~120s 静默期强制
-# 断连导致 502。httpcore 使用 hyper-h2 但长静默读期间从不主动发 PING，
-# 故按 25s 切片网络读并在 _write_lock 保护下经 TLS 流写 PING 帧，端到端
-# 重置应用层空闲计时器（无后台任务与线程安全隐患）。
-H2_PING_INTERVAL_SECONDS = 25.0
+# 上游长思考/长工具调用无数据时，周期性发送端到端 HTTP/2 PING 帧（穿透
+# 代理与 NAT），防止中间代理或 Google GFE 在 60s~120s 静默期强制断连导致
+# 502。httpcore 使用 hyper-h2 但长静默读期间从不主动发 PING，故按间隔切片
+# 网络读并在 _write_lock 保护下经 TLS 流写 PING 帧，端到端重置应用层空闲
+# 计时器（无后台任务与线程安全隐患）。
 _h2_ping_installed = False
+_h2_pings_sent = 0
+_h2_acks_received = 0
+_h2_last_error: str | None = None
+
+
+def _configured_ping_interval() -> float:
+    """读 AISTUDIO_UPSTREAM_H2_PING_INTERVAL_SECONDS（默认 25s，钳制 5..600）。
+
+    默认保持 25s：比补丁的 240s 更保守（更频繁地穿透 NAT/中间设备空闲
+    计时器），且 PING 帧本身仅 14 字节、每 25s 一次的带宽开销可忽略。
+    上限 600s 对齐外层请求超时，防止配置成比整个请求寿命还长的无操作值。
+    """
+    global _h2_last_error
+    raw = os.environ.get("AISTUDIO_UPSTREAM_H2_PING_INTERVAL_SECONDS", "25")
+    try:
+        parsed = float(raw)
+        if math.isfinite(parsed) and 5.0 <= parsed <= 600.0:
+            return parsed
+    except ValueError:
+        pass
+    _h2_last_error = "无效的 HTTP/2 PING 间隔；回退 25 秒（允许范围: 5..600）"
+    logger.warning("%s", _h2_last_error)
+    return 25.0
+
+
+H2_PING_INTERVAL_SECONDS = _configured_ping_interval()
+
+
+class UpstreamKeepaliveStatus(TypedDict):
+    """进程级上游保活协议计数（不含请求或凭据细节）。"""
+
+    enabled: bool
+    installed: bool
+    interval_seconds: float
+    pings_sent: int
+    acks_received: int
+    last_error: str | None
+
+
+def get_upstream_keepalive_status() -> UpstreamKeepaliveStatus:
+    """供 /rotation 状态端点读取的进程级保活快照。"""
+    return {
+        "enabled": True,
+        "installed": _h2_ping_installed,
+        "interval_seconds": H2_PING_INTERVAL_SECONDS,
+        "pings_sent": _h2_pings_sent,
+        "acks_received": _h2_acks_received,
+        "last_error": _h2_last_error,
+    }
 
 
 def _build_keepalive_socket_options() -> list[tuple[int, int, int]]:
@@ -255,14 +308,26 @@ def _install_http2_ping_keepalive() -> None:
     把网络读按 H2_PING_INTERVAL_SECONDS 切片：切片读超时（且未到请求
     deadline、连接未终止）时发一帧 PING 并继续读。已有读取异常、写异常
     或连接终止标记时照常抛出，行为对正常连接零影响。
+
+    两层防护（增强自 Mooece/ais-pg-upgrade）：
+    - 安装前校验 httpcore 私有钩子签名并做 h2 双端 PING 自检，依赖升级
+      改变契约时回退原实现（fail-open），不留半安装状态；
+    - 另给 ``_receive_stream_event`` 包一层流级截止：PING ACK 等控制帧
+      不再重置业务读超时——否则每 25s 一帧 ACK 会让切片循环反复
+      break/re-enter，deadline 被无限顺延，静默但存活的流要挂到外层
+      请求超时才被杀，300s 读超时形同虚设。
     """
-    global _h2_ping_installed
+    global _h2_last_error, _h2_ping_installed
     if _h2_ping_installed:
         return
     try:
+        import h2.config
+        import h2.connection
+        import h2.events
         import httpcore  # pyright: ignore[reportUnusedImport]
         from httpcore._async import http2 as hc_http2
     except Exception:
+        # httpcore/h2 缺失属环境形态，不重试也不报错（H1 降级路径）。
         _h2_ping_installed = True
         return
 
@@ -271,9 +336,55 @@ def _install_http2_ping_keepalive() -> None:
         _h2_ping_installed = True
         return
 
+    # httpcore 私有钩子的签名即契约：升级后参数形态变化时保留原实现。
+    try:
+        for method, parameters in (
+            (conn_cls._read_incoming_data, ["self", "request"]),
+            (conn_cls._receive_stream_event, ["self", "request", "stream_id"]),
+        ):
+            if list(inspect.signature(method).parameters) != parameters:
+                raise RuntimeError("不支持的 httpcore HTTP/2 钩子签名")
+        # 改动任何方法前先用真实 hyper-h2 双端走一遍 PING 编码 + ACK 解码。
+        client = h2.connection.H2Connection()
+        server = h2.connection.H2Connection(
+            config=h2.config.H2Configuration(client_side=False)
+        )
+        client.initiate_connection()
+        server.initiate_connection()
+        server.receive_data(client.data_to_send())
+        client.receive_data(server.data_to_send())
+        client.ping(b"aistudio")
+        server.receive_data(client.data_to_send())
+        if not any(
+            isinstance(event, h2.events.PingAckReceived)
+            for event in client.receive_data(server.data_to_send())
+        ):
+            raise RuntimeError("HTTP/2 PING 自检失败")
+    except Exception as exc:
+        _h2_last_error = f"HTTP/2 保活不可用（{type(exc).__name__}），保留原传输实现"
+        logger.warning("%s", _h2_last_error)
+        return
+
+    original_receive_stream_event = conn_cls._receive_stream_event
+
+    async def _receive_stream_event_with_deadline(
+        self: object, request: httpcore.Request, stream_id: int
+    ) -> object:
+        read_timeout = request.extensions.get("timeout", {}).get("read")
+        try:
+            # 取消会释放 _read_lock 且不落 _read_exception；超时流不得
+            # 毒化同连接上其他多路复用请求。
+            with anyio.fail_after(read_timeout):
+                return await original_receive_stream_event(self, request, stream_id)
+        except TimeoutError as exc:
+            raise httpcore.ReadTimeout(
+                "Timed out waiting for HTTP/2 response data"
+            ) from exc
+
     async def _read_incoming_data_with_ping(
         self: object, request: httpcore.Request
     ) -> list[object]:
+        global _h2_acks_received, _h2_last_error, _h2_pings_sent
         timeouts = request.extensions.get("timeout", {})
         total_timeout = timeouts.get("read", None)
         write_timeout = timeouts.get("write", 30.0)
@@ -324,20 +435,27 @@ def _install_http2_ping_keepalive() -> None:
                             await self._network_stream.write(  # type: ignore[attr-defined]
                                 outgoing, write_timeout
                             )
+                            _h2_pings_sent += 1
                     continue
 
                 if data == b"":
                     raise httpcore.RemoteProtocolError("Server disconnected")
                 break
         except Exception as exc:
+            _h2_last_error = f"HTTP/2 读失败（{type(exc).__name__}）"
             self._read_exception = exc  # type: ignore[attr-defined]
             self._connection_error = True  # type: ignore[attr-defined]
             raise exc
 
-        return list(self._h2_state.receive_data(data))  # type: ignore[attr-defined]
+        events = list(self._h2_state.receive_data(data))  # type: ignore[attr-defined]
+        _h2_acks_received += sum(
+            isinstance(event, h2.events.PingAckReceived) for event in events
+        )
+        return events
 
     conn_cls._read_incoming_data = _read_incoming_data_with_ping  # type: ignore[method-assign]
-    conn_cls._aistudio_h2_ping_installed = True
+    conn_cls._receive_stream_event = _receive_stream_event_with_deadline  # type: ignore[method-assign]
+    conn_cls._aistudio_h2_ping_installed = True  # type: ignore[attr-defined]
     _h2_ping_installed = True
 
 
