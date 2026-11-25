@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import AsyncGenerator
 from typing import cast
@@ -153,7 +154,8 @@ async def test_reasoning_items_dropped_and_content_parts() -> None:
         {
             "model": "gemini-3.8-flash",
             "input": [
-                # reasoning 回传应被静默丢弃（不透传 thoughtSignature）
+                # 空 summary 的 reasoning item 无思考文本可保留,跳过
+                # (非空 item 转 thought part,见 thought_signature 回归测试)
                 {"type": "reasoning", "id": "rs_1", "summary": []},
                 {
                     "role": "user",
@@ -510,3 +512,110 @@ async def test_responses_endpoint_validation_error(
     payload = resp.json()
     assert "error" in payload
     assert payload["error"]["type"] == "invalid_request_error"
+
+
+# ---------------------------------------------------------------------------
+# thought_signature 思考链保真回归（2026-11-25 第二轮优化）
+# ---------------------------------------------------------------------------
+
+_RS_SIG = base64.b64encode(b"responses-thinking-signature-fixture").decode()
+_RS_THINK = "Reasoning summary of the previous turn."
+_RS_BODY = "Answer text."
+
+
+def _rs_response() -> GeminiGenerateContentResponse:
+    return GeminiGenerateContentResponse(
+        candidates=[
+            GeminiCandidateResponse(
+                content=GeminiContentResponse(
+                    parts=[
+                        GeminiPartResponse(text=_RS_THINK, thought=True),
+                        GeminiPartResponse(text=_RS_BODY),
+                        GeminiPartResponse(text="", thoughtSignature=_RS_SIG),
+                    ]
+                ),
+                finishReason="STOP",
+                index=0,
+            )
+        ]
+    )
+
+
+def test_responses_reasoning_item_carries_signature() -> None:
+    """非流式:尾部签名载体随 reasoning item 的 extra_content 下发。"""
+    resp_obj = build_responses_object(_rs_response(), "gemini-3.8-flash")
+    reasoning_item = next(
+        item for item in resp_obj["output"] if item.get("type") == "reasoning"
+    )
+    assert reasoning_item["summary"][0]["text"] == _RS_THINK
+    google = reasoning_item["extra_content"]["google"]
+    assert google["thought_signature"] == _RS_SIG
+
+
+@pytest.mark.asyncio
+async def test_responses_request_reasoning_item_restored() -> None:
+    """请求侧:回传 reasoning item → thought part,签名经 extra_content 回读。"""
+    req = OpenAIResponsesRequest.model_validate(
+        {
+            "model": "gemini-3.8-flash",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": _RS_THINK}],
+                    "extra_content": {"google": {"thought_signature": _RS_SIG}},
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": _RS_BODY}],
+                },
+            ],
+        }
+    )
+    gemini_req, _ = await responses_to_gemini_request(req)
+    # reasoning item 与 assistant message 各成一轮;相邻 model 轮合并
+    # 由下游规范化层(_drop_hollow_and_merge_same_role)完成
+    thought_part = gemini_req.contents[1].parts[0]
+    assert thought_part.thought is True
+    assert thought_part.text == _RS_THINK
+    assert thought_part.thoughtSignature == _RS_SIG
+    assert gemini_req.contents[2].parts[0].text == _RS_BODY
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_reasoning_item_signature() -> None:
+    """流式:尾部独立签名帧 → 关闭 reasoning item 时随 extra_content 下发。"""
+    frames = [
+        {
+            "candidates": [
+                {"content": {"role": "model", "parts": [
+                    {"text": _RS_THINK, "thought": True}
+                ]}}
+            ]
+        },
+        {
+            "candidates": [
+                {"content": {"role": "model", "parts": [{"text": _RS_BODY}]}}
+            ]
+        },
+        {
+            "candidates": [
+                {"content": {"role": "model", "parts": [{"thoughtSignature": _RS_SIG}]}}
+            ]
+        },
+    ]
+    events: list[str] = []
+    async for sse in responses_stream_adapter(_sse_frames(frames), requested_model="m"):
+        events.append(sse)
+
+    done_items = []
+    for sse in events:
+        if "response.output_item.done" in sse:
+            data_line = next(l for l in sse.splitlines() if l.startswith("data: "))
+            done_items.append(json.loads(data_line.removeprefix("data: "))["item"])
+    reasoning_done = [i for i in done_items if i.get("type") == "reasoning"]
+    assert reasoning_done, "reasoning item 必须以 output_item.done 收尾"
+    google = reasoning_done[-1]["extra_content"]["google"]
+    assert google["thought_signature"] == _RS_SIG

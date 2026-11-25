@@ -23,7 +23,6 @@ from collections.abc import AsyncGenerator, AsyncIterable, Callable
 
 from aistudio_api.api.response_models import (
     GeminiGenerateContentResponse,
-    GeminiPartResponse,
 )
 from aistudio_api.api.schemas import (
     GeminiContent,
@@ -41,6 +40,7 @@ from aistudio_api.application.compat_service import (
     _as_str,
     _convert_items_concurrently,
     _file_block_to_part,
+    _iter_response_parts,
     _media_part_from_url,
     _openai_tool_choice_to_config,
     _openai_tools_to_gemini,
@@ -51,9 +51,6 @@ from aistudio_api.application.compat_service import (
     resolve_compat_model,
 )
 from aistudio_api.application.media_session import has_remote_media, media_session
-from aistudio_api.domain.tool_signatures import (
-    remember_function_signature as _remember_function_signature,
-)
 from aistudio_api.infrastructure.request_context import record_result
 from aistudio_api.infrastructure.utils.logger import get_logger
 
@@ -187,6 +184,20 @@ def _tool_output_text(output: object) -> dict[str, object]:
     return {"result": ""}
 
 
+def _reasoning_summary_text(item: dict[str, object]) -> str:
+    """Responses reasoning item 的 summary 文本拼接（summary_text 条目）。"""
+    summary = item.get("summary")
+    if not isinstance(summary, list):
+        return ""
+    texts: list[str] = []
+    for entry in summary:
+        if isinstance(entry, dict):
+            text = _as_str(entry.get("text"))
+            if text:
+                texts.append(text)
+    return "".join(texts)
+
+
 @media_session()
 async def responses_to_gemini_request(
     req: OpenAIResponsesRequest,
@@ -297,9 +308,27 @@ async def responses_to_gemini_request(
                     )
                 )
             elif item_type == "reasoning":
-                # 思维链回传：上游不消费（伪造 thoughtSignature 会触发风控），
-                # 静默丢弃即可——客户端会随完整历史重发
-                continue
+                # 思维链回传：思考摘要转 thought part 保留思考链（此前整项
+                # 静默丢弃，Codex CLI 等客户端重发的 reasoning 历史全部丢失）。
+                # 签名经 extra_content 精确回读——值由网关 reasoning item
+                # 原样下发（与 function_call item 同一载体形态），伪造值在
+                # 规范化层被校验丢弃，不会触达上游；缺失时由规范化层按思考
+                # 全文查 thinking 缓存回注。
+                summary_text = _reasoning_summary_text(item)
+                if not summary_text:
+                    continue
+                contents.append(
+                    GeminiContent(
+                        role="model",
+                        parts=[
+                            GeminiPart(
+                                text=summary_text,
+                                thought=True,
+                                thoughtSignature=_read_signature(item),
+                            )
+                        ],
+                    )
+                )
             else:
                 logger.debug("忽略不支持的 Responses input item 类型: %s", item_type)
 
@@ -366,9 +395,20 @@ class _ResponsesOutputBuilder:
         self.reasoning_texts: list[str] = []
         self.text_parts: list[str] = []
         self.function_calls: list[dict[str, object]] = []
+        # 思考链签名（thought part 自带 / 尾部空文本签名载体）：随 reasoning
+        # item 的 extra_content 下发（与 function_call item 同一载体形态）。
+        # FC part 的签名只属于调用本身，不并入（上游 FC 轮思考摘要无签名）。
+        self.thinking_signature: str | None = None
 
     def add_part(self, part: object, *, allow_tools: bool = True) -> None:
         text = getattr(part, "text", None)
+        if (
+            getattr(part, "functionCall", None) is None
+            and getattr(part, "inlineData", None) is None
+        ):
+            signature = getattr(part, "thoughtSignature", None)
+            if isinstance(signature, str) and signature:
+                self.thinking_signature = signature
         if isinstance(text, str) and text:
             if getattr(part, "thought", None) is True:
                 self.reasoning_texts.append(text)
@@ -402,6 +442,9 @@ class _ResponsesOutputBuilder:
         if self.reasoning_texts:
             output.append(
                 {
+                    # 思考链签名随 reasoning item 往返：客户端原样重发该项时
+                    # 签名经 extra_content 精确回读，思考链验证不丢失
+                    **_signature_extra(self.thinking_signature),
                     "id": _item_id("rs"),
                     "type": "reasoning",
                     "summary": [
@@ -531,29 +574,6 @@ def build_responses_object(
     )
 
 
-def _iter_response_parts(
-    response: GeminiGenerateContentResponse,
-) -> list[GeminiPartResponse]:
-    candidates = response.candidates or []
-    if not candidates:
-        return []
-    content = candidates[0].content
-    parts: list[GeminiPartResponse] = list(content.parts) if content else []
-    # 签名缓存回填（与 compat 层 _iter_response_parts 对齐）：非流式
-    # Responses 路径此前只取不存，纯 Codex CLI 用户丢签名后永远只能走
-    # SKIP 字面量，推理状态保真度失效。
-    for part in parts:
-        function_call = getattr(part, "functionCall", None)
-        if function_call is not None:
-            _remember_function_signature(
-                getattr(function_call, "id", None),
-                getattr(function_call, "name", None),
-                getattr(function_call, "args", None),
-                getattr(part, "thoughtSignature", None),
-            )
-    return parts
-
-
 # ---------------------------------------------------------------------------
 # 流式适配：Gemini SSE → Responses 语义事件流
 # ---------------------------------------------------------------------------
@@ -580,6 +600,10 @@ class _ResponsesStreamEmitter:
         self.finish_reason_raw: str | None = None
         self.usage: dict[str, int] | None = None
         self.saw_error = False
+        # 思考链签名（thought part 附带 / 尾部空文本签名载体 part）：
+        # 关闭 reasoning item 时随 extra_content 下发（与 function_call
+        # item 同一载体形态），供客户端重发该 item 时精确回读。
+        self.thinking_signature: str | None = None
         # 累积文本（output_text.done / completed 快照需要完整文本）
         self._text_accumulated: list[str] = []
         self._reasoning_accumulated: list[str] = []
@@ -807,6 +831,7 @@ class _ResponsesStreamEmitter:
         if self.reasoning_item_id is None:
             return []
         final_item = {
+            **_signature_extra(self.thinking_signature),
             "id": self.reasoning_item_id,
             "type": "reasoning",
             "status": status,
@@ -1019,11 +1044,24 @@ async def responses_stream_adapter(
                         if text.startswith(_ERROR_TEXT_PREFIX):
                             continue
                         if part.get("thought") is True:
+                            # thought part 自带签名（流式 pending 形态）：
+                            # 一并归入思考链签名（关闭 reasoning item 时下发）
+                            signature = part.get("thoughtSignature")
+                            if isinstance(signature, str) and signature:
+                                emitter.thinking_signature = signature
                             for event in emitter.reasoning_delta(text):
                                 yield event
                         else:
                             for event in emitter.text_delta(text):
                                 yield event
+                    elif (
+                        isinstance(part.get("thoughtSignature"), str)
+                        and part.get("thoughtSignature")
+                    ):
+                        # 独立签名帧 / 尾部空文本签名载体 part：思考链签名，
+                        # 关闭 reasoning item 时随 extra_content 下发（FC 分支
+                        # 已 continue，调用签名不并入思考链）。
+                        emitter.thinking_signature = part["thoughtSignature"]
         except Exception as exc:
             logger.warning("Responses 流式转换异常: %s", exc)
             record_result(

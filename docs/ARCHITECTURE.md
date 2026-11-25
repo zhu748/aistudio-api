@@ -202,7 +202,7 @@ sequenceDiagram
 - Gemini、Chat Completions、Claude Messages 和 Responses 共用模型请求的并发、请求体上限与总超时。并发准入在首次数据库写入前完成，超额请求不会排队争抢历史记录写锁。
 - 兼容路由直接消费 Gemini 管线的结构化帧，仅在最终 HTTP 出口序列化 SSE；原生 Gemini HTTP 输出保持 SSE。外部字符串/字节帧仍支持增量 UTF-8 解码。
 - 工具调用按明确的调用 ID 合并参数分片及累计快照；无 ID 的完整调用保持独立。参数不完整时返回流式错误，异常 finishReason 不会把待完成调用转换为可执行调用。
-- 工具签名通过 `extra_content.google.thought_signature` 扩展字段往返，客户端需保留该字段。Claude thinking 的真实 Gemini 签名封装于 `signature` 中；占位签名不会作为真实签名传给上游。
+- 工具签名通过 `extra_content.google.thought_signature` 扩展字段往返，客户端需保留该字段。Claude thinking 的真实 Gemini 签名封装于 `signature` 中；占位签名不会作为真实签名传给上游。纯文本轮的尾部空文本签名载体（wire 抓包形态）会回填到最后一个 thinking 块：非流式直接覆写占位签名，流式在 `finish()` 前对该块补发 `signature_delta`（Anthropic SDK 按索引赋值语义，后到覆盖占位值）。`valid_thought_signature` 接受 URL-safe / 缺 padding 的 Base64 变体，与 wire 编码侧归一化语义对齐。OpenAI 侧 assistant 回传的 `reasoning_content`（及 OpenRouter `reasoning` 字符串形态）转为 thought part，思考链签名随消息级 `extra_content` 往返（非流式 message / 流式终结块 delta 同一载体形态）；Responses 侧非空 reasoning item 双向保留 summary 与 `extra_content` 签名。thinking 签名按思考摘要全文哈希入持久化缓存（与函数调用签名同一文件），thought part 无有效签名时由规范化层精确匹配回注。详见 `THOUGHT_SIGNATURE_FIDELITY_2026-11-25.md`。
 - Responses 当前采用无状态的完整历史输入模式。`previous_response_id` 返回 400；system/developer 消息进入 `systemInstruction`。`n != 1` 和无法强制执行的 `parallel_tool_calls=false` 返回明确错误，不静默忽略。
 - Responses 客户端应监听 `response.completed`、`response.incomplete` 和 `response.failed`。OpenAI SDK 3.50.0 的 `get_final_response()` 仅接受 completed；截断与失败需从相应事件读取状态，网关不会为此伪造成功事件。
 - JSON Schema 支持本地 `$ref`、`$defs` 和 JSON Pointer 转义；外部引用、循环引用及过于复杂的展开返回 400。wire Schema 的能力子集仍不等同于完整 JSON Schema/strict 验证。

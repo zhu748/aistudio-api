@@ -42,6 +42,7 @@ from aistudio_api.application.schema_wire_codec import (  # noqa: F401
 from aistudio_api.domain.tool_signatures import (
     SKIP_THOUGHT_SIGNATURE,
     lookup_function_signature as _lookup_function_signature,
+    lookup_thinking_signature as _lookup_thinking_signature,
     tool_history_text,
     valid_thought_signature_or_none as _valid_thought_signature_or_none,
 )
@@ -721,7 +722,11 @@ def _convert_part(
                 thought=is_thought,
                 thought_signature=_valid_thought_signature_or_none(
                     part.thoughtSignature
-                ),
+                )
+                # 思考文本无有效签名时按全文精确匹配回注 thinking 缓存
+                # （客户端回传 reasoning_content 等丢失签名载体的场景，
+                # 与 functionCall 的缓存回注同一兜底哲学）。
+                or (_lookup_thinking_signature(part.text) if is_thought else None),
             )
         )
         return parts

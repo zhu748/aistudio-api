@@ -501,3 +501,91 @@ def test_parallel_results_are_linked_by_id_even_in_reverse_order():
     ]
     assert [result[0] for result in results] == ["g", "f"]
     assert [result[-1] for result in results] == ["b", "a"]
+
+
+def test_valid_thought_signature_accepts_urlsafe_and_unpadded_variants():
+    """URL-safe / 缺 padding 的 Base64 签名必须被接受。
+
+    wire 编码侧（_normalize_standard_base64）会把这两种形态归一化后发送，
+    校验层若拒绝会出现「能发却被判无效」的自相矛盾：客户端原样回传的
+    真实签名被静默丢弃，只能退化为 SKIP 字面量。
+    """
+    raw = b"signature-fixture-with-enough-length-for-normalization"
+    urlsafe_padded = base64.urlsafe_b64encode(raw).decode()
+    urlsafe_unpadded = urlsafe_padded.rstrip("=")
+    standard_unpadded = base64.b64encode(raw).decode().rstrip("=")
+
+    assert tool_signatures.valid_thought_signature(urlsafe_padded)
+    assert tool_signatures.valid_thought_signature(urlsafe_unpadded)
+    assert tool_signatures.valid_thought_signature(standard_unpadded)
+    # 长度 %4==1 或含非法字符的伪值仍然拒绝
+    assert not tool_signatures.valid_thought_signature("A" * 17)
+    assert not tool_signatures.valid_thought_signature("not!base64!!value")
+    # SKIP 字面量维持特例放行
+    assert tool_signatures.valid_thought_signature(SENTINEL)
+
+
+@pytest.mark.asyncio
+async def test_thinking_signature_cache_restores_unsigned_thought(
+    isolated_signature_cache,
+):
+    """thinking 签名缓存:thought part 无签名时按思考全文精确匹配回注。
+
+    客户端回传 reasoning_content 等思考文本但丢失签名载体时,规范化层
+    (_convert_part)以思考全文为键查缓存;有效签名优先于缓存,不匹配的
+    文本不借用(与函数调用缓存的精确匹配哲学一致)。
+    """
+    import base64 as b64
+
+    from aistudio_api.api.schemas import GeminiPart
+    from aistudio_api.application.chat_service import _convert_part
+
+    signature = b64.b64encode(b"thinking-cache-fixture-signature").decode()
+    thought_text = "Careful multi-step reasoning about the weather query."
+    # isolated_signature_cache 已把模块单例替换为临时目录实例,
+    # 模块级函数经由单例写入该实例
+    tool_signatures.remember_thinking_signature(thought_text, signature)
+
+    unsigned = _convert_part(
+        GeminiPart(text=thought_text, thought=True), pending_calls=[]
+    )
+    assert unsigned[0].thought is True
+    assert unsigned[0].thought_signature == signature
+
+    # 携带有效签名的 thought part 不被缓存值覆盖
+    own_signature = b64.b64encode(b"part-own-signature").decode()
+    signed = _convert_part(
+        GeminiPart(text=thought_text, thought=True, thoughtSignature=own_signature),
+        pending_calls=[],
+    )
+    assert signed[0].thought_signature == own_signature
+
+    # 非思考文本 part 不触发 thinking 缓存查询
+    plain = _convert_part(GeminiPart(text=thought_text), pending_calls=[])
+    assert plain[0].thought_signature is None
+
+    # 文本不匹配:不借用签名(缓存精确匹配,无值返回 None)
+    other = _convert_part(
+        GeminiPart(text=thought_text + " altered", thought=True), pending_calls=[]
+    )
+    assert other[0].thought_signature is None
+
+
+def test_thinking_signature_cache_persists_across_reload(tmp_path):
+    """thinking 签名与函数调用签名共用同一持久化文件,重启后可恢复。"""
+    import base64 as b64
+
+    signature = b64.b64encode(b"persisted-thinking-signature").decode()
+    text = "A reasoning summary worth persisting across restarts."
+    cache = tool_signatures.ThoughtSignatureCache(tmp_path / "signatures.json")
+    tool_signatures._cache_instance = cache
+    try:
+        tool_signatures.remember_thinking_signature(text, signature)
+        cache.flush()
+
+        reloaded = tool_signatures.ThoughtSignatureCache(tmp_path / "signatures.json")
+        tool_signatures._cache_instance = reloaded
+        assert tool_signatures.lookup_thinking_signature(text) == signature
+        assert tool_signatures.lookup_thinking_signature(text + " mismatch") is None
+    finally:
+        tool_signatures._cache_instance = None

@@ -340,6 +340,23 @@ async def openai_to_gemini_request(
             continue
         if role == "assistant":
             parts: list[GeminiPart] = []
+            # 思考历史回传（DeepSeek 风格 reasoning_content / OpenRouter
+            # reasoning 字符串形态）：转为 thought part 保留思考链，签名经
+            # 消息级 extra_content 载体精确回读；缺失时由规范化层
+            # （_convert_part）按思考全文查 thinking 缓存回注。
+            reasoning_text = message.reasoning_content or (
+                message.reasoning if isinstance(message.reasoning, str) else None
+            )
+            if reasoning_text:
+                parts.append(
+                    GeminiPart(
+                        text=reasoning_text,
+                        thought=True,
+                        thoughtSignature=_read_signature(
+                            {"extra_content": message.extra_content}
+                        ),
+                    )
+                )
             text = _openai_content_text(message.content)
             if text:
                 parts.append(GeminiPart(text=text))
@@ -631,6 +648,10 @@ def build_openai_completion(
     reasoning_parts: list[str] = []
     tool_calls: list[dict[str, object]] = []
     has_tool_calls = False
+    # 尾部空文本签名载体 part 携带的思考链签名（纯文本轮 wire 抓包形态）：
+    # 随消息级 extra_content 下发，供客户端回传 reasoning_content 时与
+    # tool_calls 签名同一载体形态精确还原。
+    trailing_signature: str | None = None
     # 与 Claude 侧同源的双重防御：上游若不执行 stopSequences（或拒绝该
     # 参数），停止词及其后的全部内容不得泄漏给客户端（Agent 客户端用
     # stop 切分输出/观察边界，泄漏会打穿解析）。
@@ -681,6 +702,17 @@ def build_openai_completion(
                     },
                 }
             )
+        elif (
+            not text
+            and function_call is None
+            and inline is None
+            and isinstance(getattr(part, "thoughtSignature", None), str)
+            and getattr(part, "thoughtSignature", None)
+        ):
+            # 空文本纯签名 part（尾部签名载体）：thought part 自身不带签名
+            # 时签名在这里到达，记录最后出现的值（Gemini 语义：最后一 part
+            # 的签名是整轮的权威签名）。
+            trailing_signature = part.thoughtSignature
 
     flush_pending()
     content_text = "".join(text_parts)
@@ -690,6 +722,9 @@ def build_openai_completion(
     }
     if reasoning_parts:
         message["reasoning_content"] = "".join(reasoning_parts)
+        # 思考链签名与思考文本同发：无 reasoning 的轮无思考可绑定，不下发
+        if trailing_signature is not None:
+            message.update(_signature_extra(trailing_signature))
     if tool_calls:
         message["tool_calls"] = tool_calls
 
@@ -790,6 +825,11 @@ async def openai_stream_adapter(
     tool_index = 0
     has_tool_calls = False
     saw_error = False
+    # 思考链签名（纯文本轮尾部签名载体 / thought part 附带形态）与思考
+    # 增量是否已下发：签名在终结块的 delta.extra_content 下发，与
+    # tool_calls 签名同一载体形态，客户端合并 delta 后随消息回传。
+    late_signature: str | None = None
+    saw_reasoning = False
 
     # 确定性关闭内层 SSE 生成器（3.6）：适配器自身异常或客户端断连时，
     # 不再依赖事件循环的异步生成器终结器延迟释放上游连接。
@@ -899,12 +939,23 @@ async def openai_stream_adapter(
                         if part.get("thought") is True:
                             if stops.hit is None:
                                 yield _sse(_chunk({"reasoning_content": text}, None))
+                            saw_reasoning = True
+                            signature = part.get("thoughtSignature")
+                            if isinstance(signature, str) and signature:
+                                late_signature = signature
                             continue
                         if stops.hit is not None:
                             continue
                         filtered = stops.feed(text)
                         if filtered:
                             yield _sse(_chunk({"content": filtered}, None))
+                    elif (
+                        isinstance(part.get("thoughtSignature"), str)
+                        and part.get("thoughtSignature")
+                    ):
+                        # 独立签名帧 / 尾部空文本签名载体 part：思考链签名，
+                        # 记录后随终结块 delta 下发（无正文可混入，不产块）。
+                        late_signature = part["thoughtSignature"]
         except Exception as exc:
             saw_error = True
             record_result(
@@ -932,7 +983,10 @@ async def openai_stream_adapter(
         usage_payload = (
             _openai_usage_from_frame(usage_frame) if usage_frame is not None else None
         )
-        final_chunk = _chunk({}, finish_reason)
+        final_delta: dict[str, object] = {}
+        if late_signature is not None and saw_reasoning:
+            final_delta.update(_signature_extra(late_signature))
+        final_chunk = _chunk(final_delta, finish_reason)
         # OpenAI 语义：仅 include_usage=True 时发送 usage（且以 choices 为空的
         # 独立尾块形式）。False 时任何 chunk 都不得携带 usage 字段，否则 SDK
         # 会把带 finish_reason 的终结块解析成混合块（协议不允许）。

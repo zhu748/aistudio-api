@@ -29,6 +29,19 @@ def valid_thought_signature(signature: object) -> bool:
         return False
     try:
         base64.b64decode(signature, validate=True)
+        return True
+    except (ValueError, UnicodeEncodeError):
+        pass
+    # URL-safe（-/_）或缺 padding 变体：换写标准字母表并补齐 padding 后再
+    # 校验。与 wire 编码侧 _normalize_standard_base64 的容忍语义对齐——否则
+    # 出现「编码层愿意归一化发送、校验层却判无效丢弃」的自相矛盾，客户端
+    # 原样回传的签名会被静默丢弃。len%4==1 不可能是合法 Base64，直接拒绝。
+    if len(signature) % 4 == 1:
+        return False
+    normalized = signature.replace("-", "+").replace("_", "/")
+    normalized += "=" * (-len(normalized) % 4)
+    try:
+        base64.b64decode(normalized, validate=True)
     except (ValueError, UnicodeEncodeError):
         return False
     return True
@@ -257,3 +270,34 @@ def lookup_function_signature(
     if not call_id and not name:
         return None
     return get_signature_cache().lookup(call_id, name, arguments)
+
+
+# ---------------------------------------------------------------------------
+# 思考链（thinking）签名缓存：按思考摘要全文哈希精确匹配
+# ---------------------------------------------------------------------------
+
+
+def _thinking_digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def remember_thinking_signature(text: str, signature: object) -> None:
+    """缓存纯文本轮的 thinking 签名，键为思考摘要全文哈希。
+
+    与函数调用签名共用同一缓存实例与持久化文件：键经固定的 "thinking"
+    伪调用标识 + 文本哈希隔离，哈希键不落任何明文思考内容（与既有
+    隐私设计一致）。供客户端回传思考文本（OpenAI reasoning_content /
+    Responses reasoning item）但丢失签名载体时回注，保证思考链签名
+    在跨重启、账号轮换（model_turns 回放失配）窗口内仍可恢复。
+    """
+    if not text or not valid_thought_signature(signature):
+        return
+    assert isinstance(signature, str)
+    remember_function_signature("thinking", _thinking_digest(text), None, signature)
+
+
+def lookup_thinking_signature(text: str) -> str | None:
+    """按思考摘要全文精确匹配恢复 thinking 签名（无匹配返回 None）。"""
+    if not text:
+        return None
+    return lookup_function_signature("thinking", _thinking_digest(text), None)

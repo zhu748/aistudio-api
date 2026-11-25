@@ -42,6 +42,7 @@ from aistudio_api.application.stream_utils import (
 )
 from aistudio_api.domain.tool_signatures import (
     remember_function_signature as _remember_function_signature,
+    remember_thinking_signature as _remember_thinking_signature,
 )
 from aistudio_api.infrastructure.gateway.model_defaults import get_compat_settings
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -403,6 +404,11 @@ def _iter_response_parts(
     parts: list[object] = list(content.parts) if content else []
     # 签名缓存：凡见到 functionCall part 携带有效 thoughtSignature 就缓存
     # （call_id 首选 + 函数名兜底），供客户端丢失签名的下轮请求回注。
+    # thinking 签名按思考摘要全文拼接缓存（载体在尾部空文本 part 上，
+    # FC part 的签名只属于调用本身、不入 thinking 缓存——上游 FC 轮的
+    # 思考摘要本就无签名）。
+    thinking_texts: list[str] = []
+    thinking_signature: str | None = None
     for part in parts:
         function_call = getattr(part, "functionCall", None)
         if function_call is not None:
@@ -412,28 +418,66 @@ def _iter_response_parts(
                 getattr(function_call, "args", None),
                 getattr(part, "thoughtSignature", None),
             )
+            continue
+        text = getattr(part, "text", None)
+        if isinstance(text, str) and text and getattr(part, "thought", None) is True:
+            thinking_texts.append(text)
+        signature = getattr(part, "thoughtSignature", None)
+        if isinstance(signature, str) and signature:
+            thinking_signature = signature
+    if thinking_texts and thinking_signature:
+        _remember_thinking_signature("".join(thinking_texts), thinking_signature)
     return parts
 
 
 async def _iter_gemini_sse_frames(
     source: AsyncIterable[object],
 ) -> AsyncGenerator[dict[str, object], None]:
+    recorder = _FrameSignatureRecorder()
     async for frame in coalesce_tool_frames(_parse_gemini_sse_frames(source)):
-        _remember_frame_tool_signatures(frame)
+        recorder.feed(frame)
         yield frame
+    # 源自然耗尽后统一收口（错误/断连路径跳过：FC 签名已逐帧即时缓存，
+    # thinking 签名仅该窗口丢失，非关键数据）
+    recorder.finalize()
 
 
-def _remember_frame_tool_signatures(frame: dict[str, object]) -> None:
-    """流式帧签名缓存：functionCall part 携带签名即缓存（同 _iter_response_parts）。"""
-    candidate = _frame_candidate(frame)
-    for part in _frame_parts(candidate):
-        function_call = _as_dict(part.get("functionCall"))
-        if function_call:
-            _remember_function_signature(
-                _as_str(function_call.get("id")) or None,
-                _as_str(function_call.get("name")) or None,
-                function_call.get("args"),
-                part.get("thoughtSignature"),
+class _FrameSignatureRecorder:
+    """流式签名缓存累积器。
+
+    functionCall 签名逐帧即时缓存（同 _iter_response_parts）；thinking
+    签名跨帧拼接思考全文后于 finalize 统一缓存——键必须与客户端将回传
+    的完整 reasoning 文本一致，签名早于思考文本结束时到达时逐帧快照
+    会缓存到残缺前缀，故只在流终态收口一次。
+    """
+
+    def __init__(self) -> None:
+        self._thinking_texts: list[str] = []
+        self._thinking_signature: str | None = None
+
+    def feed(self, frame: dict[str, object]) -> None:
+        candidate = _frame_candidate(frame)
+        for part in _frame_parts(candidate):
+            function_call = _as_dict(part.get("functionCall"))
+            if function_call:
+                _remember_function_signature(
+                    _as_str(function_call.get("id")) or None,
+                    _as_str(function_call.get("name")) or None,
+                    function_call.get("args"),
+                    part.get("thoughtSignature"),
+                )
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text and part.get("thought") is True:
+                self._thinking_texts.append(text)
+            signature = part.get("thoughtSignature")
+            if isinstance(signature, str) and signature:
+                self._thinking_signature = signature
+
+    def finalize(self) -> None:
+        if self._thinking_texts and self._thinking_signature:
+            _remember_thinking_signature(
+                "".join(self._thinking_texts), self._thinking_signature
             )
 
 

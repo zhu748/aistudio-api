@@ -20,6 +20,15 @@ class OpenAIChatMessage(BaseModel):
     name: str | None = None
     tool_calls: list[dict[str, object]] | None = None
     tool_call_id: str | None = None
+    # —— 思考历史回传（2026-11-25 thought_signature 全面优化）——
+    # DeepSeek 风格 ``reasoning_content`` / OpenRouter ``reasoning``（字符串
+    # 形态）是客户端回传网关下发思考摘要的两种主流形态；``extra_content``
+    # 为网关在响应消息上原样下发的签名载体（与 tool_calls 同一扩展形态）。
+    # 三者一并收进来转为 thought part：思考链历史不再被静默丢弃，签名经
+    # 载体精确回读，缺失时由规范化层查 thinking 缓存回注。
+    reasoning_content: str | None = None
+    reasoning: str | dict[str, object] | None = None
+    extra_content: dict[str, object] | None = None
 
 
 class OpenAIChatCompletionRequest(BaseModel):

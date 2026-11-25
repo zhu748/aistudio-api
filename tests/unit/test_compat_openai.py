@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import AsyncGenerator
 from typing import Any, cast
@@ -1115,3 +1116,135 @@ async def test_openai_reasoning_effort_unknown_falls_through() -> None:
     gemini_req2, _ = await openai_to_gemini_request(req2)
     assert gemini_req2.generationConfig is not None
     assert gemini_req2.generationConfig.reasoningEffort == "high"
+
+
+# ---------------------------------------------------------------------------
+# thought_signature 思考链保真回归（2026-11-25 第二轮优化）
+# ---------------------------------------------------------------------------
+
+_ROUND2_SIG = base64.b64encode(b"round2-thinking-signature-fixture").decode()
+_ROUND2_THINK = "Step by step analysis of the problem."
+_ROUND2_BODY = "The final answer."
+
+
+def _round2_response() -> GeminiGenerateContentResponse:
+    """纯文本轮 wire 抓包形态:思考摘要 + 正文 + 尾部空文本签名载体。"""
+    return GeminiGenerateContentResponse(
+        candidates=[
+            GeminiCandidateResponse(
+                content=GeminiContentResponse(
+                    parts=[
+                        GeminiPartResponse(text=_ROUND2_THINK, thought=True),
+                        GeminiPartResponse(text=_ROUND2_BODY),
+                        GeminiPartResponse(text="", thoughtSignature=_ROUND2_SIG),
+                    ]
+                ),
+                finishReason="STOP",
+                index=0,
+            )
+        ]
+    )
+
+
+def test_openai_completion_message_level_thinking_signature() -> None:
+    """非流式:尾部签名载体必须随 message 级 extra_content 下发。
+
+    OpenAI 协议 reasoning_content 无官方签名字段,与 tool_calls 同一
+    extra_content 载体形态随消息下发,客户端原样回传时精确还原。
+    """
+    completion = build_openai_completion(_round2_response(), "gemini-3.8-flash", None)
+    message = cast(dict[str, Any], completion["choices"][0]["message"])
+    assert message["reasoning_content"] == _ROUND2_THINK
+    extra = cast(dict[str, Any], message.get("extra_content"))
+    google = cast(dict[str, Any], extra.get("google"))
+    assert google.get("thought_signature") == _ROUND2_SIG
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_final_chunk_carries_thinking_signature() -> None:
+    """流式:迟到签名(尾部独立签名帧,晚于正文)随终结块 delta 下发。"""
+    frames = [
+        {
+            "candidates": [
+                {"content": {"role": "model", "parts": [
+                    {"text": _ROUND2_THINK, "thought": True}
+                ]}}
+            ]
+        },
+        {
+            "candidates": [
+                {"content": {"role": "model", "parts": [{"text": _ROUND2_BODY}]}}
+            ]
+        },
+        {
+            "candidates": [
+                {"content": {"role": "model", "parts": [{"thoughtSignature": _ROUND2_SIG}]}}
+            ]
+        },
+    ]
+    chunks: list[str] = []
+    async for sse in openai_stream_adapter(
+        _sse_frames(frames), requested_model="m", stop_sequences=None, include_usage=False
+    ):
+        chunks.append(sse)
+
+    reasoning = [c for c in chunks if "reasoning_content" in c]
+    assert reasoning, "thinking 增量必须以 reasoning_content 形态下发"
+    final = [
+        json.loads(c.removeprefix("data: ").strip())
+        for c in chunks
+        if '"finish_reason":"' in c and "reasoning_content" not in c
+    ]
+    assert final, "流必须以带 finish_reason 的终结块收尾"
+    delta = cast(dict[str, Any], final[-1]["choices"][0]["delta"])
+    google = cast(dict[str, Any], cast(dict[str, Any], delta.get("extra_content")).get("google"))
+    assert google.get("thought_signature") == _ROUND2_SIG
+
+
+@pytest.mark.asyncio
+async def test_openai_request_reasoning_content_restored_as_thought() -> None:
+    """请求侧:assistant 回传 reasoning_content(+extra_content 载体)→ thought part。"""
+    req = OpenAIChatCompletionRequest.model_validate(
+        {
+            "model": "gemini-3.8-flash",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": _ROUND2_BODY,
+                    "reasoning_content": _ROUND2_THINK,
+                    "extra_content": {"google": {"thought_signature": _ROUND2_SIG}},
+                },
+            ],
+        }
+    )
+    gemini_req, _ = await openai_to_gemini_request(req)
+    parts = gemini_req.contents[1].parts
+    assert parts[0].thought is True
+    assert parts[0].text == _ROUND2_THINK
+    assert parts[0].thoughtSignature == _ROUND2_SIG
+    assert parts[1].text == _ROUND2_BODY
+
+
+@pytest.mark.asyncio
+async def test_openai_request_reasoning_alias_without_signature() -> None:
+    """OpenRouter reasoning 字符串别名同样转 thought part;无载体时签名置空
+    (由规范化层查 thinking 缓存回注,不在此断言)。"""
+    req = OpenAIChatCompletionRequest.model_validate(
+        {
+            "model": "gemini-3.8-flash",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": _ROUND2_BODY,
+                    "reasoning": _ROUND2_THINK,
+                },
+            ],
+        }
+    )
+    gemini_req, _ = await openai_to_gemini_request(req)
+    parts = gemini_req.contents[1].parts
+    assert parts[0].thought is True
+    assert parts[0].text == _ROUND2_THINK
+    assert parts[0].thoughtSignature is None
