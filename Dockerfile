@@ -16,15 +16,42 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # SpiderMonkey 静态库基于 LLVM libc++ 构建（std::__1:: 符号），clang/gcc 的
 # libstdc++ 无法完成链接；zig 工具链自带 libc++（musl 静态链接），build.sh
 # 检测到 zig 后会优先使用并产出全静态二进制（运行阶段无 libc++ 依赖）。
+#
+# 下载源加固（2026-11-25：Render 构建机到 ziglang.org 链路慢至 ~80KB/s，
+# 57MB 工具链拖 10 分钟以上，且 curl 默认无超时导致构建"假死"）：
+#   1. 多源回退：ziglang.org（官方）→ pkg.machengine.org（Mach 引擎官方
+#      镜像，tarball 与官方 bit 级一致，已核验 sha256）；
+#      zig 0.16+ 不再发布到 GitHub Releases，故无第三源。
+#   2. 连接/总时长/慢速三重超时：--connect-timeout 10、--max-time 240、
+#      --speed-limit 102400 --speed-time 30（<100KB/s 持续 30s 即断流），
+#      任一超时即失败换下一源，杜绝无限挂起。
+#   3. sha256 校验：两个源的 tarball 都必须匹配官方发布的校验和，
+#      防镜像篡改，也防半截下载被解包。
 ARG ZIG_VERSION=0.17.1
+ARG ZIG_X86_64_SHA256=3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a
+ARG ZIG_AARCH64_SHA256=a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795
 RUN set -eux; \
     case "$(uname -m)" in \
-        x86_64)  ZIG_ARCH="x86_64" ;; \
-        aarch64) ZIG_ARCH="aarch64" ;; \
+        x86_64)  ZIG_ARCH="x86_64";  ZIG_SHA256="${ZIG_X86_64_SHA256}" ;; \
+        aarch64) ZIG_ARCH="aarch64"; ZIG_SHA256="${ZIG_AARCH64_SHA256}" ;; \
         *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL --retry 2 -o /tmp/zig.tar.xz \
-        "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"; \
+    ZIG_TARBALL="zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"; \
+    ZIG_URLS="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TARBALL} https://pkg.machengine.org/zig/${ZIG_TARBALL}"; \
+    ok=0; \
+    for url in ${ZIG_URLS}; do \
+        echo "trying ${url}"; \
+        if curl -fsSL --connect-timeout 10 --max-time 240 --speed-limit 102400 --speed-time 30 \
+            --retry 2 --retry-delay 2 -o /tmp/zig.tar.xz "${url}"; then \
+            if echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -; then \
+                ok=1; break; \
+            fi; \
+            echo "sha256 mismatch for ${url}, trying next" >&2; \
+        else \
+            echo "source failed (or too slow): ${url}, trying next" >&2; \
+        fi; \
+    done; \
+    [ "${ok}" = "1" ] || { echo "all zig download sources failed" >&2; exit 1; }; \
     mkdir -p /opt/zig; \
     tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 --no-same-owner; \
     rm -f /tmp/zig.tar.xz; \
