@@ -144,13 +144,15 @@ async def test_api_accounts_active_endpoint():
 
 
 @pytest.mark.asyncio
-async def test_update_account_tier_manual_normalizes_tier():
+async def test_update_account_tier_manual_normalizes_tier(
+    setup_mock_account_service: MagicMock,
+):
     """PUT tier：别名归一化（pro→Pro / ultra_20x→Ultra_20X）。
 
     目录缓存失效已收敛到 AccountService.update_account_tier（路由层以
     mock 服务注入，服务层失效不在此处断言，见 test_account_service_catalog）。
     """
-    mock_svc = runtime_state.account_service
+    mock_svc = setup_mock_account_service
     mock_svc.get_account.return_value = AccountMeta(
         id="acc_1",
         name="Test Account 1",
@@ -168,10 +170,12 @@ async def test_update_account_tier_manual_normalizes_tier():
 
 
 @pytest.mark.asyncio
-async def test_update_account_tier_manual_rejects_unknown_tier():
+async def test_update_account_tier_manual_rejects_unknown_tier(
+    setup_mock_account_service: MagicMock,
+):
     """未知等级显式 400（normalize_benefit_tier 的静默落 Free 会把误拼的
     Pro 号降级成 Free，手动端点不允许这种静默行为）。"""
-    mock_svc = runtime_state.account_service
+    mock_svc = setup_mock_account_service
     mock_svc.get_account.return_value = AccountMeta(
         id="acc_1",
         name="Test Account 1",
@@ -186,9 +190,11 @@ async def test_update_account_tier_manual_rejects_unknown_tier():
 
 
 @pytest.mark.asyncio
-async def test_update_account_tier_manual_404_for_missing_account():
+async def test_update_account_tier_manual_404_for_missing_account(
+    setup_mock_account_service: MagicMock,
+):
     """账号不存在时 404，且不触碰层级存储。"""
-    mock_svc = runtime_state.account_service
+    mock_svc = setup_mock_account_service
     mock_svc.get_account.return_value = None
     async with _client() as client:
         resp = await client.put("/accounts/acc_1/tier", json={"tier": "pro"})

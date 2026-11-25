@@ -602,6 +602,7 @@ async def test_pro_catalog_neon_blocked_for_free_active_account(monkeypatch):
     """Pro 账号刷出的目录里 neon 可用，切到 Free 活跃账号后请求 neon：
     门控以请求时的活跃账号 tier 为准（目录元数据描述的是模型的订阅门槛，
     与刷目录的账号无关）→ 换号失败则 403，绝不放行 Free 账号去上游。"""
+    from typing import cast
     from unittest.mock import AsyncMock
 
     from fastapi import HTTPException
@@ -632,7 +633,10 @@ async def test_pro_catalog_neon_blocked_for_free_active_account(monkeypatch):
         with pytest.raises(HTTPException) as exc_info:
             await ensure_active_account(attempt=0, model="gemini-4-neon")
         assert exc_info.value.status_code == 403
-        assert exc_info.value.detail["type"] == "permission_denied"
+        # starlette 0.50 将 detail 声明为 str（运行时可为任意 JSON 值），
+        # 需 cast 升宽后索引（同 test_round4_concurrency 的处理）。
+        detail = cast("dict[str, object]", exc_info.value.detail)
+        assert detail["type"] == "permission_denied"
         # 换号要求来自目录 accessModes [1,3]（而非 config 兜底）
         switch.assert_awaited_once_with(
             model="gemini-4-neon",
@@ -671,6 +675,8 @@ async def test_unknown_catalog_entry_still_blocks_free_via_config_rules(
             await ensure_active_account(attempt=0, model="gemini-4-neon")
         assert exc_info.value.status_code == 403
         switch.assert_awaited_once()
+        # await_args 类型为 _Call | None（typeshed），先收窄再取 kwargs
+        assert switch.await_args is not None
         assert switch.await_args.kwargs["required_tiers"] == (
             "Pro",
             "Ultra",

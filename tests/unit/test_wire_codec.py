@@ -530,12 +530,14 @@ def test_normalize_standard_base64_variants():
 
 def test_inline_data_urlsafe_base64_normalized_on_wire():
     """inlineData 载荷经归一化后落 wire：URL-safe 输入转标准字母表。"""
+    from typing import Any, cast
+
     from aistudio_api.infrastructure.gateway.wire_types import AistudioPart
 
     standard = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbg=="
     urlsafe = standard.replace("+", "-").replace("/", "_").rstrip("=")
     part = AistudioPart(inline_data=("image/png", urlsafe))
-    wire = part.to_wire()[2]
+    wire = cast("list[Any]", part.to_wire())[2]
     assert wire[1] == standard.rstrip("=")  # 字母表已换写，padding 不补
 
 

@@ -242,6 +242,7 @@ def test_incompatible_httpcore_hook_keeps_existing_implementation(
 
 
 async def test_rotation_status_exposes_keepalive_counters() -> None:
+    from typing import Any, cast
     from unittest.mock import MagicMock
 
     from aistudio_api.api.state import runtime_state
@@ -256,7 +257,8 @@ async def test_rotation_status_exposes_keepalive_counters() -> None:
         response = await get_rotation_status(runtime_state=runtime_state)
     finally:
         runtime_state.rotator = None
-    keepalive = response["upstream_keepalive"]
+    # 端点返回 dict[str, object]，cast 升宽后才能索引/成员判断
+    keepalive = cast("dict[str, Any]", response["upstream_keepalive"])
     assert keepalive["enabled"] is True
     assert keepalive["interval_seconds"] > 0
     assert "installed" in keepalive
