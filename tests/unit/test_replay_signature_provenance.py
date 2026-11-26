@@ -516,7 +516,10 @@ async def test_cold_replay_does_not_move_a_compound_signature_to_the_split_call(
         AistudioPart(text="Checking.", function_call=call, thought_signature=SIG_A)
     )
     model = _strip_signatures(await _request(client, "chat", initial))
-    assert model[0]["content"] == "Checking." and model[0]["tool_calls"][0]["id"] == "A"
+    assert model[0]["content"] == "Checking."
+    tool_calls = model[0]["tool_calls"]
+    assert isinstance(tool_calls, list) and len(tool_calls) == 1
+    assert isinstance(tool_calls[0], dict) and tool_calls[0]["id"] == "A"
     gateway.history.clear()
     tool_signatures.get_signature_cache().flush()
     monkeypatch.setattr(

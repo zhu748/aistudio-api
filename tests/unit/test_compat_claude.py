@@ -100,8 +100,7 @@ async def test_claude_request_basic_conversion() -> None:
 
 @pytest.mark.asyncio
 async def test_claude_request_tool_roundtrip(monkeypatch, tmp_path) -> None:
-    # 2026-11-14：上游对客户端函数同样强制 thought_signature —— 模拟
-    # 响应侧已缓存该 tool_use 的签名（客户端丢失后由网关回注）。
+    # A fixture knows the old unscoped entry but no original conversation.
     import base64
 
     from aistudio_api.domain import tool_signatures
@@ -166,7 +165,7 @@ async def test_claude_request_tool_roundtrip(monkeypatch, tmp_path) -> None:
     gemini_req, resolved = await claude_to_gemini_request(req)
 
     assert resolved == "gemini-3.8-flash"
-    # assistant: text + tool_use（签名由缓存回注）
+    # Assistant text and tool_use retain their structure without legacy replay.
     assistant_parts = gemini_req.contents[0].parts
     assert assistant_parts[0].text == "I'll check the weather."
     fc = assistant_parts[1].functionCall
@@ -177,7 +176,7 @@ async def test_claude_request_tool_roundtrip(monkeypatch, tmp_path) -> None:
     assert assistant_parts[1].thoughtSignature is None
     normalized = normalize_gemini_request(gemini_req, resolved)
     outbound, _, _ = ModelTurnHistory().prepare(resolved, normalized.contents)
-    assert outbound[0].parts[1].thought_signature == cached_sig
+    assert outbound[0].parts[1].thought_signature != cached_sig
     # user: tool_result（含图片展开）
     user_parts = gemini_req.contents[1].parts
     fr = user_parts[0].functionResponse

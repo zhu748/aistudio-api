@@ -443,9 +443,7 @@ async def test_openai_reasoning_effort_http_passthrough(
 
 @pytest.mark.asyncio
 async def test_openai_request_tools_and_tool_roundtrip(monkeypatch, tmp_path) -> None:
-    # 2026-11-14 实测：上游对客户端函数的 functionCall 回传同样强制
-    # thought_signature —— 模拟响应侧已缓存该调用的签名（客户端丢失后
-    # 由网关回注），验证往返仍完整保留。
+    # An old entry without a matching conversation is not replay evidence.
     import base64
 
     from aistudio_api.domain import tool_signatures
@@ -500,8 +498,7 @@ async def test_openai_request_tools_and_tool_roundtrip(monkeypatch, tmp_path) ->
     gemini_req, resolved = await openai_to_gemini_request(req)
 
     assert resolved == "gemini-3.8-flash"
-    # assistant tool_calls → functionCall parts（保留 id 供回传；
-    # 客户端丢失的签名由缓存回注）
+    # Assistant tool_calls preserve their ID but do not borrow unscoped metadata.
     model_content = gemini_req.contents[0]
     assert model_content.role == "model"
     fc_part = model_content.parts[0]
@@ -512,7 +509,7 @@ async def test_openai_request_tools_and_tool_roundtrip(monkeypatch, tmp_path) ->
     assert fc_part.thoughtSignature is None
     normalized = normalize_gemini_request(gemini_req, resolved)
     outbound, _, _ = ModelTurnHistory().prepare(resolved, normalized.contents)
-    assert outbound[0].parts[0].thought_signature == cached_sig
+    assert outbound[0].parts[0].thought_signature != cached_sig
     # tool 消息 → functionResponse（name 由 tool_call_id 反查）
     tool_content = gemini_req.contents[1]
     assert tool_content.role == "user"
