@@ -1509,7 +1509,10 @@ def _build_gemini_streaming_response(
                         client=client,
                         model_path=model_path,
                         normalized=normalized,
-                        has_yielded_data=state.has_yielded_data,
+                        # A published opaque-only Part already commits the
+                        # native turn. Keep this retry boundary separate from
+                        # has_yielded_data, which measures usable model output.
+                        has_yielded_data=has_yielded_any,
                         serving_account_id=serving_account_id,
                     )
                     if retry:
