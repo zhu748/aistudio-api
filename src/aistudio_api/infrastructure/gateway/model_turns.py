@@ -23,6 +23,7 @@ from collections import Counter, OrderedDict
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
+from typing import TYPE_CHECKING
 
 from aistudio_api.config import detect_memory_budget_mb
 from aistudio_api.domain.tool_signatures import (
@@ -35,6 +36,9 @@ from .wire_codec import AistudioWireCodec
 from .wire_parser import parse_response_part, wire_size_estimate
 from .wire_spec import PartIndex
 from .wire_types import AistudioContent, AistudioPart, wire_function_name
+
+if TYPE_CHECKING:
+    from aistudio_api.domain.models import ResponsePart
 
 _TOKEN_RE = re.compile(r"v1_[A-Za-z0-9+/=_-]{16,}")
 _DEFAULT_MAX_TURN_BYTES = 4 * 1024 * 1024
@@ -214,6 +218,33 @@ def _tool_owner(payload: dict[str, object] | None) -> object:
     return payload.get("name"), payload.get("args", payload.get("arguments", {}))
 
 
+def _carrier_payload(
+    part: ResponsePart, *, include_call: bool = True
+) -> tuple[object, ...]:
+    return (
+        part.thought,
+        part.text if part.text_present else None,
+        _tool_owner(part.function_call) if include_call else None,
+        _tool_owner(part.function_response),
+        part.inline_data,
+        part.executable_code,
+        part.code_execution_result,
+    )
+
+
+def _call_provenance(
+    scope: str, turn: str, ordinal: int, part: ResponsePart
+) -> SignatureProvenance:
+    # A compatible client can echo a compound Part as two separate Parts
+    # with the same visible digest. That does not prove that either is the
+    # original signature carrier.
+    call = part.function_call.get("raw") if part.function_call else None
+    extra = call[3:] if isinstance(call, list) and len(call) > 3 else None
+    shape = _carrier_payload(part, include_call=False)
+    carrier = hashlib.sha256(_json([shape, extra]).encode()).hexdigest()
+    return SignatureProvenance(scope, turn, ordinal, carrier)
+
+
 def _signed_owners(wires: Iterable[list[object]]) -> Iterator[tuple[object, ...]]:
     """Signed carriers, with stable offsets despite split unsigned text."""
     text_offset = thought_offset = call_ordinal = 0
@@ -235,13 +266,7 @@ def _signed_owners(wires: Iterable[list[object]]) -> Iterator[tuple[object, ...]
                 signature.rstrip("=").replace("-", "+").replace("_", "/"),
                 call_ordinal,
                 offset,
-                part.thought,
-                part.text if part.text_present else None,
-                _tool_owner(part.function_call),
-                _tool_owner(part.function_response),
-                part.inline_data,
-                part.executable_code,
-                part.code_execution_result,
+                *_carrier_payload(part),
             )
         if part.function_call is not None:
             call_ordinal += 1
@@ -326,7 +351,9 @@ def _restore_unmatched_calls(
                 call_id = call[2] if len(call) > 2 else None
                 known, signature = (
                     get_signature_cache().lookup_scoped(
-                        SignatureProvenance(scope, turn, ordinal),
+                        _call_provenance(
+                            scope, turn, ordinal, parse_response_part(part.to_wire())
+                        ),
                         call_id,
                         wire_function_name(name),
                         args,
@@ -567,7 +594,7 @@ class ModelTurnHistory:
                 name, args = call.get("name"), call.get("args")
                 if isinstance(name, str) and isinstance(args, dict):
                     get_signature_cache().remember_scoped(
-                        SignatureProvenance(context.scope, turn, ordinal),
+                        _call_provenance(context.scope, turn, ordinal, part),
                         call_id,
                         name,
                         args,

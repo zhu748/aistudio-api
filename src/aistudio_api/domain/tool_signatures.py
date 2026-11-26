@@ -69,11 +69,12 @@ def tool_history_text(
 
 @dataclass(frozen=True, slots=True)
 class SignatureProvenance:
-    """Scope and cumulative visible turn, plus the call's original position."""
+    """Scope, exact carrier and call position within a cumulative visible turn."""
 
     scope: str
     turn: str
     ordinal: int
+    carrier: str
 
 
 class ThoughtSignatureCache:
@@ -97,9 +98,9 @@ class ThoughtSignatureCache:
         self._path = Path(path) if path is not None else None
         self._lock = threading.Lock()
         self._signatures: OrderedDict[str, str] = OrderedDict()
-        # None records either a verified unsigned call or a conflicting roll.
-        # In both cases subsequent cache reads must withhold any signature.
-        self._scoped: OrderedDict[str, str | None] = OrderedDict()
+        # A record with no value is an observed unsigned call; a None entry
+        # marks a conflicting roll. Both keep any older signature withheld.
+        self._scoped: OrderedDict[str, tuple[str, str | None] | None] = OrderedDict()
         self._loaded = False
         self._load_error_logged = False
         self._dirty = False
@@ -161,16 +162,17 @@ class ThoughtSignatureCache:
             signature
         ):
             signature = None
+        observed: tuple[str, str | None] | None = (provenance.carrier, signature)
         with self._lock:
             self._ensure_loaded()
             conflict = False
             if key in self._scoped:
-                if self._scoped[key] == signature or self._scoped[key] is None:
+                if self._scoped[key] == observed or self._scoped[key] is None:
                     self._scoped.move_to_end(key)
                     return
-                signature = None
+                observed = None
                 conflict = True
-            self._scoped[key] = signature
+            self._scoped[key] = observed
             self._scoped.move_to_end(key)
             # Do not leave a previously persisted value usable after a
             # restart while an observed conflicting roll is only in memory.
@@ -236,7 +238,10 @@ class ThoughtSignatureCache:
             if key not in self._scoped:
                 return False, None
             self._scoped.move_to_end(key)
-            return True, self._scoped[key]
+            observed = self._scoped[key]
+            return True, observed[1] if observed and observed[
+                0
+            ] == provenance.carrier else None
 
     # -- 持久化 ------------------------------------------------------------
 
@@ -267,16 +272,25 @@ class ThoughtSignatureCache:
             )
             if isinstance(scoped, dict):
                 for key, value in scoped.items():
-                    if isinstance(key, str) and (
-                        value is None
-                        or (
-                            isinstance(value, str)
-                            and value != SKIP_THOUGHT_SIGNATURE
-                            and valid_thought_signature(value)
+                    if not isinstance(key, str):
+                        continue
+                    if value is None:
+                        self._scoped[key] = None
+                    elif (
+                        isinstance(value, list)
+                        and len(value) == 2
+                        and isinstance(value[0], str)
+                        and (
+                            value[1] is None
+                            or (
+                                isinstance(value[1], str)
+                                and value[1] != SKIP_THOUGHT_SIGNATURE
+                                and valid_thought_signature(value[1])
+                            )
                         )
                     ):
-                        self._scoped[key] = value
-                        self._trim_locked()
+                        self._scoped[key] = (value[0], value[1])
+                    self._trim_locked()
         except (OSError, ValueError):
             # 首次运行 / 文件损坏：从空缓存开始即可
             pass

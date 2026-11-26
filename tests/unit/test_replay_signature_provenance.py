@@ -499,6 +499,39 @@ async def test_cold_restart_withholds_conflicting_exact_scoped_occurrences(
     ]
 
 
+@pytest.mark.parametrize("prior_split", [False, True])
+async def test_cold_replay_does_not_move_a_compound_signature_to_the_split_call(
+    route, monkeypatch, tmp_path, prior_split
+):
+    client, gateway = route
+    initial = _prompt("chat", "Look up Paris.")
+    call = ("lookup", {"city": "Paris"}, "A")
+    if prior_split:
+        gateway.reply(
+            AistudioPart(text="Checking."),
+            AistudioPart(function_call=call, thought_signature=SIG_B),
+        )
+        await _request(client, "chat", initial)
+    gateway.reply(
+        AistudioPart(text="Checking.", function_call=call, thought_signature=SIG_A)
+    )
+    model = _strip_signatures(await _request(client, "chat", initial))
+    assert model[0]["content"] == "Checking." and model[0]["tool_calls"][0]["id"] == "A"
+    gateway.history.clear()
+    tool_signatures.get_signature_cache().flush()
+    monkeypatch.setattr(
+        tool_signatures,
+        "_cache_instance",
+        tool_signatures.ThoughtSignatureCache(tmp_path / "signatures.json"),
+    )
+    gateway.reply(AistudioPart(text="Done."))
+    await _request(client, "chat", initial + model + _outputs("chat", [("A", "done")]))
+    assert [part.text for part in gateway.wire_parts(1)] == ["Checking.", ""]
+    assert _wire_tools(gateway, 1, "function_call") == [
+        ("A", "lookup", {"city": "Paris"}, ""),
+    ]
+
+
 @pytest.mark.parametrize("supplied", [None, "A"])
 async def test_native_mixed_results_reserve_id_and_leave_idless_order_untouched(
     route, supplied
