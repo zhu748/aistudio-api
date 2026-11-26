@@ -19,7 +19,6 @@
 
 from __future__ import annotations
 
-import json
 import secrets
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field, replace
@@ -377,77 +376,83 @@ def prepare_anti_truncation(
 # ---------------------------------------------------------------------------
 
 
-def _extract_call_content(call: dict[str, object]) -> str:
-    """从单个合成函数调用中提取 content 文本，兼容 dict args 与 JSON 字符串。"""
-    args = call.get("args")
-    if isinstance(args, dict):
-        content = args.get("content")
-        return content if isinstance(content, str) else ""
-    raw_arguments = call.get("arguments")
-    if isinstance(raw_arguments, str) and raw_arguments.strip():
-        try:
-            parsed = json.loads(raw_arguments)
-        except json.JSONDecodeError:
-            return ""
-        if isinstance(parsed, dict):
-            content = parsed.get("content")
-            return content if isinstance(content, str) else ""
-    return ""
+def _presentation_id(call: dict[str, object]) -> str:
+    value = call.get("call_id") or call.get("id")
+    return value if isinstance(value, str) else ""
 
 
 def restore_anti_truncation_output(
     output: ModelOutput, ctx: AntiTruncationContext
 ) -> None:
-    """非流式响应还原：把合成工具调用参数中的正文搬回 ``candidate.text``。"""
+    """Decode completed presentation calls in their original output positions."""
     if not ctx.active or not output.candidates:
         return
     candidate = output.candidates[0]
-    if not candidate.function_calls:
+    if not any(call.get("name") == ctx.tool_name for call in candidate.function_calls):
         return
 
-    restored_parts: list[str] = []
+    original = candidate.ordered_parts
+    source = (
+        original
+        if original is not None
+        else [ResponsePart(function_call=call) for call in candidate.function_calls]
+    )
+    keyed: dict[str, _StreamCallState] = {}
+    # Record deltas at their physical positions, but commit only those whose
+    # argument object completed. Never turn presentation metadata into a tool.
+    positions: dict[int, tuple[_StreamCallState, str]] = {}
     real_calls: list[dict[str, object]] = []
-    for call in candidate.function_calls:
-        if str(call.get("name") or "") == ctx.tool_name:
-            ctx.synthetic_seen = True
-            content = _extract_call_content(call)
-            if content:
-                restored_parts.append(content)
-        else:
+    call_count = 0
+    for index, part in enumerate(source):
+        call = part.function_call
+        if call is None:
+            continue
+        ident = _presentation_id(call)
+        name = call.get("name")
+        if name != ctx.tool_name and not (not name and ident and ident in keyed):
+            if ident and name:
+                keyed.pop(ident, None)
             real_calls.append(call)
+            continue
+        # Keep the existing independent-object semantics when there is no
+        # stable ID. A matching presentation name alone cannot link snapshots.
+        state = keyed.get(ident)
+        if state is None:
+            state = _StreamCallState(call_id=ident or None)
+            if ident:
+                keyed[ident] = state
+            call_count += 1
+        positions[index] = state, state.feed_content(call)
 
+    ctx.synthetic_seen = bool(positions)
     if not ctx.synthetic_seen:
-        return  # 模型未走工具通道，纯文本原样透传。
-
-    if len(restored_parts) > 1:
-        ctx.multiple_calls = True
+        return
+    ctx.multiple_calls = call_count > 1
+    if ctx.multiple_calls:
         logger.warning(
             "抗截断传输出现多次合成调用，已按顺序拼接: tool=%s, calls=%d",
             ctx.tool_name,
-            len(restored_parts),
+            call_count,
         )
-
-    if restored_parts:
-        # 与上游 JS 语义一致：工具通道的正文整体替换纯文本通道内容。
-        candidate.text = "".join(restored_parts)
-        ctx.restored = True
     candidate.function_calls = real_calls
-    if candidate.ordered_parts is not None:
+    restored = {
+        i: delta for i, (state, delta) in positions.items() if delta and state.complete
+    }
+    ctx.restored = bool(restored)
+    if ctx.restored:
+        candidate.text = "".join(restored.values())
+
+    if original is not None:
         ordered: list[ResponsePart] = []
-        restored_text = candidate.text if ctx.restored else ""
-        for part in candidate.ordered_parts:
-            if (part.function_call or {}).get("name") == ctx.tool_name:
-                if restored_text:
-                    ordered.append(
-                        ResponsePart(
-                            text=restored_text,
-                            text_present=True,
-                            wire_chunk=part.wire_chunk,
-                        )
+        for index, part in enumerate(original):
+            if delta := restored.get(index):
+                ordered.append(
+                    ResponsePart(
+                        text=delta, text_present=True, wire_chunk=part.wire_chunk
                     )
-                    restored_text = ""
-                # The internal transport call's signature is not a signature
-                # for the reconstructed presentation text.
+                )
+            if index in positions:
+                # This signature belongs to the internal call, not its text.
                 part = replace(part, function_call=None, thought_signature="")
             if ctx.restored and part.text_present and not part.thought:
                 part = _without_plain_text(part)
@@ -727,6 +732,33 @@ class _StreamCallState:
             self.fragments.append(text)
             self.size += len(text)
 
+    def feed_content(self, call: dict[str, object]) -> str:
+        """Accept object snapshots or streamed JSON and return only new text."""
+        delta: str
+        args = call.get("args")
+        if isinstance(args, dict):
+            content = args.get("content")
+            self.dict_seen = isinstance(content, str)
+            delta = _merge_content(self, content if isinstance(content, str) else "")
+        else:
+            raw_fragment = args if isinstance(args, str) else call.get("arguments")
+            if not isinstance(raw_fragment, str) or not raw_fragment:
+                delta = ""
+            elif self.dict_seen:
+                # dict 参数已完整收到，字符串分片是冗余重发。
+                delta = ""
+            else:
+                # 上游以 JSON 字符串形式分片下发参数。
+                delta = self.decoder.feed(raw_fragment)
+                if self.decoder.invalid:
+                    logger.warning("抗截断流式参数 JSON 识别失败，跳过后续解码")
+                    return ""
+                if delta:
+                    # 与 dict 路径共享累积状态：若上游随后补发完整
+                    # dict 参数帧，_merge_content 可据此去重。
+                    self.append(delta)
+        return delta
+
 
 def _merge_content(state: _StreamCallState, new: str) -> str:
     """合并新到的 content 片段，返回应作为正文增量下发的新文本。
@@ -814,7 +846,10 @@ async def _ordered_transport_events(
     events: AsyncIterator[tuple[str, object | None]], tool_name: str
 ) -> AsyncIterator[tuple[str, object | None]]:
     """Expose only this variant's internal transport calls to its decoder."""
+    active_id = ""
     async for kind, payload in events:
+        if kind == "tool_interruption":
+            active_id = ""
         if kind != "ordered_parts" or not isinstance(payload, list):
             yield kind, payload
             continue
@@ -824,8 +859,15 @@ async def _ordered_transport_events(
                 continue
             call = part.function_call
             name = str((call or {}).get("name") or "")
+            ident = _presentation_id(call) if call is not None else ""
+            same_presentation = bool(not name and ident and ident == active_id)
+            if name == tool_name:
+                active_id = ident
+            elif name and ident and ident == active_id:
+                active_id = ""
             if call is not None and (
                 name == tool_name
+                or same_presentation
                 or (
                     tool_name.startswith(name)
                     and not {"args", "arguments"} & call.keys()
@@ -838,9 +880,12 @@ async def _ordered_transport_events(
                     "tool_calls",
                     [
                         {
-                            key: value
-                            for key, value in call.items()
-                            if key != "thought_signature"
+                            **{
+                                key: value
+                                for key, value in call.items()
+                                if key != "thought_signature"
+                            },
+                            **({"name": tool_name} if same_presentation else {}),
                         }
                     ],
                 )
@@ -888,32 +933,7 @@ async def _restore_anti_truncation_stream_inner(
         elif call_state.call_id is None and call_id_str is not None:
             call_state.call_id = call_id_str
 
-        delta: str
-        args = call.get("args")
-        if isinstance(args, dict):
-            content = args.get("content")
-            call_state.dict_seen = isinstance(content, str)
-            delta = _merge_content(
-                call_state, content if isinstance(content, str) else ""
-            )
-        else:
-            raw_fragment = args if isinstance(args, str) else call.get("arguments")
-            if not isinstance(raw_fragment, str) or not raw_fragment:
-                delta = ""
-            elif call_state.dict_seen:
-                # dict 参数已完整收到，字符串分片是冗余重发。
-                delta = ""
-            else:
-                # 上游以 JSON 字符串形式分片下发参数。
-                delta = call_state.decoder.feed(raw_fragment)
-                if call_state.decoder.invalid:
-                    logger.warning("抗截断流式参数 JSON 识别失败，跳过后续解码")
-                    return None
-                if delta:
-                    # 与 dict 路径共享累积状态：若上游随后补发完整
-                    # dict 参数帧，_merge_content 可据此去重。
-                    call_state.append(delta)
-        return delta if delta else None
+        return call_state.feed_content(call) or None
 
     async for event_type, payload in _ordered_transport_events(events, ctx.tool_name):
         if event_type == "ordered_parts" and isinstance(payload, list):
