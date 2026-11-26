@@ -6,6 +6,7 @@ import base64
 import json
 from collections.abc import AsyncIterator
 from copy import deepcopy
+from typing import TypeVar
 from unittest.mock import AsyncMock
 
 import httpx
@@ -32,6 +33,7 @@ SIG_A = base64.b64encode(b"opaque-fixture-state-a").decode()
 SIG_B = base64.b64encode(b"opaque-fixture-state-b").decode()
 SIG_C = base64.b64encode(b"opaque-fixture-state-c").decode()
 SURFACES = ["native", "chat", "claude", "responses"]
+_JSON = TypeVar("_JSON")
 
 
 class FixtureGateway:
@@ -270,13 +272,16 @@ async def test_parallel_original_unsigned_sibling_stays_unsigned(route, mode, su
     assert len(wires[1]) <= PartIndex.THOUGHT_SIGNATURE
 
 
-def _prompt(surface, text):
+def _prompt(surface: str, text: str) -> list[dict[str, object]]:
     if surface == "native":
         return [{"role": "user", "parts": [{"text": text}]}]
     return [{"role": "user", "content": text}]
 
 
-async def _request(client, surface, history):
+async def _request(
+    client: httpx.AsyncClient, surface: str, history: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    body: dict[str, object]
     if surface == "native":
         path = f"/v1beta/models/{MODEL}:generateContent"
         body = {"contents": history}
@@ -301,7 +306,9 @@ async def _request(client, surface, history):
     return data["output"]
 
 
-def _outputs(surface, pairs, name="lookup"):
+def _outputs(
+    surface: str, pairs: list[tuple[str | None, str]], name: str = "lookup"
+) -> list[dict[str, object]]:
     if surface == "native":
         return [
             {
@@ -335,7 +342,7 @@ def _outputs(surface, pairs, name="lookup"):
     ]
 
 
-def _strip_signatures(tree):
+def _strip_signatures(tree: _JSON) -> _JSON:
     if isinstance(tree, list):
         for child in tree:
             _strip_signatures(child)
@@ -506,12 +513,19 @@ async def test_native_mixed_results_reserve_id_and_leave_idless_order_untouched(
     )
     model = await _request(client, "native", initial)
     outputs = _outputs("native", [(None, "first"), (supplied, "second")])
-    for part, attachment in zip(outputs[0]["parts"], ("YQ==", "Yg=="), strict=True):
-        part["functionResponse"]["parts"] = [
+    result_parts = outputs[0]["parts"]
+    assert isinstance(result_parts, list)
+    for part, attachment in zip(result_parts, ("YQ==", "Yg=="), strict=True):
+        assert isinstance(part, dict)
+        response = part["functionResponse"]
+        assert isinstance(response, dict)
+        response["parts"] = [
             {"inlineData": {"mimeType": "image/png", "data": attachment}}
         ]
     # Also exercise two consecutive user Contents in one return batch.
-    split = [{"role": "user", "parts": [p]} for p in outputs[0]["parts"]]
+    split: list[dict[str, object]] = [
+        {"role": "user", "parts": [p]} for p in result_parts
+    ]
     gateway.reply(AistudioPart(text="Done."))
     await _request(client, "native", initial + model + split)
     assert _wire_tools(gateway, 2, "function_response") == [

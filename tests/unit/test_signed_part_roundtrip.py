@@ -297,7 +297,11 @@ async def test_chat_does_not_sign_a_thought_that_scalar_replay_would_move(
     ]
 
 
-CALL = {"function_call": ("lookup", {"city": "Paris"}, "call-fixture")}
+CALL: tuple[str, dict[str, object], str] = (
+    "lookup",
+    {"city": "Paris"},
+    "call-fixture",
+)
 COMPOUNDS = (
     ("Compound caption", {"inline_data": ("image/png", "aGVsbG8=")}),
     (
@@ -307,8 +311,8 @@ COMPOUNDS = (
             "code_execution_result": ("OUTCOME_OK", "1"),
         },
     ),
-    ("Compound caption", CALL),
-    ("", CALL),
+    ("Compound caption", {"function_call": CALL}),
+    ("", {"function_call": CALL}),
 )
 
 
@@ -404,12 +408,12 @@ async def test_later_snapshot_does_not_move_signature_between_different_envelope
         AistudioPart(
             text="Caption." if anchor_has_caption else None,
             thought_signature=first,
-            **CALL,
+            function_call=CALL,
         ),
         AistudioPart(
             text=None if anchor_has_caption else "Caption.",
             thought_signature=later,
-            **CALL,
+            function_call=CALL,
         ),
     )
     if protocol == "native":
