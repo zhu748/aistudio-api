@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 
 import pytest
 
-from aistudio_api.api.schemas import GeminiGenerateContentRequest
+from aistudio_api.api.schemas import (
+    GeminiContent,
+    GeminiGenerateContentRequest,
+    GeminiPart,
+)
 from aistudio_api.api.schemas_compat import (
     ClaudeMessagesRequest,
     OpenAIChatCompletionRequest,
@@ -20,6 +25,8 @@ from aistudio_api.application.compat_service import (
 )
 from aistudio_api.application.responses_service import responses_to_gemini_request
 from aistudio_api.domain import tool_signatures
+from aistudio_api.infrastructure.gateway.model_turns import ModelTurnHistory
+from aistudio_api.infrastructure.gateway.wire_types import AistudioPart
 
 SIGNATURE = base64.b64encode(b"fixture-only-signature").decode()
 SENTINEL = "skip_thought_signature_validator"
@@ -173,9 +180,8 @@ async def test_preset_context_survives_cache_misses(
             {"contents": gemini_contents}
         )
     normalized = normalize_gemini_request(request, model)
-    wire = json.dumps(
-        [content.to_wire() for content in normalized.contents], ensure_ascii=False
-    )
+    outbound, _, _ = ModelTurnHistory().prepare("fixture", normalized.contents)
+    wire = json.dumps([content.to_wire() for content in outbound], ensure_ascii=False)
     for call_id, _name, args, result in HISTORY:
         assert call_id in wire and result in wire
         for value in args.values():
@@ -183,17 +189,14 @@ async def test_preset_context_survives_cache_misses(
     assert normalized.contents[-1].role == "user"
     assert normalized.contents[-1].parts[0].text != " "
     calls = [
-        part
-        for content in normalized.contents
-        for part in content.parts
-        if part.function_call
+        part for content in outbound for part in content.parts if part.function_call
     ]
     assert len(calls) == 3
     assert (
         len(
             [
                 part
-                for content in normalized.contents
+                for content in outbound
                 for part in content.parts
                 if part.function_response
             ]
@@ -367,7 +370,8 @@ async def test_response_signature_cache_records_arguments(isolated_signature_cac
                                 "thoughtSignature": SIGNATURE,
                             }
                         ]
-                    }
+                    },
+                    "finishReason": "STOP",
                 }
             ]
         }
@@ -525,164 +529,50 @@ def test_valid_thought_signature_accepts_urlsafe_and_unpadded_variants():
     assert tool_signatures.valid_thought_signature(SENTINEL)
 
 
-@pytest.mark.asyncio
-async def test_thinking_signature_cache_restores_unsigned_thought(
-    isolated_signature_cache,
+@pytest.mark.parametrize("warm", [False, True])
+def test_split_thinking_replays_exact_parts_only_with_scoped_history(
+    warm, tmp_path, monkeypatch
 ):
-    """thinking 签名缓存:thought part 无签名时按思考全文精确匹配回注。
-
-    客户端回传 reasoning_content 等思考文本但丢失签名载体时,规范化层
-    (_convert_part)以思考全文为键查缓存;有效签名优先于缓存,不匹配的
-    文本不借用(与函数调用缓存的精确匹配哲学一致)。
-    """
-    import base64 as b64
-
-    from aistudio_api.api.schemas import GeminiPart
-    from aistudio_api.application.chat_service import _convert_part
-
-    signature = b64.b64encode(b"thinking-cache-fixture-signature").decode()
-    thought_text = "Careful multi-step reasoning about the weather query."
-    # isolated_signature_cache 已把模块单例替换为临时目录实例,
-    # 模块级函数经由单例写入该实例
-    tool_signatures.remember_thinking_signature(thought_text, signature)
-
-    unsigned = _convert_part(
-        GeminiPart(text=thought_text, thought=True), pending_calls=[]
+    a, b = "First half of reasoning.", "Second half of reasoning."
+    fingerprint = hashlib.sha256((a + b).encode()).hexdigest()
+    path = tmp_path / "pre-upgrade-cache.json"
+    legacy_cache = tool_signatures.ThoughtSignatureCache(path)
+    legacy_cache.remember("thinking", fingerprint, None, SIGNATURE)
+    legacy_cache.flush()
+    monkeypatch.setattr(
+        tool_signatures, "_cache_instance", tool_signatures.ThoughtSignatureCache(path)
     )
-    assert unsigned[0].thought is True
-    assert unsigned[0].thought_signature == signature
-
-    # 携带有效签名的 thought part 不被缓存值覆盖
-    own_signature = b64.b64encode(b"part-own-signature").decode()
-    signed = _convert_part(
-        GeminiPart(text=thought_text, thought=True, thoughtSignature=own_signature),
-        pending_calls=[],
-    )
-    assert signed[0].thought_signature == own_signature
-
-    # 非思考文本 part 不触发 thinking 缓存查询
-    plain = _convert_part(GeminiPart(text=thought_text), pending_calls=[])
-    assert plain[0].thought_signature is None
-
-    # 文本不匹配:不借用签名(缓存精确匹配,无值返回 None)
-    other = _convert_part(
-        GeminiPart(text=thought_text + " altered", thought=True), pending_calls=[]
-    )
-    assert other[0].thought_signature is None
-
-
-def test_thinking_signature_cache_persists_across_reload(tmp_path):
-    """thinking 签名与函数调用签名共用同一持久化文件,重启后可恢复。"""
-    import base64 as b64
-
-    signature = b64.b64encode(b"persisted-thinking-signature").decode()
-    text = "A reasoning summary worth persisting across restarts."
-    cache = tool_signatures.ThoughtSignatureCache(tmp_path / "signatures.json")
-    tool_signatures._cache_instance = cache
-    try:
-        tool_signatures.remember_thinking_signature(text, signature)
-        cache.flush()
-
-        reloaded = tool_signatures.ThoughtSignatureCache(tmp_path / "signatures.json")
-        tool_signatures._cache_instance = reloaded
-        assert tool_signatures.lookup_thinking_signature(text) == signature
-        assert tool_signatures.lookup_thinking_signature(text + " mismatch") is None
-    finally:
-        tool_signatures._cache_instance = None
-
-
-@pytest.mark.asyncio
-async def test_split_thinking_blocks_backfill_by_joined_text(
-    isolated_signature_cache,
-):
-    """客户端把单个 thinking 块拆分回传:逐 part 查找 miss,整轮拼接兜底命中。
-
-    签名缓存键是整轮思考全文(响应侧拼接后收口缓存)。Claude 拆分
-    thinking 块 / Responses 把 reasoning 分散到多条 model 消息时,
-    _backfill_thinking_signatures 在轮合并后按拼接文本查一次,命中挂到
-    最后一个 thought part(末位签名权威语义)。
-    """
-    import base64 as b64
-
-    from aistudio_api.api.schemas import (
-        GeminiContent,
-        GeminiGenerateContentRequest,
-        GeminiPart as GeminiPartSchema,
-    )
-    from aistudio_api.application.chat_service import normalize_gemini_request
-
-    signature = b64.b64encode(b"joined-thinking-signature").decode()
-    full_text = "First half of reasoning." + "Second half of reasoning."
-    tool_signatures.remember_thinking_signature(full_text, signature)
-
     req = GeminiGenerateContentRequest(
         contents=[
-            GeminiContent(
-                role="user", parts=[GeminiPartSchema(text="What is the answer?")]
-            ),
-            # 拆分为两条 assistant 消息、各带一个 thought part(签名全部丢失)
-            GeminiContent(
-                role="model",
-                parts=[GeminiPartSchema(text="First half of reasoning.", thought=True)],
-            ),
+            GeminiContent(role="user", parts=[GeminiPart(text="What is the answer?")]),
+            GeminiContent(role="model", parts=[GeminiPart(text=a, thought=True)]),
             GeminiContent(
                 role="model",
                 parts=[
-                    GeminiPartSchema(text="Second half of reasoning.", thought=True)
+                    GeminiPart(text=b, thought=True),
+                    GeminiPart(text="answer"),
                 ],
             ),
-            GeminiContent(role="user", parts=[GeminiPartSchema(text="Thanks")]),
+            GeminiContent(role="user", parts=[GeminiPart(text="Thanks")]),
         ]
     )
     normalized = normalize_gemini_request(req, "gemini-3.8-flash")
-    # 相邻 model 轮合并为单轮
-    model_turns = [c for c in normalized.contents if c.role == "model"]
-    assert len(model_turns) == 1
-    wires = [part.to_wire() for part in model_turns[0].parts]
-    # 兜底命中:签名挂到最后一个 thought part 的 slot 14（THOUGHT_ALT_FLAG=12）
-    thought_wires = [w for w in wires if len(w) > 12 and w[12] == 1]
-    assert len(thought_wires) == 2
-    assert thought_wires[-1][14] == signature
-    assert not (len(thought_wires[0]) > 14 and thought_wires[0][14])
-
-
-@pytest.mark.asyncio
-async def test_backfill_skips_when_any_thought_part_signed(
-    isolated_signature_cache,
-):
-    """任一 thought part 已带有效签名(envelope 回传成功)时兜底不介入。"""
-    import base64 as b64
-
-    from aistudio_api.api.schemas import (
-        GeminiContent,
-        GeminiGenerateContentRequest,
-        GeminiPart as GeminiPartSchema,
+    history = ModelTurnHistory()
+    if warm:
+        _, _, context = history.prepare("fixture", normalized.contents[:1])
+        assert context is not None
+        capture = context.capture()
+        capture.add(
+            [
+                AistudioPart(text=a + b, thought=True).to_wire(),
+                AistudioPart(text="answer", thought_signature=SIGNATURE).to_wire(),
+            ]
+        )
+        capture.finish(1)
+    outbound, _, _ = history.prepare("fixture", normalized.contents)
+    assert len(outbound) == 3
+    assert [(part.text, part.thought_signature) for part in outbound[1].parts] == (
+        [(a + b, None), ("answer", SIGNATURE)]
+        if warm
+        else [(a, None), (b, None), ("answer", None)]
     )
-    from aistudio_api.application.chat_service import normalize_gemini_request
-
-    own_signature = b64.b64encode(b"own-part-signature").decode()
-    joined_signature = b64.b64encode(b"joined-signature").decode()
-    tool_signatures.remember_thinking_signature("PartA." + "PartB.", joined_signature)
-
-    req = GeminiGenerateContentRequest(
-        contents=[
-            GeminiContent(role="user", parts=[GeminiPartSchema(text="Q")]),
-            GeminiContent(
-                role="model",
-                parts=[
-                    GeminiPartSchema(
-                        text="PartA.", thought=True, thoughtSignature=own_signature
-                    ),
-                    GeminiPartSchema(text="PartB.", thought=True),
-                ],
-            ),
-            GeminiContent(role="user", parts=[GeminiPartSchema(text="A")]),
-        ]
-    )
-    normalized = normalize_gemini_request(req, "gemini-3.8-flash")
-    model_turn = next(c for c in normalized.contents if c.role == "model")
-    wires = [part.to_wire() for part in model_turn.parts]
-    thought_wires = [w for w in wires if len(w) > 12 and w[12] == 1]
-    # 已带签名 part 保持原值,无签名 part 不被兜底污染
-    assert thought_wires[0][14] == own_signature
-    assert not (len(thought_wires[1]) > 14 and thought_wires[1][14])

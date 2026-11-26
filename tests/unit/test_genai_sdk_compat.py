@@ -49,7 +49,7 @@ async def test_genai_sdk_aio_non_streaming(mock_client: MagicMock) -> None:
     """Test async non-streaming generation with official Google GenAI SDK."""
     mock_client.generate_content = AsyncMock(
         return_value=ModelOutput(
-            candidates=[Candidate(text="Hello from AI Studio!")],
+            candidates=[Candidate(text="Hello from AI Studio!", finish_reason=1)],
             usage={
                 "prompt_tokens": 10,
                 "completion_tokens": 20,
@@ -95,6 +95,7 @@ async def test_genai_sdk_aio_streaming(mock_client: MagicMock) -> None:
         yield ("thinking", "Thinking about the greeting...")
         yield ("body", "Hello ")
         yield ("body", "World!")
+        yield ("finish_reason", 1)
         yield (
             "usage",
             {
@@ -168,6 +169,7 @@ async def test_genai_sdk_function_calling_and_response_flow(
                 candidates=[
                     Candidate(
                         text="",
+                        finish_reason=1,
                         function_calls=[
                             {
                                 "name": "get_current_weather",
@@ -181,7 +183,8 @@ async def test_genai_sdk_function_calling_and_response_flow(
         return ModelOutput(
             candidates=[
                 Candidate(
-                    text="The current weather in San Francisco is sunny and 18°C."
+                    text="The current weather in San Francisco is sunny and 18°C.",
+                    finish_reason=1,
                 )
             ],
             usage={"prompt_tokens": 25, "completion_tokens": 15, "total_tokens": 40},

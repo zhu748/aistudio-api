@@ -523,13 +523,17 @@ _RS_THINK = "Reasoning summary of the previous turn."
 _RS_BODY = "Answer text."
 
 
-def _rs_response() -> GeminiGenerateContentResponse:
+def _rs_response(attached: bool) -> GeminiGenerateContentResponse:
     return GeminiGenerateContentResponse(
         candidates=[
             GeminiCandidateResponse(
                 content=GeminiContentResponse(
                     parts=[
-                        GeminiPartResponse(text=_RS_THINK, thought=True),
+                        GeminiPartResponse(
+                            text=_RS_THINK,
+                            thought=True,
+                            thoughtSignature=_RS_SIG if attached else None,
+                        ),
                         GeminiPartResponse(text=_RS_BODY),
                         GeminiPartResponse(text="", thoughtSignature=_RS_SIG),
                     ]
@@ -541,14 +545,16 @@ def _rs_response() -> GeminiGenerateContentResponse:
     )
 
 
-def test_responses_reasoning_item_carries_signature() -> None:
-    """非流式:尾部签名载体随 reasoning item 的 extra_content 下发。"""
-    resp_obj = build_responses_object(_rs_response(), "gemini-3.8-flash")
+@pytest.mark.parametrize("attached", [False, True])
+def test_responses_reasoning_item_carries_signature(attached: bool) -> None:
+    """Do not relabel an independent Part as reasoning metadata."""
+    resp_obj = build_responses_object(_rs_response(attached), "gemini-3.8-flash")
     output = cast(list[dict[str, Any]], resp_obj["output"])
     reasoning_item = next(item for item in output if item.get("type") == "reasoning")
     assert reasoning_item["summary"][0]["text"] == _RS_THINK
-    google = reasoning_item["extra_content"]["google"]
-    assert google["thought_signature"] == _RS_SIG
+    assert reasoning_item.get("extra_content", {}).get("google", {}).get(
+        "thought_signature"
+    ) == (_RS_SIG if attached else None)
 
 
 @pytest.mark.asyncio
@@ -584,15 +590,19 @@ async def test_responses_request_reasoning_item_restored() -> None:
 
 
 @pytest.mark.asyncio
-async def test_responses_stream_reasoning_item_signature() -> None:
-    """流式:尾部独立签名帧 → 关闭 reasoning item 时随 extra_content 下发。"""
+@pytest.mark.parametrize("attached", [False, True])
+async def test_responses_stream_reasoning_item_signature(attached: bool) -> None:
+    """Only attached reasoning signatures appear on the done item."""
+    thought = {"text": _RS_THINK, "thought": True}
+    if attached:
+        thought["thoughtSignature"] = _RS_SIG
     frames: list[dict[str, object]] = [
         {
             "candidates": [
                 {
                     "content": {
                         "role": "model",
-                        "parts": [{"text": _RS_THINK, "thought": True}],
+                        "parts": [thought],
                     }
                 }
             ]
@@ -600,7 +610,13 @@ async def test_responses_stream_reasoning_item_signature() -> None:
         {"candidates": [{"content": {"role": "model", "parts": [{"text": _RS_BODY}]}}]},
         {
             "candidates": [
-                {"content": {"role": "model", "parts": [{"thoughtSignature": _RS_SIG}]}}
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"thoughtSignature": _RS_SIG}],
+                    },
+                    "finishReason": "STOP",
+                }
             ]
         },
     ]
@@ -615,5 +631,6 @@ async def test_responses_stream_reasoning_item_signature() -> None:
             done_items.append(json.loads(data_line.removeprefix("data: "))["item"])
     reasoning_done = [i for i in done_items if i.get("type") == "reasoning"]
     assert reasoning_done, "reasoning item 必须以 output_item.done 收尾"
-    google = reasoning_done[-1]["extra_content"]["google"]
-    assert google["thought_signature"] == _RS_SIG
+    assert reasoning_done[-1].get("extra_content", {}).get("google", {}).get(
+        "thought_signature"
+    ) == (_RS_SIG if attached else None)

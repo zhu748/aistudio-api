@@ -38,6 +38,7 @@ from aistudio_api.application.compat_shared import (
     _as_int,
     _as_str,
     _assert_media_size,
+    _code_text,
     _convert_items_concurrently,
     _file_block_to_part,
     _frame_candidate,
@@ -54,10 +55,7 @@ from aistudio_api.application.compat_shared import (
 from aistudio_api.application.media_session import has_remote_media, media_session
 from aistudio_api.application.stream_utils import StopSequenceBuffer
 from aistudio_api.domain.tool_signatures import (
-    SKIP_THOUGHT_SIGNATURE,
-    lookup_function_signature as _lookup_function_signature,
     remember_function_signature as _remember_function_signature,
-    valid_thought_signature as _valid_thought_signature,
 )
 from aistudio_api.infrastructure.request_context import record_result
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -343,8 +341,7 @@ async def openai_to_gemini_request(
             parts: list[GeminiPart] = []
             # 思考历史回传（DeepSeek 风格 reasoning_content / OpenRouter
             # reasoning 字符串形态）：转为 thought part 保留思考链，签名经
-            # 消息级 extra_content 载体精确回读；缺失时由规范化层
-            # （_convert_part）按思考全文查 thinking 缓存回注。
+            # 消息级 extra_content 载体回读；缺失时不按思考文本猜测签名。
             reasoning_text = message.reasoning_content or (
                 message.reasoning if isinstance(message.reasoning, str) else None
             )
@@ -381,15 +378,9 @@ async def openai_to_gemini_request(
                 name = _as_str(function.get("name")) or "unknown"
                 args = _openai_tool_arguments(function.get("arguments"))
                 call_id = _as_str(tool_call.get("id"))
-                signature = _read_signature(tool_call)
-                if not _valid_thought_signature(signature):
-                    # 客户端未回传可用签名时，仅恢复同一次调用的缓存。
-                    signature = _lookup_function_signature(call_id or None, name, args)
-                if not _valid_thought_signature(signature):
-                    signature = SKIP_THOUGHT_SIGNATURE
                 parts.append(
                     GeminiPart(
-                        thoughtSignature=signature,
+                        thoughtSignature=_read_signature(tool_call),
                         functionCall=GeminiFunctionCall(
                             name=name, args=args, id=call_id or None
                         ),
@@ -604,7 +595,7 @@ def _openai_reasoning_effort(req: OpenAIChatCompletionRequest) -> str | None:
 
 
 def _openai_finish_reason(finish_reason: str | None, *, has_tool_calls: bool) -> str:
-    raw = finish_reason or "STOP"
+    raw = finish_reason or "OTHER"
     # 安全/异常终结优先于 tool_calls：同一帧带 functionCall 但被 SAFETY 拦截时
     # 必须报 content_filter，不能误报成成功完成的 tool_calls。
     mapped = _GEMINI_TO_OPENAI_FINISH.get(raw)
@@ -649,10 +640,7 @@ def build_openai_completion(
     reasoning_parts: list[str] = []
     tool_calls: list[dict[str, object]] = []
     has_tool_calls = False
-    # 尾部空文本签名载体 part 携带的思考链签名（纯文本轮 wire 抓包形态）：
-    # 随消息级 extra_content 下发，供客户端回传 reasoning_content 时与
-    # tool_calls 签名同一载体形态精确还原。
-    trailing_signature: str | None = None
+    reasoning_signature: str | None = None
     # 与 Claude 侧同源的双重防御：上游若不执行 stopSequences（或拒绝该
     # 参数），停止词及其后的全部内容不得泄漏给客户端（Agent 客户端用
     # stop 切分输出/观察边界，泄漏会打穿解析）。
@@ -673,10 +661,17 @@ def build_openai_completion(
         if isinstance(text, str) and text:
             if getattr(part, "thought", None) is True:
                 reasoning_parts.append(text)
+                if (
+                    len(reasoning_parts) == 1
+                    and getattr(part, "functionCall", None) is None
+                ):
+                    reasoning_signature = _as_str(part_signature)
             else:
                 filtered = stops.feed(text)
                 if filtered:
                     text_parts.append(filtered)
+                if stops.hit is not None:
+                    break
         inline = getattr(part, "inlineData", None)
         if inline is not None:
             flush_pending()
@@ -684,11 +679,17 @@ def build_openai_completion(
                 f"\n\n![image](data:{inline.mimeType};base64,{inline.data})"
             )
         function_call = getattr(part, "functionCall", None)
-        # 异常终结（MAX_TOKENS/SAFETY/未知枚举）下丢弃工具调用：截断的
-        # 并行调用集合可能不完整，执行部分调用集有副作用风险——有意与
-        # 流式侧（已冲刷内容无法撤回）不对称，见回归测试
-        # test_non_streaming_interrupted_calls_are_not_executable。
-        if function_call is not None and finish_reason_raw in (None, "STOP"):
+        code = _code_text(
+            getattr(part, "executableCode", None),
+            getattr(part, "codeExecutionResult", None),
+        )
+        if code and (filtered_code := stops.feed(code)):
+            text_parts.append(filtered_code)
+        if (
+            function_call is not None
+            and finish_reason_raw == "STOP"
+            and stops.hit is None
+        ):
             flush_pending()
             has_tool_calls = True
             call_id = function_call.id or f"call_{secrets.token_hex(12)}"
@@ -712,23 +713,6 @@ def build_openai_completion(
                     },
                 }
             )
-        elif (
-            not text
-            and function_call is None
-            and inline is None
-            and isinstance(part_signature, str)
-            and part_signature
-            # 纯文本轮的尾部签名载体必然不与 functionCall 共存（wire 抓包
-            # 形态）；含工具调用的响应里裸签名无法排除是调用签名迟到，
-            # 下发后客户端回传会挂到 thought part 上，可能触发上游
-            # "Corrupted thought signature."，宁缺勿错（与 Claude 侧同款）。
-            and not has_tool_calls
-        ):
-            # 空文本纯签名 part（尾部签名载体）：thought part 自身不带签名
-            # 时签名在这里到达，记录最后出现的值（Gemini 语义：最后一 part
-            # 的签名是整轮的权威签名）。
-            trailing_signature = part_signature
-
     flush_pending()
     content_text = "".join(text_parts)
     message: dict[str, object] = {
@@ -737,9 +721,8 @@ def build_openai_completion(
     }
     if reasoning_parts:
         message["reasoning_content"] = "".join(reasoning_parts)
-        # 思考链签名与思考文本同发：无 reasoning 的轮无思考可绑定，不下发
-        if trailing_signature is not None:
-            message.update(_signature_extra(trailing_signature))
+        if len(reasoning_parts) == 1:
+            message.update(_signature_extra(reasoning_signature))
     if tool_calls:
         message["tool_calls"] = tool_calls
 
@@ -756,7 +739,7 @@ def build_openai_completion(
                 "message": message,
                 "finish_reason": (
                     "stop"
-                    if stops.hit is not None
+                    if stops.hit is not None and finish_reason_raw == "STOP"
                     else _openai_finish_reason(
                         finish_reason_raw, has_tool_calls=has_tool_calls
                     )
@@ -843,8 +826,8 @@ async def openai_stream_adapter(
     # 思考链签名（纯文本轮尾部签名载体 / thought part 附带形态）与思考
     # 增量是否已下发：签名在终结块的 delta.extra_content 下发，与
     # tool_calls 签名同一载体形态，客户端合并 delta 后随消息回传。
-    late_signature: str | None = None
-    saw_reasoning = False
+    reasoning_signature: str | None = None
+    reasoning_count = 0
 
     # 确定性关闭内层 SSE 生成器（3.6）：适配器自身异常或客户端断连时，
     # 不再依赖事件循环的异步生成器终结器延迟释放上游连接。
@@ -955,27 +938,15 @@ async def openai_stream_adapter(
                         if part.get("thought") is True:
                             if stops.hit is None:
                                 yield _sse(_chunk({"reasoning_content": text}, None))
-                            saw_reasoning = True
-                            if isinstance(part_signature, str) and part_signature:
-                                late_signature = part_signature
+                                reasoning_count += 1
+                                if reasoning_count == 1:
+                                    reasoning_signature = _as_str(part_signature)
                             continue
                         if stops.hit is not None:
                             continue
                         filtered = stops.feed(text)
                         if filtered:
                             yield _sse(_chunk({"content": filtered}, None))
-                    elif (
-                        isinstance(part_signature, str)
-                        and part_signature
-                        # 独立签名帧 / 尾部空文本签名载体 part：思考链签名，
-                        # 记录后随终结块 delta 下发（无正文可混入，不产块）。
-                        # 含工具调用的流里裸签名无法排除是调用签名迟到
-                        # （纯文本轮尾部载体必然无 FC，wire 抓包形态）——
-                        # 误当思考链签名下发会在回传时挂到 thought part，
-                        # 可能触发上游 "Corrupted thought signature."。
-                        and not has_tool_calls
-                    ):
-                        late_signature = part_signature
         except Exception as exc:
             saw_error = True
             record_result(
@@ -997,15 +968,15 @@ async def openai_stream_adapter(
                 yield _sse(_chunk({"content": tail}, None))
         finish_reason = (
             "stop"
-            if stops.hit is not None
+            if stops.hit is not None and finish_reason_raw == "STOP"
             else _openai_finish_reason(finish_reason_raw, has_tool_calls=has_tool_calls)
         )
         usage_payload = (
             _openai_usage_from_frame(usage_frame) if usage_frame is not None else None
         )
         final_delta: dict[str, object] = {}
-        if late_signature is not None and saw_reasoning:
-            final_delta.update(_signature_extra(late_signature))
+        if reasoning_count == 1:
+            final_delta.update(_signature_extra(reasoning_signature))
         final_chunk = _chunk(final_delta, finish_reason)
         # OpenAI 语义：仅 include_usage=True 时发送 usage（且以 choices 为空的
         # 独立尾块形式）。False 时任何 chunk 都不得携带 usage 字段，否则 SDK

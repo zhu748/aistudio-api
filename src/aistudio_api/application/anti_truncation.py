@@ -22,13 +22,13 @@ from __future__ import annotations
 import json
 import secrets
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from aistudio_api.application.chat_service import (
     NormalizedGeminiRequest,
     encode_function_declaration_to_wire,
 )
-from aistudio_api.domain.models import ModelOutput
+from aistudio_api.domain.models import ModelOutput, ResponsePart
 from aistudio_api.infrastructure.gateway.model_defaults import (
     get_anti_truncation_settings,
     resolve_model_defaults,
@@ -432,6 +432,27 @@ def restore_anti_truncation_output(
         candidate.text = "".join(restored_parts)
         ctx.restored = True
     candidate.function_calls = real_calls
+    if candidate.ordered_parts is not None:
+        ordered: list[ResponsePart] = []
+        restored_text = candidate.text if ctx.restored else ""
+        for part in candidate.ordered_parts:
+            if (part.function_call or {}).get("name") == ctx.tool_name:
+                if restored_text:
+                    ordered.append(
+                        ResponsePart(
+                            text=restored_text,
+                            text_present=True,
+                            wire_chunk=part.wire_chunk,
+                        )
+                    )
+                    restored_text = ""
+                # The internal transport call's signature is not a signature
+                # for the reconstructed presentation text.
+                part = replace(part, function_call=None, thought_signature="")
+            if ctx.restored and part.text_present and not part.thought:
+                part = _without_plain_text(part)
+            ordered.append(part)
+        candidate.ordered_parts = ordered
 
     logger.info(
         "抗截断非流式还原完成: restored=%s, real_calls=%d, text_len=%d",
@@ -774,6 +795,61 @@ async def restore_anti_truncation_stream(
         await _close_stream_quietly(events)
 
 
+def _without_plain_text(part: ResponsePart) -> ResponsePart:
+    signature = (
+        part.thought_signature
+        if (
+            part.function_call
+            or part.function_response
+            or part.image
+            or part.executable_code is not None
+            or part.code_execution_result is not None
+        )
+        else ""
+    )
+    return replace(part, text="", text_present=False, thought_signature=signature)
+
+
+async def _ordered_transport_events(
+    events: AsyncIterator[tuple[str, object | None]], tool_name: str
+) -> AsyncIterator[tuple[str, object | None]]:
+    """Expose only this variant's internal transport calls to its decoder."""
+    async for kind, payload in events:
+        if kind != "ordered_parts" or not isinstance(payload, list):
+            yield kind, payload
+            continue
+        ordered: list[ResponsePart] = []
+        for part in payload:
+            if not isinstance(part, ResponsePart):
+                continue
+            call = part.function_call
+            name = str((call or {}).get("name") or "")
+            if call is not None and (
+                name == tool_name
+                or (
+                    tool_name.startswith(name)
+                    and not {"args", "arguments"} & call.keys()
+                )
+            ):
+                ordered.append(replace(part, function_call=None, thought_signature=""))
+                yield kind, ordered
+                ordered = []
+                yield (
+                    "tool_calls",
+                    [
+                        {
+                            key: value
+                            for key, value in call.items()
+                            if key != "thought_signature"
+                        }
+                    ],
+                )
+            else:
+                ordered.append(part)
+        if ordered:
+            yield kind, ordered
+
+
 async def _restore_anti_truncation_stream_inner(
     events: AsyncIterator[tuple[str, object | None]],
     ctx: AntiTruncationContext,
@@ -839,7 +915,24 @@ async def _restore_anti_truncation_stream_inner(
                     call_state.append(delta)
         return delta if delta else None
 
-    async for event_type, payload in events:
+    async for event_type, payload in _ordered_transport_events(events, ctx.tool_name):
+        if event_type == "ordered_parts" and isinstance(payload, list):
+            ordered = []
+            for part in payload:
+                if not isinstance(part, ResponsePart):
+                    continue
+                if part.function_call:
+                    real_calls_seen = True
+                if part.text and not part.thought:
+                    if channel == "synthetic":
+                        part = _without_plain_text(part)
+                    else:
+                        channel = "plain"
+                        ctx.plain_seen = True
+                ordered.append(part)
+            if ordered:
+                yield event_type, ordered
+            continue
         if event_type == "body":
             if channel == "synthetic":
                 # 工具频道已胜出，抑制其后的纯文本回声。

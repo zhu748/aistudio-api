@@ -3,7 +3,7 @@
 覆盖：/config 代理凭据掩码、API Key 回退会话写保护清单、countTokens
 空轮 400、stream_parser 闭合 chunk 修复回退、schema 深嵌套彻底降级、
 OpenAI/Claude 适配器错误兜底文本过滤、Responses 错误码映射、签名缓存
-去抖落盘、pending_signature 不覆盖 part 自带签名、历史日志 ts_ms 兜底。
+去抖落盘、签名事件不覆盖 part 自带签名、历史日志 ts_ms 兜底。
 """
 
 from __future__ import annotations
@@ -257,11 +257,8 @@ def test_signature_cache_compact_persistence(tmp_path: Path) -> None:
     assert json.loads(raw)["by_call"]
 
 
-# ─── pending_signature 不覆盖 part 自带签名 ───
-
-
-def test_pending_signature_does_not_override_part_signature() -> None:
-    from aistudio_api.application.api_service_gemini import _event_payload
+def test_opaque_signature_only_stays_on_its_source_event() -> None:
+    from aistudio_api.application.api_service_gemini import _event_parts
 
     call = {
         "call_id": "c1",
@@ -269,18 +266,12 @@ def test_pending_signature_does_not_override_part_signature() -> None:
         "args": {"q": "x"},
         "thought_signature": SIGNATURE,
     }
-    payload = _event_payload("tool_calls", [call], thought_signature="OTHERSIG==")
-    part = payload["candidates"][0]["content"]["parts"][0]  # type: ignore[index]
-    assert part["thoughtSignature"] == SIGNATURE
-
-
-def test_pending_signature_fills_missing_part_signature() -> None:
-    from aistudio_api.application.api_service_gemini import _event_payload
-
-    call = {"call_id": "c1", "name": "f", "args": {"q": "x"}}
-    payload = _event_payload("tool_calls", [call], thought_signature="OTHERSIG==")
-    part = payload["candidates"][0]["content"]["parts"][0]  # type: ignore[index]
-    assert part["thoughtSignature"] == "OTHERSIG=="
+    assert _event_parts("thought_signature", "OTHERSIG==") == [
+        {"thoughtSignature": "OTHERSIG=="}
+    ]
+    assert _event_parts("tool_calls", [call])[0]["thoughtSignature"] == SIGNATURE
+    del call["thought_signature"]
+    assert "thoughtSignature" not in _event_parts("tool_calls", [call])[0]
 
 
 # ─── 历史日志缺 ts_ms 不再 500 ───

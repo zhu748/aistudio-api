@@ -4,11 +4,11 @@
 
 1. 非流式合成 tool id（toolu_/call_）后补记签名缓存——对齐流式路径
    （coalesce 先定 id、recorder 后记忆化），客户端丢失 extra_content
-   载体时按 id 回查仍可命中，思考链/工具调用签名不退化为 SKIP；
+   载体时按 id 回查仍可命中；
 2. Claude SSE message_start 携带真实 input_tokens（等首帧 usageMetadata，
    Anthropic 官方语义；旧版 SDK 不合并 message_delta 的 input 字段）；
 3. build_claude_message 合并连续 thought part 为单 thinking 块——对齐
-   流式形态，并使块文本与思考签名缓存的整段拼接键一致；
+   流式形态；
 4. tool_choice.disable_parallel_tool_use 忽略告警。
 """
 
@@ -28,8 +28,13 @@ from aistudio_api.api.response_models import (
     GeminiGenerateContentResponse,
     GeminiPartResponse,
 )
+from aistudio_api.api.schemas import (
+    GeminiContent,
+    GeminiGenerateContentRequest,
+    GeminiPart,
+)
 from aistudio_api.api.schemas_compat import ClaudeMessagesRequest
-from aistudio_api.application.chat_service import _convert_part
+from aistudio_api.application.chat_service import normalize_gemini_request
 from aistudio_api.application.compat_claude import (
     _claude_blocks_to_parts,
     _claude_tool_choice_to_config,
@@ -39,14 +44,15 @@ from aistudio_api.application.compat_claude import (
 )
 from aistudio_api.application.compat_openai import build_openai_completion
 from aistudio_api.domain import tool_signatures
+from aistudio_api.infrastructure.gateway.model_turns import ModelTurnHistory
 
 _SIG = base64.b64encode(b"upstream-signature-fixture-0123456789").decode()
 _SIG2 = base64.b64encode(b"second-signature-fixture-abcdefghij").decode()
 
 
 @pytest.fixture
-def fresh_signature_cache(monkeypatch: pytest.MonkeyPatch):
-    cache = tool_signatures.ThoughtSignatureCache(path=None)
+def fresh_signature_cache(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    cache = tool_signatures.ThoughtSignatureCache(tmp_path / "signatures.json")
     monkeypatch.setattr(tool_signatures, "get_signature_cache", lambda: cache)
     return cache
 
@@ -184,7 +190,16 @@ async def test_synthetic_tool_id_round_trip_to_upstream(fresh_signature_cache) -
     }
     parts = await _claude_blocks_to_parts([replayed], tool_name_by_id={})
     assert parts[0].functionCall is not None
-    assert parts[0].thoughtSignature == _SIG
+    assert parts[0].thoughtSignature is None
+    request = GeminiGenerateContentRequest(
+        contents=[
+            GeminiContent(role="model", parts=parts),
+            GeminiContent(role="user", parts=[GeminiPart(text="continue")]),
+        ]
+    )
+    normalized = normalize_gemini_request(request, "gemini-3.8-flash")
+    outbound, _, _ = ModelTurnHistory().prepare("fixture", normalized.contents)
+    assert outbound[0].parts[0].thought_signature == _SIG
 
 
 # ---------------------------------------------------------------------------
@@ -290,8 +305,8 @@ def test_contiguous_thought_parts_merge_into_one_block() -> None:
     assert thinking_blocks[0]["thinking"] == "Thinking hard"
 
 
-def test_merged_thought_run_signature_takes_last_real_value() -> None:
-    """段内签名取最后到达的真实值（Gemini 末位签名权威语义）。"""
+def test_signed_thought_keeps_its_own_part() -> None:
+    """Consecutive thinking text must not inherit its neighbor’s signature."""
     response = _gemini_response(
         [
             GeminiPartResponse(text="part one", thought=True),
@@ -300,36 +315,14 @@ def test_merged_thought_run_signature_takes_last_real_value() -> None:
         ]
     )
     message = build_claude_message(response, "m", None)
-    thinking_block = next(b for b in _blocks(message) if b["type"] == "thinking")
+    blocks = [b for b in _blocks(message) if b["type"] == "thinking"]
     from aistudio_api.application.compat_errors import _read_claude_signature
 
-    assert _read_claude_signature(thinking_block["signature"]) == _SIG2
-
-
-async def test_merged_thinking_block_matches_signature_cache_key() -> None:
-    """合并后块文本 == 思考签名缓存的整段拼接键：客户端丢签名仍可回注。"""
-    from aistudio_api.application.compat_errors import _claude_signature
-    from aistudio_api.domain.tool_signatures import remember_thinking_signature
-
-    # 上游一次响应：thought 分两 part 到达，签名经尾部载体（remember 键为
-    # 全文拼接 "Thinking hard"）
-    remember_thinking_signature("Thinking hard", _SIG)
-    # 客户端把 build_claude_message 合并后的单 thinking 块原样回传，但
-    # signature 为占位（信封解析不出真实值）
-    parts = await _claude_blocks_to_parts(
-        [
-            {
-                "type": "thinking",
-                "thinking": "Thinking hard",
-                "signature": _claude_signature(None),
-            }
-        ],
-        tool_name_by_id={},
-    )
-    # GeminiPart 阶段无签名 → chat_service._convert_part 按全文查缓存回注
-    converted = _convert_part(parts[0], pending_calls=[])
-    assert converted[0].thought is True
-    assert converted[0].thought_signature == _SIG
+    assert [block["thinking"] for block in blocks] == ["part one", "part two"]
+    assert [_read_claude_signature(block["signature"]) for block in blocks] == [
+        None,
+        _SIG2,
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -368,18 +361,20 @@ def test_tool_choice_without_flag_no_warning(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("signed_thought", [False, True])
 async def test_claude_code_tool_turn_replay_with_stripped_signature(
     fresh_signature_cache,
+    signed_thought,
 ) -> None:
-    """Claude Code 回放形态：thinking + tool_use（签名载体被剥离）+ tool_result。
-
-    合成 id 补记（Fix1）+ thinking 块合并（Fix3）双管齐下后，整轮回放
-    无任何签名退化为 SKIP（thought part 恢复真实签名，functionCall 经
-    缓存恢复真实签名）。
-    """
+    """An unsigned thought never takes a tool signature; an explicit one survives."""
+    expected_thought_signature = _SIG2 if signed_thought else None
     response = _gemini_response(
         [
-            GeminiPartResponse(text="Thinking hard", thought=True),
+            GeminiPartResponse(
+                text="Thinking hard",
+                thought=True,
+                thoughtSignature=expected_thought_signature,
+            ),
             GeminiPartResponse(
                 functionCall=GeminiFunctionCallPayload(
                     name="Bash", args={"command": "ls"}
@@ -402,11 +397,11 @@ async def test_claude_code_tool_turn_replay_with_stripped_signature(
                 {
                     "role": "assistant",
                     "content": [
-                        # thinking 块 signature 占位（客户端未保留真实信封）
+                        # The real thinking signature, when present, is independent.
                         {
                             "type": "thinking",
                             "thinking": thinking_block["thinking"],
-                            "signature": "invalid-placeholder",
+                            "signature": thinking_block["signature"],
                         },
                         # tool_use 剥离 extra_content（未知字段）
                         {
@@ -431,21 +426,18 @@ async def test_claude_code_tool_turn_replay_with_stripped_signature(
         }
     )
     gemini_req, _ = await claude_to_gemini_request(req)
-    # 思考签名的缓存回注发生在 normalize 层（chat_service._convert_part），
-    # 兼容层只负责剥离占位信封
-    from aistudio_api.application.chat_service import normalize_gemini_request
-
     normalized = normalize_gemini_request(gemini_req, "gemini-2.5-pro")
-    model_turn = normalized.contents[1]
+    outbound, _, _ = ModelTurnHistory().prepare("fixture", normalized.contents)
+    model_turn = outbound[1]
     thought_part = next(p for p in model_turn.parts if p.thought)
-    assert thought_part.thought_signature == _SIG
+    assert thought_part.thought_signature == expected_thought_signature
     fc_part = next(p for p in model_turn.parts if p.function_call)
     fc = fc_part.function_call
     assert fc is not None
     assert fc[0] == "Bash"
     assert fc_part.thought_signature == _SIG
     # tool_result 反查名字正确（id 匹配）
-    fr_part = next(p for p in normalized.contents[2].parts if p.function_response)
+    fr_part = next(p for p in outbound[2].parts if p.function_response)
     fr = fr_part.function_response
     assert fr is not None
     assert fr[0] == "Bash"

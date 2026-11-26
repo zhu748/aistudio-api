@@ -17,6 +17,23 @@ class GeneratedImage:
     raw_b64: str | None = field(default=None, repr=False)
 
 
+@dataclass(slots=True)
+class ResponsePart:
+    """One decoded upstream Part, including the owner of any opaque signature."""
+
+    text: str = ""
+    text_present: bool = False
+    inline_data: tuple[str, str] | None = None
+    thought: bool = False
+    function_call: dict[str, object] | None = None
+    function_response: dict[str, object] | None = None
+    thought_signature: str = ""
+    executable_code: object | None = None
+    code_execution_result: object | None = None
+    image: GeneratedImage | None = None
+    wire_chunk: int = 0
+
+
 @dataclass
 class Candidate:
     text: str = ""
@@ -32,6 +49,8 @@ class Candidate:
     finish_message: str = ""
     safety_ratings: list[dict[str, object]] = field(default_factory=list)
     raw_parts: list[list[object]] = field(default_factory=list, repr=False)
+    ordered_parts: list[ResponsePart] | None = field(default=None, repr=False)
+    tool_interrupted: bool = False
 
     @property
     def has_content(self) -> bool:
@@ -93,4 +112,5 @@ __all__ = [
     "Candidate",
     "GeneratedImage",
     "ModelOutput",
+    "ResponsePart",
 ]

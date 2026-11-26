@@ -80,6 +80,9 @@ async def test_failed_stream_closes_partial_items_as_incomplete_only_once(failur
         if event["type"] == "response.output_item.done"
     ]
     assert len(done) == 2
-    assert all(item["status"] == "incomplete" for item in done)
+    assert [(item["type"], item["status"]) for item in done] == [
+        ("reasoning", "completed"),
+        ("message", "incomplete"),
+    ]
     assert events[-1]["type"] == "response.failed"
     assert events[-1]["response"]["output"] == done

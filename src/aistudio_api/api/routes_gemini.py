@@ -69,7 +69,9 @@ async def generate_content(
             anti_truncation=_parse_anti_truncation_header(http_request),
         )
         assert isinstance(response, GeminiGenerateContentResponse)
-        return JSONResponse(response.model_dump(mode="json"))
+        # An absent field and a present empty-text signature carrier are
+        # different Parts. Serialize only fields belonging to that Part.
+        return JSONResponse(response.model_dump(mode="json", exclude_none=True))
 
     return await keepalive_response(respond, http_request)
 

@@ -40,9 +40,6 @@ from aistudio_api.application.schema_wire_codec import (  # noqa: F401
     encode_schema_to_wire,
 )
 from aistudio_api.domain.tool_signatures import (
-    SKIP_THOUGHT_SIGNATURE,
-    lookup_function_signature as _lookup_function_signature,
-    lookup_thinking_signature as _lookup_thinking_signature,
     tool_history_text,
     valid_thought_signature_or_none as _valid_thought_signature_or_none,
 )
@@ -715,18 +712,13 @@ def _convert_part(
     """
     parts: list[AistudioPart] = []
     if part.text is not None:
-        is_thought = bool(part.thought)
         parts.append(
             AistudioPart(
                 text=part.text,
-                thought=is_thought,
+                thought=bool(part.thought),
                 thought_signature=_valid_thought_signature_or_none(
                     part.thoughtSignature
-                )
-                # 思考文本无有效签名时按全文精确匹配回注 thinking 缓存
-                # （客户端回传 reasoning_content 等丢失签名载体的场景，
-                # 与 functionCall 的缓存回注同一兜底哲学）。
-                or (_lookup_thinking_signature(part.text) if is_thought else None),
+                ),
             )
         )
         return parts
@@ -745,18 +737,15 @@ def _convert_part(
     if part.functionCall is not None:
         fc = part.functionCall
         args_payload = fc.args if fc.args is not None else {}
-        signature = (
-            _valid_thought_signature_or_none(part.thoughtSignature)
-            or _lookup_function_signature(fc.id, fc.name, args_payload)
-            or SKIP_THOUGHT_SIGNATURE
-        )
         pending_calls.append((fc.id, fc.name))
         parts.append(
             AistudioPart(
                 function_call=(fc.name, args_payload, fc.id)
                 if fc.id
                 else (fc.name, args_payload),
-                thought_signature=signature,
+                thought_signature=_valid_thought_signature_or_none(
+                    part.thoughtSignature
+                ),
             )
         )
         return parts
@@ -832,38 +821,11 @@ def _convert_part(
     return parts
 
 
-def _backfill_thinking_signatures(contents: list[AistudioContent]) -> None:
-    """思考链签名整轮兜底回注（合并相邻同角色轮之后）。
-
-    签名缓存键是**整轮思考全文**（响应侧把该轮全部 thought part 拼接后
-    收口缓存）。客户端把单个 thinking 块拆分成多块回传、或把一轮思考
-    分散到多条 assistant 消息时，``_convert_part`` 的逐 part 精确匹配会
-    全部 miss。合并后按整轮拼接文本再查一次，命中则挂到最后一个
-    thought part（Gemini 语义：末位 part 的签名是整轮权威签名）。
-    任一 thought part 已带有效签名（客户端 envelope 载体回传成功）时
-    不介入——部分保留部分回注的混合形态无从判定归属。
-    """
-    for content in contents:
-        if content.role != "model":
-            continue
-        thought_indices = [
-            index for index, part in enumerate(content.parts) if part.thought
-        ]
-        if not thought_indices or any(
-            content.parts[index].thought_signature for index in thought_indices
-        ):
-            continue
-        joined = "".join(content.parts[index].text or "" for index in thought_indices)
-        signature = _lookup_thinking_signature(joined)
-        if signature:
-            content.parts[thought_indices[-1]].thought_signature = signature
-
-
 def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioContent]:
     """contents → AistudioContent 轮次列表（含 pending call 追踪与剥离残留清理）。
 
-    Only orphan/reordered results need a transcript. Unsigned calls retain
-    their native structure using the explicit skip-signature literal.
+    Only orphan/reordered results need a transcript. Preserve signature
+    presence and position until scoped model-turn history has been checked.
     user 轮（无 functionResponse）清空挂起调用表，保证跨轮不误匹配。
     剥离残留清理：丢弃全空轮（WAA 403）并合并相邻同角色轮，
     详见 _drop_hollow_and_merge_same_role docstring。
@@ -879,9 +841,7 @@ def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioConte
             p for part in content.parts for p in _convert_part(part, pending_calls)
         ]
         contents.append(AistudioContent(role=role, parts=parts))
-    merged = _drop_hollow_and_merge_same_role(contents)
-    _backfill_thinking_signatures(merged)
-    return merged
+    return _drop_hollow_and_merge_same_role(contents)
 
 
 def _normalize_system_instruction(

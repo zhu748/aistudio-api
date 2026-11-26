@@ -103,16 +103,10 @@ _CLAUDE_ERROR_TYPE: dict[int, str] = {
     529: "overloaded_error",
 }
 
-# Claude thinking 占位签名：满足协议必需的 signature 字段，
-# 回传输入侧会被丢弃（不透传给上游，避免伪造 thoughtSignature 被风控）
-_CLAUDE_DUMMY_SIGNATURE = base64.b64encode(b"aistudio-api-compat-thinking").decode(
-    "ascii"
-)
-
 
 def _claude_signature(signature: object) -> str:
     if not isinstance(signature, str) or not signature:
-        return _CLAUDE_DUMMY_SIGNATURE
+        return ""
     return base64.b64encode(
         json.dumps({"aistudio_thought_signature": signature}).encode()
     ).decode("ascii")

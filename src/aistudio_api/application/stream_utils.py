@@ -135,204 +135,348 @@ class StopSequenceBuffer:
         return text[:-hold] if hold else text
 
 
-@dataclass
+@dataclass(slots=True, eq=False)
 class _ToolCall:
     call_id: str
-    name: str
+    envelope: dict[str, object]
+    name: str = ""
     args: dict[str, object] | None = None
     fragments: list[str] = field(default_factory=list)
     size: int = 0
-    signature: str = ""
-    # call_id 是否为本地合成（上游未下发 id）：混合 id 分片链采纳真实
-    # id 时只允许并入合成 id 的链——真实 id 的链属于确定的调用，并行
-    # 同名函数分片时误并入会串联两条链的参数。
-    synthetic_id: bool = False
+    invalid: bool = False
 
-    def update(self, call: dict[str, object], signature: str) -> None:
-        name = call.get("name")
-        if isinstance(name, str) and len(name) >= len(self.name):
+    def matches(self, name: str) -> bool:
+        return self.name.startswith(name) or name.startswith(self.name)
+
+    def awaiting_args(self) -> bool:
+        if self.invalid or self.args is not None:
+            return False
+        if not self.fragments or not self.fragments[-1].rstrip().endswith("}"):
+            return True
+        return self.complete_args() is None
+
+    def matches_snapshot(self, name: str, snapshot: str) -> bool:
+        """Only a compatible prefix links a named ID-less full snapshot."""
+        if self.call_id or self.name != name or not self.fragments or not snapshot:
+            return False
+        quoted = escaped = False
+        offset = 0
+        for fragment in self.fragments:
+            for char in fragment:
+                if not quoted and char in " \t\r\n":
+                    continue
+                if offset >= len(snapshot) or char != snapshot[offset]:
+                    return False
+                offset += 1
+                if escaped:
+                    escaped = False
+                elif quoted and char == "\\":
+                    escaped = True
+                elif char == '"':
+                    quoted = not quoted
+        return offset > 0
+
+    def update(self, name: str, args: object, signature: object) -> None:
+        if not self.matches(name):
+            self.invalid = True
+        elif len(name) > len(self.name):
+            if self.name and self.args is not None:
+                self.envelope.pop("thoughtSignature", None)
             self.name = name
-        if signature:
-            self.signature = signature
-        args = call.get("args")
+
         if isinstance(args, dict):
-            self.size = len(
-                json.dumps(args, ensure_ascii=False, separators=(",", ":")).encode(
-                    "utf-8"
-                )
+            if self.args is not None and args != self.args:
+                self.envelope.pop("thoughtSignature", None)
+            self.size = _utf8_size(
+                json.dumps(args, ensure_ascii=False, separators=(",", ":"))
             )
-            if self.size > _MAX_TOOL_ARGUMENT_BYTES:
-                raise ValueError("Tool arguments exceed configured size limit")
             self.args = args
             self.fragments.clear()
-        elif isinstance(args, str):
+        elif isinstance(args, str) and args and (self.fragments or args.strip()):
             if self.args is not None:
-                if not args.strip():
-                    return  # Empty/default updates carry no replacement arguments.
-                # An explicit-ID call can change representations while pending.
-                # The latest snapshot/shards replace an earlier object; keeping
-                # the object would execute stale arguments after a new update.
+                self.envelope.pop("thoughtSignature", None)
                 self.args = None
-                self.fragments.clear()
                 self.size = 0
-            fragment_size = len(args.encode("utf-8"))
+            new_size = _utf8_size(args)
             if (
                 self.fragments
-                and fragment_size >= self.size
+                and new_size >= self.size
                 and args.startswith(self.fragments[0])
+                and args.startswith("".join(self.fragments))
             ):
-                previous = "".join(self.fragments)
-                if args.startswith(previous):
-                    self.fragments.clear()
-                    self.size = 0
-            self.size += fragment_size
-            if self.size > _MAX_TOOL_ARGUMENT_BYTES:
-                raise ValueError("Tool arguments exceed configured size limit")
-            if not self.fragments:
-                try:
-                    parsed = json.loads(args)
-                except ValueError:
-                    parsed = None
-                if isinstance(parsed, dict):
-                    # Complete JSON objects are calls/snapshots, rather than
-                    # argument shards belonging to the next ID-less call.
-                    self.args = parsed
-                    return
+                self.fragments.clear()
+                self.size = 0
+            self.size += new_size
+            if len(self.fragments) >= 16_384:
+                raise ValueError(
+                    "Tool argument fragment count exceeds configured size limit"
+                )
             self.fragments.append(args)
-        elif args is not None and not isinstance(args, (dict, str)):
-            raise ValueError(
-                "Tool arguments must be an object or JSON object fragments"
-            )
+        elif args is not None and not isinstance(args, str):
+            self.invalid = True
+        if self.size > _MAX_TOOL_ARGUMENT_BYTES:
+            raise ValueError("Tool arguments exceed configured size limit")
+        if isinstance(signature, str) and signature:
+            self.envelope["thoughtSignature"] = signature
 
-    def part(self) -> dict[str, object] | None:
-        """组装完成的 wire part；参数不可用时返回 None（由调用方告警作废）。"""
-        args = self.args
-        if args is None:
-            raw = "".join(self.fragments)
-            try:
-                args = json.loads(raw) if raw.strip() else {}
-            except ValueError:
-                # 分片被内容边界打断/上游残帧：作废该调用而非让整条流硬失败。
-                return None
-            if not isinstance(args, dict):
-                return None
-        part: dict[str, object] = {
-            "functionCall": {
-                "id": self.call_id,
-                "name": self.name or "unknown",
-                "args": args,
-            }
-        }
-        if self.signature:
-            part["thoughtSignature"] = self.signature
-        return part
+    def complete_args(self) -> dict[str, object] | None:
+        if self.invalid:
+            return None
+        if self.args is not None:
+            return self.args
+        if not self.fragments:
+            return {}
+        try:
+            result = json.loads("".join(self.fragments))
+        except ValueError:
+            return None
+        return result if isinstance(result, dict) else None
+
+    def part(self, *, synthesize_ids: bool) -> dict[str, object] | None:
+        args = self.complete_args()
+        if not self.name or args is None:
+            return None
+        call: dict[str, object] = {"name": self.name, "args": args}
+        if self.call_id:
+            call["id"] = self.call_id
+        elif synthesize_ids:
+            call["id"] = f"call_{secrets.token_hex(12)}"
+        return {**self.envelope, "functionCall": call}
 
 
-def _separate_part_payloads(parts: list[object]) -> list[object]:
-    """Keep captions before media/calls when an upstream part combines fields."""
-    separated: list[object] | None = None
-    payload_fields = ("text", "inlineData", "functionCall")
-    for index, part in enumerate(parts):
+def has_response_content(part: dict[str, object]) -> bool:
+    return any(
+        part.get(key)
+        for key in (
+            "text",
+            "inlineData",
+            "functionCall",
+            "functionResponse",
+            "executableCode",
+            "codeExecutionResult",
+        )
+    )
+
+
+def _without_call(part: dict[str, object]) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in part.items()
+        if key not in {"functionCall", "thoughtSignature"}
+    }
+
+
+def _utf8_size(value: str) -> int:
+    return len(value) if value.isascii() else len(value.encode("utf-8"))
+
+
+def _retained_size(value: object) -> int:
+    if isinstance(value, str):
+        return _utf8_size(value) + 2
+    if isinstance(value, dict):
+        return 2 + sum(
+            _retained_size(key) + _retained_size(entry) + 2
+            for key, entry in value.items()
+        )
+    if isinstance(value, list):
+        return 2 + sum(_retained_size(entry) + 1 for entry in value)
+    return 16
+
+
+class ToolResponseAssembler:
+    """Hold executable calls and the suffix they precede until confirmed STOP.
+
+    Plain leading content remains live. A stable ID anchors the first Part's
+    position across snapshots; anonymous shards join only an unambiguous
+    pending chain. Detached signature carriers are ordinary ordered Parts,
+    never implicit updates to the last tool.
+    """
+
+    def __init__(self, *, synthesize_ids: bool = False) -> None:
+        self.synthesize_ids = synthesize_ids
+        self._ordered: list[dict[str, object] | _ToolCall] = []
+        self._by_id: dict[str, _ToolCall] = {}
+        self._recent: list[_ToolCall] = []
+        self._calls: list[_ToolCall] = []
+        self._retained_bytes = 0
+        self._argument_bytes = 0
+        self._delivered = False
+        self._interrupted = False
+
+    def block_tools(self) -> list[dict[str, object]]:
+        kept, _ = self.finish("OTHER")
+        self._ordered.clear()
+        self._by_id.clear()
+        self._recent.clear()
+        self._calls.clear()
+        self._retained_bytes = self._argument_bytes = 0
+        self._interrupted = True
+        return kept
+
+    def _retain(self, part: dict[str, object] | _ToolCall, size: int) -> None:
+        self._retained_bytes += size
         if (
-            isinstance(part, dict)
-            and "functionCall" not in part
-            and sum(part.get(key) is not None for key in payload_fields) > 1
+            len(self._ordered) >= 16_384
+            or self._argument_bytes + self._retained_bytes > _MAX_TOOL_RESPONSE_BYTES
         ):
-            if separated is None:
-                separated = list(parts[:index])
-            metadata = {
-                key: value for key, value in part.items() if key not in payload_fields
-            }
-            separated.extend(
-                {**metadata, key: part[key]}
-                for key in payload_fields
-                if part.get(key) is not None
+            raise ValueError("Ordered tool response exceeds configured size limit")
+        self._ordered.append(part)
+
+    def feed(self, parts: list[dict[str, object]]) -> list[dict[str, object]]:
+        leading: list[dict[str, object]] = []
+        seen: set[_ToolCall] = set()
+        for part in parts:
+            raw = part.get("functionCall")
+            if self._interrupted and isinstance(raw, dict):
+                part = _without_call(part)
+                raw = None
+                if not has_response_content(part) and "text" not in part:
+                    continue
+            if not isinstance(raw, dict):
+                if has_response_content(part):
+                    self._recent.clear()
+                if self._ordered:
+                    self._retain(part, _retained_size(part))
+                else:
+                    self._delivered |= has_response_content(part)
+                    leading.append(part)
+                continue
+
+            raw_id, raw_name = raw.get("id"), raw.get("name")
+            call_id = raw_id if isinstance(raw_id, str) else ""
+            name = raw_name if isinstance(raw_name, str) else ""
+            args = raw.get("args")
+            # Complete named objects are independent unless there is an
+            # identifiable chain of incomplete argument shards to replace.
+            if isinstance(args, str) and args.lstrip().startswith("{"):
+                if _utf8_size(args) > _MAX_TOOL_ARGUMENT_BYTES:
+                    raise ValueError("Tool arguments exceed configured size limit")
+                if args.rstrip().endswith("}"):
+                    try:
+                        snapshot = json.loads(args)
+                    except ValueError:
+                        snapshot = None
+                    if isinstance(snapshot, dict):
+                        args = snapshot
+
+            tool = self._by_id.get(call_id) if call_id else None
+            if tool is None:
+                snapshot = (
+                    json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+                    if not call_id
+                    and name
+                    and isinstance(args, dict)
+                    and any(pending.fragments for pending in self._recent)
+                    else ""
+                )
+                matches = [
+                    pending
+                    for pending in self._recent
+                    if pending not in seen
+                    and (not call_id or not pending.call_id)
+                    and (
+                        call_id
+                        or not name
+                        or not isinstance(args, dict)
+                        or pending.matches_snapshot(name, snapshot)
+                    )
+                    and pending.matches(name)
+                    and (
+                        pending.awaiting_args()
+                        or (not name and args is None)
+                        or not pending.name
+                    )
+                ]
+                if len(matches) == 1:
+                    tool = matches[0]
+                    if call_id:
+                        tool.call_id = call_id
+                        self._retained_bytes += _utf8_size(call_id)
+                elif len(matches) > 1:
+                    # No identity information makes this update unsafe to
+                    # assign. Do not guess among parallel calls.
+                    for pending in matches:
+                        pending.invalid = True
+            if tool is None:
+                if len(self._calls) >= 256:
+                    raise ValueError("Too many tool calls in one response")
+                envelope = _without_call(part)
+                tool = _ToolCall(call_id, envelope)
+                self._calls.append(tool)
+                self._recent.append(tool)
+                self._retain(tool, _retained_size(envelope) + _utf8_size(call_id))
+            else:
+                caption = _without_call(part)
+                if has_response_content(caption) or "text" in caption:
+                    self._retain(caption, _retained_size(caption))
+            seen.add(tool)
+            if call_id:
+                self._by_id[call_id] = tool
+            old_size = tool.size
+            old_fields_size = _retained_size(tool.name) + _retained_size(
+                tool.envelope.get("thoughtSignature")
             )
-        elif separated is not None:
-            separated.append(part)
-    return parts if separated is None else separated
+            tool.update(name, args, part.get("thoughtSignature"))
+            self._retained_bytes += (
+                _retained_size(tool.name)
+                + _retained_size(tool.envelope.get("thoughtSignature"))
+                - old_fields_size
+            )
+            self._argument_bytes += tool.size - old_size
+            if self._argument_bytes + self._retained_bytes > _MAX_TOOL_RESPONSE_BYTES:
+                raise ValueError(
+                    "Total tool arguments and ordered response exceed configured size limit"
+                )
+        return leading
 
-
-def _has_function_call(parts: list[object]) -> bool:
-    """帧内是否含 functionCall part（快路径判定，单次遍历）。"""
-    return any(isinstance(part, dict) and "functionCall" in part for part in parts)
+    def finish(
+        self, reason: str, *, error_on_empty_invalid: bool = False
+    ) -> tuple[list[dict[str, object]], str]:
+        calls: dict[_ToolCall, dict[str, object]] = {}
+        invalid: _ToolCall | None = None
+        if reason == "STOP":
+            for tool in self._calls:
+                part = tool.part(synthesize_ids=self.synthesize_ids)
+                if part is None:
+                    invalid = tool
+                    reason = "MALFORMED_FUNCTION_CALL"
+                    break
+                calls[tool] = part
+        kept: list[dict[str, object]] = []
+        for value in self._ordered:
+            if isinstance(value, _ToolCall):
+                if reason == "STOP":
+                    kept.append(calls[value])
+                else:
+                    caption = _without_call(value.envelope)
+                    if has_response_content(caption) or "text" in caption:
+                        kept.append(caption)
+            else:
+                kept.append(value)
+        if invalid is not None:
+            ident = invalid.name or invalid.call_id or "unnamed call"
+            if error_on_empty_invalid and not (
+                self._delivered or any(has_response_content(part) for part in kept)
+            ):
+                raise ValueError(f"Incomplete tool arguments for {ident}")
+            logger.warning(
+                "Incomplete tool arguments for %s; tool batch discarded", ident
+            )
+        return kept, reason
 
 
 async def coalesce_tool_frames(
     source: AsyncIterable[dict[str, object]],
 ) -> AsyncGenerator[dict[str, object], None]:
-    """Merge explicit-ID snapshots/shards; preserve independent ID-less calls.
-
-    Calls close at a content boundary, finish or EOF. This avoids exposing a
-    partial JSON argument as an executable call. Plain text frames pass through.
-
-    残缺调用的处理分两个场景（2026-11 工具链路审计）：
-
-    - 内容边界（独立文本帧/图注插入分片中间）：作废该调用并告警，流继续——
-      已产出的正文不应为一个残缺分片陪葬（旧行为是整流硬失败 500）。
-    - 流终结（STOP/EOF）且全流无任何已投递内容：保持报错。此时响应的
-      唯一载荷就是这次调用，静默作废会变成空回（与空回防护同一哲学）。
-
-    分片链的三种 id 形态（均归并到同一 _ToolCall）：
-
-    - 同 id 分片：by_id 直接命中；
-    - 无 id 分片：名称兼容时延伸最后一个未完成调用；
-    - 混合 id 链（首帧无 id、续帧才携带真实 id——JSPB 渐进填充形态，
-      anti_truncation 的 call_id 补填分支同源）：by_id miss 且最后一个
-      pending 调用仍是合成 id 的未完成链时并入该链并采纳真实 id。
-      合成 id 尚未投递给客户端，改写安全；后续同 id 分片经 by_id 命中
-      继续累积。带完整参数的独立调用不受影响（args 已是 dict 或可独立
-      解析的完整 JSON 时，并入与否结果等价：dict 快照整体替换分片）。
-    """
-    pending: list[_ToolCall] = []
-    by_id: dict[str, _ToolCall] = {}
-    sent: dict[str, dict[str, object]] = {}
-    total_size = 0
-    # 本流是否已向客户端投递过任何内容部件（文本/图片/完整调用）。
-    # 终结时若一无所出且仅剩残缺调用，报错好过静默空回。
-    delivered = False
-
-    def flush(
-        *, before: _ToolCall | None = None, terminal: bool = False
-    ) -> dict[str, object] | None:
-        parts: list[dict[str, object]] = []
-        count = pending.index(before) if before is not None else len(pending)
-        ready_tools = pending[:count]
-        del pending[:count]
-        for tool in ready_tools:
-            by_id.pop(tool.call_id, None)
-            part = tool.part()
-            if part is None:
-                if terminal and not delivered:
-                    # 全流无任何已投递内容且唯一载荷是残缺调用：报错好过
-                    # 静默空回（与空回防护同一哲学）。
-                    raise ValueError(
-                        f"Incomplete tool arguments for {tool.name or tool.call_id}"
-                    )
-                # 分片被独立文本帧/内容边界打断：作废该调用并告警，
-                # 不让整条流硬失败。
-                logger.warning(
-                    "丢弃参数不完整的工具调用 %s（分片中断或非对象载荷）",
-                    tool.name or tool.call_id,
-                )
-                continue
-            previous = sent.get(tool.call_id)
-            if previous is not None:
-                if previous.get("functionCall") != part.get("functionCall"):
-                    # 上游对已完成调用下发了不同内容：保留已投递版本（客户端
-                    # 已按旧内容执行）并告警，不再硬失败。
-                    logger.warning(
-                        "上游修改了已完成的工具调用 %s，保留已投递版本",
-                        tool.call_id,
-                    )
-                continue
-            sent[tool.call_id] = part
-            parts.append(part)
-        return {"candidates": [{"content": {"parts": parts}}]} if parts else None
-
+    """Normalize Gemini-compatible SSE input not produced by the local gateway."""
+    assembler = ToolResponseAssembler(synthesize_ids=True)
+    terminal: dict[str, object] = {}
+    reason = "OTHER"
     async for frame in source:
         if "error" in frame:
-            # Never flush uncompleted tool calls after an upstream failure.
+            kept, _ = assembler.finish("OTHER")
+            if kept:
+                yield {"candidates": [{"content": {"parts": kept}}]}
             yield frame
             return
         candidates = frame.get("candidates")
@@ -341,162 +485,45 @@ async def coalesce_tool_frames(
             yield frame
             continue
         content = candidate.get("content")
-        parts = content.get("parts", []) if isinstance(content, dict) else []
-        if not isinstance(parts, list):
-            parts = []
-        # 快路径单次遍历：无 pending 调用时同时判定「纯文本/图片帧（无
-        # functionCall、无多载荷组合 part）」，命中直接透传原 frame，
-        # 免去 _separate_part_payloads 的第二次全量遍历（纯文本流是
-        # 绝对主流形态，实测每帧省约 1µs）。
-        if not pending:
-            simple = True
-            for part in parts:
-                if not isinstance(part, dict):
-                    simple = False
-                    break
-                if "functionCall" in part:
-                    simple = False
-                    break
-                if part.get("text") is not None and part.get("inlineData") is not None:
-                    simple = False
-                    break
-            if simple:
-                if parts:
-                    delivered = True
-                yield frame
-                continue
-        parts = _separate_part_payloads(parts)
-        # The fast path yields the frame directly; include any separated fields
-        # there as well, before interrupted calls are filtered below.
-        if isinstance(content, dict) and parts is not content.get("parts"):
-            candidate = {**candidate, "content": {**content, "parts": parts}}
-            frame = {**frame, "candidates": [candidate]}
-        interrupted = (
-            bool(candidate.get("finishReason")) and candidate["finishReason"] != "STOP"
+        raw_parts = content.get("parts", []) if isinstance(content, dict) else []
+        parts = (
+            [p for p in raw_parts if isinstance(p, dict)]
+            if isinstance(raw_parts, list)
+            else []
         )
-        if interrupted:
-            # Decide before any content boundary can flush pending calls.
-            total_size -= sum(tool.size for tool in pending if tool.call_id not in sent)
-            pending.clear()
-            by_id.clear()
-            parts = _separate_part_payloads(
-                [
-                    {key: value for key, value in part.items() if key != "functionCall"}
-                    if isinstance(part, dict) and "functionCall" in part
-                    else part
-                    for part in parts
-                    if not isinstance(part, dict)
-                    or "functionCall" not in part
-                    or part.get("text") is not None
-                    or part.get("inlineData") is not None
-                ]
-            )
-            candidate = {**candidate, "content": {"parts": parts}}
-            frame = {**frame, "candidates": [candidate]}
-        if not pending and not _has_function_call(parts):
-            if parts:
-                delivered = True
-            yield frame
-            continue
-        for part in parts:
-            if not isinstance(part, dict):
-                continue
-            call = part.get("functionCall")
-            if isinstance(call, dict):
-                raw_id = call.get("id")
-                call_id = raw_id if isinstance(raw_id, str) else ""
-                name = str(call.get("name") or "")
-                tool = by_id.get(call_id) if call_id else None
-                # A name/argument shard without an ID may extend the last
-                # incomplete call. Complete object arguments denote a new call.
-                if tool is None and not call_id and pending:
-                    last = pending[-1]
-                    if last.args is None and (
-                        last.name.startswith(name) or name.startswith(last.name)
-                    ):
-                        tool = last
-                if tool is None and call_id and pending:
-                    # 混合 id 分片链：首帧无 id（合成 id 占位）、续帧携带
-                    # 真实 id。仅当最后一个 pending 调用是合成 id 的未完成
-                    # 分片链（args 未集齐）且名称兼容时并入——合成 id 尚未
-                    # 投递给客户端，改写安全；真实 id 的链（可能是并行同名
-                    # 调用的另一条分片链）绝不并入，避免两条链的参数串联。
-                    # 后续同 id 分片经 by_id 命中继续累积；带完整参数的独立
-                    # 调用不受影响（dict 快照整体替换分片，结果等价）。
-                    # 名称兼容语义与无 id 延伸路径一致（空名视为兼容）。
-                    last = pending[-1]
-                    if (
-                        last.args is None
-                        and last.synthetic_id
-                        and (name.startswith(last.name) or last.name.startswith(name))
-                    ):
-                        tool = last
-                        by_id[call_id] = tool
-                        tool.call_id = call_id
-                        tool.synthetic_id = False
-                if tool is None:
-                    if len(pending) + len(sent) >= 256:
-                        raise ValueError("Too many tool calls in one response")
-                    tool = _ToolCall(
-                        call_id or f"call_{secrets.token_hex(12)}",
-                        name,
-                        synthetic_id=not call_id,
-                    )
-                    pending.append(tool)
-                    if call_id:
-                        by_id[call_id] = tool
-                sig = part.get("thoughtSignature")
-                previous_size = tool.size
-                tool.update(call, sig if isinstance(sig, str) else "")
-                if tool.call_id not in sent:
-                    total_size += tool.size - previous_size
-                    if total_size > _MAX_TOOL_RESPONSE_BYTES:
-                        raise ValueError(
-                            "Total tool arguments exceed configured response size limit"
-                        )
-                if part.get("text") is not None or part.get("inlineData") is not None:
-                    # A caption accompanying a shard is before this call, not a
-                    # boundary forcing its incomplete arguments to execute.
-                    ready = flush(before=tool)
-                    if ready:
-                        yield ready
-                    accompanying = {
-                        key: value
-                        for key, value in part.items()
-                        if key != "functionCall"
+        finish = candidate.get("finishReason")
+        leading = []
+        if isinstance(finish, str) and finish:
+            reason = finish
+            if finish != "STOP":
+                leading = assembler.block_tools()
+            terminal = {
+                key: value for key, value in candidate.items() if key != "content"
+            }
+        elif any(
+            has_response_content(part) or "functionCall" in part for part in parts
+        ):
+            reason = "OTHER"
+            terminal = {}
+        leading.extend(assembler.feed(parts))
+        if leading or not parts or any(key != "candidates" for key in frame):
+            yield {
+                **frame,
+                "candidates": [
+                    {
+                        **{
+                            key: value
+                            for key, value in candidate.items()
+                            if key != "finishReason"
+                        },
+                        "content": {
+                            **(content if isinstance(content, dict) else {}),
+                            "parts": leading,
+                        },
                     }
-                    delivered = True
-                    yield {
-                        "candidates": [
-                            {
-                                "content": {
-                                    "parts": _separate_part_payloads([accompanying])
-                                }
-                            }
-                        ]
-                    }
-            else:
-                if pending and set(part) == {"thoughtSignature"}:
-                    signature = part.get("thoughtSignature")
-                    if isinstance(signature, str):
-                        pending[-1].signature = signature
-                    continue
-                ready = flush()
-                if ready:
-                    yield ready
-                delivered = True
-                yield {"candidates": [{"content": {"parts": [part]}}]}
-        if candidate.get("finishReason"):
-            if candidate["finishReason"] == "STOP":
-                ready = flush(terminal=True)
-                if ready:
-                    yield ready
-            else:
-                # An interrupted/blocked call must never become executable.
-                pending.clear()
-                by_id.clear()
-        # Preserve usage, response ID and finish metadata without replaying parts.
-        yield {**frame, "candidates": [{**candidate, "content": {"parts": []}}]}
-    ready = flush(terminal=True)
-    if ready:
-        yield ready
+                ],
+            }
+    kept, reason = assembler.finish(reason, error_on_empty_invalid=True)
+    yield {
+        "candidates": [{**terminal, "content": {"parts": kept}, "finishReason": reason}]
+    }

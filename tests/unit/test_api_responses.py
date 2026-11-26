@@ -137,7 +137,7 @@ def test_classify_gemini_error_payload():
 
 
 def test_to_gemini_finish_reason_mappings():
-    assert to_gemini_finish_reason(None) == "STOP"
+    assert to_gemini_finish_reason(None) == "OTHER"
     assert to_gemini_finish_reason(1) == "STOP"
     assert to_gemini_finish_reason(5) == "OTHER"
     assert to_gemini_finish_reason(6) == "LANGUAGE"

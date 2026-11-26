@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from aistudio_api.api.schemas import GeminiCodeExecutionResult, GeminiExecutableCode
+
 
 class GeminiUsageMetadata(BaseModel):
     promptTokenCount: int = 0
@@ -39,6 +41,8 @@ class GeminiPartResponse(BaseModel):
     thoughtSignature: str | None = None
     functionCall: GeminiFunctionCallPayload | None = None
     functionResponse: GeminiFunctionResponsePayload | None = None
+    executableCode: GeminiExecutableCode | None = None
+    codeExecutionResult: GeminiCodeExecutionResult | None = None
 
 
 class GeminiContentResponse(BaseModel):

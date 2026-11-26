@@ -22,6 +22,7 @@ from aistudio_api.api.response_models import (
     GeminiUsageMetadata,
 )
 from aistudio_api.api.schemas_compat import OpenAIChatCompletionRequest
+from aistudio_api.application.chat_service import normalize_gemini_request
 from aistudio_api.application.compat_service import (
     _openai_tools_to_gemini,
     build_openai_completion,
@@ -31,6 +32,7 @@ from aistudio_api.application.compat_service import (
 )
 from aistudio_api.domain.models import Candidate, ModelOutput
 from aistudio_api.infrastructure.gateway.model_defaults import get_compat_settings
+from aistudio_api.infrastructure.gateway.model_turns import ModelTurnHistory
 
 
 @pytest.fixture
@@ -440,18 +442,18 @@ async def test_openai_reasoning_effort_http_passthrough(
 
 
 @pytest.mark.asyncio
-async def test_openai_request_tools_and_tool_roundtrip() -> None:
+async def test_openai_request_tools_and_tool_roundtrip(monkeypatch, tmp_path) -> None:
     # 2026-11-14 实测：上游对客户端函数的 functionCall 回传同样强制
     # thought_signature —— 模拟响应侧已缓存该调用的签名（客户端丢失后
     # 由网关回注），验证往返仍完整保留。
     import base64
 
-    from aistudio_api.domain.tool_signatures import remember_function_signature
+    from aistudio_api.domain import tool_signatures
 
     cached_sig = base64.b64encode(b"sig-for-call-abc123").decode()
-    remember_function_signature(
-        "call_abc123", "get_weather", {"location": "Beijing"}, cached_sig
-    )
+    cache = tool_signatures.ThoughtSignatureCache(tmp_path / "signatures.json")
+    monkeypatch.setattr(tool_signatures, "_cache_instance", cache)
+    cache.remember("call_abc123", "get_weather", {"location": "Beijing"}, cached_sig)
     req = OpenAIChatCompletionRequest.model_validate(
         {
             "model": "gemini-3.8-flash",
@@ -507,7 +509,10 @@ async def test_openai_request_tools_and_tool_roundtrip() -> None:
     assert fc_part.functionCall.name == "get_weather"
     assert fc_part.functionCall.args == {"location": "Beijing"}
     assert fc_part.functionCall.id == "call_abc123"
-    assert fc_part.thoughtSignature == cached_sig
+    assert fc_part.thoughtSignature is None
+    normalized = normalize_gemini_request(gemini_req, resolved)
+    outbound, _, _ = ModelTurnHistory().prepare(resolved, normalized.contents)
+    assert outbound[0].parts[0].thought_signature == cached_sig
     # tool 消息 → functionResponse（name 由 tool_call_id 反查）
     tool_content = gemini_req.contents[1]
     assert tool_content.role == "user"
@@ -569,13 +574,16 @@ async def test_openai_unsigned_call_keeps_native_history() -> None:
             ],
         }
     )
-    gemini_req, _ = await openai_to_gemini_request(req)
+    gemini_req, resolved = await openai_to_gemini_request(req)
     assert [content.role for content in gemini_req.contents] == ["model", "user"]
     call = gemini_req.contents[0].parts[0]
     result = gemini_req.contents[1].parts[0]
     assert call.functionCall is not None and result.functionResponse is not None
     assert call.functionCall.args == {"location": "Beijing"}
-    assert call.thoughtSignature == "skip_thought_signature_validator"
+    assert call.thoughtSignature is None
+    normalized = normalize_gemini_request(gemini_req, resolved)
+    outbound, _, _ = ModelTurnHistory().prepare(resolved, normalized.contents)
+    assert outbound[0].parts[0].thought_signature == "skip_thought_signature_validator"
     assert result.functionResponse.response == {"temp": 25}
 
 
@@ -981,7 +989,7 @@ async def test_e2e_openai_non_streaming(
 ) -> None:
     mock_client.generate_content = AsyncMock(
         return_value=ModelOutput(
-            candidates=[Candidate(text="Hello from compat!")],
+            candidates=[Candidate(text="Hello from compat!", finish_reason=1)],
             usage={"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8},
         )
     )
@@ -1127,14 +1135,18 @@ _ROUND2_THINK = "Step by step analysis of the problem."
 _ROUND2_BODY = "The final answer."
 
 
-def _round2_response() -> GeminiGenerateContentResponse:
+def _round2_response(attached: bool) -> GeminiGenerateContentResponse:
     """纯文本轮 wire 抓包形态:思考摘要 + 正文 + 尾部空文本签名载体。"""
     return GeminiGenerateContentResponse(
         candidates=[
             GeminiCandidateResponse(
                 content=GeminiContentResponse(
                     parts=[
-                        GeminiPartResponse(text=_ROUND2_THINK, thought=True),
+                        GeminiPartResponse(
+                            text=_ROUND2_THINK,
+                            thought=True,
+                            thoughtSignature=_ROUND2_SIG if attached else None,
+                        ),
                         GeminiPartResponse(text=_ROUND2_BODY),
                         GeminiPartResponse(text="", thoughtSignature=_ROUND2_SIG),
                     ]
@@ -1146,31 +1158,36 @@ def _round2_response() -> GeminiGenerateContentResponse:
     )
 
 
-def test_openai_completion_message_level_thinking_signature() -> None:
-    """非流式:尾部签名载体必须随 message 级 extra_content 下发。
-
-    OpenAI 协议 reasoning_content 无官方签名字段,与 tool_calls 同一
-    extra_content 载体形态随消息下发,客户端原样回传时精确还原。
-    """
-    completion = build_openai_completion(_round2_response(), "gemini-3.8-flash", None)
+@pytest.mark.parametrize("attached", [False, True])
+def test_openai_completion_message_level_thinking_signature(attached: bool) -> None:
+    """Only the original reasoning Part can provide a reasoning signature."""
+    completion = build_openai_completion(
+        _round2_response(attached), "gemini-3.8-flash", None
+    )
     choices = cast(list[dict[str, Any]], completion["choices"])
     message = cast(dict[str, Any], choices[0]["message"])
     assert message["reasoning_content"] == _ROUND2_THINK
-    extra = cast(dict[str, Any], message.get("extra_content"))
-    google = cast(dict[str, Any], extra.get("google"))
-    assert google.get("thought_signature") == _ROUND2_SIG
+    assert message.get("extra_content", {}).get("google", {}).get(
+        "thought_signature"
+    ) == (_ROUND2_SIG if attached else None)
 
 
 @pytest.mark.asyncio
-async def test_openai_stream_final_chunk_carries_thinking_signature() -> None:
-    """流式:迟到签名(尾部独立签名帧,晚于正文)随终结块 delta 下发。"""
+@pytest.mark.parametrize("attached", [False, True])
+async def test_openai_stream_final_chunk_carries_thinking_signature(
+    attached: bool,
+) -> None:
+    """A late detached carrier is not a signature for earlier reasoning."""
+    thought = {"text": _ROUND2_THINK, "thought": True}
+    if attached:
+        thought["thoughtSignature"] = _ROUND2_SIG
     frames: list[dict[str, object]] = [
         {
             "candidates": [
                 {
                     "content": {
                         "role": "model",
-                        "parts": [{"text": _ROUND2_THINK, "thought": True}],
+                        "parts": [thought],
                     }
                 }
             ]
@@ -1186,7 +1203,8 @@ async def test_openai_stream_final_chunk_carries_thinking_signature() -> None:
                     "content": {
                         "role": "model",
                         "parts": [{"thoughtSignature": _ROUND2_SIG}],
-                    }
+                    },
+                    "finishReason": "STOP",
                 }
             ]
         },
@@ -1209,10 +1227,9 @@ async def test_openai_stream_final_chunk_carries_thinking_signature() -> None:
     ]
     assert final, "流必须以带 finish_reason 的终结块收尾"
     delta = cast(dict[str, Any], final[-1]["choices"][0]["delta"])
-    google = cast(
-        dict[str, Any], cast(dict[str, Any], delta.get("extra_content")).get("google")
-    )
-    assert google.get("thought_signature") == _ROUND2_SIG
+    assert delta.get("extra_content", {}).get("google", {}).get(
+        "thought_signature"
+    ) == (_ROUND2_SIG if attached else None)
 
 
 @pytest.mark.asyncio

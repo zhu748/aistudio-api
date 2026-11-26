@@ -28,6 +28,7 @@ from aistudio_api.infrastructure.gateway.wire_parser import (
 )
 from aistudio_api.infrastructure.gateway.wire_spec import (
     WIRE_FINISH_REASON_CONTINUING,
+    WIRE_FINISH_REASON_STOP,
 )
 from aistudio_api.infrastructure.utils.logger import get_logger
 
@@ -96,14 +97,17 @@ class StreamingGateway:
         head_sample: str = ""
         HEAD_SAMPLE_LIMIT = 2000
         emitted_any_chunk = False
+        tool_interrupted = False
         has_received_chunks = False
         status_code = 0
 
         def emit_parsed_chunk(
             parsed_chunk: list[object],
+            *,
+            trusted_terminal: bool = True,
         ) -> list[tuple[str, object | None]]:
             nonlocal latest_usage, latest_finish_reason
-            nonlocal latest_response_id, emitted_any_chunk
+            nonlocal latest_response_id, emitted_any_chunk, tool_interrupted
             events: list[tuple[str, object | None]] = []
             usage = parse_chunk_usage(parsed_chunk)
             if usage:
@@ -119,33 +123,53 @@ class StreamingGateway:
             candidate = parse_response_chunk(parsed_chunk)
             if capture is not None:
                 capture.add(candidate.raw_parts, latest_response_id)
-            if candidate.thinking:
-                events.append(("thinking", candidate.thinking))
-            if candidate.reasoning_images:
-                events.append(("reasoning_images", candidate.reasoning_images))
-            if candidate.function_calls:
-                events.append(("tool_calls", candidate.function_calls))
-            if candidate.images:
-                events.append(("images", candidate.images))
-            if candidate.code_output:
-                # 代码执行输出（executableCode/codeExecutionResult 文本）：
-                # 缺此分支时纯代码 chunk 的 events 为空，内容静默丢失
-                # （非流式 parse_text_output 保留，两路径不对称）
-                events.append(("body", candidate.code_output))
-            if candidate.text:
-                events.append(("body", candidate.text))
-            if candidate.thought_signature:
-                events.append(("thought_signature", candidate.thought_signature))
-            if any(
-                kind not in {"response_id", "thought_signature"} for kind, _ in events
+            finish = candidate.finish_reason if trusted_terminal else None
+            if finish not in (
+                None,
+                0,
+                WIRE_FINISH_REASON_CONTINUING,
+                WIRE_FINISH_REASON_STOP,
+            ):
+                # Do not let a STOP in a later chunk certify an earlier
+                # interrupted tool set. These chunks do not expose separate
+                # candidate identities to downstream protocols.
+                tool_interrupted = True
+                events.append(("tool_interruption", None))
+            parts = candidate.ordered_parts or []
+            if (
+                len(parts) == 1
+                and (part := parts[0]).text
+                and not (
+                    part.image
+                    or part.function_call
+                    or part.function_response
+                    or part.thought_signature
+                    or part.executable_code is not None
+                    or part.code_execution_result is not None
+                )
+            ):
+                events.append(("thinking" if part.thought else "body", part.text))
+            elif parts:
+                # Don't emit an aggregate candidate signature: only the owner
+                # Part (or an actual standalone carrier) is sent downstream.
+                events.append(("ordered_parts", parts))
+            if (
+                candidate.has_content
+                or candidate.thinking
+                or candidate.reasoning_images
             ):
                 emitted_any_chunk = True
                 # New output needs its own terminal reason; an earlier STOP
                 # cannot certify a later truncated continuation.
                 latest_finish_reason = None
-            if candidate.finish_reason is not None and candidate.finish_reason not in (
-                0,
-                WIRE_FINISH_REASON_CONTINUING,
+            if (
+                trusted_terminal
+                and candidate.finish_reason is not None
+                and candidate.finish_reason
+                not in (
+                    0,
+                    WIRE_FINISH_REASON_CONTINUING,
+                )
             ):
                 latest_finish_reason = candidate.finish_reason
             return events
@@ -219,8 +243,12 @@ class StreamingGateway:
                 for parsed_chunk in parser.feed(trailing_text):
                     for event in emit_parsed_chunk(parsed_chunk):
                         yield event
+            if parser.chunk_start is not None:
+                # EOF repair can salvage display text but cannot certify a
+                # complete candidate or authorize publishing tool calls.
+                latest_finish_reason = None
             for parsed_chunk in parser.finish():
-                for event in emit_parsed_chunk(parsed_chunk):
+                for event in emit_parsed_chunk(parsed_chunk, trusted_terminal=False):
                     yield event
         except ValueError as exc:
             raise TransportError(f"Invalid upstream stream: {exc}") from exc
@@ -258,7 +286,7 @@ class StreamingGateway:
             raise TransportError(
                 "upstream returned no usable content or finish reason on HTTP 200"
             )
-        if capture is not None:
+        if capture is not None and not tool_interrupted:
             capture.finish(latest_finish_reason)
         if latest_finish_reason is not None:
             yield ("finish_reason", latest_finish_reason)

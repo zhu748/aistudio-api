@@ -20,11 +20,14 @@ import os
 import re
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 
 from aistudio_api.config import detect_memory_budget_mb
-from aistudio_api.domain.tool_signatures import SKIP_THOUGHT_SIGNATURE
+from aistudio_api.domain.tool_signatures import (
+    SKIP_THOUGHT_SIGNATURE,
+    lookup_function_signature,
+)
 
 from .wire_codec import AistudioWireCodec
 from .wire_parser import parse_response_part, wire_size_estimate
@@ -96,7 +99,9 @@ def _digest(previous: str, model: bool, parts: list[AistudioPart]) -> str:
 
     def flush_text() -> None:
         if text:
-            value = "".join(text).strip()
+            value = "".join(text)
+            if model:
+                value = value.strip()
             if value:
                 items.append(["text", value])
             text.clear()
@@ -154,6 +159,42 @@ def _digest(previous: str, model: bool, parts: list[AistudioPart]) -> str:
                 items.append(["opaque", visible])
     flush_text()
     return hashlib.sha256(_json([previous, model, items]).encode()).hexdigest()
+
+
+def _restore_unmatched_calls(contents: list[AistudioContent]) -> list[AistudioContent]:
+    """Handle omitted tool signatures only after a scoped raw-turn miss.
+
+    In an ordinary signed parallel batch later calls need not carry a
+    signature. Do not guess a value for those calls from the per-call cache.
+    Retain the existing legacy behavior for an unidentified batch.
+    """
+    result: list[AistudioContent] = []
+    first_call = True
+    signed_batch = False
+    for content in contents:
+        updated: list[AistudioPart] | None = None
+        for index, part in enumerate(content.parts):
+            call = part.function_call
+            if call is None:
+                continue
+            signature = part.thought_signature
+            if not signature and not signed_batch and part.raw_wire is None:
+                name, args = call[:2]
+                call_id = call[2] if len(call) > 2 else None
+                signature = (
+                    lookup_function_signature(call_id, name, args)
+                    or SKIP_THOUGHT_SIGNATURE
+                )
+                if updated is None:
+                    updated = list(content.parts)
+                updated[index] = replace(part, thought_signature=signature)
+            if first_call:
+                first_call = False
+                signed_batch = bool(signature and signature != SKIP_THOUGHT_SIGNATURE)
+        result.append(
+            replace(content, parts=updated) if updated is not None else content
+        )
+    return result
 
 
 @dataclass(frozen=True)
@@ -235,9 +276,11 @@ class ModelTurnHistory:
 
     def __init__(self) -> None:
         cache_bytes, max_entries, max_turn_bytes = _turn_limits()
-        self._entries: OrderedDict[tuple[str, str], tuple[str, str | None, int]] = (
-            OrderedDict()
-        )
+        # A None payload marks conflicting captures for the same visible
+        # history. The marker uses the same bounded LRU as regular captures.
+        self._entries: OrderedDict[
+            tuple[str, str], tuple[str | None, str | None, int]
+        ] = OrderedDict()
         self._bytes = 0
         self._max_bytes = cache_bytes
         self._max_entries = max_entries
@@ -269,16 +312,31 @@ class ModelTurnHistory:
                 token = None
             if entry is not None:
                 raw, saved_token, _ = entry
+                if raw is None:
+                    restored.extend(contents[start:end])
+                    compatible = False
+                    start = end
+                    continue
                 saved: list[list[object]] = json.loads(raw)
-                known = {parse_response_part(wire).thought_signature for wire in saved}
-                if any(
+                echoed_thought = "".join(
+                    part.text or "" for part in parts if part.thought
+                )
+                saved_thought: list[str] = []
+                known: set[str] = set()
+                for wire in saved:
+                    parsed = parse_response_part(wire)
+                    if parsed.thought_signature:
+                        known.add(parsed.thought_signature)
+                    if echoed_thought and parsed.thought and parsed.text:
+                        saved_thought.append(parsed.text)
+                if (echoed_thought and echoed_thought != "".join(saved_thought)) or any(
                     part.thought_signature not in known
                     for part in parts
                     if part.thought_signature
                     and part.thought_signature != SKIP_THOUGHT_SIGNATURE
                 ):
-                    # An explicit different state may belong to another roll
-                    # with identical visible text. Keep the client's state.
+                    # Echoed thoughts or an explicit signature may identify a
+                    # different roll with identical visible text.
                     restored.extend(contents[start:end])
                     compatible = False
                     start = end
@@ -307,12 +365,14 @@ class ModelTurnHistory:
                     rebuilt.append(part)
                 restored.append(AistudioContent("model", rebuilt))
                 token = saved_token
+            elif model and compatible:
+                restored.extend(_restore_unmatched_calls(contents[start:end]))
             else:
                 restored.extend(contents[start:end])
             start = end
         context = (
             ModelTurnContext(self, scope, previous)
-            if contents and contents[-1].role != "model"
+            if compatible and contents and contents[-1].role != "model"
             else None
         )
         return restored, token, context
@@ -325,7 +385,7 @@ class ModelTurnHistory:
         for part, wire in zip(decoded, parts, strict=True):
             part.raw_wire = wire
         key = (context.scope, _digest(context.prefix, True, decoded))
-        raw = _json(parts)
+        raw: str | None = _json(parts)
         size = len(raw.encode())
         if size > self._max_turn_bytes:
             return
@@ -333,6 +393,14 @@ class ModelTurnHistory:
             old = self._entries.pop(key, None)
             if old is not None:
                 self._bytes -= old[2]
+                if old[0] != raw:
+                    # No occurrence ID distinguishes these captures on replay.
+                    # Withhold both, even if another identical reroll arrives.
+                    raw, token, size = None, None, 0
+                elif old[1] != token:
+                    # Identical original Parts can be restored, but there is
+                    # no evidence for which continuation token to use.
+                    token = None
             self._entries[key] = (raw, token, size)
             self._bytes += size
             while (
