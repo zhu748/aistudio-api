@@ -777,7 +777,7 @@ class _ResponsesStreamEmitter:
 
     def function_call(
         self, call_id: str, name: str, args: object, signature: str = ""
-    ) -> list[str]:
+    ) -> Iterator[str]:
         self.output_index += 1
         fc_index = self.output_index
         item_id = _item_id("fc")
@@ -794,46 +794,46 @@ class _ResponsesStreamEmitter:
             "arguments": arguments,
         }
         self.item_order.append((fc_index, dict(item)))
-        return [
-            self.sse(
-                "response.output_item.added",
-                {
-                    "output_index": fc_index,
-                    "item": {
-                        **_signature_extra(signature),
-                        "id": item_id,
-                        "type": "function_call",
-                        "status": "in_progress",
-                        "call_id": call_id,
-                        "name": name,
-                        "arguments": "",
-                    },
+        # The closing frames repeat the entire argument string. Keep the
+        # snapshot above, but encode only the frame the HTTP consumer requests.
+        yield self.sse(
+            "response.output_item.added",
+            {
+                "output_index": fc_index,
+                "item": {
+                    **_signature_extra(signature),
+                    "id": item_id,
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": "",
                 },
-            ),
-            self.sse(
-                "response.function_call_arguments.delta",
-                {
-                    "item_id": item_id,
-                    "output_index": fc_index,
-                    "delta": arguments,
-                },
-            ),
-            self.sse(
-                "response.function_call_arguments.done",
-                {
-                    "item_id": item_id,
-                    "output_index": fc_index,
-                    "arguments": arguments,
-                },
-            ),
-            self.sse(
-                "response.output_item.done",
-                {
-                    "output_index": fc_index,
-                    "item": dict(item),
-                },
-            ),
-        ]
+            },
+        )
+        yield self.sse(
+            "response.function_call_arguments.delta",
+            {
+                "item_id": item_id,
+                "output_index": fc_index,
+                "delta": arguments,
+            },
+        )
+        yield self.sse(
+            "response.function_call_arguments.done",
+            {
+                "item_id": item_id,
+                "output_index": fc_index,
+                "arguments": arguments,
+            },
+        )
+        yield self.sse(
+            "response.output_item.done",
+            {
+                "output_index": fc_index,
+                "item": dict(item),
+            },
+        )
 
     def _close_reasoning(
         self, accumulated: str, status: str = "completed"
