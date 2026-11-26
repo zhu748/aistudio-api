@@ -35,7 +35,7 @@ async def test_partial_synthetic_body_cannot_turn_failure_into_stop(finish, argu
 
 @pytest.mark.parametrize("finish", [10, 12, 13])
 @pytest.mark.parametrize("structured", [False, True])
-async def test_complete_synthetic_body_can_normalize_tool_finish(finish, structured):
+async def test_complete_synthetic_body_preserves_tool_finish(finish, structured):
     async def source():
         call: dict[str, object] = {"name": "router_emit"}
         if structured:
@@ -51,14 +51,12 @@ async def test_complete_synthetic_body_can_normalize_tool_finish(finish, structu
         event async for event in restore_anti_truncation_stream(source(), context)
     ]
     assert ("body", "complete") in events
-    assert ("finish_reason", 1) in events
+    assert ("finish_reason", finish) in events
 
 
-@pytest.mark.parametrize("finish", [10, 12, 13])
+@pytest.mark.parametrize("finish", [1, 10, 12, 13])
 @pytest.mark.parametrize("first_complete", [False, True])
-async def test_every_synthetic_call_must_be_complete_before_normalizing_finish(
-    finish, first_complete
-):
+async def test_every_synthetic_call_must_be_complete_for_stop(finish, first_complete):
     async def source():
         yield (
             "tool_calls",
@@ -89,7 +87,10 @@ async def test_every_synthetic_call_must_be_complete_before_normalizing_finish(
     events = [
         event async for event in restore_anti_truncation_stream(source(), context)
     ]
-    assert ("finish_reason", 1 if first_complete else finish) in events
+    assert (
+        "finish_reason",
+        10 if finish == 1 and not first_complete else finish,
+    ) in events
 
 
 async def test_large_sharded_synthetic_body_and_final_snapshot_do_not_duplicate():

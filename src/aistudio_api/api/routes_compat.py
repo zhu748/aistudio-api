@@ -49,6 +49,7 @@ from aistudio_api.application.compat_service import (
     openai_stream_adapter,
     openai_to_gemini_request,
 )
+from aistudio_api.application.responses_delivery import ResponsesStreamDelivery
 from aistudio_api.application.responses_service import (
     build_responses_object,
     build_responses_preparation_failure,
@@ -255,8 +256,10 @@ async def openai_responses(
     def register_failure(handler: Callable[[str], list[str]]) -> None:
         http_request.state.stream_failure = handler
 
-    def prelude_sequence() -> int | None:
-        return getattr(http_request.state, "responses_prelude_sequence", None)
+    delivery = None
+    if req.stream and hasattr(http_request.state, "responses_accept_event"):
+        delivery = ResponsesStreamDelivery()
+        http_request.state.responses_accept_event = delivery.accept
 
     async def respond():
         try:
@@ -291,7 +294,7 @@ async def openai_responses(
                         else response.body_iterator,
                         requested_model=req.model,
                         register_failure=register_failure,
-                        prelude_sequence=prelude_sequence,
+                        delivery=delivery,
                     ),
                     media_type="text/event-stream",
                     headers=_STREAM_HEADERS,
@@ -317,7 +320,7 @@ async def openai_responses(
             code,
             message,
             register_failure=register_failure,
-            prelude_sequence=prelude_sequence,
+            delivery=delivery,
         ),
     )
 

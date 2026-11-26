@@ -462,6 +462,14 @@ def _claude_stop_reason(
     return "end_turn", None
 
 
+def _inline_output_notice(media_type: str) -> str:
+    kind = "Image" if media_type.lower().startswith("image/") else "Inline media"
+    return (
+        f"[{kind} output is unavailable in the Claude Messages format. "
+        "Use the native Gemini endpoint for binary output.]"
+    )
+
+
 def build_claude_message(
     response: GeminiGenerateContentResponse,
     requested_model: str,
@@ -473,7 +481,8 @@ def build_claude_message(
     if candidates:
         finish_reason_raw = candidates[0].finishReason
 
-    blocks: list[dict[str, object]] = []
+    # Strings are gateway notices, not generated text subject to stop matching.
+    blocks: list[dict[str, object] | str] = []
     has_tool_use = False
     for part in _iter_response_parts(response):
         text = getattr(part, "text", None)
@@ -482,13 +491,14 @@ def build_claude_message(
             signature = part_payload_signature(part, "text") if is_thought else ""
             if is_thought and (text or _is_signed_empty_thought(text, signature)):
                 # A signed Part must match precisely one output block.
+                previous = blocks[-1] if blocks else None
                 if (
                     not signature
-                    and blocks
-                    and blocks[-1].get("type") == "thinking"
-                    and not blocks[-1].get("signature")
+                    and isinstance(previous, dict)
+                    and previous.get("type") == "thinking"
+                    and not previous.get("signature")
                 ):
-                    blocks[-1]["thinking"] = _as_str(blocks[-1].get("thinking")) + text
+                    previous["thinking"] = _as_str(previous.get("thinking")) + text
                 else:
                     blocks.append(
                         {
@@ -500,17 +510,8 @@ def build_claude_message(
             elif not is_thought and text:
                 blocks.append({"type": "text", "text": text})
         inline = getattr(part, "inlineData", None)
-        if inline is not None:
-            blocks.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": inline.mimeType,
-                        "data": inline.data,
-                    },
-                }
-            )
+        if inline is not None and inline.data:
+            blocks.append(_inline_output_notice(inline.mimeType))
         code = _code_text(
             getattr(part, "executableCode", None),
             getattr(part, "codeExecutionResult", None),
@@ -545,11 +546,12 @@ def build_claude_message(
 
     stops = StopSequenceBuffer(stop_sequences)
     filtered: list[dict[str, object]] = []
+    text_block_open = False
 
     def flush_pending() -> None:
         tail = stops.feed("", final=True)
         if tail:
-            if filtered and filtered[-1].get("type") == "text":
+            if text_block_open:
                 filtered[-1]["text"] = _as_str(filtered[-1].get("text")) + tail
             else:
                 filtered.append({"type": "text", "text": tail})
@@ -557,15 +559,20 @@ def build_claude_message(
     for block in blocks:
         if stops.hit is not None:
             break
-        if block.get("type") == "text":
+        if isinstance(block, str):
+            flush_pending()
+            filtered.append({"type": "text", "text": block})
+            text_block_open = False
+        elif block.get("type") == "text":
             text = stops.feed(_as_str(block.get("text")))
             if text:
                 filtered.append({**block, "text": text})
+                text_block_open = True
         else:
             flush_pending()
             filtered.append(block)
+            text_block_open = False
     flush_pending()
-    blocks = filtered
     if stops.hit is not None and finish_reason_raw == "STOP":
         stop_reason, stop_seq = "stop_sequence", stops.hit
     else:
@@ -579,7 +586,7 @@ def build_claude_message(
         "type": "message",
         "role": "assistant",
         "model": requested_model,
-        "content": blocks or [{"type": "text", "text": ""}],
+        "content": filtered or [{"type": "text", "text": ""}],
         "stop_reason": stop_reason,
         "stop_sequence": stop_seq,
         "usage": usage_payload,
@@ -775,32 +782,12 @@ class _ClaudeStreamEmitter:
         )
         return events
 
-    def image(self, media_type: str, data: str) -> list[str]:
+    def inline_output_notice(self, media_type: str) -> list[str]:
+        # An image block is valid input, but not valid Messages output.
+        # Keep the replacement text distinct from surrounding generated text.
         events = self._close_events()
-        self.index += 1
-        events.append(
-            self.sse(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": self.index,
-                    "content_block": {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": data,
-                        },
-                    },
-                },
-            )
-        )
-        events.append(
-            self.sse(
-                "content_block_stop",
-                {"type": "content_block_stop", "index": self.index},
-            )
-        )
+        events += self.text_delta(_inline_output_notice(media_type))
+        events += self._close_events()
         return events
 
     def error(self, status: int, message: str) -> list[str]:
@@ -925,9 +912,12 @@ async def claude_stream_adapter(
                 for part in _frame_parts(candidate):
                     if stops.hit is not None:
                         continue
+                    function_call = _as_dict(part.get("functionCall"))
+                    inline = _as_dict(part.get("inlineData"))
+                    has_inline_output = bool(_as_str(inline.get("data")))
                     if (
-                        part.get("functionCall")
-                        or part.get("inlineData")
+                        function_call
+                        or has_inline_output
                         or part.get("thought") is True
                     ):
                         # A retained text prefix belongs before this next block.
@@ -939,7 +929,6 @@ async def claude_stream_adapter(
                         if tail:
                             for event in emitter.text_delta(tail):
                                 yield event
-                    function_call = _as_dict(part.get("functionCall"))
                     if function_call:
                         call_id = _as_str(function_call.get("id"))
                         if not call_id:
@@ -954,13 +943,10 @@ async def claude_stream_adapter(
                         ):
                             yield event
                         continue
-                    inline = _as_dict(part.get("inlineData"))
-                    if inline:
-                        mime = _as_str(inline.get("mimeType")) or "image/png"
-                        data = _as_str(inline.get("data"))
-                        if data:
-                            for event in emitter.image(mime, data):
-                                yield event
+                    if has_inline_output:
+                        mime = _as_str(inline.get("mimeType"))
+                        for event in emitter.inline_output_notice(mime):
+                            yield event
                         continue
                     text = part.get("text")
                     if isinstance(text, str):

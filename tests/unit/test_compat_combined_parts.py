@@ -47,6 +47,16 @@ def events(chunks):
     ]
 
 
+def assert_presented_payload(result, protocol, kind):
+    encoded = json.dumps(result)
+    assert "caption" in encoded
+    if protocol == "claude" and kind == "image":
+        assert encoded.index("caption") < encoded.index("Image output is unavailable")
+        assert "aGVsbG8=" not in encoded
+    else:
+        assert ("aGVsbG8=" if kind == "image" else "lookup") in encoded
+
+
 @pytest.mark.parametrize("kind", ["image", "tool"])
 @pytest.mark.parametrize("protocol", ["chat", "claude", "responses"])
 def test_nonstream_combined_parts_keep_caption_and_payload(protocol, kind):
@@ -57,9 +67,7 @@ def test_nonstream_combined_parts_keep_caption_and_payload(protocol, kind):
         result = build_claude_message(response, "test", None)
     else:
         result = build_responses_object(response, "test")
-    encoded = json.dumps(result)
-    assert "caption" in encoded
-    assert ("aGVsbG8=" if kind == "image" else "lookup") in encoded
+    assert_presented_payload(result, protocol, kind)
 
 
 @pytest.mark.parametrize("kind", ["image", "tool"])
@@ -69,9 +77,7 @@ async def test_stream_combined_parts_keep_caption_and_payload(protocol, kind):
         yield frame(kind)
 
     chunks = [chunk async for chunk in adapter(protocol, source())]
-    encoded = json.dumps(events(chunks))
-    assert "caption" in encoded
-    assert ("aGVsbG8=" if kind == "image" else "lookup") in encoded
+    assert_presented_payload(events(chunks), protocol, kind)
 
 
 @pytest.mark.parametrize("protocol", ["chat", "claude", "responses"])

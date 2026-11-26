@@ -326,8 +326,10 @@ def test_build_claude_message_image_and_refusal() -> None:
         finish_reason="SAFETY",
     )
     message = cast(dict[str, Any], build_claude_message(response, "m", None))
-    assert message["content"][0]["type"] == "image"
-    assert message["content"][0]["source"]["media_type"] == "image/png"
+    block = message["content"][0]
+    assert block["type"] == "text"
+    assert "Image output is unavailable" in block["text"]
+    assert "iVBORw0KGgo=" not in block["text"]
     assert message["stop_reason"] == "refusal"
 
 

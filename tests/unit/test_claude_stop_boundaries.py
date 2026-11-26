@@ -57,11 +57,30 @@ async def render(parts: list[dict[str, object]], streaming: bool, stop: str):
         {"inlineData": {"mimeType": "image/png", "data": "aA=="}},
     ],
 )
-async def test_pending_stop_prefix_stays_before_non_text_block(streaming, boundary):
+async def test_pending_stop_prefix_stays_before_block_boundary(streaming, boundary):
     blocks, reason = await render([{"text": "hello <EN"}, boundary], streaming, "<END>")
     assert blocks[0] == {"type": "text", "text": "hello <EN"}
-    assert blocks[1]["type"] != "text"
+    if "inlineData" in boundary:
+        assert blocks[1]["type"] == "text"
+        assert "Image output is unavailable" in blocks[1]["text"]
+    else:
+        assert blocks[1]["type"] != "text"
     assert reason in ("tool_use", "end_turn")
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_inline_notice_does_not_absorb_following_partial_stop(streaming):
+    blocks, reason = await render(
+        [
+            {"inlineData": {"mimeType": "image/png", "data": "aA=="}},
+            {"text": "<EN"},
+        ],
+        streaming,
+        "<END>",
+    )
+    assert "Image output is unavailable" in blocks[0]["text"]
+    assert blocks[1:] == [{"type": "text", "text": "<EN"}]
+    assert reason == "end_turn"
 
 
 @pytest.mark.parametrize("streaming", [False, True])

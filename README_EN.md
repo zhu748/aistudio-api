@@ -424,6 +424,8 @@ curl http://localhost:8080/v1/chat/completions \
 | `chat_template_kwargs.thinking` | vLLM | `"chat_template_kwargs": {"thinking": true}` |
 
   Level words: `minimal` / `low` / `medium` / `high` / `very_high` (aliases `xhigh` / `max`); `none` / `off` / `disabled` explicitly disables thinking; `budget_tokens` maps by token budget (≤2048 low / ≤8192 medium / ≤32768 high / larger xhigh). `reasoning.effort` on `/v1/responses` is supported as well.
+
+On `/v1/responses`, `function_call_output.output` accepts text and bounded inline image (`input_image.image_url`) or file (`input_file.file_data`, preserving `filename`) data URLs with Base64 payloads. Remote URLs and file IDs in tool results are reported as omitted, not downloaded.
 </details>
 
 <details>
@@ -444,7 +446,7 @@ curl http://localhost:8080/v1/messages \
 
 - `claude-*` family names are mapped to `compat.claude.default_model` in `config.yaml` (Gemini model names pass through directly);
 - Streaming emits the full Claude event sequence (`message_start` / `content_block_delta` / `message_delta` / `message_stop`) with thinking blocks for reasoning chains;
-- Tools (`tools` / `tool_choice`), `thinking.budget_tokens` (auto-converted to Gemini thinking levels), image/PDF blocks, and `stop_sequences` are supported;
+- Tools (`tools` / `tool_choice`), `thinking.budget_tokens` (auto-converted to Gemini thinking levels), image/PDF inputs, and `stop_sequences` are supported. Claude Messages cannot return raw images, so the gateway emits a short text notice instead. Use the native Gemini endpoint for image bytes;
 - `POST /v1/messages/count_tokens` provides a rough token estimate; `GET /v1/models` returns the Claude format when the `anthropic-version` header is present.
 </details>
 

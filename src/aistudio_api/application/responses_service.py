@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import time
 from collections.abc import AsyncGenerator, AsyncIterable, Callable, Iterator
@@ -30,6 +31,7 @@ from aistudio_api.api.schemas import (
     GeminiFunctionResponse,
     GeminiGenerateContentRequest,
     GeminiGenerationConfig,
+    GeminiInlineData,
     GeminiPart,
 )
 from aistudio_api.api.schemas_compat import OpenAIResponsesRequest
@@ -49,8 +51,16 @@ from aistudio_api.application.compat_service import (
     normalize_reasoning_effort_word,
     resolve_compat_model,
 )
-from aistudio_api.application.compat_shared import _code_text, _is_signed_empty_thought
+from aistudio_api.application.compat_shared import (
+    _code_text,
+    _is_signed_empty_thought,
+    _parse_data_url,
+)
 from aistudio_api.application.media_session import has_remote_media, media_session
+from aistudio_api.application.responses_delivery import (
+    PartStage,
+    ResponsesStreamDelivery,
+)
 from aistudio_api.application.stream_utils import part_payload_signature
 from aistudio_api.domain.tool_signatures import (
     remember_function_signature as _remember_function_signature,
@@ -59,6 +69,7 @@ from aistudio_api.infrastructure.request_context import record_result
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("compat.responses")
+_STANDARD_BASE64 = re.compile(r"[A-Za-z0-9+/]++={0,2}")
 
 # Responses reasoning.effort → Gemini reasoningEffort：统一走
 # normalize_reasoning_effort_word（与 chat completions 侧同一套词表，
@@ -168,24 +179,60 @@ def _content_text(content: object) -> str:
     return ""
 
 
-def _tool_output_text(output: object) -> dict[str, object]:
-    """``function_call_output.output``（str 或 content 数组）→ functionResponse 载荷。"""
+def _tool_output_payload(
+    output: object,
+) -> tuple[dict[str, object], list[GeminiPart]]:
+    """Keep text and bounded local media attached to their own function result."""
     if isinstance(output, str):
-        return {"result": output}
-    if isinstance(output, list):
-        texts: list[str] = []
-        for part in output:
-            if not isinstance(part, dict):
+        return {"result": output}, []
+    texts: list[str] = []
+    media: list[GeminiPart] = []
+    if not isinstance(output, list):
+        return {"result": ""}, media
+    for index, part in enumerate(output):
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type in ("output_text", "input_text", "text"):
+            texts.append(_as_str(part.get("text")))
+        elif part_type in ("input_image", "input_file"):
+            field = "image_url" if part_type == "input_image" else "file_data"
+            path = f"function_call_output.output[{index}].{field}"
+            # The ordinary image helper also fetches HTTP URLs. Tool output
+            # accepts only self-contained attachments, with no extra I/O.
+            reference = _as_str(part.get(field)).strip()
+            if reference[:5].lower() != "data:":
+                texts.append(
+                    "[image omitted]"
+                    if part_type == "input_image"
+                    else "[file omitted]"
+                )
                 continue
-            part_type = part.get("type")
-            if part_type in ("output_text", "input_text", "text"):
-                texts.append(_as_str(part.get("text")))
-            elif part_type == "input_image":
-                # 图片无 functionResponse 通道：占位提示模型（静默丢弃
-                # 会让模型以为结果缺失而重复调用）
-                texts.append("[image omitted]")
-        return {"result": "\n".join(t for t in texts if t) or ""}
-    return {"result": ""}
+            parsed = _parse_data_url(reference)
+            if parsed is None:
+                raise ValueError(f"{path} must be an inline base64 data URL")
+            mime, data = parsed
+            # Bound and account first; check alphabet/padding without decoding
+            # another copy of the full attachment.
+            if len(data) % 4 or _STANDARD_BASE64.fullmatch(data) is None:
+                raise ValueError(f"{path} contains invalid base64 data")
+            if not mime.isascii() or (
+                part_type == "input_image" and not mime.lower().startswith("image/")
+            ):
+                raise ValueError(f"{path} has an invalid media type")
+            filename = (
+                _as_str(part.get("filename")).strip()
+                if part_type == "input_file"
+                else ""
+            )
+            media.append(
+                GeminiPart(
+                    inlineData=GeminiInlineData(
+                        mimeType=mime, data=data, filename=filename or None
+                    )
+                )
+            )
+    return {"result": "\n".join(t for t in texts if t)}, media
 
 
 def _reasoning_summary_text(item: dict[str, object]) -> str:
@@ -304,7 +351,7 @@ async def responses_to_gemini_request(
             elif item_type == "function_call_output":
                 call_id = _as_str(item.get("call_id"))
                 name = tool_name_by_call_id.get(call_id, "unknown")
-                payload = _tool_output_text(item.get("output"))
+                payload, media = _tool_output_payload(item.get("output"))
                 contents.append(
                     GeminiContent(
                         role="user",
@@ -314,6 +361,7 @@ async def responses_to_gemini_request(
                                     name=name,
                                     response=payload,
                                     id=call_id or None,
+                                    parts=media or None,
                                 )
                             )
                         ],
@@ -589,11 +637,11 @@ class _ResponsesStreamEmitter:
         self,
         response_id: str,
         requested_model: str,
-        prelude_sequence: Callable[[], int | None] | None = None,
+        delivery: ResponsesStreamDelivery | None = None,
     ) -> None:
         self.response_id = response_id
         self.requested_model = requested_model
-        self.prelude_sequence = prelude_sequence
+        self.delivery = delivery
         self.created_at = int(time.time())
         self.seq = -1  # 首事件自增后为 0，与 SDK 从 0 递增一致
         self.output_index = -1
@@ -619,11 +667,14 @@ class _ResponsesStreamEmitter:
         self.seq += 1
         frame = {"type": event_type, "sequence_number": self.seq, **payload}
         # separators：SSE 每帧省去 ", " 与 ": " 的空格（约 2-4% 字节/分配）
-        return (
+        encoded = (
             f"event: {event_type}\ndata: "
             + json.dumps(frame, ensure_ascii=False, separators=(",", ":"))
             + "\n\n"
         )
+        if self.delivery is not None and isinstance(delta := payload.get("delta"), str):
+            self.delivery.encoded_delta(delta)
+        return encoded
 
     def _response_snapshot(
         self,
@@ -855,7 +906,11 @@ class _ResponsesStreamEmitter:
         )
 
     def _close_reasoning(
-        self, accumulated: str, status: str = "completed"
+        self,
+        accumulated: str,
+        status: str = "completed",
+        *,
+        stage: PartStage = PartStage.OPEN,
     ) -> Iterator[str]:
         if self.reasoning_item_id is None:
             return
@@ -866,34 +921,42 @@ class _ResponsesStreamEmitter:
             "id": self.reasoning_item_id,
             "type": "reasoning",
             "status": status,
-            "summary": [{"type": "summary_text", "text": accumulated}],
+            "summary": [{"type": "summary_text", "text": accumulated}]
+            if stage is not PartStage.ABSENT
+            else [],
         }
         self._replace_order_item(self.reasoning_item_id, final_item)
-        yield self.sse(
-            "response.reasoning_summary_text.done",
-            {
-                "item_id": self.reasoning_item_id,
-                "output_index": self.reasoning_index,
-                "summary_index": 0,
-                "text": accumulated,
-            },
-        )
-        yield self.sse(
-            "response.reasoning_summary_part.done",
-            {
-                "item_id": self.reasoning_item_id,
-                "output_index": self.reasoning_index,
-                "summary_index": 0,
-                "part": {"type": "summary_text", "text": accumulated},
-            },
-        )
+        if stage is PartStage.OPEN:
+            yield self.sse(
+                "response.reasoning_summary_text.done",
+                {
+                    "item_id": self.reasoning_item_id,
+                    "output_index": self.reasoning_index,
+                    "summary_index": 0,
+                    "text": accumulated,
+                },
+            )
+        if stage in (PartStage.OPEN, PartStage.TEXT_DONE):
+            yield self.sse(
+                "response.reasoning_summary_part.done",
+                {
+                    "item_id": self.reasoning_item_id,
+                    "output_index": self.reasoning_index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": accumulated},
+                },
+            )
         yield self.sse(
             "response.output_item.done",
             {"output_index": self.reasoning_index, "item": dict(final_item)},
         )
 
     def _close_message(
-        self, accumulated: str, status: str = "completed"
+        self,
+        accumulated: str,
+        status: str = "completed",
+        *,
+        stage: PartStage = PartStage.OPEN,
     ) -> Iterator[str]:
         if self.message_item_id is None:
             return
@@ -903,34 +966,36 @@ class _ResponsesStreamEmitter:
             "type": "message",
             "role": "assistant",
             "status": status,
-            "content": [
-                {"type": "output_text", "text": accumulated, "annotations": []}
-            ],
+            "content": [{"type": "output_text", "text": accumulated, "annotations": []}]
+            if stage is not PartStage.ABSENT
+            else [],
         }
         self._replace_order_item(self.message_item_id, final_item)
-        yield self.sse(
-            "response.output_text.done",
-            {
-                "item_id": self.message_item_id,
-                "output_index": self.message_index,
-                "content_index": 0,
-                "text": accumulated,
-                "logprobs": [],
-            },
-        )
-        yield self.sse(
-            "response.content_part.done",
-            {
-                "item_id": self.message_item_id,
-                "output_index": self.message_index,
-                "content_index": 0,
-                "part": {
-                    "type": "output_text",
+        if stage is PartStage.OPEN:
+            yield self.sse(
+                "response.output_text.done",
+                {
+                    "item_id": self.message_item_id,
+                    "output_index": self.message_index,
+                    "content_index": 0,
                     "text": accumulated,
-                    "annotations": [],
+                    "logprobs": [],
                 },
-            },
-        )
+            )
+        if stage in (PartStage.OPEN, PartStage.TEXT_DONE):
+            yield self.sse(
+                "response.content_part.done",
+                {
+                    "item_id": self.message_item_id,
+                    "output_index": self.message_index,
+                    "content_index": 0,
+                    "part": {
+                        "type": "output_text",
+                        "text": accumulated,
+                        "annotations": [],
+                    },
+                },
+            )
         yield self.sse(
             "response.output_item.done",
             {"output_index": self.message_index, "item": dict(final_item)},
@@ -954,11 +1019,14 @@ class _ResponsesStreamEmitter:
             "".join(self._reasoning_accumulated), "incomplete"
         )
         yield from self._close_message("".join(self._text_accumulated), "incomplete")
+        yield self._failed(message, code)
+
+    def _failed(self, message: str, code: int) -> str:
         # The typed Responses error.code enum is not Chat's error.type.
         response_code = {400: "invalid_prompt", 429: "rate_limit_exceeded"}.get(
             code, "server_error"
         )
-        yield self.sse(
+        return self.sse(
             "response.failed",
             {
                 "response": {
@@ -973,17 +1041,70 @@ class _ResponsesStreamEmitter:
             },
         )
 
+    def _delivered_text(self, item: dict[str, object], length: int) -> str:
+        if not length:
+            return ""
+        reasoning = item["type"] == "reasoning"
+        parts = item["summary" if reasoning else "content"]
+        if isinstance(parts, list) and parts and isinstance(parts[0], dict):
+            # The producer may already have closed this item and advanced.
+            return _as_str(parts[0].get("text"))[:length]
+        fragments = self._reasoning_accumulated if reasoning else self._text_accumulated
+        prefix = []
+        for fragment in fragments:
+            prefix.append(fragment[:length])
+            length -= len(prefix[-1])
+            if not length:
+                break
+        return "".join(prefix)
+
     def timeout_error(self, message: str) -> list[str]:
-        sent = self.prelude_sequence() if self.prelude_sequence is not None else None
+        sent = self.delivery
         if sent is None:
             return list(self.error(message, code=504))
-        # No output items have reached the client. Reuse the original ID
-        # but start from the sequence actually accepted by the outer sender.
+        if not sent.begin_failure():
+            return []
         emitter = _ResponsesStreamEmitter(self.response_id, self.requested_model)
         emitter.created_at = self.created_at
-        emitter.seq = sent
-        opening = [emitter.created()] if sent == -1 else []
-        return [*opening, *emitter.error(message, code=504)]
+        emitter.seq = sent.sequence
+        chunks = [emitter.created()] if sent.sequence == -1 else []
+        # Items are opened serially and in output_index order. Already closed
+        # snapshots are immutable; only the final accepted item may be partial.
+        index = sent.output_index
+        emitter.item_order = self.item_order[: index + 1]
+        if index >= 0 and sent.last != b"response.output_item.done":
+            _, item = emitter.item_order[-1]
+            item_id = _as_str(item["id"])
+            if item["type"] == "function_call":
+                # No synthetic arguments.done: an unfinished call is not an
+                # instruction to execute, even if the producer knew more.
+                partial = {
+                    **item,
+                    "status": "incomplete",
+                    "arguments": _as_str(item["arguments"])[: sent.characters],
+                }
+                emitter.item_order[-1] = (index, partial)
+                chunks.append(
+                    emitter.sse(
+                        "response.output_item.done",
+                        {"output_index": index, "item": partial},
+                    )
+                )
+            else:
+                text = self._delivered_text(item, sent.characters)
+                stage = sent.part_stage()
+                if item["type"] == "reasoning":
+                    emitter.reasoning_item_id, emitter.reasoning_index = item_id, index
+                    chunks.extend(
+                        emitter._close_reasoning(text, "incomplete", stage=stage)
+                    )
+                else:
+                    emitter.message_item_id, emitter.message_index = item_id, index
+                    chunks.extend(
+                        emitter._close_message(text, "incomplete", stage=stage)
+                    )
+        chunks.append(emitter._failed(message, 504))
+        return chunks
 
     def _ordered_output(self) -> list[dict[str, object]]:
         """按实际打开顺序（output_index）产出 items 快照。"""
@@ -1023,10 +1144,10 @@ def build_responses_preparation_failure(
     message: str,
     *,
     register_failure: Callable[[Callable[[str], list[str]]], None],
-    prelude_sequence: Callable[[], int | None],
+    delivery: ResponsesStreamDelivery | None,
 ) -> list[str]:
     """Open and fail a Responses stream whose HTTP headers are already sent."""
-    emitter = _ResponsesStreamEmitter(_response_id(), requested_model, prelude_sequence)
+    emitter = _ResponsesStreamEmitter(_response_id(), requested_model, delivery)
     register_failure(emitter.timeout_error)
     return [emitter.created(), *emitter.error(message, code)]
 
@@ -1036,11 +1157,11 @@ async def responses_stream_adapter(
     *,
     requested_model: str,
     register_failure: Callable[[Callable[[str], list[str]]], None] | None = None,
-    prelude_sequence: Callable[[], int | None] | None = None,
+    delivery: ResponsesStreamDelivery | None = None,
 ) -> AsyncGenerator[str, None]:
     """Gemini SSE → OpenAI Responses 语义事件流。"""
     response_id = _response_id()
-    emitter = _ResponsesStreamEmitter(response_id, requested_model, prelude_sequence)
+    emitter = _ResponsesStreamEmitter(response_id, requested_model, delivery)
     async with _stream_adapter_lifecycle(
         source, emitter.timeout_error, register_failure
     ):
