@@ -70,6 +70,7 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("compat.responses")
 _STANDARD_BASE64 = re.compile(r"[A-Za-z0-9+/]++={0,2}")
+_UNFINISHED_CALL_STATUSES = ("incomplete", "in_progress")
 
 # Responses reasoning.effort → Gemini reasoningEffort：统一走
 # normalize_reasoning_effort_word（与 chat completions 侧同一套词表，
@@ -275,14 +276,22 @@ async def responses_to_gemini_request(
     system_texts: list[str] = [req.instructions] if req.instructions else []
     tool_name_by_call_id: dict[str, str] = {}
 
-    # 第一遍：扫 function_call items 建 call_id → 函数名映射（容忍乱序历史）
+    # Index call ownership first because a result may precede its call.
+    replayable_call_ids: set[str] = set()
+    unfinished_call_ids: set[str] = set()
     for item in req.input if isinstance(req.input, list) else []:
         if not isinstance(item, dict) or item.get("type") != "function_call":
             continue
         call_id = _as_str(item.get("call_id"))
-        name = _as_str(item.get("name"))
-        if call_id and name:
+        if not call_id:
+            continue
+        if item.get("status") in _UNFINISHED_CALL_STATUSES:
+            unfinished_call_ids.add(call_id)
+            continue
+        replayable_call_ids.add(call_id)
+        if name := _as_str(item.get("name")):
             tool_name_by_call_id[call_id] = name
+    unfinished_call_ids.difference_update(replayable_call_ids)
 
     if req.input is None and not req.instructions:
         raise ValueError("input is required when instructions is empty")
@@ -318,6 +327,8 @@ async def responses_to_gemini_request(
                         GeminiContent(role="user", parts=parts or [GeminiPart(text="")])
                     )
             elif item_type == "function_call":
+                if item.get("status") in _UNFINISHED_CALL_STATUSES:
+                    continue
                 name = _as_str(item.get("name")) or "unknown"
                 call_id = _as_str(item.get("call_id"))
                 args = item.get("arguments")
@@ -350,6 +361,8 @@ async def responses_to_gemini_request(
                 )
             elif item_type == "function_call_output":
                 call_id = _as_str(item.get("call_id"))
+                if call_id in unfinished_call_ids:
+                    continue
                 name = tool_name_by_call_id.get(call_id, "unknown")
                 payload, media = _tool_output_payload(item.get("output"))
                 contents.append(
@@ -866,12 +879,12 @@ class _ResponsesStreamEmitter:
         self.item_order.append((fc_index, dict(item)))
         # The closing frames repeat the entire argument string. Keep the
         # snapshot above, but encode only the frame the HTTP consumer requests.
+        # Only the completed argument carrier can expose its signature.
         yield self.sse(
             "response.output_item.added",
             {
                 "output_index": fc_index,
                 "item": {
-                    **_signature_extra(signature),
                     "id": item_id,
                     "type": "function_call",
                     "status": "in_progress",
@@ -1083,6 +1096,7 @@ class _ResponsesStreamEmitter:
                     "status": "incomplete",
                     "arguments": _as_str(item["arguments"])[: sent.characters],
                 }
+                partial.pop("extra_content", None)
                 emitter.item_order[-1] = (index, partial)
                 chunks.append(
                     emitter.sse(

@@ -154,7 +154,9 @@ async def test_argument_frames_wait_for_each_asgi_write(
     ]
     added, delta, done, item_done, terminal = events[2:]
     item = item_done["item"]
-    assert added["item"] == {**item, "arguments": "", "status": "in_progress"}
+    preview = {**item, "arguments": "", "status": "in_progress"}
+    del preview["extra_content"]
+    assert added["item"] == preview
     assert item["type"] == "function_call"
     assert (item["name"], item["call_id"]) == ("lookup", "fixture-id")
     assert item["extra_content"]["google"]["thought_signature"] == signature

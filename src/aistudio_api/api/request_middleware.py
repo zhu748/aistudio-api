@@ -691,6 +691,13 @@ class RequestMiddleware:
             finally:
                 if model_call and admitted:
                     unregister_request(context.request_id)
+                if responses_call:
+                    # After the final send and cleanup, an idle HTTP connection
+                    # can still hold this scope. Don't let its callbacks pin the
+                    # Responses emitter and its accumulated output.
+                    scope["state"].pop("stream_failure", None)
+                    scope["state"].pop("responses_accept_event", None)
+                if model_call and admitted:
                     # 大请求收尾后归还 glibc 堆碎片（小内存容器 RSS 高水位
                     # 治理，详见 _release_allocator_memory）；放行务落账之后。
                     _release_allocator_memory(
