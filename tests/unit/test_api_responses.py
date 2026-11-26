@@ -265,13 +265,14 @@ async def test_streaming_metadata_event_does_not_block_failover():
     from aistudio_api.infrastructure.gateway.client import AIStudioClient
 
     attempt_count = 0
+    abandoned_marker = "bGVnYWN5LWZpcnN0LWF0dGVtcHQ="
 
     async def fake_stream_generate_content(*args, **kwargs):
         nonlocal attempt_count
         attempt_count += 1
         if attempt_count == 1:
             # 首次尝试：仅产生内部元数据事件，尚未发出实际正文 chunk，随即遇到 204/抖动异常
-            yield ("thought_signature", "sig_early")
+            yield ("thought_signature", abandoned_marker)
             raise RequestError(204, "No content")
         # 第二次尝试：正常流式输出
         yield ("body", "Hello world after retry")
@@ -295,3 +296,4 @@ async def test_streaming_metadata_event_does_not_block_failover():
     # 验证重试成功完成
     assert attempt_count == 2
     assert any("Hello world after retry" in str(c) for c in chunks)
+    assert all(abandoned_marker not in str(chunk) for chunk in chunks)

@@ -1,7 +1,14 @@
 """An opaque-only Part belongs to one generation, even after a transport error."""
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 import test_ordered_tool_routes as wire_routes
+
+from aistudio_api.api.app import app
+from aistudio_api.api.dependencies import get_client
+from aistudio_api.application import api_service_gemini
 
 wire_gateway = wire_routes.wire_source
 _MARK = "Y2Fycmllcg=="
@@ -49,3 +56,44 @@ async def test_retry_respects_native_part_ownership(wire_gateway, monkeypatch, e
             for event in events
             for candidate in event.get("candidates", [])
         )
+
+
+@pytest.mark.parametrize("placement", ["before_part", "behind_tool", "metadata_only"])
+async def test_legacy_marker_is_not_an_independently_publishable_part(
+    monkeypatch, placement
+):
+    async def answer(**_kwargs):
+        if placement == "behind_tool":
+            yield "tool_calls", [
+                {"id": "fixture", "name": "weather", "args": {"city": "Paris"}}
+            ]
+        else:
+            yield "thought_signature", "b2xkZXItbGVnYWN5"
+        yield "thought_signature", _MARK
+        if placement != "metadata_only":
+            yield "body", "same attempt"
+        yield "finish_reason", 1
+
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        get_client,
+        lambda: SimpleNamespace(stream_generate_content=answer),
+    )
+    monkeypatch.setattr(api_service_gemini, "ensure_active_account", AsyncMock())
+    events = await wire_routes.request("native", True)
+    parts = wire_routes.native_parts(events)
+    if placement == "before_part":
+        assert parts == [{"thoughtSignature": _MARK}, {"text": "same attempt"}]
+    elif placement == "behind_tool":
+        assert parts == [
+            {
+                "functionCall": {
+                    "id": "fixture",
+                    "name": "weather",
+                    "args": {"city": "Paris"},
+                }
+            },
+            {"text": "same attempt"},
+        ]
+    else:
+        assert all("thoughtSignature" not in part for part in parts)

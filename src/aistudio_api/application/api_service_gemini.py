@@ -1348,8 +1348,15 @@ async def _stream_attempt_frames(
 ) -> AsyncGenerator[dict[str, object], None]:
     """Publish leading content live, then the ordered tool suffix upon STOP."""
     assembler = ToolResponseAssembler()
+    legacy_prefix: dict[str, object] | None = None
+    seen_part = published_part = False
 
     def publish(parts: list[dict[str, object]]) -> dict[str, object]:
+        nonlocal legacy_prefix, published_part
+        if legacy_prefix is not None:
+            parts = [legacy_prefix, *parts]
+            legacy_prefix = None
+        published_part = True
         _observe_output_parts(parts)
         if any(has_response_content(part) for part in parts):
             if not state.has_yielded_data:
@@ -1376,12 +1383,19 @@ async def _stream_attempt_frames(
                     state.final_finish_reason = value
             elif event_type == "response_id":
                 state.latest_response_id = str(value)
+            elif event_type == "thought_signature" and not published_part:
+                # This legacy event is metadata, not an ordered wire Part.
+                # Only publish a leading marker with a Part of this attempt;
+                # never move a later marker ahead of an unconfirmed call.
+                if not seen_part and isinstance(value, str) and value:
+                    legacy_prefix = {"thoughtSignature": value}
             elif event_type == "tool_interruption":
                 for part in _consume_finished_parts(assembler.block_tools()):
                     yield publish([part])
                     del part
             else:
                 parts = _event_parts(event_type, value)
+                seen_part |= bool(parts)
                 if any(
                     has_response_content(part) or "functionCall" in part
                     for part in parts
