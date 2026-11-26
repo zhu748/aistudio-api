@@ -111,7 +111,10 @@ def _is_terminal_event(path: str, body: bytes) -> bool:
     fields, not model text or tool arguments.
     """
     if path == "/v1/chat/completions":
-        return body == b"data: [DONE]\n\n"
+        # Official Chat clients raise and close on a top-level error without
+        # consuming [DONE]. Our encoder places that object first; a nested
+        # tool argument or text containing "error" cannot match this prefix.
+        return body == b"data: [DONE]\n\n" or body.startswith(b'data: {"error":{')
     if path == "/v1/messages":
         return body.startswith((b"event: message_stop\n", b"event: error\n"))
     if path == "/v1/responses":
@@ -163,6 +166,7 @@ class _ResponseObserver:
     sending: bool = False
     json_payload_sent: bool = False
     stream_terminal_sent: bool = False
+    delivered_outcome: tuple[str, str, str] | None = None
     client_disconnected: bool = False
     is_stream: bool = False
     first_byte_ms: float | None = None
@@ -421,9 +425,10 @@ class RequestMiddleware:
                     async with asyncio.timeout(settings.stream_send_timeout):
                         await send(message)
                 except TimeoutError as exc:
-                    context.result = "cancelled"
-                    context.error = "Downstream response send timed out"
-                    raise OSError(context.error) from exc
+                    detail = "Downstream response send timed out"
+                    if not observer.response_delivered:
+                        context.result, context.error = "cancelled", detail
+                    raise OSError(detail) from exc
             else:
                 await send(message)
             observer.sending = False
@@ -457,6 +462,12 @@ class RequestMiddleware:
                     )
                 ):
                     observer.json_payload_sent = True
+                if observer.response_delivered and observer.delivered_outcome is None:
+                    observer.delivered_outcome = (
+                        context.result,
+                        context.error,
+                        context.finish_reason,
+                    )
 
         try:
             # Reserve a slot before the first await, including history I/O.
@@ -501,10 +512,21 @@ class RequestMiddleware:
             else:
                 await self.app(scope, observed_receive, observed_send)
         except asyncio.CancelledError:
-            context.result = "cancelled"
+            if not observer.response_delivered:
+                context.result = "cancelled"
             raise
         except TimeoutError:
             if observer.client_disconnected:
+                return
+            if observer.response_delivered:
+                if observer.sending:
+                    # The earlier terminal/JSON send succeeded. The trailing
+                    # write may have partially completed: don't try it again.
+                    raise OSError(
+                        "Timeout interrupted trailing downstream send"
+                    ) from None
+                if not observer.completed:
+                    await observed_send({"type": "http.response.body", "body": b""})
                 return
             if not request_timeout.expired():
                 context.result, context.error = "error", "Upstream operation timed out"
@@ -520,13 +542,6 @@ class RequestMiddleware:
                 context.result = "cancelled"
                 context.error = "Request timeout interrupted downstream send"
                 raise OSError(context.error) from None
-            if observer.completed:
-                return
-            if observer.json_payload_sent or observer.stream_terminal_sent:
-                # The result or terminal event has reached ASGI send. Only end
-                # HTTP; appending an error would corrupt or contradict it.
-                await observed_send({"type": "http.response.body", "body": b""})
-                return
             context.result, context.error = "timeout", "Request exceeded total timeout"
             if not observer.response_started:
                 await reply(504, context.error)
@@ -561,13 +576,15 @@ class RequestMiddleware:
                     }
                 )
         except (OSError, ClientDisconnect):
-            context.result = "cancelled"
-            if not context.error:
-                context.error = _DOWNSTREAM_DISCONNECT
+            if not observer.response_delivered:
+                context.result = "cancelled"
+                if not context.error:
+                    context.error = _DOWNSTREAM_DISCONNECT
             if not observer.client_disconnected:
                 raise
         except Exception:
-            context.result, context.error = "error", "Internal server error"
+            if not observer.response_delivered:
+                context.result, context.error = "error", "Internal server error"
             logger.exception("Request failed")
             if observer.client_disconnected:
                 return
@@ -590,7 +607,13 @@ class RequestMiddleware:
                     # an undelivered response into client-visible success.
                     context.result, context.error = "cancelled", _DOWNSTREAM_DISCONNECT
                     context.finish_reason = ""
-                elif not context.result:
+                elif context.result == "cancelled" and observer.delivered_outcome:
+                    # An inner response writer may also report its own send
+                    # timeout. That cannot revoke an earlier successful send.
+                    context.result, context.error, context.finish_reason = (
+                        observer.delivered_outcome
+                    )
+                if not context.result:
                     context.result = (
                         "rate_limited"
                         if observer.status == 429

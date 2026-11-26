@@ -246,3 +246,196 @@ async def test_delivered_buffered_request_remains_successful(
     assert json.loads(body)["choices"][0]["message"]["content"] == _ANSWER
     outcome = client.stored_result()
     assert outcome["result"] == "success" and outcome["finish_reason"] == "STOP"
+
+
+@pytest.mark.parametrize("spec", ["2.3", "2.4"])
+@pytest.mark.parametrize("protocol", ["gemini", "chat", "claude", "responses"])
+@pytest.mark.parametrize("cut", ["terminal_send", "after_terminal"])
+async def test_send_only_disconnect_respects_accepted_terminal(
+    monkeypatch, isolated_history, spec, protocol, cut
+):
+    closed = 0
+
+    async def stream_generate_content(**_kwargs):
+        nonlocal closed
+        try:
+            yield "body", _ANSWER
+            yield "finish_reason", 1
+        finally:
+            closed += 1
+
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        get_client,
+        lambda: SimpleNamespace(stream_generate_content=stream_generate_content),
+    )
+    client = _Client(protocol, stream=True, spec_version=spec)
+    accepted = False
+
+    async def send(message):
+        nonlocal accepted
+        if message["type"] == "http.response.body":
+            terminal = _stream_finished(protocol, message.get("body", b""))
+            if (cut == "terminal_send" and terminal) or (
+                accepted and not message.get("more_body", False)
+            ):
+                raise OSError("fixture client closed")
+            await client.send(message)
+            if terminal:
+                accepted = True
+        else:
+            await client.send(message)
+
+    # A socket send can report closure before ASGI receive reports it.
+    async with asyncio.timeout(3):
+        with pytest.raises(OSError):
+            await app(client.scope, client.receive, send)
+    outcome = client.stored_result()
+    assert closed == 1 and not active_requests()
+    if cut == "after_terminal":
+        assert accepted and (
+            outcome["result"],
+            outcome["error"],
+            outcome["finish_reason"],
+        ) == ("success", "", "STOP")
+    else:
+        assert (
+            not accepted
+            and outcome["result"] == "cancelled"
+            and not outcome["finish_reason"]
+        )
+
+
+@pytest.mark.parametrize("keepalive", [False, True])
+async def test_send_only_disconnect_after_buffered_json(
+    monkeypatch, isolated_history, keepalive
+):
+    monkeypatch.setattr(settings, "nonstream_keepalive", keepalive)
+    monkeypatch.setattr(settings, "stream_heartbeat_interval", 0.01)
+    client = _Client("chat", stream=False, spec_version="2.4")
+
+    async def generate_content(**_kwargs):
+        if keepalive:
+            await client.heartbeat.wait()
+        return ModelOutput(candidates=[Candidate(text=_ANSWER, finish_reason=1)])
+
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        get_client,
+        lambda: SimpleNamespace(generate_content=generate_content),
+    )
+    accepted = False
+
+    async def send(message):
+        nonlocal accepted
+        if (
+            message["type"] == "http.response.body"
+            and accepted
+            and not message.get("more_body", False)
+        ):
+            raise OSError("fixture client closed after JSON")
+        await client.send(message)
+        accepted |= _ANSWER.encode() in message.get("body", b"")
+
+    async with asyncio.timeout(3):
+        with pytest.raises(OSError):
+            await app(client.scope, client.receive, send)
+    outcome = client.stored_result()
+    assert accepted and (
+        outcome["result"],
+        outcome["error"],
+        outcome["finish_reason"],
+    ) == ("success", "", "STOP")
+
+
+@pytest.mark.parametrize("spec", ["2.3", "2.4"])
+@pytest.mark.parametrize("actual_error", [False, True])
+async def test_only_a_delivered_top_level_chat_error_is_terminal(
+    monkeypatch, isolated_history, spec, actual_error
+):
+    from aistudio_api.domain.errors import TransportError
+
+    text = 'The station replied: {"error":{"message":"station offline"}}.'
+
+    async def stream_generate_content(**_kwargs):
+        yield "body", text
+        if actual_error:
+            raise TransportError("fixture connection closed")
+        await asyncio.Event().wait()
+
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        get_client,
+        lambda: SimpleNamespace(stream_generate_content=stream_generate_content),
+    )
+    client = _Client("chat", stream=True, spec_version=spec)
+
+    async def send(message):
+        body = message.get("body", b"")
+        if body == b"data: [DONE]\n\n" and client.disconnect.is_set():
+            # A client which has raised on the error doesn't read the sentinel.
+            await asyncio.Event().wait()
+        await client.send(message)
+        if body.startswith(b"data: {"):
+            frame = json.loads(body[6:])
+            if (
+                "error" in frame
+                if actual_error
+                else frame["choices"][0]["delta"].get("content") == text
+            ):
+                client.disconnect.set()
+
+    async with asyncio.timeout(3):
+        await app(client.scope, client.receive, send)
+    outcome = client.stored_result()
+    assert client.disconnect.is_set()
+    if actual_error:
+        assert (
+            outcome["result"] == "error"
+            and "fixture connection closed" in outcome["error"]
+        )
+    else:
+        assert outcome["result"] == "cancelled" and not outcome["finish_reason"]
+
+
+@pytest.mark.parametrize("deadline", ["total", "send"])
+async def test_timeout_writing_empty_http_close_cannot_revoke_a_terminal(
+    monkeypatch, isolated_history, deadline
+):
+    monkeypatch.setattr(
+        settings, "request_timeout", 0.6 if deadline == "total" else 20.0
+    )
+    monkeypatch.setattr(
+        settings, "stream_send_timeout", 0.05 if deadline == "send" else 10.0
+    )
+    client = _Client("chat", stream=True, spec_version="2.4")
+
+    async def stream_generate_content(**_kwargs):
+        yield "body", _ANSWER
+        yield "finish_reason", 1
+
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        get_client,
+        lambda: SimpleNamespace(stream_generate_content=stream_generate_content),
+    )
+    accepted = False
+
+    async def send(message):
+        nonlocal accepted
+        if message["type"] == "http.response.body" and not message.get(
+            "more_body", False
+        ):
+            await asyncio.Event().wait()
+        await client.send(message)
+        accepted |= _stream_finished("chat", message.get("body", b""))
+
+    async with asyncio.timeout(3):
+        with pytest.raises(OSError):
+            await app(client.scope, client.receive, send)
+    outcome = client.stored_result()
+    assert accepted and (
+        outcome["result"],
+        outcome["error"],
+        outcome["finish_reason"],
+    ) == ("success", "", "STOP")

@@ -809,14 +809,17 @@ async def openai_stream_adapter(
         # id/object/created/model/choices 会直接抛 ValidationError。error 字段
         # 作为附加信息保留（SDK 默认忽略未知字段），finish_reason 用终止态，
         # 保证流以正常终结块收尾而不是异常断流。
-        payload = _chunk({}, "stop")
-        payload["error"] = {
-            "message": message,
-            "type": error_type,
-            "param": None,
-            "code": code,
+        # Put the top-level error first so HTTP delivery tracking can
+        # distinguish it without reparsing ordinary (possibly large) deltas.
+        return {
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": None,
+                "code": code,
+            },
+            **_chunk({}, "stop"),
         }
-        return payload
 
     finish_reason_raw: str | None = None
     usage_frame: dict[str, object] | None = None
