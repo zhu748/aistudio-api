@@ -167,8 +167,11 @@ def test_synthetic_id_cache_skips_invalid_signature(fresh_signature_cache) -> No
     )
 
 
-async def test_synthetic_tool_id_round_trip_to_upstream(fresh_signature_cache) -> None:
-    """端到端：合成 id 的工具轮，客户端剥离 extra_content 后仍能恢复签名。"""
+@pytest.mark.parametrize("keep_signature", [False, True])
+async def test_synthetic_tool_id_round_trip_to_upstream(
+    fresh_signature_cache, keep_signature
+) -> None:
+    """A synthetic ID alone cannot turn a legacy record into replay evidence."""
     response = _gemini_response(
         [
             GeminiPartResponse(
@@ -181,16 +184,13 @@ async def test_synthetic_tool_id_round_trip_to_upstream(fresh_signature_cache) -
     )
     message = build_claude_message(response, "claude-sonnet-4-5", None)
     tool_use = next(b for b in _blocks(message) if b["type"] == "tool_use")
-    # 客户端回传 tool_use 时丢掉了 extra_content（未知字段被剥离）
-    replayed = {
-        "type": "tool_use",
-        "id": tool_use["id"],
-        "name": "Bash",
-        "input": {"command": "ls"},
-    }
+    replayed = dict(tool_use)
+    if not keep_signature:
+        replayed.pop("extra_content", None)
     parts = await _claude_blocks_to_parts([replayed], tool_name_by_id={})
     assert parts[0].functionCall is not None
-    assert parts[0].thoughtSignature is None
+    assert parts[0].functionCall.id == tool_use["id"]
+    assert parts[0].thoughtSignature == (_SIG if keep_signature else None)
     request = GeminiGenerateContentRequest(
         contents=[
             GeminiContent(role="model", parts=parts),
@@ -199,7 +199,7 @@ async def test_synthetic_tool_id_round_trip_to_upstream(fresh_signature_cache) -
     )
     normalized = normalize_gemini_request(request, "gemini-3.8-flash")
     outbound, _, _ = ModelTurnHistory().prepare("fixture", normalized.contents)
-    assert outbound[0].parts[0].thought_signature == _SIG
+    assert (outbound[0].parts[0].thought_signature == _SIG) is keep_signature
 
 
 # ---------------------------------------------------------------------------
@@ -362,9 +362,11 @@ def test_tool_choice_without_flag_no_warning(
 
 
 @pytest.mark.parametrize("signed_thought", [False, True])
-async def test_claude_code_tool_turn_replay_with_stripped_signature(
+@pytest.mark.parametrize("keep_tool_signature", [False, True])
+async def test_claude_code_tool_turn_replay_keeps_only_known_owners(
     fresh_signature_cache,
     signed_thought,
+    keep_tool_signature,
 ) -> None:
     """An unsigned thought never takes a tool signature; an explicit one survives."""
     expected_thought_signature = _SIG2 if signed_thought else None
@@ -387,6 +389,9 @@ async def test_claude_code_tool_turn_replay_with_stripped_signature(
     message = build_claude_message(response, "claude-sonnet-4-5", None)
     tool_use = next(b for b in _blocks(message) if b["type"] == "tool_use")
     thinking_block = next(b for b in _blocks(message) if b["type"] == "thinking")
+    tool_echo = dict(tool_use)
+    if not keep_tool_signature:
+        tool_echo.pop("extra_content", None)
 
     req = ClaudeMessagesRequest.model_validate(
         {
@@ -403,13 +408,7 @@ async def test_claude_code_tool_turn_replay_with_stripped_signature(
                             "thinking": thinking_block["thinking"],
                             "signature": thinking_block["signature"],
                         },
-                        # tool_use 剥离 extra_content（未知字段）
-                        {
-                            "type": "tool_use",
-                            "id": tool_use["id"],
-                            "name": "Bash",
-                            "input": {"command": "ls"},
-                        },
+                        tool_echo,
                     ],
                 },
                 {
@@ -435,7 +434,7 @@ async def test_claude_code_tool_turn_replay_with_stripped_signature(
     fc = fc_part.function_call
     assert fc is not None
     assert fc[0] == "Bash"
-    assert fc_part.thought_signature == _SIG
+    assert fc_part.thought_signature == (_SIG if keep_tool_signature else None)
     # tool_result 反查名字正确（id 匹配）
     fr_part = next(p for p in outbound[2].parts if p.function_response)
     fr = fr_part.function_response
