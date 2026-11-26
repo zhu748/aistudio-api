@@ -50,12 +50,12 @@ def isolated_signature_cache(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("protocol", ["openai", "claude", "responses", "gemini"])
-@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("legacy_record", [False, True])
 @pytest.mark.parametrize("signature_mode", ["missing", "sentinel"])
 async def test_preset_context_survives_cache_misses(
-    protocol, warm, signature_mode, isolated_signature_cache
+    protocol, legacy_record, signature_mode, isolated_signature_cache
 ):
-    if warm:
+    if legacy_record:
         isolated_signature_cache.remember(
             "init", "context", {"query": "init_world"}, SIGNATURE
         )
@@ -203,14 +203,10 @@ async def test_preset_context_survives_cache_misses(
         )
         == 3
     )
-    for index, part in enumerate(calls):
-        expected = (
-            SIGNATURE
-            if warm and signature_mode == "missing" and index == 0
-            else SENTINEL
-        )
-        assert part.thought_signature == expected
-        assert part.to_wire()[14] == expected
+    for part in calls:
+        # An unscoped prior record never claims this preset's call occurrence.
+        assert part.thought_signature == SENTINEL
+        assert part.to_wire()[14] == SENTINEL
 
 
 @pytest.mark.parametrize("with_id", [False, True])

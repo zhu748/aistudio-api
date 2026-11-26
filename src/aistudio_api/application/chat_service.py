@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections import Counter, defaultdict
+from itertools import groupby
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from aistudio_api.api.schemas import (
+        GeminiContent,
         GeminiFunctionResponse,
         GeminiGenerateContentRequest,
         GeminiPart,
@@ -671,38 +674,80 @@ def _rewrite_model_tail_for_continuation(
     return contents, system_instruction
 
 
-def _match_pending_call(
-    fr: GeminiFunctionResponse, pending_calls: list[tuple[str | None, str]]
-) -> int | None:
-    """按 ID（并行调用）或名称/唯一挂起项匹配 functionResponse。
+_ToolOwner = tuple[str | None, str]
 
-    IDs identify parallel calls. When an endpoint omits IDs, use the only
-    pending call or the next matching name. 无任何匹配时返回 None（调用方
-    回落 tool_history 转录形态）。
+
+def _match_pending_calls(
+    parts: list[GeminiPart], pending: list[_ToolOwner]
+) -> dict[int, _ToolOwner]:
+    """Resolve exact pairs before considering any ID-less result.
+
+    Remaining same-name results with no reliable ID keep their supplied order
+    and do not acquire guessed IDs. Orphans keep their payload as transcript.
     """
-    matched = next(
-        (
-            i
-            for i, (call_id, _) in enumerate(pending_calls)
-            if fr.id and call_id == fr.id
-        ),
-        None,
-    )
-    if matched is None:
-        matched = next(
-            (
-                i
-                for i, (call_id, name) in enumerate(pending_calls)
-                if not (fr.id and call_id)
-                and (fr.name == name or (not fr.name and len(pending_calls) == 1))
-            ),
-            None,
-        )
-    return matched
+    if not pending:
+        return {}
+    results = {
+        i: part.functionResponse
+        for i, part in enumerate(parts)
+        if part.functionResponse is not None
+    }
+    call_ids = Counter(call_id for call_id, _ in pending if call_id)
+    result_ids = Counter(fr.id for fr in results.values() if fr.id)
+    call_by_id = {call_id: i for i, (call_id, _) in enumerate(pending) if call_id}
+    owners: dict[int, _ToolOwner] = {}
+    consumed: set[int] = set()
+    named: dict[str, list[tuple[int, GeminiFunctionResponse]]] = defaultdict(list)
+    unnamed: list[tuple[int, GeminiFunctionResponse]] = []
+
+    for index, fr in results.items():
+        if fr.id and (call_ids[fr.id] > 1 or result_ids[fr.id] > 1):
+            continue
+        if fr.id and fr.id in call_by_id:
+            owner = call_by_id[fr.id]
+            owners[index] = pending[owner]
+            consumed.add(owner)
+        elif fr.name:
+            named[fr.name].append((index, fr))
+        else:
+            unnamed.append((index, fr))
+
+    by_name: dict[str, list[int]] = defaultdict(list)
+    for index, (_, name) in enumerate(pending):
+        if index not in consumed:
+            by_name[name].append(index)
+
+    for name, outputs in named.items():
+        possible = by_name.get(name, [])
+        unnamed_ids = [i for i in possible if not pending[i][0]]
+        unbound = [(i, fr.id) for i, fr in outputs if fr.id]
+        if len(unnamed_ids) == len(unbound) == 1:
+            index, result_id = unbound[0]
+            owner = unnamed_ids[0]
+            owners[index] = (result_id, name)
+            consumed.add(owner)
+            possible = [i for i in possible if i != owner]
+
+        positional = [index for index, fr in outputs if not fr.id]
+        if len(possible) == len(positional) == 1:
+            owners[positional[0]] = pending[possible[0]]
+            consumed.add(possible[0])
+        else:
+            for index, owner in zip(positional, possible, strict=False):
+                owners[index] = (None, name)
+                consumed.add(owner)
+
+    if len(unnamed) == 1 and len(consumed) + 1 == len(pending):
+        owner = next(i for i in range(len(pending)) if i not in consumed)
+        call_id, name = pending[owner]
+        index, fr = unnamed[0]
+        if not (fr.id and call_id):
+            owners[index] = (fr.id or call_id, name)
+    return owners
 
 
 def _convert_part(
-    part: GeminiPart, pending_calls: list[tuple[str | None, str]]
+    part: GeminiPart, result_owner: _ToolOwner | None = None
 ) -> list[AistudioPart]:
     """单个 Gemini part → AistudioPart 列表（functionResponse 附图会展开多部件）。
 
@@ -711,7 +756,7 @@ def _convert_part(
     _drop_hollow_and_merge_same_role 统一清理）。
     """
     parts: list[AistudioPart] = []
-    if part.text is not None:
+    if part.text is not None and part.functionResponse is None:
         parts.append(
             AistudioPart(
                 text=part.text,
@@ -722,7 +767,7 @@ def _convert_part(
             )
         )
         return parts
-    if part.inlineData is not None:
+    if part.inlineData is not None and part.functionResponse is None:
         img_data = (part.inlineData.mimeType, part.inlineData.data)
         parts.append(
             AistudioPart(
@@ -734,10 +779,9 @@ def _convert_part(
             )
         )
         return parts
-    if part.functionCall is not None:
+    if part.functionCall is not None and part.functionResponse is None:
         fc = part.functionCall
         args_payload = fc.args if fc.args is not None else {}
-        pending_calls.append((fc.id, fc.name))
         parts.append(
             AistudioPart(
                 function_call=(fc.name, args_payload, fc.id)
@@ -752,43 +796,55 @@ def _convert_part(
     if part.functionResponse is not None:
         fr = part.functionResponse
         resp_payload = fr.response if fr.response is not None else {}
-        matched = _match_pending_call(fr, pending_calls)
-        if matched is None:
+        inline = part.inlineData
+        result = AistudioPart(
+            text=part.text,
+            inline_data=(inline.mimeType, inline.data) if inline else None,
+            inline_filename=inline.filename if inline else None,
+            thought=bool(part.thought),
+        )
+        if result_owner is None:
             parts.append(
                 AistudioPart(
                     text=tool_history_text("tool_result", fr.name, fr.id, resp_payload)
                 )
             )
+            if part.text is not None or inline is not None:
+                parts.append(result)
         else:
-            call_id, name = pending_calls.pop(matched)
-            result_id = fr.id or call_id
-            parts.append(
-                AistudioPart(
-                    function_response=(name, resp_payload, result_id)
-                    if result_id
-                    else (name, resp_payload),
-                )
+            result_id, name = result_owner
+            result.function_response = (
+                (name, resp_payload, result_id) if result_id else (name, resp_payload)
             )
+            if not (
+                part.fileData
+                or part.functionCall
+                or part.executableCode
+                or part.codeExecutionResult
+            ):
+                result.thought_signature = _valid_thought_signature_or_none(
+                    part.thoughtSignature
+                )
+            parts.append(result)
         if fr.parts:
             for subpart in fr.parts:
-                if subpart.inlineData is not None:
-                    img_data = (
-                        subpart.inlineData.mimeType,
-                        subpart.inlineData.data,
-                    )
+                child_inline = subpart.inlineData
+                if child_inline is not None or subpart.text is not None:
                     parts.append(
                         AistudioPart(
-                            inline_data=img_data,
-                            # 工具结果附图的签名同样必须过校验：伪
-                            # 签名会触发上游 400 "Corrupted thought
-                            # signature."（密码学校验，2026-11 实验）
+                            text=subpart.text,
+                            inline_data=(child_inline.mimeType, child_inline.data)
+                            if child_inline
+                            else None,
+                            inline_filename=child_inline.filename
+                            if child_inline
+                            else None,
+                            thought=bool(subpart.thought),
                             thought_signature=_valid_thought_signature_or_none(
                                 subpart.thoughtSignature
                             ),
                         )
                     )
-                elif subpart.text is not None:
-                    parts.append(AistudioPart(text=subpart.text))
         return parts
     if part.executableCode is not None:
         ec = part.executableCode
@@ -822,24 +878,29 @@ def _convert_part(
 
 
 def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioContent]:
-    """contents → AistudioContent 轮次列表（含 pending call 追踪与剥离残留清理）。
-
-    Only orphan/reordered results need a transcript. Preserve signature
-    presence and position until scoped model-turn history has been checked.
-    user 轮（无 functionResponse）清空挂起调用表，保证跨轮不误匹配。
-    剥离残留清理：丢弃全空轮（WAA 403）并合并相邻同角色轮，
-    详见 _drop_hollow_and_merge_same_role docstring。
-    """
+    """Normalize logical turns without changing call/result or attachment order."""
     contents: list[AistudioContent] = []
-    pending_calls: list[tuple[str | None, str]] = []
+    pending: list[_ToolOwner] = []
 
-    for content in req.contents:
-        role = content.role or "user"
-        if role == "user" and not any(p.functionResponse for p in content.parts):
-            pending_calls.clear()
+    def result_run(content: GeminiContent) -> tuple[str, bool]:
+        return content.role or "user", any(p.functionResponse for p in content.parts)
+
+    for (role, has_results), run in groupby(req.contents, key=result_run):
+        incoming = [p for content in run for p in content.parts]
+        owners = _match_pending_calls(incoming, pending) if has_results else {}
         parts = [
-            p for part in content.parts for p in _convert_part(part, pending_calls)
+            p
+            for i, part in enumerate(incoming)
+            for p in _convert_part(part, owners.get(i))
         ]
+        if role == "model":
+            pending = [
+                (call[2] if len(call) > 2 else None, call[0])
+                for part in parts
+                if (call := part.function_call) is not None
+            ]
+        elif has_results or role == "user":
+            pending = []
         contents.append(AistudioContent(role=role, parts=parts))
     return _drop_hollow_and_merge_same_role(contents)
 

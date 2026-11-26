@@ -19,20 +19,22 @@ import json
 import os
 import re
 import threading
-from collections import OrderedDict
+from collections import Counter, OrderedDict
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 
 from aistudio_api.config import detect_memory_budget_mb
 from aistudio_api.domain.tool_signatures import (
     SKIP_THOUGHT_SIGNATURE,
-    lookup_function_signature,
+    SignatureProvenance,
+    get_signature_cache,
 )
 
 from .wire_codec import AistudioWireCodec
 from .wire_parser import parse_response_part, wire_size_estimate
 from .wire_spec import PartIndex
-from .wire_types import AistudioContent, AistudioPart
+from .wire_types import AistudioContent, AistudioPart, wire_function_name
 
 _TOKEN_RE = re.compile(r"v1_[A-Za-z0-9+/=_-]{16,}")
 _DEFAULT_MAX_TURN_BYTES = 4 * 1024 * 1024
@@ -93,8 +95,33 @@ def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def _digest(previous: str, model: bool, parts: list[AistudioPart]) -> str:
-    items: list[object] = []
+@dataclass(frozen=True, slots=True)
+class _ResultOwners:
+    by_id: dict[str, tuple[int, str]]
+    count: int
+
+
+def _result_owners(parts: list[AistudioPart]) -> _ResultOwners:
+    calls = [part.function_call for part in parts if part.function_call is not None]
+    counts = Counter(call[2] for call in calls if len(call) > 2 and call[2])
+    return _ResultOwners(
+        {
+            call[2]: (index, wire_function_name(call[0]))
+            for index, call in enumerate(calls)
+            if len(call) > 2 and counts[call[2]] == 1
+        },
+        len(calls),
+    )
+
+
+def _digest(
+    previous: str,
+    model: bool,
+    parts: list[AistudioPart],
+    owners: _ResultOwners | None = None,
+) -> str:
+    items: list[list[object]] = []
+    explicit_results: list[tuple[int, list[object]]] = []
     text: list[str] = []
 
     def flush_text() -> None:
@@ -112,9 +139,7 @@ def _digest(previous: str, model: bool, parts: list[AistudioPart]) -> str:
         # store() 对捕获轮的每个 part 深拷贝曾占摘要计算的大头。
         wire = part.raw_wire if part.raw_wire is not None else part.to_wire()
         parsed = parse_response_part(wire)
-        if parsed.thought:
-            continue
-        if parsed.text:
+        if parsed.text and not parsed.thought:
             text.append(parsed.text)
         for kind, payload in (
             ("call", parsed.function_call),
@@ -122,13 +147,26 @@ def _digest(previous: str, model: bool, parts: list[AistudioPart]) -> str:
         ):
             if payload is not None:
                 flush_text()
-                items.append(
-                    [
-                        kind,
-                        payload.get("name"),
-                        payload.get("args", payload.get("arguments", {})),
-                    ]
-                )
+                name = payload.get("name")
+                item: list[object] = [
+                    kind,
+                    name,
+                    payload.get("args", payload.get("arguments", {})),
+                ]
+                if kind == "result":
+                    call_id = payload.get("call_id") or payload.get("id")
+                    if isinstance(call_id, str) and call_id:
+                        owner = (
+                            owners.by_id.get(call_id) if owners is not None else None
+                        )
+                        if owner is not None and owner[1] == name:
+                            item.append(["call", owner[0]])
+                            explicit_results.append((owner[0], item))
+                        else:
+                            # Unknown or ambiguous IDs must not be dropped from
+                            # identity or mapped by their name alone.
+                            item.append(["unbound", call_id])
+                items.append(item)
         if parsed.inline_data is not None:
             flush_text()
             mime, data = parsed.inline_data
@@ -144,7 +182,8 @@ def _digest(previous: str, model: bool, parts: list[AistudioPart]) -> str:
                 ]
             )
         elif (
-            not parsed.text
+            not parsed.thought
+            and not parsed.text
             and parsed.function_call is None
             and parsed.function_response is None
         ):
@@ -158,19 +197,123 @@ def _digest(previous: str, model: bool, parts: list[AistudioPart]) -> str:
                 flush_text()
                 items.append(["opaque", visible])
     flush_text()
+    if (
+        owners is not None
+        and 1 < len(items) == len(explicit_results) == owners.count
+        and len({index for index, _ in explicit_results}) == owners.count
+    ):
+        # Completion order is immaterial only for a whole result-only batch
+        # with a verified one-to-one ID mapping. The wire order is unchanged.
+        items = [item for _, item in sorted(explicit_results)]
     return hashlib.sha256(_json([previous, model, items]).encode()).hexdigest()
 
 
-def _restore_unmatched_calls(contents: list[AistudioContent]) -> list[AistudioContent]:
+def _tool_owner(payload: dict[str, object] | None) -> object:
+    if payload is None:
+        return None
+    return payload.get("name"), payload.get("args", payload.get("arguments", {}))
+
+
+def _signed_owners(wires: Iterable[list[object]]) -> Iterator[tuple[object, ...]]:
+    """Signed carriers, with stable offsets despite split unsigned text."""
+    text_offset = thought_offset = call_ordinal = 0
+    for wire in wires:
+        part = parse_response_part(wire)
+        signature = part.thought_signature
+        if signature and signature != SKIP_THOUGHT_SIGNATURE:
+            # A call's own ordinal is stable if compatibility formats hoist
+            # reasoning or visible text. Text and detached carriers must also
+            # still occupy their original place within that response lane.
+            offset = (
+                None
+                if part.function_call is not None
+                else thought_offset
+                if part.thought
+                else text_offset
+            )
+            yield (
+                signature.rstrip("=").replace("-", "+").replace("_", "/"),
+                call_ordinal,
+                offset,
+                part.thought,
+                part.text if part.text_present else None,
+                _tool_owner(part.function_call),
+                _tool_owner(part.function_response),
+                part.inline_data,
+                part.executable_code,
+                part.code_execution_result,
+            )
+        if part.function_call is not None:
+            call_ordinal += 1
+        if part.thought:
+            thought_offset += len(part.text)
+        else:
+            text_offset += len(part.text)
+
+
+def _explicit_owners_match(
+    parts: list[AistudioPart], saved: list[list[object]]
+) -> bool:
+    if not any(part.thought_signature for part in parts):
+        return True
+    remaining = _signed_owners(saved)
+    return all(
+        any(candidate == owner for candidate in remaining)
+        for owner in _signed_owners(part.to_wire() for part in parts)
+    )
+
+
+def _echoed_call_ids_match(
+    parts: list[AistudioPart], saved: list[list[object]], owners: _ResultOwners
+) -> bool:
+    echoed = [
+        call[2]
+        for part in parts
+        if (call := part.function_call) is not None and len(call) > 2 and call[2]
+    ]
+    if not echoed:
+        return True
+    if len(echoed) != len(owners.by_id):
+        return False
+    # Allow an alias introduced by the compatibility client, but not the
+    # movement of an ID already belonging to a different captured call.
+    ordinal = 0
+    for wire in saved:
+        call = parse_response_part(wire).function_call
+        if call is not None:
+            call_id = call.get("call_id")
+            if (
+                isinstance(call_id, str)
+                and (owner := owners.by_id.get(call_id)) is not None
+                and owner[0] != ordinal
+            ):
+                return False
+            ordinal += 1
+    return ordinal == owners.count
+
+
+def _restore_unmatched_calls(
+    contents: list[AistudioContent], scope: str, turn: str, owners: _ResultOwners
+) -> list[AistudioContent]:
     """Handle omitted tool signatures only after a scoped raw-turn miss.
 
     In an ordinary signed parallel batch later calls need not carry a
     signature. Do not guess a value for those calls from the per-call cache.
     Retain the existing legacy behavior for an unidentified batch.
     """
+    if any(
+        part.thought
+        or (part.thought_signature and part.thought_signature != SKIP_THOUGHT_SIGNATURE)
+        for content in contents
+        for part in content.parts
+    ):
+        # These owners or thought fragments may identify a different roll.
+        # A cold per-call record lacks the raw Parts needed to verify them.
+        return contents
     result: list[AistudioContent] = []
     first_call = True
     signed_batch = False
+    ordinal = 0
     for content in contents:
         updated: list[AistudioPart] | None = None
         for index, part in enumerate(content.parts):
@@ -181,13 +324,23 @@ def _restore_unmatched_calls(contents: list[AistudioContent]) -> list[AistudioCo
             if not signature and not signed_batch and part.raw_wire is None:
                 name, args = call[:2]
                 call_id = call[2] if len(call) > 2 else None
-                signature = (
-                    lookup_function_signature(call_id, name, args)
-                    or SKIP_THOUGHT_SIGNATURE
+                known, signature = (
+                    get_signature_cache().lookup_scoped(
+                        SignatureProvenance(scope, turn, ordinal),
+                        call_id,
+                        wire_function_name(name),
+                        args,
+                    )
+                    if call_id and call_id in owners.by_id
+                    else (False, None)
                 )
-                if updated is None:
-                    updated = list(content.parts)
-                updated[index] = replace(part, thought_signature=signature)
+                if not known:
+                    signature = SKIP_THOUGHT_SIGNATURE  # Existing legacy handling.
+                if signature:
+                    if updated is None:
+                        updated = list(content.parts)
+                    updated[index] = replace(part, thought_signature=signature)
+            ordinal += 1
             if first_call:
                 first_call = False
                 signed_batch = bool(signature and signature != SKIP_THOUGHT_SIGNATURE)
@@ -263,11 +416,6 @@ class ModelTurnCapture:
         # a complete historical turn. Each retry gets its own capture.
         if self._disabled or reason != 1 or not self.parts:
             return
-        if self.token is None and not any(
-            (part := parse_response_part(wire)).thought or part.thought_signature
-            for wire in self.parts
-        ):
-            return
         self.context.history.store(self.context, self.parts, self.token)
 
 
@@ -296,13 +444,15 @@ class ModelTurnHistory:
         token = None
         start = 0
         compatible = True
+        owners = None
         while start < len(contents):
             model = contents[start].role == "model"
             end = start + 1
             while end < len(contents) and (contents[end].role == "model") == model:
                 end += 1
             parts = [part for content in contents[start:end] for part in content.parts]
-            previous = _digest(previous, model, parts)
+            previous = _digest(previous, model, parts, owners)
+            owners = _result_owners(parts) if model else None
             entry = None
             if model:
                 with self._lock:
@@ -322,18 +472,18 @@ class ModelTurnHistory:
                     part.text or "" for part in parts if part.thought
                 )
                 saved_thought: list[str] = []
-                known: set[str] = set()
-                for wire in saved:
-                    parsed = parse_response_part(wire)
-                    if parsed.thought_signature:
-                        known.add(parsed.thought_signature)
-                    if echoed_thought and parsed.thought and parsed.text:
-                        saved_thought.append(parsed.text)
-                if (echoed_thought and echoed_thought != "".join(saved_thought)) or any(
-                    part.thought_signature not in known
-                    for part in parts
-                    if part.thought_signature
-                    and part.thought_signature != SKIP_THOUGHT_SIGNATURE
+                if echoed_thought:
+                    for wire in saved:
+                        parsed = parse_response_part(wire)
+                        if parsed.thought and parsed.text:
+                            saved_thought.append(parsed.text)
+                if (
+                    (echoed_thought and echoed_thought != "".join(saved_thought))
+                    or not _explicit_owners_match(parts, saved)
+                    or (
+                        owners is not None
+                        and not _echoed_call_ids_match(parts, saved, owners)
+                    )
                 ):
                     # Echoed thoughts or an explicit signature may identify a
                     # different roll with identical visible text.
@@ -341,32 +491,41 @@ class ModelTurnHistory:
                     compatible = False
                     start = end
                     continue
-                ids = [
+                ids = (
                     part.function_call[2] if len(part.function_call) > 2 else None
                     for part in parts
                     if part.function_call
-                ]
+                )
                 rebuilt: list[AistudioPart] = []
                 for wire in saved:
                     part = self._codec.decode_part(wire)
                     if part.function_call is not None:
-                        call_id = ids.pop(0)
+                        call_id = next(ids)
                         name, args = part.function_call[:2]
                         part.function_call = (
                             (name, args, call_id) if call_id else (name, args)
                         )
-                        index = PartIndex.FUNCTION_CALL_ALT
+                        index = PartIndex.FUNCTION_CALL
                         if len(wire) <= index or not isinstance(wire[index], list):
-                            index = PartIndex.FUNCTION_CALL
+                            index = PartIndex.FUNCTION_CALL_ALT
                         payload = wire[index]
                         assert isinstance(payload, list)
-                        wire[index] = payload[:2] + ([call_id] if call_id else [])
+                        if len(payload) < 3 and call_id:
+                            payload.append(call_id)
+                        elif len(payload) >= 3:
+                            # Keep any future/opaque function-call fields.
+                            payload[2] = call_id
                     part.raw_wire = wire
                     rebuilt.append(part)
                 restored.append(AistudioContent("model", rebuilt))
                 token = saved_token
             elif model and compatible:
-                restored.extend(_restore_unmatched_calls(contents[start:end]))
+                assert owners is not None
+                restored.extend(
+                    _restore_unmatched_calls(
+                        contents[start:end], scope, previous, owners
+                    )
+                )
             else:
                 restored.extend(contents[start:end])
             start = end
@@ -380,11 +539,41 @@ class ModelTurnHistory:
     def store(
         self, context: ModelTurnContext, parts: list[list[object]], token: str | None
     ) -> None:
+        parsed = [parse_response_part(wire) for wire in parts]
+        calls = [part for part in parsed if part.function_call is not None]
+        if (
+            not calls
+            and token is None
+            and not any(part.thought or part.thought_signature for part in parsed)
+        ):
+            return
         decoded = [self._codec.decode_part(wire) for wire in parts]
         # Preserve exact response slots for hashing and subsequent replay.
         for part, wire in zip(decoded, parts, strict=True):
             part.raw_wire = wire
-        key = (context.scope, _digest(context.prefix, True, decoded))
+        turn = _digest(context.prefix, True, decoded)
+        if calls:
+            identifiers = [
+                part.function_call.get("call_id") if part.function_call else None
+                for part in calls
+            ]
+            counts = Counter(key for key in identifiers if isinstance(key, str) and key)
+            for ordinal, (part, call_id) in enumerate(
+                zip(calls, identifiers, strict=True)
+            ):
+                call = part.function_call
+                if not isinstance(call_id, str) or counts[call_id] != 1 or call is None:
+                    continue
+                name, args = call.get("name"), call.get("args")
+                if isinstance(name, str) and isinstance(args, dict):
+                    get_signature_cache().remember_scoped(
+                        SignatureProvenance(context.scope, turn, ordinal),
+                        call_id,
+                        name,
+                        args,
+                        part.thought_signature or None,
+                    )
+        key = (context.scope, turn)
         raw: str | None = _json(parts)
         size = len(raw.encode())
         if size > self._max_turn_bytes:

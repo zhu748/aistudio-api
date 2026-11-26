@@ -16,6 +16,7 @@ import json
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 
 SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
@@ -66,11 +67,20 @@ def tool_history_text(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class SignatureProvenance:
+    """Scope and cumulative visible turn, plus the call's original position."""
+
+    scope: str
+    turn: str
+    ordinal: int
+
+
 class ThoughtSignatureCache:
-    """Bounded persistent LRU keyed by call ID, name and canonical arguments.
+    """Bounded persistent cache with a separate replay-provenance namespace.
 
     Keys are hashed to avoid persisting prompts or tool arguments. Legacy
-    by-name/by-ID entries cannot establish an exact match and are not loaded.
+    records have no history scope and can never be promoted to replay records.
     """
 
     _MAX_ENTRIES = 2048
@@ -81,11 +91,15 @@ class ThoughtSignatureCache:
     # 进程退出时 atexit 兜底刷盘（窗口内丢的签名仅退化为 SKIP 字面量，
     # 非关键数据）。
     _SAVE_DEBOUNCE_SECONDS = 2.0
+    _REPLAY_NAMESPACE = "by_scoped_call_v1"
 
     def __init__(self, path=None) -> None:
         self._path = Path(path) if path is not None else None
         self._lock = threading.Lock()
         self._signatures: OrderedDict[str, str] = OrderedDict()
+        # None records either a verified unsigned call or a conflicting roll.
+        # In both cases subsequent cache reads must withhold any signature.
+        self._scoped: OrderedDict[str, str | None] = OrderedDict()
         self._loaded = False
         self._load_error_logged = False
         self._dirty = False
@@ -95,11 +109,19 @@ class ThoughtSignatureCache:
     # -- 公共接口 ----------------------------------------------------------
 
     @staticmethod
-    def _key(call_id: str | None, name: str | None, arguments: object) -> str | None:
+    def _key(
+        call_id: str | None,
+        name: str | None,
+        arguments: object,
+        provenance: SignatureProvenance | None = None,
+    ) -> str | None:
         if not call_id or not name:
             return None
+        fields = [call_id, name, arguments if arguments is not None else {}]
+        if provenance is not None:
+            fields += [provenance.scope, provenance.turn, provenance.ordinal]
         canonical = json.dumps(
-            [call_id, name, arguments if arguments is not None else {}],
+            fields,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -109,7 +131,7 @@ class ThoughtSignatureCache:
     def remember(
         self, call_id: str | None, name: str | None, arguments: object, signature: str
     ) -> None:
-        """Cache an upstream signature for this exact call, excluding sentinels."""
+        """Record legacy response metadata without replay provenance."""
         key = self._key(call_id, name, arguments)
         if (
             key is None
@@ -121,25 +143,55 @@ class ThoughtSignatureCache:
             self._ensure_loaded()
             self._signatures[key] = signature
             self._signatures.move_to_end(key)
-            while len(self._signatures) > self._MAX_ENTRIES:
-                self._signatures.popitem(last=False)
-            # 首次变脏时定死落盘路径：若推迟到退出钩子（atexit）才解析，
-            # 测试 monkeypatch 的 env 可能已还原，退出 flush 会写到真实
-            # 仓库 data/（跨运行状态串扰，已实测发生过）。此刻解析拿到的
-            # 是「当前生效」的 data 目录，与后续 save/atexit 一致。
-            try:
-                if self._path is None:
-                    self._path = self._resolve_path()
-            except Exception:
-                self._path = None
-            self._dirty = True
-            now = time.monotonic()
-            if (
-                now - self._last_save >= self._SAVE_DEBOUNCE_SECONDS
-                and self._save_locked()
-            ):
-                self._last_save = now
-                self._dirty = False
+            self._mark_dirty_locked()
+
+    def remember_scoped(
+        self,
+        provenance: SignatureProvenance,
+        call_id: str,
+        name: str,
+        arguments: object,
+        signature: str | None,
+    ) -> None:
+        """Record an observed call from a complete, scoped model capture."""
+        key = self._key(call_id, name, arguments, provenance)
+        if key is None:
+            return
+        if signature == SKIP_THOUGHT_SIGNATURE or not valid_thought_signature(
+            signature
+        ):
+            signature = None
+        with self._lock:
+            self._ensure_loaded()
+            conflict = False
+            if key in self._scoped:
+                if self._scoped[key] == signature or self._scoped[key] is None:
+                    self._scoped.move_to_end(key)
+                    return
+                signature = None
+                conflict = True
+            self._scoped[key] = signature
+            self._scoped.move_to_end(key)
+            # Do not leave a previously persisted value usable after a
+            # restart while an observed conflicting roll is only in memory.
+            self._mark_dirty_locked(force=conflict)
+
+    def _trim_locked(self) -> None:
+        while len(self._signatures) + len(self._scoped) > self._MAX_ENTRIES:
+            # Legacy metadata must not evict replay provenance.
+            (self._signatures or self._scoped).popitem(last=False)
+
+    def _mark_dirty_locked(self, *, force: bool = False) -> None:
+        self._trim_locked()
+        # Bind the data directory now, not after the request/test environment
+        # disappears at atexit. _ensure_loaded has already resolved the path.
+        self._dirty = True
+        now = time.monotonic()
+        if (
+            force or now - self._last_save >= self._SAVE_DEBOUNCE_SECONDS
+        ) and self._save_locked():
+            self._last_save = now
+            self._dirty = False
 
     def flush(self) -> None:
         """落盘窗口内累积的脏数据（优雅关停或退出钩子调用）。"""
@@ -157,7 +209,7 @@ class ThoughtSignatureCache:
     def lookup(
         self, call_id: str | None, name: str | None, arguments: object
     ) -> str | None:
-        """Restore only a signature for matching ID, name and arguments."""
+        """Inspect legacy, unscoped metadata; not suitable for replay."""
         key = self._key(call_id, name, arguments)
         if key is None:
             return None
@@ -167,6 +219,24 @@ class ThoughtSignatureCache:
             if sig is not None:
                 self._signatures.move_to_end(key)
             return sig
+
+    def lookup_scoped(
+        self,
+        provenance: SignatureProvenance,
+        call_id: str,
+        name: str,
+        arguments: object,
+    ) -> tuple[bool, str | None]:
+        """Distinguish no record from a record that withholds its signature."""
+        key = self._key(call_id, name, arguments, provenance)
+        if key is None:
+            return False, None
+        with self._lock:
+            self._ensure_loaded()
+            if key not in self._scoped:
+                return False, None
+            self._scoped.move_to_end(key)
+            return True, self._scoped[key]
 
     # -- 持久化 ------------------------------------------------------------
 
@@ -192,6 +262,21 @@ class ThoughtSignatureCache:
                         self._signatures[key] = value
                         if len(self._signatures) > self._MAX_ENTRIES:
                             self._signatures.popitem(last=False)
+            scoped = (
+                data.get(self._REPLAY_NAMESPACE, {}) if isinstance(data, dict) else {}
+            )
+            if isinstance(scoped, dict):
+                for key, value in scoped.items():
+                    if isinstance(key, str) and (
+                        value is None
+                        or (
+                            isinstance(value, str)
+                            and value != SKIP_THOUGHT_SIGNATURE
+                            and valid_thought_signature(value)
+                        )
+                    ):
+                        self._scoped[key] = value
+                        self._trim_locked()
         except (OSError, ValueError):
             # 首次运行 / 文件损坏：从空缓存开始即可
             pass
@@ -208,7 +293,10 @@ class ThoughtSignatureCache:
 
             atomic_write_json(
                 path,
-                {"by_call": dict(self._signatures)},
+                {
+                    "by_call": dict(self._signatures),
+                    self._REPLAY_NAMESPACE: dict(self._scoped),
+                },
                 private=True,
                 compact=True,
             )
@@ -261,12 +349,3 @@ def remember_function_signature(
     if valid_thought_signature(signature):
         assert isinstance(signature, str)
         get_signature_cache().remember(call_id, name, arguments, signature)
-
-
-def lookup_function_signature(
-    call_id: str | None, name: str | None, arguments: object
-) -> str | None:
-    """Restore a signature for the exact historical call."""
-    if not call_id and not name:
-        return None
-    return get_signature_cache().lookup(call_id, name, arguments)

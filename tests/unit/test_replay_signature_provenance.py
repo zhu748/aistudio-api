@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import AsyncIterator
+from copy import deepcopy
 from unittest.mock import AsyncMock
 
 import httpx
@@ -18,13 +19,19 @@ from aistudio_api.application import api_service_gemini
 from aistudio_api.domain import tool_signatures
 from aistudio_api.domain.models import ModelOutput
 from aistudio_api.infrastructure.gateway.model_turns import ModelTurnHistory
-from aistudio_api.infrastructure.gateway.wire_parser import parse_text_output
-from aistudio_api.infrastructure.gateway.wire_spec import PartIndex
+from aistudio_api.infrastructure.gateway.wire_codec import encode_request_body
+from aistudio_api.infrastructure.gateway.wire_parser import (
+    parse_response_part,
+    parse_text_output,
+)
+from aistudio_api.infrastructure.gateway.wire_spec import PartIndex, TopLevelIndex
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent, AistudioPart
 
 MODEL = "gemini-3.8-flash"
 SIG_A = base64.b64encode(b"opaque-fixture-state-a").decode()
 SIG_B = base64.b64encode(b"opaque-fixture-state-b").decode()
+SIG_C = base64.b64encode(b"opaque-fixture-state-c").decode()
+SURFACES = ["native", "chat", "claude", "responses"]
 
 
 class FixtureGateway:
@@ -32,6 +39,7 @@ class FixtureGateway:
         self.history = ModelTurnHistory()
         self.raw = ""
         self.last: list[AistudioContent] = []
+        self.wire: list = []
 
     def reply(self, *parts: AistudioPart) -> None:
         candidate = [[[part.to_wire() for part in parts], "model"], 1]
@@ -42,6 +50,9 @@ class FixtureGateway:
         self, *, model: str, contents: list[AistudioContent], **_kwargs: object
     ) -> ModelOutput:
         self.last, _, context = self.history.prepare(model, contents)
+        self.wire = json.loads(encode_request_body(model=model, contents=self.last))[
+            TopLevelIndex.CONTENTS
+        ]
         response = parse_text_output(self.raw)
         if context is not None:
             capture = context.capture()
@@ -54,6 +65,9 @@ class FixtureGateway:
         return [
             part for turn in self.last if turn.role == "model" for part in turn.parts
         ]
+
+    def wire_parts(self, index: int):
+        return [parse_response_part(part) for part in self.wire[index][0]]
 
 
 @pytest.fixture
@@ -254,3 +268,293 @@ async def test_parallel_original_unsigned_sibling_stays_unsigned(route, mode, su
     assert wires == [part.to_wire() for part in parts]
     assert wires[0][PartIndex.THOUGHT_SIGNATURE] == SIG_A
     assert len(wires[1]) <= PartIndex.THOUGHT_SIGNATURE
+
+
+def _prompt(surface, text):
+    if surface == "native":
+        return [{"role": "user", "parts": [{"text": text}]}]
+    return [{"role": "user", "content": text}]
+
+
+async def _request(client, surface, history):
+    if surface == "native":
+        path = f"/v1beta/models/{MODEL}:generateContent"
+        body = {"contents": history}
+    elif surface == "chat":
+        path = "/v1/chat/completions"
+        body = {"model": MODEL, "messages": history}
+    elif surface == "claude":
+        path = "/v1/messages"
+        body = {"model": MODEL, "max_tokens": 128, "messages": history}
+    else:
+        path = "/v1/responses"
+        body = {"model": MODEL, "input": history}
+    response = await client.post(path, json=body)
+    assert response.status_code == 200, response.text
+    data = response.json()
+    if surface == "native":
+        return [data["candidates"][0]["content"]]
+    if surface == "chat":
+        return [data["choices"][0]["message"]]
+    if surface == "claude":
+        return [{"role": "assistant", "content": data["content"]}]
+    return data["output"]
+
+
+def _outputs(surface, pairs, name="lookup"):
+    if surface == "native":
+        return [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "id": i,
+                            "name": name,
+                            "response": {"result": v},
+                        }
+                    }
+                    for i, v in pairs
+                ],
+            }
+        ]
+    if surface == "chat":
+        return [{"role": "tool", "tool_call_id": i, "content": v} for i, v in pairs]
+    if surface == "claude":
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": i, "content": v}
+                    for i, v in pairs
+                ],
+            }
+        ]
+    return [
+        {"type": "function_call_output", "call_id": i, "output": v} for i, v in pairs
+    ]
+
+
+def _strip_signatures(tree):
+    if isinstance(tree, list):
+        for child in tree:
+            _strip_signatures(child)
+    elif isinstance(tree, dict):
+        tree.pop("extra_content", None)
+        tree.pop("thoughtSignature", None)
+        for child in tree.values():
+            _strip_signatures(child)
+    return tree
+
+
+def _wire_tools(gateway, index, attribute):
+    return [
+        (tool.get("call_id"), tool["name"], tool["args"], part.thought_signature)
+        for part in gateway.wire_parts(index)
+        if (tool := getattr(part, attribute)) is not None
+    ]
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+async def test_result_ownership_survives_reordered_completions_and_sequential_calls(
+    route, surface
+):
+    client, gateway = route
+    prompt = _prompt(surface, "Look up both cities, then compare them.")
+    gateway.reply(
+        AistudioPart(
+            function_call=("lookup", {"city": "Paris"}, "A"), thought_signature=SIG_A
+        ),
+        AistudioPart(function_call=("lookup", {"city": "Oslo"}, "B")),
+    )
+    batch = _strip_signatures(await _request(client, surface, prompt))
+    reverse = _outputs(surface, [("B", "cold"), ("A", "warm")])
+    equivalent = _outputs(surface, [("A", "warm"), ("B", "cold")])
+    different = _outputs(surface, [("A", "cold"), ("B", "warm")])
+
+    gateway.reply(
+        AistudioPart(
+            function_call=("compare", {"unit": "C"}, "C"), thought_signature=SIG_B
+        )
+    )
+    compare = _strip_signatures(
+        await _request(client, surface, prompt + batch + reverse)
+    )
+    assert _wire_tools(gateway, 1, "function_call") == [
+        ("A", "lookup", {"city": "Paris"}, SIG_A),
+        ("B", "lookup", {"city": "Oslo"}, ""),
+    ]
+    assert _wire_tools(gateway, 2, "function_response") == [
+        ("B", "lookup", {"result": "cold"}, ""),
+        ("A", "lookup", {"result": "warm"}, ""),
+    ]
+
+    final_output = _outputs(surface, [("C", "done")], "compare")
+    gateway.reply(AistudioPart(text="Done."))
+    base = prompt + batch
+    # Even with only one cached capture, the same sequence of payload values
+    # is not evidence that they belonged to the same calls.
+    await _request(client, surface, base + different + compare + final_output)
+    assert _wire_tools(gateway, 3, "function_call")[0][-1] not in {SIG_B, SIG_C}
+    # Reordering completion with ownership unchanged should match that capture.
+    await _request(client, surface, base + equivalent + compare + final_output)
+    assert _wire_tools(gateway, 3, "function_call")[0][-1] == SIG_B
+    assert _wire_tools(gateway, 4, "function_response") == [
+        ("C", "compare", {"result": "done"}, ""),
+    ]
+
+    # Both branches can now retain different signed state for the same visible
+    # sequential call (including an identical ID and arguments).
+    gateway.reply(
+        AistudioPart(
+            function_call=("compare", {"unit": "C"}, "C"), thought_signature=SIG_C
+        )
+    )
+    other_compare = _strip_signatures(await _request(client, surface, base + different))
+    gateway.reply(AistudioPart(text="Done."))
+    for results, echo, expected in [
+        (reverse, compare, SIG_B),
+        (different, other_compare, SIG_C),
+    ]:
+        await _request(client, surface, base + results + echo + final_output)
+        assert _wire_tools(gateway, 3, "function_call")[0][-1] == expected
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_cold_restart_does_not_borrow_a_reused_call_id(
+    route, monkeypatch, tmp_path, surface, reverse
+):
+    client, gateway = route
+    cases = [("First prompt", SIG_A), ("Different prompt", SIG_B)]
+    if reverse:
+        cases.reverse()
+    histories = []
+    for prompt, signature in cases:
+        gateway.reply(
+            AistudioPart(
+                function_call=("lookup", {"city": "Paris"}, "A"),
+                thought_signature=signature,
+            )
+        )
+        initial = _prompt(surface, prompt)
+        echoed = _strip_signatures(await _request(client, surface, initial))
+        histories.append(
+            (initial + echoed + _outputs(surface, [("A", "done")]), signature)
+        )
+
+    # A process restart loses the raw turn LRU, not scoped persisted evidence.
+    gateway.history.clear()
+    tool_signatures.get_signature_cache().flush()
+    monkeypatch.setattr(
+        tool_signatures,
+        "_cache_instance",
+        tool_signatures.ThoughtSignatureCache(tmp_path / "signatures.json"),
+    )
+    gateway.reply(AistudioPart(text="Done."))
+    for history, expected in histories:
+        await _request(client, surface, history)
+        assert _wire_tools(gateway, 1, "function_call") == [
+            ("A", "lookup", {"city": "Paris"}, expected),
+        ]
+    unrelated = _prompt(surface, "Unobserved prompt") + histories[0][0][1:]
+    await _request(client, surface, unrelated)
+    assert _wire_tools(gateway, 1, "function_call")[0][-1] not in {SIG_A, SIG_B}
+
+
+@pytest.mark.parametrize("second_signature", [SIG_B, None])
+async def test_cold_restart_withholds_conflicting_exact_scoped_occurrences(
+    route, monkeypatch, tmp_path, second_signature
+):
+    client, gateway = route
+    initial = _prompt("native", "Look up Paris.")
+    for signature in (SIG_A, second_signature):
+        gateway.reply(
+            AistudioPart(
+                function_call=("lookup", {"city": "Paris"}, "A"),
+                thought_signature=signature,
+            )
+        )
+        echoed = _strip_signatures(await _request(client, "native", initial))
+    gateway.history.clear()
+    tool_signatures.get_signature_cache().flush()
+    monkeypatch.setattr(
+        tool_signatures,
+        "_cache_instance",
+        tool_signatures.ThoughtSignatureCache(tmp_path / "signatures.json"),
+    )
+    gateway.reply(AistudioPart(text="Done."))
+    await _request(
+        client, "native", initial + echoed + _outputs("native", [("A", "done")])
+    )
+    assert _wire_tools(gateway, 1, "function_call") == [
+        ("A", "lookup", {"city": "Paris"}, ""),
+    ]
+
+
+@pytest.mark.parametrize("supplied", [None, "A"])
+async def test_native_mixed_results_reserve_id_and_leave_idless_order_untouched(
+    route, supplied
+):
+    client, gateway = route
+    initial = _prompt("native", "Look up both cities.")
+    gateway.reply(
+        AistudioPart(
+            function_call=("lookup", {"city": "Paris"}, "A"), thought_signature=SIG_A
+        ),
+        AistudioPart(function_call=("lookup", {"city": "Oslo"}, "B")),
+    )
+    model = await _request(client, "native", initial)
+    outputs = _outputs("native", [(None, "first"), (supplied, "second")])
+    for part, attachment in zip(outputs[0]["parts"], ("YQ==", "Yg=="), strict=True):
+        part["functionResponse"]["parts"] = [
+            {"inlineData": {"mimeType": "image/png", "data": attachment}}
+        ]
+    # Also exercise two consecutive user Contents in one return batch.
+    split = [{"role": "user", "parts": [p]} for p in outputs[0]["parts"]]
+    gateway.reply(AistudioPart(text="Done."))
+    await _request(client, "native", initial + model + split)
+    assert _wire_tools(gateway, 2, "function_response") == [
+        ("B" if supplied else None, "lookup", {"result": "first"}, ""),
+        (supplied, "lookup", {"result": "second"}, ""),
+    ]
+    encoded = gateway.wire_parts(2)
+    assert [p.inline_data for p in encoded] == [
+        None,
+        ("image/png", "YQ=="),
+        None,
+        ("image/png", "Yg=="),
+    ]
+
+
+@pytest.mark.parametrize("variant", ["swap", "visible_boundary", "thought_boundary"])
+async def test_native_warm_capture_never_replaces_explicit_signed_owners(
+    route, variant
+):
+    client, gateway = route
+    initial = _prompt("native", "Think and answer.")
+    if variant == "swap":
+        original = [
+            AistudioPart(text="Thought", thought=True, thought_signature=SIG_A),
+            AistudioPart(text="Answer", thought_signature=SIG_B),
+        ]
+        explicit = deepcopy(original)
+        explicit[0].thought_signature, explicit[1].thought_signature = SIG_B, SIG_A
+    else:
+        thought = variant == "thought_boundary"
+        original = [
+            AistudioPart(text="Early ", thought=thought),
+            AistudioPart(text="phrase", thought=thought, thought_signature=SIG_A),
+        ]
+        explicit = [
+            AistudioPart(text="Early phrase", thought=thought, thought_signature=SIG_A)
+        ]
+    # Get the explicit model history first, from a different worker's capture.
+    gateway.reply(*explicit)
+    echoed = await _request(client, "native", initial)
+    gateway.history.clear()
+    gateway.reply(*original)
+    await _request(client, "native", initial)
+    gateway.reply(AistudioPart(text="Done."))
+    await _request(client, "native", initial + echoed + _prompt("native", "Continue."))
+    assert gateway.wire[1][0] == [part.to_wire() for part in explicit]
