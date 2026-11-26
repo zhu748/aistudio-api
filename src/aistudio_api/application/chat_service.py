@@ -832,6 +832,33 @@ def _convert_part(
     return parts
 
 
+def _backfill_thinking_signatures(contents: list[AistudioContent]) -> None:
+    """思考链签名整轮兜底回注（合并相邻同角色轮之后）。
+
+    签名缓存键是**整轮思考全文**（响应侧把该轮全部 thought part 拼接后
+    收口缓存）。客户端把单个 thinking 块拆分成多块回传、或把一轮思考
+    分散到多条 assistant 消息时，``_convert_part`` 的逐 part 精确匹配会
+    全部 miss。合并后按整轮拼接文本再查一次，命中则挂到最后一个
+    thought part（Gemini 语义：末位 part 的签名是整轮权威签名）。
+    任一 thought part 已带有效签名（客户端 envelope 载体回传成功）时
+    不介入——部分保留部分回注的混合形态无从判定归属。
+    """
+    for content in contents:
+        if content.role != "model":
+            continue
+        thought_indices = [
+            index for index, part in enumerate(content.parts) if part.thought
+        ]
+        if not thought_indices or any(
+            content.parts[index].thought_signature for index in thought_indices
+        ):
+            continue
+        joined = "".join(content.parts[index].text or "" for index in thought_indices)
+        signature = _lookup_thinking_signature(joined)
+        if signature:
+            content.parts[thought_indices[-1]].thought_signature = signature
+
+
 def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioContent]:
     """contents → AistudioContent 轮次列表（含 pending call 追踪与剥离残留清理）。
 
@@ -852,7 +879,9 @@ def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioConte
             p for part in content.parts for p in _convert_part(part, pending_calls)
         ]
         contents.append(AistudioContent(role=role, parts=parts))
-    return _drop_hollow_and_merge_same_role(contents)
+    merged = _drop_hollow_and_merge_same_role(contents)
+    _backfill_thinking_signatures(merged)
+    return merged
 
 
 def _normalize_system_instruction(

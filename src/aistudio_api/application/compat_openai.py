@@ -718,6 +718,11 @@ def build_openai_completion(
             and inline is None
             and isinstance(part_signature, str)
             and part_signature
+            # 纯文本轮的尾部签名载体必然不与 functionCall 共存（wire 抓包
+            # 形态）；含工具调用的响应里裸签名无法排除是调用签名迟到，
+            # 下发后客户端回传会挂到 thought part 上，可能触发上游
+            # "Corrupted thought signature."，宁缺勿错（与 Claude 侧同款）。
+            and not has_tool_calls
         ):
             # 空文本纯签名 part（尾部签名载体）：thought part 自身不带签名
             # 时签名在这里到达，记录最后出现的值（Gemini 语义：最后一 part
@@ -959,9 +964,17 @@ async def openai_stream_adapter(
                         filtered = stops.feed(text)
                         if filtered:
                             yield _sse(_chunk({"content": filtered}, None))
-                    elif isinstance(part_signature, str) and part_signature:
+                    elif (
+                        isinstance(part_signature, str)
+                        and part_signature
                         # 独立签名帧 / 尾部空文本签名载体 part：思考链签名，
                         # 记录后随终结块 delta 下发（无正文可混入，不产块）。
+                        # 含工具调用的流里裸签名无法排除是调用签名迟到
+                        # （纯文本轮尾部载体必然无 FC，wire 抓包形态）——
+                        # 误当思考链签名下发会在回传时挂到 thought part，
+                        # 可能触发上游 "Corrupted thought signature."。
+                        and not has_tool_calls
+                    ):
                         late_signature = part_signature
         except Exception as exc:
             saw_error = True

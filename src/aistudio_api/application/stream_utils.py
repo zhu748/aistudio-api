@@ -143,6 +143,10 @@ class _ToolCall:
     fragments: list[str] = field(default_factory=list)
     size: int = 0
     signature: str = ""
+    # call_id 是否为本地合成（上游未下发 id）：混合 id 分片链采纳真实
+    # id 时只允许并入合成 id 的链——真实 id 的链属于确定的调用，并行
+    # 同名函数分片时误并入会串联两条链的参数。
+    synthetic_id: bool = False
 
     def update(self, call: dict[str, object], signature: str) -> None:
         name = call.get("name")
@@ -268,6 +272,17 @@ async def coalesce_tool_frames(
       已产出的正文不应为一个残缺分片陪葬（旧行为是整流硬失败 500）。
     - 流终结（STOP/EOF）且全流无任何已投递内容：保持报错。此时响应的
       唯一载荷就是这次调用，静默作废会变成空回（与空回防护同一哲学）。
+
+    分片链的三种 id 形态（均归并到同一 _ToolCall）：
+
+    - 同 id 分片：by_id 直接命中；
+    - 无 id 分片：名称兼容时延伸最后一个未完成调用；
+    - 混合 id 链（首帧无 id、续帧才携带真实 id——JSPB 渐进填充形态，
+      anti_truncation 的 call_id 补填分支同源）：by_id miss 且最后一个
+      pending 调用仍是合成 id 的未完成链时并入该链并采纳真实 id。
+      合成 id 尚未投递给客户端，改写安全；后续同 id 分片经 by_id 命中
+      继续累积。带完整参数的独立调用不受影响（args 已是 dict 或可独立
+      解析的完整 JSON 时，并入与否结果等价：dict 快照整体替换分片）。
     """
     pending: list[_ToolCall] = []
     by_id: dict[str, _ToolCall] = {}
@@ -400,10 +415,33 @@ async def coalesce_tool_frames(
                         last.name.startswith(name) or name.startswith(last.name)
                     ):
                         tool = last
+                if tool is None and call_id and pending:
+                    # 混合 id 分片链：首帧无 id（合成 id 占位）、续帧携带
+                    # 真实 id。仅当最后一个 pending 调用是合成 id 的未完成
+                    # 分片链（args 未集齐）且名称兼容时并入——合成 id 尚未
+                    # 投递给客户端，改写安全；真实 id 的链（可能是并行同名
+                    # 调用的另一条分片链）绝不并入，避免两条链的参数串联。
+                    # 后续同 id 分片经 by_id 命中继续累积；带完整参数的独立
+                    # 调用不受影响（dict 快照整体替换分片，结果等价）。
+                    # 名称兼容语义与无 id 延伸路径一致（空名视为兼容）。
+                    last = pending[-1]
+                    if (
+                        last.args is None
+                        and last.synthetic_id
+                        and (name.startswith(last.name) or last.name.startswith(name))
+                    ):
+                        tool = last
+                        by_id[call_id] = tool
+                        tool.call_id = call_id
+                        tool.synthetic_id = False
                 if tool is None:
                     if len(pending) + len(sent) >= 256:
                         raise ValueError("Too many tool calls in one response")
-                    tool = _ToolCall(call_id or f"call_{secrets.token_hex(12)}", name)
+                    tool = _ToolCall(
+                        call_id or f"call_{secrets.token_hex(12)}",
+                        name,
+                        synthetic_id=not call_id,
+                    )
                     pending.append(tool)
                     if call_id:
                         by_id[call_id] = tool

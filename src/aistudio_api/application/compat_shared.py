@@ -409,9 +409,15 @@ def _iter_response_parts(
     # 思考摘要本就无签名）。
     thinking_texts: list[str] = []
     thinking_signature: str | None = None
+    # 纯文本轮的尾部签名载体必然不与 functionCall 共存（wire 抓包形态）；
+    # 含 FC 的响应里裸签名 part 无法归属——记成 thinking 签名会把 FC 的
+    # 签名污染进 thinking 缓存（回传挂到 thought part 可能触发上游
+    # "Corrupted thought signature."），宁缺勿错。
+    saw_function_call = False
     for part in parts:
         function_call = getattr(part, "functionCall", None)
         if function_call is not None:
+            saw_function_call = True
             _remember_function_signature(
                 getattr(function_call, "id", None),
                 getattr(function_call, "name", None),
@@ -423,7 +429,7 @@ def _iter_response_parts(
         if isinstance(text, str) and text and getattr(part, "thought", None) is True:
             thinking_texts.append(text)
         signature = getattr(part, "thoughtSignature", None)
-        if isinstance(signature, str) and signature:
+        if isinstance(signature, str) and signature and (text or not saw_function_call):
             thinking_signature = signature
     if thinking_texts and thinking_signature:
         _remember_thinking_signature("".join(thinking_texts), thinking_signature)
@@ -449,17 +455,25 @@ class _FrameSignatureRecorder:
     签名跨帧拼接思考全文后于 finalize 统一缓存——键必须与客户端将回传
     的完整 reasoning 文本一致，签名早于思考文本结束时到达时逐帧快照
     会缓存到残缺前缀，故只在流终态收口一次。
+
+    裸签名 part（无文本载体）在流中已出现 functionCall 时不再记为
+    thinking 签名：纯文本轮的尾部签名载体必然不与 FC 共存（wire 抓包
+    形态），含 FC 流里的裸签名无法排除是调用签名迟到（内容边界已把
+    调用冲刷投递）——记进 thinking 缓存会污染回传（见 _iter_response_parts
+    同款判别）。
     """
 
     def __init__(self) -> None:
         self._thinking_texts: list[str] = []
         self._thinking_signature: str | None = None
+        self._saw_function_call = False
 
     def feed(self, frame: dict[str, object]) -> None:
         candidate = _frame_candidate(frame)
         for part in _frame_parts(candidate):
             function_call = _as_dict(part.get("functionCall"))
             if function_call:
+                self._saw_function_call = True
                 _remember_function_signature(
                     _as_str(function_call.get("id")) or None,
                     _as_str(function_call.get("name")) or None,
@@ -471,7 +485,11 @@ class _FrameSignatureRecorder:
             if isinstance(text, str) and text and part.get("thought") is True:
                 self._thinking_texts.append(text)
             signature = part.get("thoughtSignature")
-            if isinstance(signature, str) and signature:
+            if (
+                isinstance(signature, str)
+                and signature
+                and (text or not self._saw_function_call)
+            ):
                 self._thinking_signature = signature
 
     def finalize(self) -> None:

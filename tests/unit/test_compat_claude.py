@@ -906,3 +906,117 @@ async def test_claude_late_signature_round_trips_to_upstream() -> None:
     )
     assert parts[0].thought is True
     assert parts[0].thoughtSignature == _SIGNATURE
+
+
+# ---------------------------------------------------------------------------
+# 迟到签名防误归属（2026-11-26 harness 审查）：纯文本轮的尾部签名载体
+# 必然不与 functionCall 共存（wire 抓包形态）；含工具调用的流里裸签名
+# 无法排除是调用签名晚于内容边界冲刷到达——回填到 thinking 块会在回传
+# 时挂到 thought part 上，可能触发上游 "Corrupted thought signature."。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claude_stream_late_signature_not_backfilled_with_tool_use() -> None:
+    """FC 轮的迟到裸签名不回填 thinking 块（保持占位签名）。"""
+    frames: list[dict[str, object]] = [
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "Plan the call.", "thought": True}],
+                    }
+                }
+            ]
+        },
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "name": "get_weather",
+                                    "args": {"city": "SF"},
+                                    "id": "toolu_1",
+                                }
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+        # 调用冲刷后到达的裸签名：无法排除属于该调用，不得回填 thinking
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"thoughtSignature": _SIGNATURE}],
+                    }
+                }
+            ]
+        },
+        {
+            "candidates": [{"content": {"parts": []}, "finishReason": "STOP"}],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 5,
+                "totalTokenCount": 10,
+            },
+        },
+    ]
+    parsed: list[dict[str, Any]] = []
+    async for sse in claude_stream_adapter(
+        _sse_frames(frames), requested_model="m", stop_sequences=None
+    ):
+        data_line = next(line for line in sse.splitlines() if line.startswith("data: "))
+        parsed.append(json.loads(data_line.removeprefix("data: ")))
+
+    signature_deltas = [
+        event["delta"]["signature"]
+        for event in parsed
+        if event.get("type") == "content_block_delta"
+        and event.get("delta", {}).get("type") == "signature_delta"
+        and event.get("index") == 0
+    ]
+    # thinking 块只收到占位签名，真实签名未被误当思考链签名补发
+    assert all(_read_claude_signature(sig) is None for sig in signature_deltas)
+
+
+def test_build_claude_message_trailing_carrier_ignored_with_tool_use() -> None:
+    """非流式：FC 响应里的裸签名 part 不回填 thinking 块。"""
+    response = _gemini_response(
+        [
+            GeminiPartResponse(text="Plan the call.", thought=True),
+            GeminiPartResponse(
+                text="",
+                functionCall=GeminiFunctionCallPayload(
+                    name="get_weather", args={"city": "SF"}
+                ),
+                thoughtSignature=_SIGNATURE,
+            ),
+            # 裸签名 part：FC 已出现，归属存疑——不作为思考链签名
+            GeminiPartResponse(text="", thoughtSignature=_SIGNATURE),
+        ]
+    )
+    message = cast(dict[str, Any], build_claude_message(response, "m", None))
+    thinking_blocks = [
+        block for block in message["content"] if block.get("type") == "thinking"
+    ]
+    assert thinking_blocks
+    # thinking 块保持占位签名（真实签名只在 tool_use 的 extra_content 上）
+    assert _read_claude_signature(thinking_blocks[0]["signature"]) is None
+    tool_blocks = [
+        block for block in message["content"] if block.get("type") == "tool_use"
+    ]
+    assert tool_blocks
+    assert (
+        tool_blocks[0]
+        .get("extra_content", {})
+        .get("google", {})
+        .get("thought_signature")
+        == _SIGNATURE
+    )

@@ -560,6 +560,11 @@ def build_claude_message(
             and inline is None
             and isinstance(part_signature, str)
             and part_signature
+            # 纯文本轮的尾部签名载体必然不与 functionCall 共存（wire 抓包
+            # 形态）；含工具调用的响应里裸签名无法排除是调用签名迟到，
+            # 回填到 thinking 块会在客户端回传时挂到 thought part 上，
+            # 可能触发上游 "Corrupted thought signature."，宁缺勿错。
+            and not has_tool_use
         ):
             # 空文本纯签名 part（尾部签名载体）：thought part 自身不带签名时
             # 签名在这里到达。记录最后出现的值（Gemini 语义：最后一 part 的
@@ -1040,8 +1045,19 @@ async def claude_stream_adapter(
                                 yield event
                     elif isinstance(part.get("thoughtSignature"), str):
                         if emitter.open_kind == "thinking":
+                            # 分解形态：thought part 自带签名被内部管线拆成
+                            # 相邻两帧（thinking 帧 + 裸签名帧），块仍打开，
+                            # 直接归属当前思考块。
                             emitter.thinking_signature = str(part["thoughtSignature"])
-                        elif emitter.thinking_index is not None:
+                        elif (
+                            emitter.thinking_index is not None
+                            # 迟到签名只可能在纯文本轮（尾部签名载体，wire
+                            # 抓包形态必然无 FC）；含工具调用的流里裸签名
+                            # 无法排除是调用签名晚于内容边界冲刷到达——回填
+                            # 到 thinking 块会在回传时挂到 thought part 上，
+                            # 可能触发上游 "Corrupted thought signature."。
+                            and not emitter.has_tool_use
+                        ):
                             # 迟到签名：thinking 块已关闭（上游把纯文本轮的
                             # 真实签名放在正文之后的尾部空文本 part）。记录到
                             # finish() 统一补发，见 _ClaudeStreamEmitter 注释。

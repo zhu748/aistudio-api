@@ -344,6 +344,243 @@ async def test_b2_terminal_incomplete_without_any_content_still_raises():
         ]
 
 
+# ---------------------------------------------------------------------------
+# 混合 id 分片链（2026-11-26 harness 审查）：首帧无 id、续帧携带真实 id
+# （JSPB 渐进填充形态，anti_truncation 的 call_id 补填分支同源）。旧行为
+# 把链拆成两条都不完整的调用双双作废；修复后并入合成 id 链并采纳真实 id。
+# ---------------------------------------------------------------------------
+
+
+async def test_mixed_id_shard_chain_merges_into_one_call():
+    """首帧无 id、续帧带真实 id：合并为单个完整调用，id 为真实 id。"""
+    frames = [
+        frame
+        async for frame in coalesce_tool_frames(
+            _frames(
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "functionCall": {
+                                            "name": "get_weather",
+                                            "args": '{"city":',
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "functionCall": {
+                                            "id": "call_1786466761448",
+                                            "name": "get_weather",
+                                            "args": ' "Tokyo"}',
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]},
+            )
+        )
+    ]
+    calls = [p["functionCall"] for p in _parts_of(frames) if "functionCall" in p]
+    assert len(calls) == 1, f"混合 id 分片链断裂: {calls}"
+    assert calls[0]["id"] == "call_1786466761448"
+    assert calls[0]["args"] == {"city": "Tokyo"}
+
+
+async def test_mixed_id_chain_continues_with_same_id_fragments():
+    """真实 id 采纳后：后续同 id 分片经 by_id 命中继续累积。"""
+    frames = [
+        frame
+        async for frame in coalesce_tool_frames(
+            _frames(
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {"functionCall": {"name": "w", "args": '{"a":'}}
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {"functionCall": {"id": "real_1", "args": '"x",'}}
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {"functionCall": {"id": "real_1", "args": '"b":1}'}}
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]},
+            )
+        )
+    ]
+    calls = [p["functionCall"] for p in _parts_of(frames) if "functionCall" in p]
+    assert len(calls) == 1
+    assert calls[0]["id"] == "real_1"
+    assert calls[0]["args"] == {"a": "x", "b": 1}
+
+
+async def test_mixed_id_adoption_never_joins_real_id_chains():
+    """并行同名函数分片：真实 id 的未完成链不被后续不同 id 的分片并入。"""
+    frames = [
+        frame
+        async for frame in coalesce_tool_frames(
+            _frames(
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "functionCall": {
+                                            "id": "call_A",
+                                            "name": "weather",
+                                            "args": '{"city":"Par',
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "functionCall": {
+                                            "id": "call_B",
+                                            "name": "weather",
+                                            "args": '{"city":"Tok',
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "functionCall": {
+                                            "id": "call_A",
+                                            "args": 'is"}',
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "functionCall": {
+                                            "id": "call_B",
+                                            "args": 'yo"}',
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]},
+            )
+        )
+    ]
+    calls = [p["functionCall"] for p in _parts_of(frames) if "functionCall" in p]
+    assert len(calls) == 2
+    by_id = {call["id"]: call for call in calls}
+    assert by_id["call_A"]["args"] == {"city": "Paris"}
+    assert by_id["call_B"]["args"] == {"city": "Tokyo"}
+
+
+async def test_mixed_id_dict_snapshot_completes_chain():
+    """混合链的续帧是完整 dict 快照：整体替换分片，调用以真实 id 完成。"""
+    frames = [
+        frame
+        async for frame in coalesce_tool_frames(
+            _frames(
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "functionCall": {
+                                            "name": "get_weather",
+                                            "args": '{"city": "sta',
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "functionCall": {
+                                            "id": "call_dict",
+                                            "name": "get_weather",
+                                            "args": {"city": "Tokyo"},
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]},
+            )
+        )
+    ]
+    calls = [p["functionCall"] for p in _parts_of(frames) if "functionCall" in p]
+    assert len(calls) == 1
+    assert calls[0]["id"] == "call_dict"
+    assert calls[0]["args"] == {"city": "Tokyo"}
+
+
 async def test_b2_changed_completed_call_keeps_delivered_version():
     """上游修改已完成调用：保留已投递版本并告警，不再硬失败。"""
     frames = [

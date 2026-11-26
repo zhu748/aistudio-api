@@ -410,7 +410,16 @@ class _ResponsesOutputBuilder:
             and getattr(part, "inlineData", None) is None
         ):
             signature = getattr(part, "thoughtSignature", None)
-            if isinstance(signature, str) and signature:
+            if (
+                isinstance(signature, str)
+                and signature
+                # 纯文本轮的尾部签名载体必然不与 functionCall 共存（wire
+                # 抓包形态）；含调用的响应里裸签名无法排除是调用签名迟到，
+                # 误当思考链签名下发会在回传时挂到 thought part 上，可能
+                # 触发上游 "Corrupted thought signature."（与 Chat/Claude
+                # 侧同款判别）。
+                and (text or not self.function_calls)
+            ):
                 self.thinking_signature = signature
         if isinstance(text, str) and text:
             if getattr(part, "thought", None) is True:
@@ -1013,6 +1022,7 @@ async def responses_stream_adapter(
         )
 
         try:
+            saw_function_call = False
             async for frame in _iter_gemini_sse_frames(source):
                 error_obj = frame.get("error")
                 if isinstance(error_obj, dict):
@@ -1031,6 +1041,7 @@ async def responses_stream_adapter(
                 for part in _frame_parts(candidate):
                     function_call = part.get("functionCall")
                     if isinstance(function_call, dict):
+                        saw_function_call = True
                         call_id = _as_str(function_call.get("id")) or _call_id()
                         name = _as_str(function_call.get("name")) or "unknown"
                         args = function_call.get("args")
@@ -1069,10 +1080,18 @@ async def responses_stream_adapter(
                         else:
                             for event in emitter.text_delta(text):
                                 yield event
-                    elif isinstance(part_signature, str) and part_signature:
+                    elif (
+                        isinstance(part_signature, str)
+                        and part_signature
                         # 独立签名帧 / 尾部空文本签名载体 part：思考链签名，
                         # 关闭 reasoning item 时随 extra_content 下发（FC 分支
-                        # 已 continue，调用签名不并入思考链）。
+                        # 已 continue，调用签名不并入思考链）。含工具调用的
+                        # 流里裸签名无法排除是调用签名迟到（纯文本轮尾部
+                        # 载体必然无 FC，wire 抓包形态）——误当思考链签名
+                        # 下发会在回传时挂到 thought part，可能触发上游
+                        # "Corrupted thought signature."。
+                        and not saw_function_call
+                    ):
                         emitter.thinking_signature = part_signature
         except Exception as exc:
             logger.warning("Responses 流式转换异常: %s", exc)
