@@ -3,17 +3,27 @@
 Adapted from Mag1cFall/AIStudio2API's model_turns.go (MIT). The package's
 THIRD_PARTY_NOTICES.md retains its license. Entries are scoped to the client,
 upstream account, model and instructions, and live in bounded process memory.
+
+上限按容器内存预算自适应（cgroup 限额 / AISTUDIO_MEMORY_BUDGET_MB）：
+默认档 64MB/1000 条/单条 4MB（大内存部署维持历史取值）；≤1GB 档
+32MB/500 条/2MB；≤512MB 档（Render 免费档等）12MB/300 条/1MB——小容器
+上回放缓存与请求峰值（长代理会话正文 MB 级 ×多份拷贝）叠加曾直接把
+RSS 顶过 OOMKiller 阈值。AISTUDIO_MODEL_TURN_CACHE_MB 显式覆盖总量，
+条数/单条按比例折算（保留下限）。
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from functools import lru_cache
 
+from aistudio_api.config import detect_memory_budget_mb
 from aistudio_api.domain.tool_signatures import SKIP_THOUGHT_SIGNATURE
 
 from .wire_codec import AistudioWireCodec
@@ -22,10 +32,58 @@ from .wire_spec import PartIndex
 from .wire_types import AistudioContent, AistudioPart
 
 _TOKEN_RE = re.compile(r"v1_[A-Za-z0-9+/=_-]{16,}")
-_MAX_TURN_BYTES = 4 * 1024 * 1024
-_MAX_CACHE_BYTES = 64 * 1024 * 1024
-_MAX_ENTRIES = 1000
+_DEFAULT_MAX_TURN_BYTES = 4 * 1024 * 1024
+_DEFAULT_MAX_CACHE_BYTES = 64 * 1024 * 1024
+_DEFAULT_MAX_ENTRIES = 1000
 _MAX_TURN_PARTS = 16384
+
+# 媒体指纹分块尺寸：base64 字母表全 ASCII，分块 encode 的字节串拼接与
+# 整串 encode 恒等；64KB 块让 MB 级媒体哈希的瞬时拷贝从"整份"降到常数。
+_MEDIA_HASH_CHUNK = 65536
+
+
+@lru_cache(maxsize=1)
+def _turn_limits() -> tuple[int, int, int]:
+    """(cache_bytes, max_entries, max_turn_bytes) 按内存预算/环境变量分档。"""
+    override = os.getenv("AISTUDIO_MODEL_TURN_CACHE_MB")
+    if override:
+        try:
+            megabytes = int(override)
+        except ValueError:
+            megabytes = 0
+        if megabytes > 0:
+            cache_bytes = megabytes * 1024 * 1024
+            scale = cache_bytes / _DEFAULT_MAX_CACHE_BYTES
+            return (
+                cache_bytes,
+                max(
+                    64,
+                    min(_DEFAULT_MAX_ENTRIES, int(_DEFAULT_MAX_ENTRIES * scale)),
+                ),
+                max(
+                    256 * 1024,
+                    min(_DEFAULT_MAX_TURN_BYTES, int(_DEFAULT_MAX_TURN_BYTES * scale)),
+                ),
+            )
+    budget = detect_memory_budget_mb()
+    if budget is None or budget > 1024:
+        return (_DEFAULT_MAX_CACHE_BYTES, _DEFAULT_MAX_ENTRIES, _DEFAULT_MAX_TURN_BYTES)
+    if budget <= 512:
+        return (12 * 1024 * 1024, 300, 1024 * 1024)
+    return (32 * 1024 * 1024, 500, 2 * 1024 * 1024)
+
+
+def _hash_media_b64(data: str) -> str:
+    """对 base64 媒体串做稳定指纹，分块 encode 避免整份拷贝。
+
+    旧实现 ``sha256(data.encode())`` 在多模态代理会话里对每张历史图片
+    （MB 级 base64）整体 encode 一次；``_digest`` 每请求走全对话，N 张
+    图片 × M 轮次的瞬时拷贝是 512MB 容器上请求峰值的主要放大器之一。
+    """
+    digest = hashlib.sha256()
+    for index in range(0, len(data), _MEDIA_HASH_CHUNK):
+        digest.update(data[index : index + _MEDIA_HASH_CHUNK].encode("ascii"))
+    return digest.hexdigest()
 
 
 def _json(value: object) -> str:
@@ -69,7 +127,7 @@ def _digest(previous: str, model: bool, parts: list[AistudioPart]) -> str:
         if parsed.inline_data is not None:
             flush_text()
             mime, data = parsed.inline_data
-            items.append(["media", mime, hashlib.sha256(data.encode()).hexdigest()])
+            items.append(["media", mime, _hash_media_b64(data)])
         elif part.file_id or parsed.executable_code or parsed.code_execution_result:
             flush_text()
             items.append(
@@ -115,6 +173,11 @@ class ModelTurnCapture:
     token: str | None = None
     _size: int = 0
     _disabled: bool = False
+    # 进程启动时解析一次的档位上限（流式每 chunk 走 add，避免热路径重复
+    # 读环境变量/env 解析；env 不会在运行中变更语义）。
+    _max_turn_bytes: int = field(
+        default_factory=lambda: _turn_limits()[2], init=False, repr=False
+    )
 
     def add(self, parts: list[list[object]], token: object = None) -> None:
         if self._disabled:
@@ -148,7 +211,7 @@ class ModelTurnCapture:
             # 尺寸用廉价估计（流式每 chunk 走此路径）：精确上限由 store()
             # 的整树 _json 复核兜底。
             self._size += wire_size_estimate(wire)
-            if self._size > _MAX_TURN_BYTES or len(self.parts) >= _MAX_TURN_PARTS:
+            if self._size > self._max_turn_bytes or len(self.parts) >= _MAX_TURN_PARTS:
                 self._disabled = True
                 self.parts.clear()
                 return
@@ -171,10 +234,14 @@ class ModelTurnHistory:
     """Bounded LRU of complete signed turns, keyed by cumulative history."""
 
     def __init__(self) -> None:
+        cache_bytes, max_entries, max_turn_bytes = _turn_limits()
         self._entries: OrderedDict[tuple[str, str], tuple[str, str | None, int]] = (
             OrderedDict()
         )
         self._bytes = 0
+        self._max_bytes = cache_bytes
+        self._max_entries = max_entries
+        self._max_turn_bytes = max_turn_bytes
         self._lock = threading.Lock()
         self._codec = AistudioWireCodec()
 
@@ -260,7 +327,7 @@ class ModelTurnHistory:
         key = (context.scope, _digest(context.prefix, True, decoded))
         raw = _json(parts)
         size = len(raw.encode())
-        if size > _MAX_TURN_BYTES:
+        if size > self._max_turn_bytes:
             return
         with self._lock:
             old = self._entries.pop(key, None)
@@ -268,7 +335,9 @@ class ModelTurnHistory:
                 self._bytes -= old[2]
             self._entries[key] = (raw, token, size)
             self._bytes += size
-            while len(self._entries) > _MAX_ENTRIES or self._bytes > _MAX_CACHE_BYTES:
+            while (
+                len(self._entries) > self._max_entries or self._bytes > self._max_bytes
+            ):
                 _, (_, _, removed) = self._entries.popitem(last=False)
                 self._bytes -= removed
 

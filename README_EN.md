@@ -55,7 +55,7 @@
 | **Downstream Parameter Fault Tolerance** | `drop_unsupported_params` automatically drops unsupported safety categories (e.g. `HARM_CATEGORY_CIVIC_INTEGRITY`) and tools to prevent 400 errors |
 | **Multi-Account Probing** | Extracts and verifies sub-accounts (`u/0`, `u/1`...) automatically when importing a multi-session Cookie |
 | **Built-in Tools** | Supports official tools such as Google Search, Google Maps, and Code Execution sandbox |
-| **Dual-Track Signing & Feature Alignment** | Browserless architecture supporting standalone Go signer (SpiderMonkey 152) or remote NodeVM signers with matched User-Agent/header binding |
+| **Local-Only Signing & Feature Alignment** | Browserless architecture with the embedded Go signer (SpiderMonkey 152) as the single signing engine, matched User-Agent/header binding |
 | **Web Management Console** | Built-in web dashboard for account management (supporting text and JSON bundle file imports), live request metrics, and runtime `config.yaml` hot reloading |
 > [!NOTE]
 > **Memory Footprint**: Operating completely browserless, resident memory is only ~35 - 50 MB with sub-second cold start, running smoothly even on lightweight mobile Termux environments or entry-level servers.
@@ -74,7 +74,7 @@
 └───────────────────────────┼────────────────────────────┘
                             │ Proof Mint & HTTP/2 Stream
 ┌───────────────────────────▼────────────────────────────┐
-│       Browserless WAA Engine (waa-signer / Remote NodeVM)     │
+│       Browserless WAA Engine (waa-signer, local only)        │
 │       Async Connection Pooling (HTTPStreamTransport)   │
 └───────────────────────────┬────────────────────────────┘
                             │ HTTPS / RPC
@@ -96,7 +96,7 @@ Technical reference documentation:
 ## Quick Start
 
 > [!NOTE]
-> **Out-of-the-Box Operation**: The service comes pre-configured with a remote WAA proof signing node. Once dependencies are installed, **start the server directly without compilation**! For offline operation or ultra-fast 10-30 ms local performance, compile the native engine at any time (see the optional advanced guides below).
+> **Out-of-the-Box Operation**: Docker/Render images ship with the compiled local WAA proof signing engine built in—start the server directly. When running from source, compile the local signer first via the platform-specific advanced guide below.
 ### Android (Termux)
 
 > [!TIP]
@@ -580,7 +580,7 @@ During reverse engineering, attestation protocol analysis, and gateway implement
 
 - **[Mag1cFall/AIStudio2API](https://github.com/Mag1cFall/AIStudio2API)**: Provided the embedded SpiderMonkey 152 runtime and Firefox 152 DOM / WebIDL host environment implementation, along with the uTLS transport stack design. The standalone `waa-signer` module is extracted and adapted from its core logic.
 - **[Lianues/aistudio-pg-bridge](https://github.com/Lianues/aistudio-pg-bridge)**: Pioneered the lightweight browserless WAA proof signing service concept and established the `/v1/proof/mint` API interface specification.
-- **[spinsnow](https://waa.spinsnow.fun)**: Provided a public, stable Node.js VM WAA attestation relay service.
+- **[spinsnow](https://waa.spinsnow.fun)**: A historical remote WAA attestation relay that informed protocol observations (remote signer support has been removed; the local engine is the only signing method).
 - **[Camoufox](https://github.com/daijro/camoufox)** & **[go-browserforge](https://github.com/brainplusplus/go-browserforge)**: Provided real-world browser fingerprint datasets and anti-fingerprinting generation algorithms.
 
 ---

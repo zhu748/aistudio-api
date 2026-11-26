@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import time
 import urllib.parse
 from collections.abc import Callable
@@ -38,6 +39,67 @@ from aistudio_api.infrastructure.utils.logger import (
 from aistudio_api.infrastructure.utils.redaction import redact_text
 
 logger = get_logger("requests")
+
+
+# ── 小内存容器的 RSS 高水位治理 ──────────────────────────────────────────────
+# 长代理会话（Claude Code 等）的请求体随轮次增长到 MB 级，多份正文/协议树
+# 拷贝反复分配释放后，glibc 堆把空闲页留在高水位不归还 OS；512MB 档容器
+# （Render 免费档等）上水位只升不降，最终被 OOMKiller SIGKILL（无优雅
+# 关停）。大请求收尾后调用 malloc_trim(0) 让内核回收空闲页。
+_MALLOC_TRIM_THRESHOLD_BYTES = 1024 * 1024
+_MALLOC_TRIM_MIN_INTERVAL = 2.0
+_malloc_trim_enabled: bool | None = None  # 延迟解析 env（AISTUDIO_MALLOC_TRIM=0 关闭）
+_malloc_trim_fn: Callable[[int], int] | None = None
+_malloc_trim_unavailable = False
+_last_trim_monotonic = 0.0
+
+
+def _resolve_malloc_trim() -> Callable[[int], int] | None:
+    """glibc malloc_trim（解析一次并缓存）；musl/非 glibc 返回 None。"""
+    global _malloc_trim_fn, _malloc_trim_unavailable
+    if _malloc_trim_unavailable:
+        return None
+    if _malloc_trim_fn is None:
+        try:
+            import ctypes
+
+            libc = ctypes.CDLL(None)
+            libc.malloc_trim.argtypes = [ctypes.c_size_t]
+            libc.malloc_trim.restype = ctypes.c_int
+            _malloc_trim_fn = libc.malloc_trim
+        except (OSError, AttributeError, ValueError):
+            _malloc_trim_unavailable = True
+            return None
+    return _malloc_trim_fn
+
+
+def _release_allocator_memory(received_bytes: int, sent_bytes: int) -> None:
+    """体量超阈值的请求收尾后归还 glibc 堆碎片（throttle 限频）。
+
+    事件循环线程内同步调用（malloc_trim 常态亚毫秒）；持有 arena 锁期间
+    其他线程的分配会短暂等待，故仅大请求触发 + 2s 限频。解析失败
+    （Alpine musl 无此符号）静默跳过，不影响请求路径。
+    """
+    global _malloc_trim_enabled, _last_trim_monotonic
+    if _malloc_trim_enabled is None:
+        _malloc_trim_enabled = os.environ.get(
+            "AISTUDIO_MALLOC_TRIM", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+    if not _malloc_trim_enabled:
+        return
+    if max(received_bytes, sent_bytes) < _MALLOC_TRIM_THRESHOLD_BYTES:
+        return
+    trim = _resolve_malloc_trim()
+    if trim is None:
+        return
+    now = time.monotonic()
+    if now - _last_trim_monotonic < _MALLOC_TRIM_MIN_INTERVAL:
+        return
+    _last_trim_monotonic = now
+    try:
+        trim(0)
+    except Exception:  # pragma: no cover - ctypes 调用的防御性兜底
+        logger.debug("malloc_trim 调用失败，跳过内存归还", exc_info=True)
 
 
 def _is_terminal_event(path: str, body: bytes) -> bool:
@@ -79,6 +141,9 @@ class _ResponseObserver:
     is_stream: bool = False
     first_byte_ms: float | None = None
     received_bytes: int = 0
+    # 累计下行字节（SSE 帧逐条累加，不缓冲内容）：大请求收尾的内存
+    # 归还判断依据（长流式响应同样是内存高水位的贡献者）。
+    sent_bytes: int = 0
     request_body_truncated: bool = False
     request_body_complete: bool = False
     response_body_truncated: bool = False
@@ -268,6 +333,7 @@ class RequestMiddleware:
                 context.is_stream = observer.is_stream
             elif message["type"] == "http.response.body":
                 body = message.get("body", b"")
+                observer.sent_bytes += len(body)
                 if body and observer.first_byte_ms is None:
                     observer.first_byte_ms = (time.perf_counter() - started) * 1000
                     context.first_byte_ms = observer.first_byte_ms
@@ -498,6 +564,11 @@ class RequestMiddleware:
             finally:
                 if model_call and admitted:
                     unregister_request(context.request_id)
+                    # 大请求收尾后归还 glibc 堆碎片（小内存容器 RSS 高水位
+                    # 治理，详见 _release_allocator_memory）；放行务落账之后。
+                    _release_allocator_memory(
+                        observer.received_bytes, observer.sent_bytes
+                    )
                 current_request.reset(token)
 
     @staticmethod

@@ -36,7 +36,7 @@ from aistudio_api.infrastructure.utils.log_files import (
     start_file_logging,
     stop_file_logging,
 )
-from aistudio_api.infrastructure.waa.signer import RemoteProofSigner, WaaSigner
+from aistudio_api.infrastructure.waa.signer import LocalProofSigner
 
 
 @pytest.fixture(autouse=True)
@@ -429,7 +429,6 @@ async def test_cancelled_stream_is_persisted_and_context_reset():
 
 async def test_signer_receives_proxy_and_shared_secret(monkeypatch):
     monkeypatch.setattr(settings, "signer_secret", "shared")
-    monkeypatch.setattr(settings, "signer_secret_url", "http://signer")
     seen = {}
 
     def handler(request):
@@ -437,7 +436,7 @@ async def test_signer_receives_proxy_and_shared_secret(monkeypatch):
         assert request.headers["Authorization"] == "Bearer shared"
         return httpx.Response(200, json={"ok": True, "proof": "!signed"})
 
-    signer = RemoteProofSigner(server_url="http://signer")
+    signer = LocalProofSigner(server_url="http://127.0.0.1:8081")
     signer._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     try:
         assert (
@@ -449,33 +448,6 @@ async def test_signer_receives_proxy_and_shared_secret(monkeypatch):
         assert seen["proxy"] == "socks5://host:1080"
     finally:
         await signer.close()
-
-
-async def test_signer_shutdown_closes_retired_clients(monkeypatch):
-    from aistudio_api.infrastructure.waa import signer as signer_module
-
-    class StubSigner:
-        def __init__(self, server_url: str, proxy_url: str | None = None):
-            self.server_url = server_url
-            self.proxy_url = proxy_url
-            self.closed = False
-
-        async def close(self):
-            self.closed = True
-
-    instances: list[StubSigner] = []
-
-    def create_signer(server_url: str, proxy_url: str | None = None) -> StubSigner:
-        instance = StubSigner(server_url, proxy_url)
-        instances.append(instance)
-        return instance
-
-    monkeypatch.setattr(signer_module, "RemoteProofSigner", create_signer)
-    signer = WaaSigner(proof_server_url="http://signer-one")
-    await signer.reconfigure(server_url="http://signer-two")
-    await signer.close()
-    assert len(instances) == 2
-    assert all(instance.closed for instance in instances)
 
 
 @pytest.mark.parametrize(

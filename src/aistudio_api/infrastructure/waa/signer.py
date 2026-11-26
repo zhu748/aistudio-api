@@ -1,8 +1,9 @@
-"""WAA proof signing client powered by aistudio-pg-bridge.
+"""WAA proof signing client for the local waa-signer daemon.
 
-Connects to Lianues/aistudio-pg-bridge (https://github.com/Lianues/aistudio-pg-bridge)
-or compatible WAA proof servers (e.g. https://waa.spinsnow.fun) to mint proof tokens
-without local browser or heavy JavaScript runtime dependencies.
+与容器内置的本地原生签名引擎（waa-signer，127.0.0.1:8081 的
+/v1/proof/mint HTTP 协议）通信铸造 proof token。远程公共签名服务
+（spinsnow / aistudio-pg-bridge 等）与多节点切换支持已移除：本地
+引擎是唯一签名方式，无浏览器、无外部依赖。
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ import contextvars
 import hashlib
 import json
 import os
-import re
 import threading
 import time
 from collections import OrderedDict
@@ -35,34 +35,20 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("waa.signer")
 
-DEFAULT_PROOF_SERVER_URL = "https://waa.spinsnow.fun"
-
 
 def signer_authorization(server_url: str) -> dict[str, str]:
-    """Bind credentials to a node, preventing fallback from disclosing its secret."""
+    """本地签名节点的共享密钥鉴权头（AISTUDIO_SIGNER_SECRET 可选）。
+
+    绑定节点凭证防止把密钥发给非预期地址；本地节点恒为本机回环。
+    """
     from aistudio_api.config import settings
-    from aistudio_api.infrastructure.gateway.model_defaults import (
-        get_configured_waa_settings,
-    )
     from aistudio_api.infrastructure.waa.daemon import is_local_signer_url
 
-    url = server_url.rstrip("/")
-    secret = ""
-    servers = get_configured_waa_settings().get("servers")
-    if isinstance(servers, list):
-        for server in servers:
-            if (
-                isinstance(server, dict)
-                and str(server.get("url") or "").rstrip("/") == url
-            ):
-                secret = os.getenv(str(server.get("auth_token_env") or ""), "")
-                break
-    if not secret and (is_local_signer_url(url) or url == settings.signer_secret_url):
-        secret = settings.signer_secret
+    secret = settings.signer_secret if is_local_signer_url(server_url) else ""
     return {"Authorization": f"Bearer {secret}"} if secret else {}
 
 
-# Per-task storage: WaaSigner/RemoteProofSigner is shared across concurrent
+# Per-task storage: WaaSigner/LocalProofSigner is shared across concurrent
 # requests. A plain instance attribute lets one request's proof headers be
 # overwritten by another task before last_headers reads them, mismatching the
 # proof with the headers and leaking cookies across accounts.
@@ -109,17 +95,15 @@ def extract_content_digest(contents: list[AistudioContent]) -> tuple[str, str]:
     return prompt, content_hash
 
 
-def _resolve_signer_timeout(server_url: str) -> float:
-    """按节点类型解析 mint 请求的 HTTP 总超时（秒）。
+def _resolve_signer_timeout() -> float:
+    """解析 mint 请求的 HTTP 总超时（秒）。
 
     Go 侧 /v1/proof/mint 的处理预算是 90s（冷启动含 loadPage 网络往返 +
     SpiderMonkey bootstrap，慢代理下可到 30-90s）。原先固定 30s：冷启动
     落在 30~90s 区间的本地签名器会被 Python 侧先掐断（Go 收到断连取消
-    冷启动、进度全丢），重试又从零开始 → 2 次耗尽后本地签名器永久不可用。
-
-    - ``AISTUDIO_SIGNER_TIMEOUT`` 显式覆盖（下限 5s）
-    - 本地节点（is_local_signer_url）：默认 95s，覆盖 Go 的 90s 预算
-    - 远程节点：保持 30s（公网延迟可控，超时通常意味着节点真不可用）
+    冷启动、进度全丢），重试又从零开始 → 2 次耗尽后签名器不可用。
+    故默认 95s 覆盖 Go 的 90s 预算；``AISTUDIO_SIGNER_TIMEOUT`` 显式
+    覆盖（下限 5s）。
     """
     raw = os.getenv("AISTUDIO_SIGNER_TIMEOUT")
     if raw and raw.strip():
@@ -127,25 +111,29 @@ def _resolve_signer_timeout(server_url: str) -> float:
             return max(5.0, float(raw.strip()))
         except ValueError:
             pass
-    from aistudio_api.infrastructure.waa.daemon import is_local_signer_url
-
-    return 95.0 if is_local_signer_url(server_url) else 30.0
+    return 95.0
 
 
-class RemoteProofSigner:
-    """Signs requests using external WAA proof server (aistudio-pg-bridge / spinsnow)."""
+class LocalProofSigner:
+    """本地 WAA 签名守护进程（waa-signer）的 proof 铸造客户端。
+
+    ``server_url`` 参数仅供测试注入模拟服务地址；生产路径省略时固定
+    解析为本地节点（127.0.0.1:8081）。
+    """
 
     def __init__(
         self,
-        server_url: str = DEFAULT_PROOF_SERVER_URL,
-        proxy_url: str | None = None,
+        server_url: str | None = None,
         timeout: float | None = None,
     ) -> None:
+        if server_url is None:
+            from aistudio_api.infrastructure.gateway.model_defaults import (
+                get_local_waa_server,
+            )
+
+            server_url = str(get_local_waa_server().get("url") or "")
         self.server_url = server_url.rstrip("/")
-        self.proxy_url = proxy_url or None
-        self.timeout = (
-            _resolve_signer_timeout(server_url) if timeout is None else timeout
-        )
+        self.timeout = _resolve_signer_timeout() if timeout is None else timeout
         self._client: httpx.AsyncClient | None = None
         self._closed = False
         # 惰性建池互斥：进程级单例被首批并发签名请求共享，
@@ -163,22 +151,17 @@ class RemoteProofSigner:
         _LAST_HEADERS.set(value)
 
     async def _get_client(self) -> httpx.AsyncClient:
-        """Get or lazily initialize shared HTTP client with connection pooling."""
+        """Get or lazily initialize shared HTTP client with connection pooling.
+
+        本机回环连接不走出站代理：签名器与主服务同容器，走了代理只会把
+        127.0.0.1:8081 的请求发往代理侧的回环地址（永远探不到本机）。
+        httpx.AsyncClient 的构造不触网，同步临界区即可，无需 await；
+        双重检查防并发首调重复建池。
+        """
         if self._closed:
             raise TransportError("Proof signer is closed")
         if self._client is not None and not self._client.is_closed:
             return self._client
-        # 解析在锁外完成：turn/sstp 全局代理需惰性启动桥接子进程（可能
-        # 占用秒级耗时），不能在 threading.Lock 临界区内 await；并发首调
-        # 各自解析后由双重检查收敛到同一客户端实例。
-        from aistudio_api.infrastructure.waa.daemon import is_local_signer_url
-
-        is_local = is_local_signer_url(self.server_url)
-        effective_proxy = (
-            None if is_local else await resolve_proxy_url_async(self.proxy_url)
-        )
-        # httpx.AsyncClient 的构造不触网，同步临界区即可，无需 await；
-        # 双重检查防并发首调重复建池。
         with self._client_lock:
             if self._closed:
                 raise TransportError("Proof signer is closed")
@@ -189,7 +172,6 @@ class RemoteProofSigner:
 
                 self._client = httpx.AsyncClient(
                     timeout=self.timeout,
-                    proxy=effective_proxy,
                     trust_env=False,
                     verify=_shared_ssl_context(),
                     limits=httpx.Limits(
@@ -206,12 +188,6 @@ class RemoteProofSigner:
             self._client = None
         if client is not None and not client.is_closed:
             await client.aclose()
-
-    def _masked_proxy(self) -> str:
-        """脱敏代理地址中的账号密码，用于日志输出。"""
-        if not self.proxy_url:
-            return "(直连)"
-        return re.sub(r"//[^@/]+@", "//***@", str(self.proxy_url))
 
     async def mint_proof(
         self,
@@ -274,7 +250,7 @@ class RemoteProofSigner:
 
                 if resp.status_code != 200:
                     detail = (
-                        f"Remote proof server returned HTTP {resp.status_code}: "
+                        f"Local proof signer returned HTTP {resp.status_code}: "
                         f"{resp.text[:300]}"
                     )
                     if (
@@ -286,12 +262,11 @@ class RemoteProofSigner:
                         # 4xx 同理，故直接上抛。
                         last_error = TransportError(detail)
                         logger.warning(
-                            "签名服务 %d (%d/%d): server=%s, proxy=%s, detail=%s",
+                            "签名服务 %d (%d/%d): server=%s, detail=%s",
                             resp.status_code,
                             attempt,
                             max_attempts,
                             self.server_url,
-                            self._masked_proxy(),
                             resp.text[:300],
                         )
                         await asyncio.sleep(_retry_delay(attempt))
@@ -301,7 +276,7 @@ class RemoteProofSigner:
                 data = resp.json()
                 if not data.get("ok") or not data.get("proof"):
                     err_msg = data.get("error") or "unknown proof server error"
-                    raise TransportError(f"Remote proof minting failed: {err_msg}")
+                    raise TransportError(f"Proof minting failed: {err_msg}")
 
                 proof = str(data["proof"])
                 raw_headers = data.get("headers")
@@ -322,11 +297,10 @@ class RemoteProofSigner:
             except (httpx.TransportError, httpx.TimeoutException) as e:
                 last_error = e
                 logger.warning(
-                    "连接签名服务失败 (%d/%d): server=%s, proxy=%s, error=%s",
+                    "连接签名服务失败 (%d/%d): server=%s, error=%s",
                     attempt,
                     max_attempts,
                     self.server_url,
-                    self._masked_proxy(),
                     e,
                 )
                 # HTTPX discards failed connections from its pool. Keep the shared
@@ -350,29 +324,30 @@ class RemoteProofSigner:
                     await asyncio.sleep(_retry_delay(attempt))
 
         raise TransportError(
-            f"Remote proof minting failed after {max_attempts} attempts "
+            f"Proof minting failed after {max_attempts} attempts "
             f"(server={self.server_url}): {last_error}"
         )
 
 
 class WaaSigner:
-    """Unified WAA signing facade backed by RemoteProofSigner."""
+    """Unified WAA signing facade backed by the local proof signer."""
 
     # WAA proof 复用缓存（2026-11 HAR + 代理实测逆向结论，行为复杂):
-    #   - 浏览器级 attestation（真机抓包 proof）重放 3 天后仍 200，且与
-    #     contents 的 SHA-256 摘要严格绑定（同 token 换 prompt 立即 403）；
-    #   - 但远程签名服务（spinsnow / NodeVM 类）mint 的 proof 观测到
-    #     「单次使用」倾向（同 proof 二次请求常 403）；不过 2026-11-12
-    #     服务 E2E 实测同一 proof 第 3 次发送恢复 200 —— 上游拒绝
-    #     存在概率性，403 阶梯前两跳免费重放具有真实恢复价值；
+    #   - 浏览器级 attestation（真机抓包 proof / 本地 SpiderMonkey 引擎）
+    #     重放 3 天后仍 200，且与 contents 的 SHA-256 摘要严格绑定
+    #     （同 token 换 prompt 立即 403）；
+    #   - 历史远程签名服务（spinsnow / NodeVM，已移除支持）的 proof 曾
+    #     观测到「单次使用」倾向，E2E 实测同一 proof 第 3 次发送可恢复
+    #     200 —— 上游拒绝存在概率性，403 阶梯前两跳免费重放具有真实
+    #     恢复价值；
     #   - X-AIStudio-Visit-Id / UA 与 proof 无确定性绑定关系（3×3 交叉
     #     实验证实 403 为概率性而非头缺失导致）。
-    #   - 2026-11-12 第三轮实测补充：spinsnow 出现服务级挑战过期
-    #     （全部节点 mint 携带同一过期 challenge_version，加密环境
-    #     载荷薄 ~340B），mint ok:true 但 proof 被上游 100% 拒绝 ——
-    #     由 SignerHealthTracker 跨账号熔断兜底（waa/health.py）。
-    # 因此缓存默认关闭（TTL=0）：仅在使用本地 SpiderMonkey 签名器等
-    # “浏览器级 attestation”场景下可按需开启（建议先小 TTL 实测重放性）。
+    #   - 2026-11-12 实测补充：远程服务级挑战过期（全部节点 mint 携带
+    #     同一过期 challenge_version）时 mint ok:true 但 proof 被上游
+    #     100% 拒绝 —— 由 SignerHealthTracker 跨账号熔断兜底
+    #     （waa/health.py），本地引擎不受该类服务级事故影响。
+    # 因此缓存默认关闭（TTL=0）：本地 SpiderMonkey 签名器属
+    # “浏览器级 attestation”场景，可按需开启（建议先小 TTL 实测重放性）。
     # 403 重签路径会主动失效缓存，作为兜底防护。
     _PROOF_CACHE_TTL_ENV = "AISTUDIO_WAA_PROOF_CACHE_TTL"
     _PROOF_CACHE_MAX_ENTRIES = 256
@@ -385,19 +360,8 @@ class WaaSigner:
         except ValueError:
             return 0.0
 
-    def __init__(
-        self,
-        proof_server_url: str | None = None,
-        proxy_url: str | None = None,
-    ) -> None:
-        url = proof_server_url or DEFAULT_PROOF_SERVER_URL
-        self._remote_signer = RemoteProofSigner(server_url=url, proxy_url=proxy_url)
-        self._reconfigure_lock: asyncio.Lock | None = None
-        self._reconfigure_lock_guard = threading.Lock()
-        self._delayed_close_tasks: set[asyncio.Task[None]] = set()
-        self._retired_signers: set[RemoteProofSigner] = set()
-        self._active_signers: dict[RemoteProofSigner, int] = {}
-        self._signer_idle: dict[RemoteProofSigner, asyncio.Event] = {}
+    def __init__(self) -> None:
+        self._local_signer = LocalProofSigner()
         self._closed = False
         # Bind proofs to the complete credential fingerprint and upstream route.
         self._proof_cache: OrderedDict[
@@ -448,114 +412,21 @@ class WaaSigner:
             upstream_proxy or "",
         )
 
-    def _get_reconfigure_lock(self) -> asyncio.Lock:
-        """惰性创建切换锁（避免 import 时无事件循环可用）。
-
-        创建本身用 threading.Lock 保护：两个并发协程同时首调时若无同步，
-        会各自 new 一个 Lock 并各持「不同的锁」，reconfigure 的原子替换
-        序列（retired 维护 + 延迟关闭）失去互斥。
-        """
-        if self._reconfigure_lock is None:
-            with self._reconfigure_lock_guard:
-                if self._reconfigure_lock is None:
-                    self._reconfigure_lock = asyncio.Lock()
-        return self._reconfigure_lock
-
-    async def reconfigure(
-        self,
-        server_url: str | None = None,
-        proxy_url: str | None = None,
-    ) -> None:
-        """热切换签名节点（3.5）。
-
-        旧实现直接改写 remote.server_url 并 close 共享连接池：正在途中的
-        并发签名请求会因连接池被关闭而失败，检查与赋值之间的 await 间隙
-        还存在双重进入竞态。改为整实例原子替换：新请求立即走新实例，
-        旧实例等待在途签名完成后关闭。
-        """
-        lock = self._get_reconfigure_lock()
-        if self._closed:
-            raise TransportError("Proof signer is closed")
-        current = self._remote_signer
-        target_url = (server_url or current.server_url).rstrip("/")
-        target_proxy = (
-            (proxy_url or None) if proxy_url is not None else current.proxy_url
-        )
-        if current.server_url == target_url and current.proxy_url == target_proxy:
-            return  # 快路径：目标未变，不进入切换序列
-
-        async with lock:
-            if self._closed:
-                raise TransportError("Proof signer is closed")
-            current = self._remote_signer
-            # Unspecified fields must inherit the latest state after waiting
-            # for another concurrent configuration change.
-            target_url = (server_url or current.server_url).rstrip("/")
-            target_proxy = (
-                (proxy_url or None) if proxy_url is not None else current.proxy_url
-            )
-            if current.server_url == target_url and current.proxy_url == target_proxy:
-                return  # 双重检查：并发切换已由先到者完成
-            new_signer = RemoteProofSigner(
-                server_url=target_url, proxy_url=target_proxy
-            )
-            # 原子替换：后续新请求立即使用新实例，在途请求仍持有旧实例引用
-            self._remote_signer = new_signer
-            self.invalidate_proof_cache()
-            self._retired_signers.add(current)
-            logger.info(
-                "签名节点已切换: %s -> %s",
-                current.server_url,
-                target_url,
-            )
-
-        # A mint may include two 30s attempts and backoff. Drain real leases
-        # instead of interrupting its second attempt after a fixed 35s timer.
-        async def _delayed_close() -> None:
-            idle = self._signer_idle.get(current)
-            try:
-                if idle is not None:
-                    await idle.wait()
-            finally:
-                try:
-                    await current.close()
-                except Exception as e:
-                    logger.debug("延迟关闭旧签名器失败: %s", e)
-                finally:
-                    self._retired_signers.discard(current)
-
-        try:
-            task = asyncio.create_task(_delayed_close())
-            self._delayed_close_tasks.add(task)
-            task.add_done_callback(self._delayed_close_tasks.discard)
-        except RuntimeError:
-            # 无运行中的事件循环（如同步测试环境）：直接关闭
-            await current.close()
-
     async def close(self) -> None:
-        """Close underlying remote signer resources."""
+        """Close underlying local signer resources."""
         self._closed = True
         self.invalidate_proof_cache()
-        tasks = list(self._delayed_close_tasks)
-        for task in tasks:
-            task.cancel()
-        self._delayed_close_tasks.clear()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        for retired in tuple(self._retired_signers):
-            await retired.close()
-        self._retired_signers.clear()
-        await self._remote_signer.close()
+        await self._local_signer.close()
 
     @property
     def server_url(self) -> str:
-        """当前远程签名节点地址（只读，热切换请使用 reconfigure）。"""
-        return self._remote_signer.server_url
+        """本地签名节点地址（固定 127.0.0.1:8081）。"""
+        return self._local_signer.server_url
 
     @property
     def last_headers(self) -> dict[str, str]:
         """Get dynamic protocol headers returned by the last successful proof minting."""
-        return self._remote_signer.last_headers
+        return self._local_signer.last_headers
 
     async def generate_snapshot(
         self,
@@ -593,7 +464,7 @@ class WaaSigner:
                 ts, proof, cached_headers = cached
                 if time.monotonic() - ts < ttl:
                     self._proof_cache.move_to_end(key)
-                    self._remote_signer.last_headers = dict(cached_headers)
+                    self._local_signer.last_headers = dict(cached_headers)
                     logger.debug(
                         "WAA proof 缓存命中: hash=%s, age=%.0fs, u/%s",
                         content_hash[:8],
@@ -603,45 +474,24 @@ class WaaSigner:
                     return proof
                 self._proof_cache.pop(key, None)
 
-        # 2) 未命中：走远程签名服务。
-        # 租约登记与 reconfigure 的实例替换互斥（同 transport._lease_client
-        # 模式）：读取 _remote_signer 与登记租籍之间若被热切换插队，旧实例
-        # 的在途租约可能已全部排空并触发延迟关闭，把仍在 mint 的请求击落
-        # 在已关闭的签名器上（Proof signer is closed）。
-        async with self._get_reconfigure_lock():
-            remote = self._remote_signer
-            self._active_signers[remote] = self._active_signers.get(remote, 0) + 1
-            idle = self._signer_idle.setdefault(remote, asyncio.Event())
-            idle.clear()
-        try:
-            proof = await remote.mint_proof(
-                cookies=cookies,
-                auth_user=auth_user,
-                tier=tier,
-                model=model,
-                prompt=prompt,
-                wire_contents=[c.to_wire() for c in contents],
-                upstream_proxy=upstream_proxy,
-            )
-        finally:
-            count = self._active_signers[remote] - 1
-            if count:
-                self._active_signers[remote] = count
-            else:
-                self._active_signers.pop(remote)
-                self._signer_idle.pop(remote).set()
+        # 2) 未命中：请求本地签名守护进程铸造 proof（mint_proof 内部已
+        # 含瞬时故障的退避重试）。
+        proof = await self._local_signer.mint_proof(
+            cookies=cookies,
+            auth_user=auth_user,
+            tier=tier,
+            model=model,
+            prompt=prompt,
+            wire_contents=[c.to_wire() for c in contents],
+            upstream_proxy=upstream_proxy,
+        )
 
         # 3) 回填缓存（LRU 容量淘汰）。失败不回填；mint_proof 内部已重试。
-        if (
-            key is not None
-            and proof
-            and remote is self._remote_signer
-            and not self._closed
-        ):
+        if key is not None and proof and not self._closed:
             self._proof_cache[key] = (
                 time.monotonic(),
                 proof,
-                dict(self._remote_signer.last_headers),
+                dict(self._local_signer.last_headers),
             )
             self._proof_cache.move_to_end(key)
             while len(self._proof_cache) > self._PROOF_CACHE_MAX_ENTRIES:

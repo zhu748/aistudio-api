@@ -56,6 +56,7 @@ from aistudio_api.application.stream_utils import StopSequenceBuffer
 from aistudio_api.domain.tool_signatures import (
     SKIP_THOUGHT_SIGNATURE,
     lookup_function_signature as _lookup_function_signature,
+    remember_function_signature as _remember_function_signature,
     valid_thought_signature as _valid_thought_signature,
 )
 from aistudio_api.infrastructure.request_context import record_result
@@ -247,6 +248,14 @@ def _claude_tool_choice_to_config(
 ) -> dict[str, object] | None:
     if not isinstance(tool_choice, dict):
         return None
+    # Claude tool_choice 可带 disable_parallel_tool_use（部分 harness 在
+    # "必须单工具"流程里置 true）：上游无强制串行开关，忽略并告警（与
+    # OpenAI 侧 parallel_tool_calls=false 同策略），静默忽略会让排障时
+    # 误以为串行已生效。
+    if tool_choice.get("disable_parallel_tool_use") is True:
+        logger.warning(
+            "tool_choice.disable_parallel_tool_use 无法在上游强制串行，已忽略该提示"
+        )
     choice_type = tool_choice.get("type")
     if choice_type == "auto":
         return {"functionCallingConfig": {"mode": "AUTO"}}
@@ -485,13 +494,24 @@ def build_claude_message(
         part_signature = getattr(part, "thoughtSignature", None)
         if isinstance(text, str) and text:
             if getattr(part, "thought", None) is True:
-                blocks.append(
-                    {
-                        "type": "thinking",
-                        "thinking": text,
-                        "signature": _claude_signature(part_signature),
-                    }
-                )
+                # 连续 thought part 合并为单个 thinking 块（对齐流式形态：
+                # 流式 thinking_delta 全部落在同一 content block）。Anthropic
+                # 官方响应同样是「每个思考段一个块」而非逐 part 一块；块内
+                # 签名取段内最后到达的真实值（Gemini 末位签名权威语义），
+                # 这也使块文本与思考签名缓存的整段拼接键一致，客户端回传
+                # 时缓存回注才能命中。
+                if blocks and blocks[-1].get("type") == "thinking":
+                    blocks[-1]["thinking"] = _as_str(blocks[-1].get("thinking")) + text
+                    if isinstance(part_signature, str) and part_signature:
+                        blocks[-1]["signature"] = _claude_signature(part_signature)
+                else:
+                    blocks.append(
+                        {
+                            "type": "thinking",
+                            "thinking": text,
+                            "signature": _claude_signature(part_signature),
+                        }
+                    )
             else:
                 blocks.append({"type": "text", "text": text})
         inline = getattr(part, "inlineData", None)
@@ -514,13 +534,24 @@ def build_claude_message(
         if function_call is not None and finish_reason_raw in (None, "STOP"):
             has_tool_use = True
             call_id = function_call.id or f"toolu_{secrets.token_hex(12)}"
+            args = _coerce_tool_args(function_call.args)
+            if function_call.id is None:
+                # 上游未带 call id：合成 toolu_ id 发生在 _iter_response_parts
+                # 的签名记忆化之后，缓存里没有该 id 的条目——客户端丢失
+                # extra_content 载体（Claude Code TS 侧可能剥离未知字段）时
+                # 按 id 回查必然 miss，只能退化为 SKIP 占位。补记一条，与
+                # 流式路径（coalesce 先定 id、recorder 后记忆化）对齐。
+                # remember 内部会校验签名合法性，无效签名静默跳过。
+                _remember_function_signature(
+                    call_id, function_call.name, args, part_signature
+                )
             blocks.append(
                 {
                     **_signature_extra(getattr(part, "thoughtSignature", None)),
                     "type": "tool_use",
                     "id": call_id,
                     "name": function_call.name,
-                    "input": _coerce_tool_args(function_call.args),
+                    "input": args,
                 }
             )
         elif (
@@ -599,6 +630,12 @@ class _ClaudeStreamEmitter:
         self.finish_reason_raw: str | None = None
         self.usage_frame: dict[str, object] | None = None
         self.saw_error = False
+        # 首帧 usageMetadata（若携带）：message_start 的 usage 据此携带真实
+        # input_tokens / cache_read_input_tokens（Anthropic 官方行为——
+        # message_start 即带真实输入计数；旧 SDK 只从 message_start 取
+        # input，等 message_delta 的客户端会拿到 0）。无首帧计量时退回
+        # 0/1 占位，终值仍由 message_delta usage 覆盖。
+        self.start_usage: dict[str, object] | None = None
         # stop sequence 命中状态：命中后丢弃后续正文增量（Claude 语义是
         # 在 stop sequence 处截断文本，透传其后内容会让客户端拿到多余文本）
         self.stop_hit: str | None = None
@@ -620,6 +657,13 @@ class _ClaudeStreamEmitter:
         )
 
     def message_start(self) -> str:
+        usage: dict[str, object] = {"input_tokens": 0, "output_tokens": 1}
+        if self.start_usage is not None:
+            # 首帧计量：真实输入计数（input 剔除缓存命中部分，与 message_delta
+            # 同口径）；首帧 output 计数为 0，按 Anthropic 惯例记 1。
+            usage = _claude_usage_payload(_usage_from_gemini(self.start_usage))
+            if not usage.get("output_tokens"):
+                usage["output_tokens"] = 1
         return self.sse(
             "message_start",
             {
@@ -632,7 +676,7 @@ class _ClaudeStreamEmitter:
                     "content": [],
                     "stop_reason": None,
                     "stop_sequence": None,
-                    "usage": {"input_tokens": 0, "output_tokens": 1},
+                    "usage": usage,
                 },
             },
         )
@@ -874,10 +918,51 @@ async def claude_stream_adapter(
         lambda message: emitter.error(504, message),
         register_failure,
     ):
+        # 先取首帧再发 message_start：Gemini 首帧一般携带 usageMetadata
+        # （promptTokenCount），据此让 message_start 的 usage 带真实
+        # input_tokens（Anthropic 官方语义；旧版 SDK 不合并 message_delta
+        # 的 input 字段，等 message_start 的客户端会拿到 0 导致上下文
+        # 用量统计失真）。首帧未带计量或流立即结束时退回占位值，终值仍
+        # 由 message_delta usage 覆盖。等待窗口内 SSE 心跳注释保活。
+        frames = _iter_gemini_sse_frames(source)
+        first_frame: dict[str, object] | None = None
+        pending_error: Exception | None = None
+        try:
+            first_frame = await anext(frames)
+        except StopAsyncIteration:
+            pass
+        except Exception as exc:
+            pending_error = exc
+        if first_frame is not None:
+            usage_meta = first_frame.get("usageMetadata")
+            if isinstance(usage_meta, dict):
+                emitter.start_usage = usage_meta
+
         yield emitter.message_start()
         yield emitter.ping()
+        if pending_error is not None:
+            logger.warning("Claude 流式转换异常: %s", pending_error)
+            record_result(
+                "error",
+                error=(
+                    "Stream conversion failed: "
+                    f"{type(pending_error).__name__}: {pending_error}"
+                ),
+            )
+            for event in emitter.error(
+                500, f"{type(pending_error).__name__}: {pending_error}"
+            ):
+                yield event
+            return
+
+        async def _peeked_frames() -> AsyncGenerator[dict[str, object], None]:
+            if first_frame is not None:
+                yield first_frame
+            async for frame in frames:
+                yield frame
+
         try:
-            async for frame in _iter_gemini_sse_frames(source):
+            async for frame in _peeked_frames():
                 error_obj = frame.get("error")
                 if isinstance(error_obj, dict):
                     code = _as_int(error_obj.get("code")) or 500

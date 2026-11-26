@@ -198,10 +198,10 @@ class AIStudioClient:
             session_token=turn_token,
         )
         from aistudio_api.infrastructure.gateway.model_defaults import (
-            get_active_waa_server,
+            get_local_waa_server,
         )
 
-        active_waa = get_active_waa_server()
+        active_waa = get_local_waa_server()
         headers = dict(DEFAULT_UPSTREAM_HEADERS)
         if active_waa.get("user_agent"):
             headers["User-Agent"] = str(active_waa["user_agent"])

@@ -373,11 +373,14 @@ def test_invalid_token_is_not_replayed(token):
 
 
 def test_large_or_media_response_is_not_retained(monkeypatch):
+    # 上限改为 _turn_limits() 档位解析（内存预算自适应）：按 (cache,
+    # entries, turn) 注入小档位，与旧常量 monkeypatch 语义一致。
+    monkeypatch.setattr(module, "_turn_limits", lambda: (64 << 20, 1000, 50))
     history = ModelTurnHistory()
-    monkeypatch.setattr(module, "_MAX_TURN_BYTES", 50)
     contents = remember(history)
     assert history.prepare("scope", echo(contents))[1] is None
-    monkeypatch.setattr(module, "_MAX_TURN_BYTES", 10000)
+    monkeypatch.setattr(module, "_turn_limits", lambda: (64 << 20, 1000, 10000))
+    history = ModelTurnHistory()
     media = AistudioPart(inline_data=("image/png", "data"), thought_signature=SIGNATURE)
     contents = remember(history, parts=[media.to_wire()])
     assert (
@@ -408,16 +411,17 @@ def test_explicit_different_signature_is_preserved():
 
 
 def test_cache_capacity_and_memory_are_bounded(monkeypatch):
+    monkeypatch.setattr(module, "_turn_limits", lambda: (64 << 20, 2, 4 << 20))
     history = ModelTurnHistory()
-    monkeypatch.setattr(module, "_MAX_ENTRIES", 2)
     first = remember(history, scope="a")
     remember(history, scope="b")
     assert history.prepare("a", echo(first))[1] == TOKEN
     remember(history, scope="c")
     assert history.prepare("b", echo(first))[1] is None
     assert history.prepare("a", echo(first))[1] == TOKEN
-    monkeypatch.setattr(module, "_MAX_CACHE_BYTES", 1)
-    remember(history, scope="d")
+    monkeypatch.setattr(module, "_turn_limits", lambda: (1, 2, 4 << 20))
+    history = ModelTurnHistory()
+    remember(history, scope="a")
     assert history.prepare("a", echo(first))[1] is None
 
 

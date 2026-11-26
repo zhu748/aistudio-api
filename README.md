@@ -57,7 +57,7 @@
 | **下游参数容错与丢弃** | 支持配置 `drop_unsupported_params` 自动过滤下游传入的非标准安全分类（如 `HARM_CATEGORY_CIVIC_INTEGRITY`）与不兼容工具，避免 400 阻断 |
 | **批量子账号探活** | 导入单个包含多个 Google 身份的 Cookie 后，自动探测子账号（`u/0`, `u/1`...）并分别建档 |
 | **内置搜索与工具** | 支持 Google Search 联网搜索、Google Maps、代码执行沙箱等官方扩展能力 |
-| **双轨签名与特征对齐** | 脱离重型浏览器，支持本地 Go 签名服务 (SpiderMonkey 152) 与远程 NodeVM 签名节点，自动绑定匹配的 User-Agent 与请求头特征 |
+| **本地签名与特征对齐** | 脱离重型浏览器，内置本地 Go 签名服务 (SpiderMonkey 152) 作为唯一签名引擎，自动绑定匹配的 User-Agent 与请求头特征 |
 | **Web 管理面板** | 提供 Web 管理控制台，支持账号管理（文本与 JSON 批量导入）、调用量监控、在线编辑与热重载 `config.yaml` |
 > [!NOTE]
 > **内存占用参考**：脱离重型浏览器后，服务常驻物理内存仅约 35 - 50 MB，冷启动毫秒级，即使在入门级 Android 手机（Termux）或轻量服务器上亦可稳定高效常驻。
@@ -98,7 +98,7 @@
 ## 快速开始
 
 > [!NOTE]
-> **开箱即用提示**：服务默认内置远程 WAA 证明签名节点，无需额外编译，安装依赖后**直接启动即可开箱即用**！若追求极致的毫秒级本地性能与离线化运行，可在运行后随时按需编译本地原生引擎（各平台步骤见下方进阶可选说明）。
+> **开箱即用提示**：Docker/Render 镜像已内置编译好的本地 WAA 证明签名引擎，无需额外编译，启动即可开箱即用。源码运行请先按各平台的进阶说明编译本地签名器（见下方进阶可选说明）。
 ### Android (Termux)
 
 > [!TIP]
@@ -255,11 +255,11 @@ docker compose up -d
 | 健康检查 | `/healthz`（`/health` 等价别名），轻量无鉴权，零账号冷启动也可通过探活 |
 | 数据持久化 | **Free 计划无磁盘**：`/app/data` 随容器重启 / 重新部署清空 —— 账号用 `AISTUDIO_COOKIES` 环境变量注入，每次启动自动重建；调用统计等易失数据随重启归零 |
 | 配置初始化 | 每次启动自动将镜像内置的 `defaults/config.yaml` 模板初始化到 `/app/data`；Free 计划面板修改不持久，需固化的配置请用环境变量下发 |
-| 签名引擎 | 默认拉起容器内置的本地 Go 签名器（无需浏览器）；Free 计划建议设 `AISTUDIO_WAA_SERVER=remote_spinsnow` 改走远程签名器（更省内存）。环境变量仅指定**启动默认**节点，面板手动切换对当前进程即时生效，重启后自动恢复默认 |
+| 签名引擎 | 自动拉起容器内置的本地 Go 签名器（无需浏览器），本地引擎是唯一签名方式；拉起失败会在日志与 `/ready` 中明确报因 |
 
 **计划选择建议：**
 
-- **Free（512MB，Blueprint 默认）**：内存足够部署 —— 本引擎不需要浏览器（纯 Go + SpiderMonkey 本地签名）。无磁盘：账号用 `AISTUDIO_COOKIES` 环境变量注入，随重启自动恢复；15 分钟无流量自动休眠（唤醒约有几十秒冷启动）。建议设置 `AISTUDIO_WAA_SERVER=remote_spinsnow` 作为长期默认（重启后自动回到该节点，同时跳过本地引擎进程更省内存）；临时排查时仍可在面板手动切换本地/远程节点，对当前进程即时生效、无需重启，面板也提供一键“恢复默认节点”；
+- **Free（512MB，Blueprint 默认）**：内存足够部署 —— 本引擎不需要浏览器（纯 Go + SpiderMonkey 本地签名）。无磁盘：账号用 `AISTUDIO_COOKIES` 环境变量注入，随重启自动恢复；15 分钟无流量自动休眠（唤醒约有几十秒冷启动）。**长代理会话（Claude Code 等 harness）内存自适应**：进程按 cgroup 内存预算自动缩放进程内有界缓存（512MB 档下 `model_turns` 回放缓存 64MB→12MB），大请求收尾后归还 glibc 堆碎片，避免长会话请求体随轮次增长把 RSS 顶过限额被 OOMKiller 杀掉；可用 `AISTUDIO_MEMORY_BUDGET_MB` / `AISTUDIO_MODEL_TURN_CACHE_MB` 显式调节，`AISTUDIO_MALLOC_TRIM=0` 关闭堆归还。注意 OOM 崩溃重启与重新部署/休眠一样会清空 `/app/data`（临时盘），请求历史与统计属易失数据；
 - **Starter（$7/月）**：支持持久磁盘 —— 将 `render.yaml` 中注释掉的 `disk` 段恢复并把 `plan` 改为 `starter` 即可；服务常驻不休眠，面板修改与 UI 导入账号持久生效；
 - **Standard 及以上**：本地签名器与 Python 服务同容器运行更宽裕，适合多账号高频调用。
 
@@ -381,7 +381,6 @@ Web 面板在「导入账号」「编辑账号」与「全局代理」处提供*
 | `AISTUDIO_CONFIG_FILE` | string | `config.yaml` | 模型规则与默认工具配置文件路径 |
 | `AISTUDIO_PERSIST_STATS` | bool | `true` | 是否持久化模型调用与 Token 统计（1=开启，0=关闭） |
 | `AISTUDIO_PERSIST_ROTATOR` | bool | `true` | 是否持久化账号 429 冷却与调度状态（1=开启，0=关闭） |
-| `AISTUDIO_PROOF_SERVER_URL` | string | `https://waa.spinsnow.fun` | 签名服务器地址覆盖项；推荐在 `config.yaml` 的 `waa.servers` 中统一配置各节点及其特征 User-Agent 并手动切换 |
 | `AISTUDIO_DEFAULT_TEXT_MODEL` | string | `gemini-3.7-flash` | 默认文本模型 |
 | `AISTUDIO_TIMEZONE` | string | 自动探测 | Wire 协议交互时区（默认 `America/Los_Angeles`） |
 | `AISTUDIO_ANTI_TRUNCATION` | bool | `false` | 强制覆盖 `config.yaml` 中 `anti_truncation.enabled` 全局开关（1=开启，0=关闭，留空跟随配置文件） |
@@ -403,14 +402,14 @@ Web 面板在「导入账号」「编辑账号」与「全局代理」处提供*
 | `AISTUDIO_DUMP_MAX_FILES` | int | `1000` | 详细转储文件最多保留数量 |
 | `AISTUDIO_DUMP_MAX_AGE_DAYS` | int | `7` | 详细转储文件最多保留天数 |
 | `AISTUDIO_DUMP_MAX_TOTAL_BYTES` | int | `268435456` | 详细转储目录最大总容量（默认 256 MiB） |
-| `AISTUDIO_SIGNER_SECRET` / `AISTUDIO_SIGNER_SECRET_URL` | string | `""` | 为对应签名节点配置 Bearer 共享密钥；仅发给匹配 URL 的节点 |
+| `AISTUDIO_SIGNER_SECRET` | string | `""` | 为本地签名节点配置 Bearer 共享密钥（仅发给本机回环地址） |
 | `AISTUDIO_AUTH_FILE` | string | `""` | 显式指定启动账号的 auth.json 路径（默认从 `AISTUDIO_ACCOUNTS_DIR` 自动发现） |
 | `AISTUDIO_TMP_DIR` | string | 系统临时目录 | 媒体转码等临时文件目录 |
 | `AISTUDIO_CORS_ALLOWED_ORIGINS` | string | `""` | 管理 API 的 CORS 白名单（逗号分隔的 origin 列表，默认同源策略） |
 | `AISTUDIO_IMPORT_ROOTS` | string | `""` | `import-bundle` 文件路径导入的额外允许目录（逗号分隔；默认仅允许数据目录） |
 | `AISTUDIO_WAA_PROOF_CACHE_TTL` | float | `300` | WAA proof 复用缓存的 TTL（秒） |
 | `AISTUDIO_ACCEPT_LANGUAGE` | string | 浏览器指纹 | 上游请求的 Accept-Language 覆盖（默认按指纹配置） |
-| `AISTUDIO_SIGNER_TIMEOUT` | float | 本地 95 / 远程 30 | 签名器 mint 请求的 HTTP 总超时（秒）；本地默认对齐 Go 侧 90s 冷启动预算 |
+| `AISTUDIO_SIGNER_TIMEOUT` | float | `95` | 签名器 mint 请求的 HTTP 总超时（秒）；默认对齐 Go 侧 90s 冷启动预算 |
 
 #### 本地 WAA 签名器（waa-signer）环境变量
 
@@ -741,7 +740,7 @@ if response.function_calls:
 | 现象 | 典型原因 |
 | --- | --- |
 | `ConnectError / ConnectTimeout`（502） | `AISTUDIO_PROXY` 指向了部署环境无法访问的代理（如把本地 SOCKS5 代理变量带上了 PaaS）；删除该环境变量改直连即可 |
-| `Remote proof minting failed (server=...)` | WAA 签名服务不可达或拒绝：在 设置 → 签名服务 切换节点（本地/远程面板切换即时生效） |
+| `Proof minting failed (server=...)` | 本地 WAA 签名引擎不可达或拒绝：检查 `waa.process` 日志与 8081 端口占用，必要时重新编译 waa-signer |
 | 403 PERMISSION_DENIED | 账号级风控：需在 Google 账号完成手机绑定/年龄验证后恢复 |
 | 429 RESOURCE_EXHAUSTED | 账号当日配额耗尽，多账号轮换或等待 00:00 PST 重置 |
 
@@ -780,9 +779,9 @@ uv run pytest
 本项目在逆向工程、签名算法与协议实现过程中，参考并借鉴了以下优秀的开源项目与社区成果，在此致以诚挚的感谢：
 
 - **[Mag1cFall/AIStudio2API](https://github.com/Mag1cFall/AIStudio2API)**：提供了嵌入式 SpiderMonkey 152 运行时与 Firefox 152 DOM / WebIDL 宿主现场实现，以及基于 uTLS 的网络栈设计，`waa-signer` 服务基于其核心逻辑适配抽离。
-- **[Lianues/aistudio-pg-bridge](https://github.com/Lianues/aistudio-pg-bridge)**：开创了脱离本地浏览器的轻量化 WAA 证明签名服务思路，并确立了 `/v1/proof/mint` 接口规范。
+- **[Lianues/aistudio-pg-bridge](https://github.com/Lianues/aistudio-pg-bridge)**：开创了脱离本地浏览器的轻量化 WAA 证明签名服务思路，并确立了 `/v1/proof/mint` 接口规范（本项目本地引擎沿用该接口协议）。
 - **[ken050210/vertex-streaming-anti-truncation](https://github.com/ken050210/vertex-streaming-anti-truncation)**：抗截断传输（工具调用参数运货）的核心机制与流式增量 JSON 识别器来源，本项目将其适配至 AI Studio JSPB 线路协议。
-- **[spinsnow](https://waa.spinsnow.fun)**：提供了公开稳定的 Node.js VM WAA 签名中继服务与环境参考。
+- **[spinsnow](https://waa.spinsnow.fun)**：历史远程签名服务，曾提供 Node.js VM WAA 签名中继与环境参考（远程签名支持已移除，本地引擎为唯一签名方式）。
 - **[Camoufox](https://github.com/daijro/camoufox)** 与 **[go-browserforge](https://github.com/brainplusplus/go-browserforge)**：提供了真实浏览器环境指纹数据与反指纹追踪生成算法。
 
 ---

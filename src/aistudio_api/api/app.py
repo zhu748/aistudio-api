@@ -376,6 +376,61 @@ async def _env_subaccount_probe(
         logger.debug("环境变量子账号探活失败: %s", e)
 
 
+def _log_memory_posture() -> None:
+    """启动时输出内存预算与缓存档位（小容器排障的第一手信息）。"""
+    from aistudio_api.config import detect_memory_budget_mb
+    from aistudio_api.infrastructure.gateway.model_turns import _turn_limits
+
+    budget = detect_memory_budget_mb()
+    cache_bytes, entries, turn_bytes = _turn_limits()
+    if budget is None:
+        logger.info(
+            "内存预算：未检测到 cgroup 限额（或非容器部署），缓存上限取默认档："
+            "model_turns 回放缓存 %.0fMB/%d 条/单条 %.0fMB",
+            cache_bytes / 1048576,
+            entries,
+            turn_bytes / 1048576,
+        )
+        return
+    logger.info(
+        "内存预算：%dMB（cgroup/AISTUDIO_MEMORY_BUDGET_MB），缓存档位自适应："
+        "model_turns 回放缓存 %.0fMB/%d 条/单条 %.0fMB",
+        budget,
+        cache_bytes / 1048576,
+        entries,
+        turn_bytes / 1048576,
+    )
+
+
+def _warn_ephemeral_data_dir() -> None:
+    """数据目录落在容器临时文件系统上时告警（重启即清零的根因提示）。
+
+    512MB 级容器上长代理会话曾因 OOM 崩溃重启后「全部数据清零」——落盘
+    写入本身是崩溃安全的（SQLite WAL 即时提交），清零根因是 Render 免费
+    档/未挂卷容器的根文件系统为临时盘。启动即给出根因与持久化方案，
+    避免用户误判为「历史没写进数据库」。
+    """
+    from aistudio_api.config import (
+        is_ephemeral_data_dir,
+        path_mount_info,
+        resolve_data_dir,
+    )
+
+    data_dir = resolve_data_dir()
+    if not is_ephemeral_data_dir():
+        logger.info("数据目录: %s", data_dir)
+        return
+    mount, filesystem = path_mount_info(data_dir)
+    logger.warning(
+        "数据目录 %s 位于容器临时文件系统（%s%s）：进程崩溃重启或重新部署后，"
+        "账号 Cookie、请求历史、签名缓存与统计数据将全部清零。持久化方案："
+        "挂载持久盘并将 AISTUDIO_DATA_DIR 指向挂载点，或定期导出备份。",
+        data_dir,
+        filesystem,
+        f"，挂载于 {mount}" if mount else "",
+    )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     from aistudio_api.infrastructure.waa.daemon import ensure_signer_ready
@@ -384,6 +439,8 @@ async def lifespan(_app: FastAPI):
     from aistudio_api.infrastructure.utils.log_files import start_file_logging
 
     start_file_logging()
+    _log_memory_posture()
+    _warn_ephemeral_data_dir()
     if settings.request_history:
         from aistudio_api.infrastructure.request_history import request_history
 

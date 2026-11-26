@@ -56,6 +56,7 @@ from aistudio_api.application.stream_utils import StopSequenceBuffer
 from aistudio_api.domain.tool_signatures import (
     SKIP_THOUGHT_SIGNATURE,
     lookup_function_signature as _lookup_function_signature,
+    remember_function_signature as _remember_function_signature,
     valid_thought_signature as _valid_thought_signature,
 )
 from aistudio_api.infrastructure.request_context import record_result
@@ -692,6 +693,14 @@ def build_openai_completion(
             has_tool_calls = True
             call_id = function_call.id or f"call_{secrets.token_hex(12)}"
             args = function_call.args if function_call.args is not None else {}
+            if function_call.id is None:
+                # 上游未带 call id：合成 id 晚于 _iter_response_parts 的签名
+                # 记忆化，缓存无此条目——客户端未保留 extra_content 载体时
+                # 按 id 回查必然 miss。补记一条对齐流式路径（coalesce 先定
+                # id、recorder 后记忆化）；remember 内部校验签名合法性。
+                _remember_function_signature(
+                    call_id, function_call.name, args, part_signature
+                )
             tool_calls.append(
                 {
                     **_signature_extra(getattr(part, "thoughtSignature", None)),

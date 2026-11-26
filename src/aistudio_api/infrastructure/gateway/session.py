@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import inspect
 import json
 import os
 import time
@@ -119,16 +118,8 @@ class GatewaySession:
         # 每次构造都要做 _resolve_accounts_dir 的 env+磁盘探测，热路径上
         # 逐请求重复探测纯属浪费；单例按目录键控，缓存实例安全。
         self._account_store: AccountStore | None = None
-        from aistudio_api.infrastructure.gateway.model_defaults import (
-            get_active_waa_server,
-        )
-
-        active_waa = get_active_waa_server()
-        server_url = str(active_waa.get("url") or settings.proof_server_url)
-        self._signer = WaaSigner(
-            proof_server_url=server_url,
-            proxy_url=settings.proxy_url,
-        )
+        # 本地签名引擎是唯一签名方式：WaaSigner 内部固定解析本地节点。
+        self._signer = WaaSigner()
 
     @property
     def is_ready(self) -> bool:
@@ -291,7 +282,6 @@ class GatewaySession:
         # 退役旧默认代理的客户端池（延迟关闭，在途请求安全排空），
         # 否则反复切代理会累积多个满配连接池直至进程退出
         await self._transport.retire_stale_clients(proxy)
-        await self._signer.reconfigure(proxy_url=proxy or "")
 
     async def retire_unused_clients(self, keep_proxies: Iterable[str | None]) -> None:
         """账号级代理变更后按「在用代理集」退役客户端池。
@@ -368,22 +358,6 @@ class GatewaySession:
         """Generate fresh WAA proof token for request contents."""
         self._ensure_open()
         active_ctx = ctx or await self.ensure_ready()
-        from aistudio_api.infrastructure.gateway.model_defaults import (
-            get_active_waa_server,
-        )
-
-        active_waa = get_active_waa_server()
-        target_url = str(active_waa.get("url") or "").rstrip("/")
-        # 面板切换签名节点后的热生效（3.5）：走 WaaSigner.reconfigure 的
-        # 原子替换路径。旧实现通过私有属性打洞就地改写 server_url 并关闭
-        # 共享连接池，会击落并发在途的签名请求且存在双重进入竞态。
-        if target_url and getattr(self._signer, "server_url", None) != target_url:
-            reconfigure_fn = getattr(self._signer, "reconfigure", None)
-            if callable(reconfigure_fn):
-                res = reconfigure_fn(server_url=target_url)
-                if inspect.isawaitable(res):
-                    await res
-
         if not active_ctx.cookies and active_ctx.auth_file:
             # 惰性补载同样下放线程池：事件循环内同步读凭据文件与写路径
             # 的既定约束相悖（transition/transport 均已 to_thread）。
@@ -404,7 +378,7 @@ class GatewaySession:
             observation.proxy = redact_text(
                 active_ctx.proxy_url or settings.proxy_url or ""
             )
-            observation.signer = redact_text(target_url)
+            observation.signer = redact_text(self._signer.server_url)
 
         request_event("signing", "正在生成请求签名")
         proof = await self._signer.generate_snapshot(

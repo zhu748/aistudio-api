@@ -6,7 +6,6 @@ import type { SystemConfig } from '@/types/system.ts'
 import ApiKeyManagerCard from '@/components/settings/ApiKeyManagerCard.vue'
 import LogConfigCard from '@/components/settings/LogConfigCard.vue'
 import VisualConfigEditor from '@/components/config/VisualConfigEditor.vue'
-import SignerServerCard from '@/components/settings/SignerServerCard.vue'
 import KeepaliveCard from '@/components/settings/KeepaliveCard.vue'
 import AntiTruncationCard from '@/components/settings/AntiTruncationCard.vue'
 import { usePageRefresh } from '@/composables/usePageRefresh.ts'
@@ -33,7 +32,7 @@ const activeTab = ref<SettingsTab>('general')
 
 const tabs: { key: SettingsTab; label: string; desc: string; icon: typeof Activity }[] = [
   { key: 'general', label: '日志与调试', desc: '日志级别与请求报文转储', icon: Activity },
-  { key: 'transport', label: '传输与保活', desc: 'WAA 签名、抗截断与出站保活', icon: KeyRound },
+  { key: 'transport', label: '传输与保活', desc: '抗截断与出站保活', icon: KeyRound },
   { key: 'apikeys', label: '客户端密钥', desc: '入站 API Keys 鉴权管理', icon: Key },
   { key: 'models', label: '模型与协议规则', desc: 'OpenAI/Claude 映射与 YAML', icon: SlidersHorizontal },
 ]
@@ -211,13 +210,12 @@ usePageRefresh(loadConfig)
       />
     </div>
 
-    <!-- Tab 2: WAA Signer & Anti-Truncation Transport -->
+    <!-- Tab 2: Anti-Truncation Transport & Keepalive -->
     <div
       v-else-if="activeTab === 'transport'"
       class="space-y-5"
     >
       <KeepaliveCard />
-      <SignerServerCard @switched="loadConfig" />
       <AntiTruncationCard />
     </div>
 

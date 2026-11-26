@@ -715,7 +715,6 @@ def _default_config() -> dict[str, object]:
 # 正常情况下永远走不到这里；走到了也只求「能启动、行为保守」。
 _FALLBACK_DEFAULT_CONFIG: dict[str, object] = {
     "anti_truncation": {"enabled": False, "tool_name": "router_emit"},
-    "waa": {"active_server": "local_spidermonkey", "servers": []},
     "logging": {"level": "INFO", "dump_requests": False},
     "model_defaults": {"drop_unsupported_params": False, "profiles": [], "models": {}},
     "rotator": {
@@ -1164,7 +1163,7 @@ def _load_yaml_config(config_path: Path) -> dict[str, object]:
     # 缓存键用 absolute() 而非 resolve()：Windows 上 resolve() 会逐段做
     # 符号链接/大小写归一化（实测 96~141µs/次，比 absolute() 慢 300 倍以上），
     # 而这条路径每处理一个配置项都要走一次（resolve_model_defaults、
-    # get_configured_api_keys、get_active_waa_server 等），是本项目的头号热点。
+    # get_configured_api_keys 等），是本项目的头号热点。
     path_key = str(config_path.absolute())
     mtime = _cached_mtime(config_path)
 
@@ -1588,226 +1587,28 @@ def get_configured_paid_model_rules(
     return {}
 
 
-# ─── WAA 签名服务多节点管理与特征绑定 (纯手动切换，不轮询) ───
+# ─── WAA 本地签名节点（固定唯一，无多节点切换） ───
+
+# 唯一签名方式：容器内置的本地原生引擎（waa-signer Go 服务，
+# 127.0.0.1:8081 的 /v1/proof/mint HTTP 协议）。多节点管理、远程公共
+# 签名服务（spinsnow 等）与 AISTUDIO_WAA_SERVER 环境变量选择已整体
+# 移除：签名节点固定为本机回环地址，特征绑定（UA / 指纹头）随节点固定。
+_LOCAL_WAA_SERVER: dict[str, object] = {
+    "id": "local_spidermonkey",
+    "name": "本地原生引擎 (SpiderMonkey 152)",
+    "url": "http://127.0.0.1:8081",
+    "user_agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) "
+        "Gecko/20100101 Firefox/152.0"
+    ),
+    "headers": {"X-User-Agent": "grpc-web-javascript/0.1"},
+}
 
 
-# 运行时覆盖层：面板切换写入，优先级高于环境变量与配置文件。
-# 目的：即便部署时用 AISTUDIO_WAA_SERVER 环境变量注入了默认节点
-# （本地或远程），面板手动切换也能对当前进程立即生效，无需重启；
-# 进程重启后覆盖自动消失，回到"环境变量 > 配置文件"的默认优先级，
-# 与无盘 PaaS（Render Free 等）的部署语义完全兼容。
-_runtime_waa_override: str | None = None
-_runtime_waa_override_lock = threading.Lock()
+def get_local_waa_server() -> dict[str, object]:
+    """返回固定的本地 WAA 签名节点配置（含特征绑定的 UA 与指纹头）。
 
-
-def set_runtime_waa_override(server_id: str | None) -> None:
-    """设置（或清除）运行时 WAA 签名服务覆盖，进程内立即生效。"""
-    global _runtime_waa_override
-    cleaned = (
-        server_id.strip() if isinstance(server_id, str) and server_id.strip() else None
-    )
-    with _runtime_waa_override_lock:
-        _runtime_waa_override = cleaned
-
-
-def get_runtime_waa_override() -> str | None:
-    """读取当前运行时覆盖的签名服务 id（未设置时为 None）。"""
-    with _runtime_waa_override_lock:
-        return _runtime_waa_override
-
-
-def clear_runtime_waa_override() -> str | None:
-    """清除运行时覆盖，恢复"环境变量 > 配置文件"的默认优先级。
-
-    返回清除前的覆盖 id（原本就未设置时返回 None）。
-    注意：不清除 config.yaml 中已持久化的 active_server —— 该值只在
-    环境变量缺失时才参与判定，而环境变量存在时清除覆盖后即回到环境
-    变量默认节点，语义自洽。
+    返回浅拷贝：调用方（session / client / cookie_parser）只读；
+    拷贝防止意外原地修改污染模块级常量。
     """
-    global _runtime_waa_override
-    with _runtime_waa_override_lock:
-        previous = _runtime_waa_override
-        _runtime_waa_override = None
-    return previous
-
-
-def get_configured_waa_settings(
-    config_path: str | os.PathLike[str] | None = None,
-) -> dict[str, object]:
-    """获取 config.yaml 中配置的 WAA 签名服务与特征设置。"""
-    resolved_path = _resolve_config_path(config_path)
-    config = _load_yaml_config(resolved_path)
-    raw_waa = config.get("waa")
-    if isinstance(raw_waa, dict):
-        return raw_waa
-    def_waa = _default_config().get("waa")
-    if isinstance(def_waa, dict):
-        return def_waa
-    return {}
-
-
-def get_active_waa_server(
-    config_path: str | os.PathLike[str] | None = None,
-) -> dict[str, object]:
-    """获取当前激活的 WAA 签名服务器配置及其绑定的特征信息。
-
-    优先级（从高到低）：
-    1. 运行时覆盖 —— 面板手动切换写入（``switch_active_waa_server``），
-       即便部署时用环境变量锁定了默认节点，面板切换也对当前进程立即生效；
-    2. 环境变量 ``AISTUDIO_WAA_SERVER``（值为目标 server id，如
-       ``remote_spinsnow``），适用于无持久磁盘的 PaaS 部署（Render Free
-       等）：面板切换无法跨部署持久，改用平台环境变量注入；也便于小内存
-       实例强制走远程签名器、跳过本地引擎进程；
-    3. config.yaml 的 ``waa.active_server``。
-
-    进程重启后运行时覆盖消失，自动回到 2/3 的默认优先级。
-    """
-    waa = get_configured_waa_settings(config_path)
-    active_id = str(waa.get("active_server") or "local_spidermonkey").strip()
-    env_override = os.getenv("AISTUDIO_WAA_SERVER", "").strip()
-    if env_override:
-        active_id = env_override
-    runtime_override = get_runtime_waa_override()
-    if runtime_override:
-        active_id = runtime_override
-    raw_servers = waa.get("servers")
-    servers = raw_servers if isinstance(raw_servers, list) else []
-
-    for item in servers:
-        if isinstance(item, dict) and str(item.get("id") or "").strip() == active_id:
-            return dict(item)
-
-    if servers and isinstance(servers[0], dict):
-        return dict(servers[0])
-
-    return {
-        "id": "local_spidermonkey",
-        "name": "本地原生引擎 (SpiderMonkey 152)",
-        "url": "http://127.0.0.1:8081",
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0",
-        "headers": {"X-User-Agent": "grpc-web-javascript/0.1"},
-    }
-
-
-def switch_active_waa_server(
-    server_id: str,
-    config_path: str | os.PathLike[str] | None = None,
-) -> dict[str, object]:
-    """纯手动切换当前激活的 WAA 签名服务器，并持久化保存到 config.yaml。
-
-    同时写入运行时覆盖层：即便 ``AISTUDIO_WAA_SERVER`` 环境变量指定了
-    默认节点，切换也对当前进程立即生效（重启后回到环境变量默认）。
-    """
-    resolved_path = _resolve_config_path(config_path)
-    with config_file_write_lock():
-        content = (
-            resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
-        )
-        parsed = yaml.safe_load(content) or {}
-        if not isinstance(parsed, dict):
-            parsed = {}
-
-        raw_waa = parsed.get("waa")
-        waa_dict = dict(raw_waa) if isinstance(raw_waa, dict) else {}
-        target_id = server_id.strip()
-        waa_dict["active_server"] = target_id
-        parsed["waa"] = waa_dict
-
-        atomic_write_text(
-            resolved_path, yaml.dump(parsed, allow_unicode=True, sort_keys=False)
-        )
-    # 运行时覆盖：确保环境变量指定默认节点的场景下，切换同样立即生效
-    set_runtime_waa_override(target_id)
-    invalidate_config_cache()
-    return get_active_waa_server(config_path)
-
-
-def upsert_waa_server(
-    server_data: dict[str, object],
-    config_path: str | os.PathLike[str] | None = None,
-) -> dict[str, object]:
-    """新增或更新指定 WAA 签名服务器配置。"""
-    import uuid
-
-    resolved_path = _resolve_config_path(config_path)
-    with config_file_write_lock():
-        content = (
-            resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
-        )
-        parsed = yaml.safe_load(content) or {}
-        if not isinstance(parsed, dict):
-            parsed = {}
-
-        raw_waa = parsed.get("waa")
-        waa_dict = dict(raw_waa) if isinstance(raw_waa, dict) else {}
-        raw_servers = waa_dict.get("servers")
-        servers = list(raw_servers) if isinstance(raw_servers, list) else []
-
-        target_id = str(server_data.get("id") or "").strip()
-        if not target_id:
-            target_id = f"server_{uuid.uuid4().hex[:8]}"
-            server_data["id"] = target_id
-
-        updated = False
-        for idx, s in enumerate(servers):
-            if isinstance(s, dict) and str(s.get("id") or "").strip() == target_id:
-                servers[idx] = server_data
-                updated = True
-                break
-        if not updated:
-            servers.append(server_data)
-
-        waa_dict["servers"] = servers
-        parsed["waa"] = waa_dict
-        atomic_write_text(
-            resolved_path, yaml.dump(parsed, allow_unicode=True, sort_keys=False)
-        )
-    invalidate_config_cache()
-    return server_data
-
-
-def delete_waa_server(
-    server_id: str,
-    config_path: str | os.PathLike[str] | None = None,
-) -> bool:
-    """删除指定 ID 的 WAA 签名服务器。"""
-    resolved_path = _resolve_config_path(config_path)
-    with config_file_write_lock():
-        content = (
-            resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
-        )
-        parsed = yaml.safe_load(content) or {}
-        if not isinstance(parsed, dict):
-            return False
-
-        raw_waa = parsed.get("waa")
-        if not isinstance(raw_waa, dict):
-            return False
-
-        raw_servers = raw_waa.get("servers")
-        if not isinstance(raw_servers, list):
-            return False
-
-        target_id = server_id.strip()
-        new_servers = [
-            s
-            for s in raw_servers
-            if isinstance(s, dict) and str(s.get("id") or "").strip() != target_id
-        ]
-        if len(new_servers) == len(raw_servers):
-            return False
-
-        raw_waa["servers"] = new_servers
-        if str(raw_waa.get("active_server") or "").strip() == target_id and new_servers:
-            raw_waa["active_server"] = str(new_servers[0].get("id") or "")
-
-        parsed["waa"] = raw_waa
-        atomic_write_text(
-            resolved_path, yaml.dump(parsed, allow_unicode=True, sort_keys=False)
-        )
-    # 删除的节点若正是运行时覆盖指向的节点，同步清掉避免悬空
-    # （清除后自动回到“环境变量 > 配置文件”的默认优先级）
-    if get_runtime_waa_override() == target_id:
-        set_runtime_waa_override(None)
-    invalidate_config_cache()
-    return True
+    return dict(_LOCAL_WAA_SERVER)

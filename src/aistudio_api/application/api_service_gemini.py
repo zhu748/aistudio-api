@@ -107,7 +107,7 @@ class Auth403RetryManager:
        CheckUserStatus 同期 200），但原版有效 proof 重放也 403；此时
        重签无效，阶梯最终切号是唯一出路。中间两次重签对该场景是
        无效消耗，维持现阶梯是为覆盖 1/2 两类可自愈场景。
-    4. 签名器 attestation 质量降级（spinsnow 服务级挑战过期实测）——
+    4. 签名器 attestation 质量降级（历史远程服务挑战过期实测案例）——
        mint 成功但 proof 被上游系统性拒绝，且跨账号全量发生（签名器
        是公共依赖）。此时重签与切号均无效且无消耗账号池价值，由
        SignerHealthTracker 熔断短路（见 waa/health.py 判据与证据链）。

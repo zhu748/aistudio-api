@@ -25,24 +25,8 @@ compat:
     default_model: gemini-3.7-flash
     model_mapping: {}
 
-# WAA 签名与挑战求解配置 (脱离浏览器的纯净轻量化签名引擎)
-waa:
-  active_server: local_spidermonkey
-  servers:
-    - id: local_spidermonkey
-      name: 本地原生引擎 (SpiderMonkey 152)
-      description: 本地独立纯静态 Go 服务，毫秒级快速生成官方原生高精度快照 Proof
-      url: http://127.0.0.1:8081
-      user_agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0
-      headers:
-        X-User-Agent: grpc-web-javascript/0.1
-    - id: remote_spinsnow
-      name: 远程公共服务 (spinsnow / NodeVM)
-      description: 远程 Node.js VM 沙箱证明签名服务，绑定 Chromium 模拟特征环境
-      url: https://waa.spinsnow.fun
-      user_agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36
-      headers:
-        X-User-Agent: grpc-web-javascript/0.1
+# WAA 签名固定使用内置本地原生引擎（waa-signer Go 服务，127.0.0.1:8081），
+# 无需任何配置项；远程签名服务与多节点切换支持已移除。
 
 # 服务端日志与请求转储调试配置
 logging:

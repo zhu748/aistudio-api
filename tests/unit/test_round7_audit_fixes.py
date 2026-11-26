@@ -148,27 +148,14 @@ def test_clean_presets_still_work(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_remote_signer_concurrent_client_init() -> None:
+async def test_local_signer_concurrent_client_init() -> None:
     """并发首调只建一个 AsyncClient。"""
-    from aistudio_api.infrastructure.waa.signer import RemoteProofSigner
+    from aistudio_api.infrastructure.waa.signer import LocalProofSigner
 
-    rs = RemoteProofSigner()
+    rs = LocalProofSigner()
     clients = await asyncio.gather(*[rs._get_client() for _ in range(20)])
     assert len({id(c) for c in clients}) == 1
     await rs.close()
-
-
-@pytest.mark.asyncio
-async def test_waa_signer_reconfigure_lock_singleton() -> None:
-    """并发首调只创建一把 reconfigure 锁。"""
-    from aistudio_api.infrastructure.waa.signer import WaaSigner
-
-    w = WaaSigner()
-    locks = [w._get_reconfigure_lock() for _ in range(10)]
-    locks += await asyncio.gather(
-        *[asyncio.to_thread(w._get_reconfigure_lock) for _ in range(10)]
-    )
-    assert len({id(lk) for lk in locks}) == 1
 
 
 # ─── P3-5: 流式 Set-Cookie 后台持久化 ───

@@ -11,12 +11,15 @@
 #     重启就重启 —— 账号凭据放在环境变量里，每次启动自动重建（幂等注入）。
 #   - 账号请用 AISTUDIO_COOKIES 注入：支持多条、每条可带独立代理，
 #     重启后自动恢复，无需磁盘。
-#   - 面板里的 config.yaml 修改不持久 —— 需要固化的配置（默认模型、抗截断、
-#     签名器选择等）请用对应环境变量下发。
-#   - 512MB 内存可正常部署：本引擎无需浏览器，纯 Go + SpiderMonkey 本地签名。
-#     若内存吃紧，设置 AISTUDIO_WAA_SERVER=remote_spinsnow 改走远程签名器，
-#     跳过本地引擎进程（省约 100~200MB；Free 计划面板切换不持久，
-#     必须用环境变量）。
+#   - 面板里的 config.yaml 修改不持久 —— 需要固化的配置（默认模型、抗截断
+#     等）请用对应环境变量下发。
+#   - 512MB 内存可正常部署：本引擎无需浏览器，纯 Go + SpiderMonkey 本地签名
+#     （本地引擎是唯一签名方式，无远程节点选项）。
+#   - 长代理会话（Claude Code 等 harness）的内存自适应：进程按 cgroup 预算
+#     自动缩放缓存上限（512MB 档下 model_turns 回放缓存 64MB→12MB），大请求
+#     收尾后归还 glibc 堆碎片，避免长会话把 RSS 顶过 OOM 阈值被 SIGKILL
+#     （OOM 崩溃重启同样会清空临时盘数据）。可用 AISTUDIO_MEMORY_BUDGET_MB /
+#     AISTUDIO_MODEL_TURN_CACHE_MB 显式调节；AISTUDIO_MALLOC_TRIM=0 关闭堆归还。
 #   - 需要持久磁盘与服务常驻（不休眠）时：plan 改回 starter，并恢复下方
 #     注释中的 disk 段。
 
@@ -76,8 +79,4 @@ services:
         sync: false
       # 【可选】默认文本模型
       - key: AISTUDIO_DEFAULT_TEXT_MODEL
-        sync: false
-      # 【Free 计划推荐】固定走远程 WAA 签名器：跳过本地签名引擎进程
-      # （省约 100~200MB 内存）；面板切换在 Free 计划不持久，必须用环境变量。
-      - key: AISTUDIO_WAA_SERVER
         sync: false

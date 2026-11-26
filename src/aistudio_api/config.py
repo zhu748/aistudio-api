@@ -150,6 +150,96 @@ def resolve_data_dir() -> Path:
     return _DEFAULT_DATA_DIR.resolve()
 
 
+def detect_memory_budget_mb() -> int | None:
+    """探测容器内存预算（MB）；非容器/未设限返回 None。
+
+    Render/Docker/K8s 等平台通过 cgroup 限额约束进程可用内存（512MB 档
+    实例即此形态）。进程内有界缓存的默认上限按大内存部署取值（如
+    model_turns 回放缓存 64MB），小容器上会显著挤占请求峰值余量——长
+    代理会话请求体随轮次增长，最终触发 OOMKiller（SIGKILL，无优雅
+    关停）。探测限额供各缓存上限自适应分档；显式设置
+    ``AISTUDIO_MEMORY_BUDGET_MB`` 优先于 cgroup 读数。
+
+    cgroup v1 未设限时 limit 是页计数器巨值（≫ 物理内存），视为无预算；
+    读取失败（非 Linux / 无权限）同样返回 None，调用方回退默认档。
+    """
+    override = os.getenv("AISTUDIO_MEMORY_BUDGET_MB")
+    if override:
+        try:
+            value = int(override)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+    try:
+        with Path("/sys/fs/cgroup/memory.max").open(encoding="ascii") as handle:
+            raw = handle.read().strip()
+        if raw and raw != "max":
+            value = int(raw)
+            if 0 < value < (1 << 60):
+                return value // (1024 * 1024)
+    except (OSError, ValueError):
+        pass
+    try:
+        with Path("/sys/fs/cgroup/memory/memory.limit_in_bytes").open(
+            encoding="ascii"
+        ) as handle:
+            value = int(handle.read().strip())
+        if 0 < value < (1 << 40):
+            return value // (1024 * 1024)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def path_mount_info(path: Path | str) -> tuple[str, str]:
+    """返回路径所在挂载点的 (挂载点, 文件系统类型)；解析失败返回 ("", "")。
+
+    用 /proc/mounts 做最长前缀匹配（mount 信息含挂载点覆盖关系）。挂载
+    点中的空格等特殊字符在 mounts 文件里以八进制转义（\\040），需还原
+    后再比较。
+    """
+    try:
+        target = Path(path).resolve()
+        best_point = ""
+        best_fs = ""
+        with Path("/proc/mounts").open(encoding="utf-8") as handle:
+            for line in handle:
+                fields = line.split()
+                if len(fields) < 3:
+                    continue
+                point = Path(
+                    fields[1]
+                    .encode("latin-1", "backslashreplace")
+                    .decode("unicode_escape")
+                )
+                try:
+                    if (target == point or point in target.parents) and len(
+                        str(point)
+                    ) > len(best_point):
+                        best_point, best_fs = str(point), fields[2]
+                except (OSError, ValueError):
+                    continue
+        return best_point, best_fs
+    except OSError:
+        return "", ""
+
+
+_EPHEMERAL_FILESYSTEMS = frozenset({"overlay", "tmpfs", "squashfs"})
+
+
+def is_ephemeral_data_dir() -> bool:
+    """数据目录是否落在容器临时文件系统（overlay/tmpfs/squashfs）上。
+
+    Render 免费档、未挂卷的 Docker/K8s 容器根文件系统均为临时盘：进程
+    崩溃重启（OOMKiller）或重新部署后，data 目录里的账号 Cookie、请求
+    历史（SQLite）、签名缓存、统计全部随之清零。落盘写入本身是崩溃
+    安全的（SQLite WAL 即时提交），清零根因是"盘没了"而非"没写进去"。
+    """
+    _, filesystem = path_mount_info(resolve_data_dir())
+    return filesystem in _EPHEMERAL_FILESYSTEMS
+
+
 def resolve_stats_file() -> Path:
     """解析调用量与 Token 统计持久化文件路径（优先使用 AISTUDIO_STATS_FILE）。"""
     override = os.getenv("AISTUDIO_STATS_FILE")
@@ -323,9 +413,6 @@ def resolve_timezone() -> str:
 @dataclass(slots=True)
 class Settings:
     port: int = int(os.getenv("AISTUDIO_PORT", "8080"))
-    proof_server_url: str = os.getenv(
-        "AISTUDIO_PROOF_SERVER_URL", "https://waa.spinsnow.fun"
-    )
     auth_file: str | None = discover_auth_file()
     tmp_dir: str = os.getenv("AISTUDIO_TMP_DIR", tempfile.gettempdir())
     proxy_url: str | None = discover_proxy_url()
@@ -344,7 +431,6 @@ class Settings:
     dump_dir: str = os.getenv("AISTUDIO_DUMP_DIR", "")
     allow_no_auth: bool = _load_bool_env("AISTUDIO_ALLOW_NO_AUTH", default=False)
     signer_secret: str = os.getenv("AISTUDIO_SIGNER_SECRET", "")
-    signer_secret_url: str = os.getenv("AISTUDIO_SIGNER_SECRET_URL", "").rstrip("/")
     request_history: bool = _load_bool_env("AISTUDIO_REQUEST_HISTORY", default=True)
     history_days: int = max(1, int(os.getenv("AISTUDIO_HISTORY_DAYS", "14")))
     history_max_rows: int = max(

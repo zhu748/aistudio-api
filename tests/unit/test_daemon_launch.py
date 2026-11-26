@@ -1,10 +1,13 @@
-"""本地 WAA 签名服务自动拉起/回退路径的单元测试。
+"""本地 WAA 签名服务自动拉起路径的单元测试。
 
 覆盖此前完全没有测试的两条高风险路径：
 1. ``is_local_signer_url`` 必须按主机名精确判定，不能用子串匹配
    （``http://127.0.0.1:8081.evil.com`` 曾被误判为本机）。
-2. 拉起后探活失败必须**先回收子进程**再回退远程节点，
+2. 拉起后探活失败必须**先回收子进程**再返回失败原因，
    否则会留下僵尸进程并长期占用 8081 端口，导致后续启动无法绑定。
+
+本地引擎是唯一签名方式（远程回退与多节点切换已移除）：失败只报因，
+不切换任何节点。
 """
 
 from __future__ import annotations
@@ -14,16 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aistudio_api.infrastructure.gateway import model_defaults
 from aistudio_api.infrastructure.waa import daemon
-
-
-@pytest.fixture(autouse=True)
-def isolate_runtime_override():
-    previous = model_defaults.get_runtime_waa_override()
-    model_defaults.set_runtime_waa_override(None)
-    yield
-    model_defaults.set_runtime_waa_override(previous)
 
 
 @pytest.mark.parametrize(
@@ -61,10 +55,10 @@ def test_is_local_signer_url_without_port_accepts_any_loopback_port() -> None:
     assert daemon.is_local_signer_url("http://127.0.0.1:8081.evil.com") is False
 
 
-def test_ensure_signer_ready_reaps_child_before_remote_fallback(
+def test_ensure_signer_ready_reaps_child_on_failed_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """探活失败的本地实例必须被 terminate + wait，再回退远程节点。"""
+    """探活失败的本地实例必须被 terminate + wait 后返回失败原因。"""
     fake_proc = MagicMock()
     fake_proc.pid = 4242
     # wait() 正常返回，避免走 TimeoutExpired 分支
@@ -78,30 +72,20 @@ def test_ensure_signer_ready_reaps_child_before_remote_fallback(
     monkeypatch.setattr(daemon.os, "access", lambda *_a, **_kw: True)
 
     monkeypatch.setattr(daemon, "_daemon_proc", None, raising=False)
-    monkeypatch.setattr(
-        daemon,
-        "get_active_waa_server",
-        lambda: {"id": "local_spidermonkey", "url": "http://127.0.0.1:8081"},
-    )
     monkeypatch.setattr(daemon, "is_service_healthy", lambda url: False)
     monkeypatch.setattr(daemon, "is_port_open", lambda host, port: False)
     monkeypatch.setattr(daemon, "_set_parent_death_signal", lambda: None)
     monkeypatch.setattr(daemon.subprocess, "Popen", lambda *a, **kw: fake_proc)
     monkeypatch.setattr(daemon.time, "sleep", lambda _s: None)
 
-    switched: list[str] = []
-    monkeypatch.setattr(
-        daemon, "switch_active_waa_server", lambda server_id: switched.append(server_id)
-    )
-
-    daemon.ensure_signer_ready()
+    reason = daemon.ensure_signer_ready(server_url="http://127.0.0.1:8081")
 
     # 子进程被回收，且全局句柄被清空
     fake_proc.terminate.assert_called_once()
     fake_proc.wait.assert_called()
     assert daemon._daemon_proc is None
-    # 回退到远程节点
-    assert switched == ["remote_spinsnow"]
+    # 失败必须显式报因（供 /ready 与日志呈现），而不是静默成功
+    assert reason is not None
 
 
 def test_ensure_signer_ready_skips_launch_when_port_busy(
@@ -109,77 +93,44 @@ def test_ensure_signer_ready_skips_launch_when_port_busy(
 ) -> None:
     """端口已占用但 /health 不通时不得再拉起实例（会立刻端口冲突退出）。"""
     popen_calls: list[object] = []
-    monkeypatch.setattr(
-        daemon,
-        "get_active_waa_server",
-        lambda: {"id": "local_spidermonkey", "url": "http://127.0.0.1:8081"},
-    )
     monkeypatch.setattr(daemon, "is_service_healthy", lambda url: False)
     monkeypatch.setattr(daemon, "is_port_open", lambda host, port: True)
     monkeypatch.setattr(
         daemon.subprocess, "Popen", lambda *a, **kw: popen_calls.append(a)
     )
-    switched: list[str] = []
-    monkeypatch.setattr(
-        daemon, "switch_active_waa_server", lambda server_id: switched.append(server_id)
-    )
 
-    daemon.ensure_signer_ready()
+    reason = daemon.ensure_signer_ready()
 
     assert popen_calls == []
-    # 端口被无关进程占用时必须回退远程节点，否则配置仍指向不可用的本地节点
-    assert switched == ["remote_spinsnow"]
+    # 端口被无关进程占用时必须返回失败原因，不能静默返回成功
+    assert reason is not None and "占用" in reason
 
 
-def test_ensure_signer_ready_noop_for_remote_server(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """配置为远程节点时直接返回，不应探活或拉起本地实例。"""
-    calls: list[str] = []
-    monkeypatch.setattr(
-        daemon,
-        "get_active_waa_server",
-        lambda: {"id": "remote_spinsnow", "url": "https://waa.spinsnow.fun"},
-    )
-    monkeypatch.setattr(
-        daemon, "is_service_healthy", lambda url: calls.append("healthy") or False
-    )
-    monkeypatch.setattr(
-        daemon, "is_port_open", lambda host, port: calls.append("port") or False
-    )
-
-    daemon.ensure_signer_ready()
-
-    assert calls == []
-
-
-def test_explicit_local_test_failure_does_not_switch_active_server(monkeypatch):
+def test_ensure_signer_ready_reports_missing_binary(monkeypatch):
+    """本地二进制缺失时返回带构建指引的失败原因。"""
     monkeypatch.setattr(Path, "is_file", lambda self: False)
     monkeypatch.setattr(daemon, "is_service_healthy", lambda url: False)
     monkeypatch.setattr(daemon, "is_port_open", lambda host, port: False)
-    switch = MagicMock()
-    monkeypatch.setattr(daemon, "switch_active_waa_server", switch)
 
     error = daemon.ensure_signer_ready(server_url="http://127.0.0.1:8081")
 
     assert error is not None and "未检测到" in error
-    switch.assert_not_called()
-    assert model_defaults.get_runtime_waa_override() is None
 
 
-def test_remote_fallback_survives_readonly_config(monkeypatch):
-    monkeypatch.setattr(Path, "is_file", lambda self: False)
-    monkeypatch.setattr(daemon, "is_service_healthy", lambda url: False)
-    monkeypatch.setattr(daemon, "is_port_open", lambda host, port: False)
+def test_ensure_signer_ready_uses_local_node_url_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """未指定 server_url 时固定解析本地节点（唯一签名方式）。"""
+    monkeypatch.setattr(daemon, "is_service_healthy", lambda url: True)
+    probed: list[str] = []
     monkeypatch.setattr(
-        daemon, "get_active_waa_server", lambda: {"url": "http://127.0.0.1:8081"}
-    )
-    monkeypatch.setattr(
-        daemon, "switch_active_waa_server", MagicMock(side_effect=OSError("readonly"))
+        daemon,
+        "is_service_healthy",
+        lambda url: probed.append(url) or True,
     )
 
-    assert daemon.ensure_signer_ready() is not None
-    assert model_defaults.get_runtime_waa_override() == "remote_spinsnow"
+    assert daemon.ensure_signer_ready() is None
+    assert probed == ["http://127.0.0.1:8081"]
 
 
 def test_local_launch_overrides_platform_listen_env(monkeypatch):

@@ -114,7 +114,7 @@ async def get_system_config(request: Request) -> dict[str, object]:
         web_auth_required,
     )
     from aistudio_api.infrastructure.gateway.model_defaults import (
-        get_active_waa_server,
+        get_local_waa_server,
     )
     from aistudio_api.infrastructure.utils.logger import (
         get_dump_dir,
@@ -135,10 +135,10 @@ async def get_system_config(request: Request) -> dict[str, object]:
     if not is_admin_password_session(request):
         yaml_content = _mask_yaml_api_keys(yaml_content)
 
-    active_waa = get_active_waa_server()
+    active_waa = get_local_waa_server()
     return {
         "port": settings.port,
-        "proof_server_url": str(active_waa.get("url") or settings.proof_server_url),
+        "proof_server_url": str(active_waa.get("url") or ""),
         "active_signer_server": active_waa.get("id"),
         "proxy_configured": bool(settings.proxy_url),
         "auth_enabled": web_auth_required(),

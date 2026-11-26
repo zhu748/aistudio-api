@@ -1,4 +1,4 @@
-"""Unit tests for WAA engine proof signing client (aistudio-pg-bridge / spinsnow)."""
+"""Unit tests for the local WAA engine proof signing client."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import pytest
 from aistudio_api.domain.errors import TransportError
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent, AistudioPart
 from aistudio_api.infrastructure.waa.signer import (
-    RemoteProofSigner,
+    LocalProofSigner,
     WaaSigner,
     extract_content_digest,
 )
@@ -31,7 +31,7 @@ def test_extract_content_digest_exact_alignment():
 
 @pytest.mark.asyncio
 async def test_remote_proof_signer_success():
-    """Verify RemoteProofSigner sends payload and parses proof token."""
+    """Verify LocalProofSigner sends payload and parses proof token."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         data = json.loads(request.content)
@@ -45,7 +45,7 @@ async def test_remote_proof_signer_success():
         )
 
     mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    signer = RemoteProofSigner(server_url="https://mock.proof.server")
+    signer = LocalProofSigner(server_url="https://mock.proof.server")
 
     with patch("httpx.AsyncClient", return_value=mock_client):
         proof = await signer.mint_proof(
@@ -63,7 +63,7 @@ async def test_remote_proof_signer_success():
 
 @pytest.mark.asyncio
 async def test_remote_proof_signer_error():
-    """Verify RemoteProofSigner raises TransportError on upstream failure."""
+    """Verify LocalProofSigner raises TransportError on upstream failure."""
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -72,7 +72,7 @@ async def test_remote_proof_signer_error():
         )
 
     mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    signer = RemoteProofSigner(server_url="https://mock.proof.server")
+    signer = LocalProofSigner(server_url="https://mock.proof.server")
 
     with (
         patch("httpx.AsyncClient", return_value=mock_client),
@@ -88,7 +88,7 @@ async def test_remote_proof_signer_error():
 
 @pytest.mark.asyncio
 async def test_remote_proof_signer_retry_on_network_error():
-    """Verify RemoteProofSigner retries on transient connection error."""
+    """Verify LocalProofSigner retries on transient connection error."""
     attempts = 0
 
     def handler(_request: httpx.Request) -> httpx.Response:
@@ -101,7 +101,7 @@ async def test_remote_proof_signer_retry_on_network_error():
             json={"ok": True, "proof": "!mock_recovered_proof", "poolState": "cold"},
         )
 
-    signer = RemoteProofSigner(server_url="https://mock.proof.server")
+    signer = LocalProofSigner(server_url="https://mock.proof.server")
 
     orig_client = httpx.AsyncClient
     with patch(
@@ -133,7 +133,7 @@ async def test_remote_proof_signer_retries_gateway_unavailable():
             json={"ok": True, "proof": "!mock_after_gateway_retry"},
         )
 
-    signer = RemoteProofSigner(server_url="https://mock.proof.server")
+    signer = LocalProofSigner(server_url="https://mock.proof.server")
     orig_client = httpx.AsyncClient
 
     with patch(
@@ -162,7 +162,7 @@ async def test_remote_proof_signer_does_not_retry_business_500():
         attempts += 1
         return httpx.Response(500, json={"ok": False, "error": "Cookie expired"})
 
-    signer = RemoteProofSigner(server_url="https://mock.proof.server")
+    signer = LocalProofSigner(server_url="https://mock.proof.server")
     orig_client = httpx.AsyncClient
 
     with (
@@ -182,8 +182,9 @@ async def test_remote_proof_signer_does_not_retry_business_500():
 
 @pytest.mark.asyncio
 async def test_waa_signer_facade():
-    """Verify WaaSigner delegates generate_snapshot to RemoteProofSigner."""
-    signer = WaaSigner(proof_server_url="https://mock.proof.server")
+    """Verify WaaSigner delegates generate_snapshot to LocalProofSigner."""
+    signer = WaaSigner()
+    signer._local_signer.server_url = "https://mock.proof.server"
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"ok": True, "proof": "!facade_token"})

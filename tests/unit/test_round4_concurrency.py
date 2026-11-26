@@ -28,7 +28,7 @@ from aistudio_api.infrastructure.gateway.client import (
     AIStudioClient,
     PreparedRequest,
 )
-from aistudio_api.infrastructure.waa.signer import RemoteProofSigner
+from aistudio_api.infrastructure.waa.signer import LocalProofSigner
 
 
 def _prep(tag: str) -> PreparedRequest:
@@ -55,7 +55,7 @@ async def test_last_prepared_request_is_task_local():
 @pytest.mark.asyncio
 async def test_signers_last_headers_are_task_local():
     """Concurrent proof mints must keep proof <-> headers aligned."""
-    signer = RemoteProofSigner(server_url="https://mock.proof.server")
+    signer = LocalProofSigner(server_url="https://mock.proof.server")
     barrier = asyncio.Barrier(2)
     observed: dict[str, dict[str, str]] = {}
 

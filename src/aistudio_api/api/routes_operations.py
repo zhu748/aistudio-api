@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from aistudio_api.api.state import runtime_state
 from aistudio_api.config import settings
-from aistudio_api.infrastructure.gateway.model_defaults import get_active_waa_server
+from aistudio_api.infrastructure.gateway.model_defaults import get_local_waa_server
 from aistudio_api.infrastructure.request_context import active_requests
 from aistudio_api.infrastructure.request_history import request_history
 from aistudio_api.infrastructure.utils.log_files import read_log_history
@@ -343,7 +343,7 @@ async def list_proxies() -> dict[str, object]:
     status = bridge_status()
     return {
         "global_proxy": redact_text(settings.proxy_url or ""),
-        "signer": redact_text(str(get_active_waa_server().get("url") or "")),
+        "signer": redact_text(str(get_local_waa_server().get("url") or "")),
         "bridge": {
             "available": status["available"],
             "binary": status["binary"],
@@ -441,32 +441,16 @@ async def readiness() -> JSONResponse:
         for a in accounts
         if a.enabled and rotator and rotator.is_account_available(a.id)
     )
-    url = str(get_active_waa_server().get("url") or settings.proof_server_url)
+    # 本地签名引擎（127.0.0.1:8081）是唯一签名方式：探活直连本机
+    # 回环，不走出站代理（代理只会把回环请求发往代理侧的 localhost）。
+    url = str(get_local_waa_server().get("url") or "")
     signer_ok = False
     try:
-        from aistudio_api.infrastructure.proxy_bridge import resolve_proxy_url_async
-        from aistudio_api.infrastructure.waa.daemon import is_local_signer_url
-
-        signer_proxy = (
-            None
-            if is_local_signer_url(url)
-            else await resolve_proxy_url_async(settings.proxy_url)
-        )
-        async with httpx.AsyncClient(
-            timeout=3,
-            proxy=signer_proxy,
-            trust_env=False,
-        ) as client:
+        async with httpx.AsyncClient(timeout=3, trust_env=False) as client:
             response = await client.get(url.rstrip("/") + "/health")
             signer_ok = response.is_success
     except httpx.HTTPError:
         pass
-    except Exception as exc:
-        # 桥接冷启动失败等代理解析错误：就绪探活直接判签名节点不可达，
-        # 不影响主体服务的 503 语义（fail-closed，不静默跳过代理）。
-        from aistudio_api.infrastructure.utils.logger import get_logger
-
-        get_logger("operations").debug("就绪探活的代理解析失败: %s", exc)
     ready = bool(runtime_state.client and available and signer_ok)
     return JSONResponse(
         {
