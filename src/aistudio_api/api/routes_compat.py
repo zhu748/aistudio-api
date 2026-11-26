@@ -314,6 +314,9 @@ async def claude_messages(
     record_requested_parameters(
         {
             "thinking": req.thinking,
+            # Claude effort 协议：Claude Code Max 档的思考强度在
+            # output_config.effort，记录进请求详情便于核对映射结果。
+            "output_config": req.output_config,
             "temperature": req.temperature,
             "top_p": req.top_p,
             "top_k": req.top_k,

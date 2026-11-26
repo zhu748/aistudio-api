@@ -66,6 +66,9 @@ def record_requested_parameters(parameters: dict[str, object]) -> None:
         "thinking",
         "thinkingConfig",
         "enable_thinking",
+        # Claude effort 协议（2026-11）：Claude Code 的思考强度选择器走
+        # 顶层 output_config.effort，一并进请求详情便于排障。
+        "output_config",
     }
     thinking_keys = {
         "type",

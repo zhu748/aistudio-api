@@ -11,6 +11,7 @@ import time
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from aistudio_api.config import settings
 from aistudio_api.domain.errors import TransportError
@@ -36,6 +37,9 @@ from aistudio_api.infrastructure.request_context import (
 from aistudio_api.infrastructure.utils.logger import get_logger
 from aistudio_api.infrastructure.utils.redaction import redact_text
 from aistudio_api.infrastructure.waa.signer import WaaSigner
+
+if TYPE_CHECKING:
+    from aistudio_api.infrastructure.account.account_store import AccountStore
 
 logger = get_logger("session")
 
@@ -111,6 +115,10 @@ class GatewaySession:
         # 次都全量重转（2×to_thread + 切换锁 + INFO 刷屏），负缓存内直接
         # 复用上次的空上下文（transport 同场景有 _empty_cookie_cache 防线）。
         self._degraded_transition_at = 0.0
+        # 账号池单例缓存（见 _reconcile_active_account）：AccountStore.__new__
+        # 每次构造都要做 _resolve_accounts_dir 的 env+磁盘探测，热路径上
+        # 逐请求重复探测纯属浪费；单例按目录键控，缓存实例安全。
+        self._account_store: AccountStore | None = None
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_active_waa_server,
         )
@@ -182,7 +190,13 @@ class GatewaySession:
         """Ensure session context is initialized and ready."""
         self._ensure_open()
         if self.is_ready and self._active_context is not None:
-            return self._active_context
+            # 注册表对账：部分管理路径只改注册表活跃账号而不切会话（如
+            # get_active_account 的禁用回退会重写 active_account_id、
+            # apply_preset 清空活跃标记后的回退），上下文会停留在旧账号
+            # （可能已被禁用）上继续发请求。以注册表为准先对齐再复用。
+            await self._reconcile_active_account()
+            if self.is_ready and self._active_context is not None:
+                return self._active_context
         # 无凭据降级态短负缓存（5s）：重复全量重转只会再次产出同一个
         # 空上下文，期间所有并发请求排队在切换锁上放大延迟并刷 INFO。
         # switch_auth / set_ready_context 直接改 _auth_file，负缓存条件
@@ -193,10 +207,79 @@ class GatewaySession:
             and time.monotonic() - self._degraded_transition_at < 5.0
         ):
             return self._active_context
+        # 冷启动路径同样先对账：_auth_file 镜像可能停留在已被禁用/删除
+        # 的账号上，对账会把切换目标纠正为注册表当前活跃账号。
+        await self._reconcile_active_account()
         ctx = await self.transition_to_account(self._auth_file, force_refresh=False)
         if self._auth_file is None:
             self._degraded_transition_at = time.monotonic()
         return ctx
+
+    def _bound_account_id(self) -> str | None:
+        """当前绑定账号 ID（上下文/镜像 auth_file 的父目录名）；无绑定为 None。"""
+        auth_file = None
+        if self._active_context is not None:
+            auth_file = self._active_context.auth_file
+        if not auth_file:
+            # 冷启动（上下文未建立）时以 _auth_file 镜像为准
+            auth_file = self._auth_file
+        if not auth_file:
+            return None
+        return Path(auth_file).parent.name
+
+    async def _reconcile_active_account(self) -> None:
+        """会话绑定账号与注册表活跃账号分叉时，以注册表为准对齐。
+
+        分叉来源（均只改注册表、不切会话）：
+        - ``AccountStore.get_active_account`` 的禁用回退会重写
+          ``active_account_id`` 为首个启用账号；
+        - ``apply_preset`` 在活跃账号被禁用时清空活跃标记，后续读取同样
+          走回退重写。
+        表现为「面板显示第二个账号已激活、请求仍用第一个（甚至已停用）
+        账号发出」。此处对账兜底全部路径：分叉即无感切换到注册表活跃账号；
+        未分叉时纯内存比较，零 IO。会话未绑定账号池内账号（legacy
+        settings.auth_file / 纯 Cookie 上下文 / 测试夹具）或注册表不可读
+        （损坏隔离中）时不介入，保持原行为。
+        """
+        bound_id = self._bound_account_id()
+        if bound_id is None:
+            return
+        try:
+            if self._account_store is None:
+                from aistudio_api.infrastructure.account.account_store import (
+                    AccountStore,
+                )
+
+                self._account_store = AccountStore()
+            store = self._account_store
+            if bound_id not in store.account_id_index():
+                # 绑定的不是账号池内账号：不越权改写（legacy/外部 auth）
+                return
+            active = store.get_active_account()
+            if active is None or active.id == bound_id:
+                return
+            expected = store.get_auth_path_optional(active.id, require_exists=False)
+        except Exception:
+            # 对账是兜底而非关键路径：注册表损坏（隔离中）等异常时保持
+            # 当前上下文继续服务，绝不因对账失败中断请求。
+            return
+        if expected is None:
+            return
+        logger.info(
+            "会话与活跃账号分叉，自动对齐: session=%s → active=%s",
+            bound_id,
+            active.id,
+        )
+        # 与 AccountService.activate_account 同语义：活跃账号变更 → 目录按
+        # 新账号凭据/层级拉取，立即失效缓存（对账路径不走服务层，须自补）
+        from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+        model_discovery.invalidate_cache()
+        if self._active_context is not None:
+            await self.transition_to_account(str(expected), force_refresh=False)
+        else:
+            # 冷启动：仅纠正转换目标，紧随其后的 transition 完成实际切换
+            self._auth_file = str(expected)
 
     async def switch_auth(self, auth_file: str | None) -> None:
         """Atomic account switch."""

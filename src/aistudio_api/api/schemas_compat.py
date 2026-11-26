@@ -129,4 +129,11 @@ class ClaudeMessagesRequest(BaseModel):
     tools: list[dict[str, object]] | None = None
     tool_choice: dict[str, object] | None = None
     thinking: dict[str, object] | None = None
+    # —— Claude effort 协议（2026-11，beta effort-2025-11-24 → 4.6+ 稳定）——
+    # Claude Code 的思考强度选择器（Low/Medium/High/Max）不在 thinking 里，
+    # 而是走顶层 ``output_config: {"effort": "max"}``（adaptive thinking 模式
+    # 下与 ``thinking: {"type": "adaptive"}`` 并发出现）。历史上无此字段时
+    # pydantic 静默丢弃，表现为「开了 max 却到不了 xhigh 顶格思考档」。
+    # 兼容个别网关把它塞进 thinking.effort 的变体（compat_claude 一并归一化）。
+    output_config: dict[str, object] | None = None
     metadata: dict[str, object] | None = None

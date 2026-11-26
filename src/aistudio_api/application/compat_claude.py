@@ -310,6 +310,39 @@ def _claude_thinking_to_level(thinking: dict[str, object] | None) -> str | None:
     return "VERY_HIGH"
 
 
+def _claude_effort_word(
+    thinking: dict[str, object] | None,
+    output_config: dict[str, object] | None,
+) -> str | None:
+    """归一化 Claude effort 参数（管线档位词；无法识别返回 None）。
+
+    位置优先级（高 → 低）：
+    1. ``output_config.effort`` —— Anthropic 官方位置（2026-11 effort 协议），
+       Claude Code 的 Low/Medium/High/Max 思考强度选择器即此形态；
+    2. ``thinking.effort`` —— 个别网关/中转的变体位置。
+
+    词表与 OpenAI 兼容层共用（normalize_reasoning_effort_word）：
+    ``max → xhigh``（顶格思考档）、``very_high → very_high``、
+    ``low/medium/high/minimal`` 原样、``none/off → none``（显式关闭）。
+    adaptive thinking（``thinking: {"type": "adaptive"}``）本身不携带档位，
+    是否顶格由 effort 决定——这正是「开 Max 却没到 xhigh」的修复点。
+    """
+    from aistudio_api.application.compat_openai import normalize_reasoning_effort_word
+
+    candidates: list[object] = []
+    if isinstance(output_config, dict):
+        candidates.append(output_config.get("effort"))
+    if isinstance(thinking, dict):
+        candidates.append(thinking.get("effort"))
+    for raw in candidates:
+        word = normalize_reasoning_effort_word(raw)
+        if word is not None:
+            return word
+        if isinstance(raw, str) and raw.strip():
+            logger.warning("忽略无法识别的 effort 参数: %r", raw)
+    return None
+
+
 @media_session()
 async def claude_to_gemini_request(
     req: ClaudeMessagesRequest,
@@ -353,8 +386,17 @@ async def claude_to_gemini_request(
         stop_list = [s for s in req.stop_sequences if isinstance(s, str) and s]
         if stop_list:
             generation_config["stopSequences"] = stop_list
+    # 思考强度归一化：显式 effort（output_config.effort / thinking.effort，
+    # Claude Code 的 Low/Medium/High/Max 选择器）优先于 budget_tokens 推断
+    # 档位——二者并存时 effort 才是用户的显式选择，budget 只剩兜底语义。
+    # effort 走 reasoningEffort 通道，与 OpenAI 兼容层共用同一管线（
+    # normalize_reasoning_effort_word：max → xhigh 顶格档、none → 显式关闭，
+    # 档位吸附按模型目录自动升降）。仅 budget 时维持既有 thinkingConfig 路径。
+    effort_word = _claude_effort_word(req.thinking, req.output_config)
     thinking_level = _claude_thinking_to_level(req.thinking)
-    if thinking_level is not None:
+    if effort_word is not None:
+        generation_config["reasoningEffort"] = effort_word
+    elif thinking_level is not None:
         generation_config["thinkingConfig"] = {"thinkingLevel": thinking_level}
     elif isinstance(req.thinking, dict) and req.thinking.get("type") == "disabled":
         generation_config["thinkingConfig"] = {"thinkingLevel": "NONE"}

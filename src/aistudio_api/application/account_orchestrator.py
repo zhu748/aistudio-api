@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
+from pathlib import Path
 
 from aistudio_api.api.state import runtime_state
 from aistudio_api.infrastructure.account.account_store import AccountMeta
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("orchestrator")
+
+# 账号 ID 形态（与 routes_accounts 的路径参数 pattern 同字符集）
+_ACCOUNT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.@]+$")
 
 
 def get_max_retries() -> int:
@@ -41,6 +46,29 @@ def _get_switch_lock() -> asyncio.Lock:
     return _switch_lock
 
 
+def _session_bound_account_id(client: object) -> str | None:
+    """读取网关会话当前绑定的账号 ID（上下文 auth_file 的父目录名）。
+
+    无绑定（纯 Cookie 上下文 / 测试夹具 / 会话未就绪）返回 None。用于
+    「注册表活跃账号 vs 会话实际服务账号」的分叉判定：只改注册表不切
+    会话的路径（如 get_active_account 的禁用回退重写 active_account_id）
+    会让二者分叉，此时凭注册表判定「已切换完成」是错的。
+
+    返回值须通过账号 ID 形态校验（与路由层 pattern 同字符集）：mock 会话
+    的 auth_file 属性可能是任意对象，str() 出来的目录名不属于合法账号 ID，
+    一律按「无法判定」处理，不参与漂移判定。
+    """
+    session = getattr(client, "session", None) if client is not None else None
+    ctx = getattr(session, "active_context", None) if session is not None else None
+    auth_file = getattr(ctx, "auth_file", None) if ctx is not None else None
+    if not isinstance(auth_file, (str, Path)) or not auth_file:
+        return None
+    bound_id = Path(str(auth_file)).parent.name
+    if not _ACCOUNT_ID_PATTERN.match(bound_id):
+        return None
+    return bound_id
+
+
 async def try_switch_account(
     model: str | None = None,
     failed_account_id: str | None = None,
@@ -63,6 +91,7 @@ async def try_switch_account(
     if failed_account_id and not is_session_expired:
         rotator = runtime_state.rotator
         account_service = runtime_state.account_service
+        client = runtime_state.client
         if rotator is not None and account_service is not None:
             cur_active = account_service.get_active_account()
             if (
@@ -74,7 +103,12 @@ async def try_switch_account(
                 and (not required_tiers or cur_active.tier in required_tiers)
                 and rotator.is_account_available(cur_active.id, model=model)
             ):
-                return True
+                # 会话一致性校验：注册表说「已切换」不代表会话真的切了——
+                # 禁用回退等只改注册表的路径会造成分叉，此处凭注册表放行
+                # 会让请求继续用旧（可能已禁用）账号发出。
+                bound_id = _session_bound_account_id(client)
+                if bound_id is None or bound_id == cur_active.id:
+                    return True
 
     async with _get_switch_lock():
         rotator = runtime_state.rotator
@@ -91,6 +125,33 @@ async def try_switch_account(
 
         current_active = account_service.get_active_account()
         current_id = current_active.id if current_active else None
+
+        # 会话漂移校正：注册表活跃账号可能被「只改注册表不切会话」的路径
+        # 改写（get_active_account 的禁用回退重写 active_account_id、
+        # apply_preset 清空活跃标记后的回退等），此时下方双重检查只看注册表
+        # 就会误判「已切换完成」而让请求继续用旧账号（甚至已禁用账号）发出。
+        # 先让会话追上注册表，再走既有的复用/切换判定。
+        if (
+            current_active is not None
+            and (not failed_account_id or current_active.id != failed_account_id)
+            and (not required_tiers or current_active.tier in required_tiers)
+        ):
+            bound_id = _session_bound_account_id(client)
+            if bound_id is not None and bound_id != current_active.id:
+                corrected = await account_service.activate_account(
+                    current_active.id,
+                    client.session,
+                )
+                if corrected is not None:
+                    _last_switch_time = time.time()
+                    logger.info(
+                        "会话漂移校正: session=%s → active=%s, model=%s",
+                        bound_id,
+                        current_active.id,
+                        model,
+                    )
+                    return True
+                # 校正失败（账号目录缺失等）：落入既有切换链路兜底
 
         # 双重检查 1：如果已有并发协程在 entry_time 之后完成切号或在位自愈刷新，且当前账号对该模型可用，则直接复用
         if (
