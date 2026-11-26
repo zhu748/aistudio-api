@@ -373,6 +373,7 @@ class ToolResponseAssembler:
             call_id = raw_id if isinstance(raw_id, str) else ""
             name = raw_name if isinstance(raw_name, str) else ""
             args = raw.get("args")
+            signature = part.get("thoughtSignature")
             # Complete named objects are independent unless there is an
             # identifiable chain of incomplete argument shards to replace.
             if isinstance(args, str) and args.lstrip().startswith("{"):
@@ -436,6 +437,11 @@ class ToolResponseAssembler:
                 caption = _without_call(part)
                 if has_response_content(caption) or "text" in caption:
                     self._retain(caption, _retained_size(caption))
+                if signature and caption != _without_call(tool.envelope):
+                    # The same call ID identifies call arguments, not a changed
+                    # enclosing Part. Preserve existing signature ownership
+                    # rather than coalescing a later differently scoped proof.
+                    signature = None
             seen.add(tool)
             if call_id:
                 self._by_id[call_id] = tool
@@ -443,7 +449,7 @@ class ToolResponseAssembler:
             old_fields_size = _retained_size(tool.name) + _retained_size(
                 tool.envelope.get("thoughtSignature")
             )
-            tool.update(name, args, part.get("thoughtSignature"))
+            tool.update(name, args, signature)
             self._retained_bytes += (
                 _retained_size(tool.name)
                 + _retained_size(tool.envelope.get("thoughtSignature"))

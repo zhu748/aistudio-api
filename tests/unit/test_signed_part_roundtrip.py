@@ -392,6 +392,42 @@ async def test_compat_never_moves_compound_signature_or_caches_it_for_the_call(
         assert route.cache.lookup("call-fixture", "lookup", {"city": "Paris"}) is None
 
 
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("anchor_has_caption", [False, True])
+async def test_later_snapshot_does_not_move_signature_between_different_envelopes(
+    route, protocol, stream, anchor_has_caption
+):
+    first = signature("exact initial owner")
+    later = signature("different later owner")
+    route.wire.reply(
+        AistudioPart(
+            text="Caption." if anchor_has_caption else None,
+            thought_signature=first,
+            **CALL,
+        ),
+        AistudioPart(
+            text=None if anchor_has_caption else "Caption.",
+            thought_signature=later,
+            **CALL,
+        ),
+    )
+    if protocol == "native":
+        action = "streamGenerateContent" if stream else "generateContent"
+        path = f"/v1beta/models/{MODEL}:{action}"
+        params = {"contents": [{"role": "user", "parts": [{"text": "Start."}]}]}
+    else:
+        path = ENDPOINT[protocol]
+        params = {**turn_params(protocol), "stream": stream}
+    response = await route.raw.post(path, json=params)
+    assert response.status_code == 200, response.text
+    assert later not in response.text
+    assert (first in response.text) is (protocol == "native" or not anchor_has_caption)
+    assert "lookup" in response.text and "Caption." in response.text
+    cached = route.cache.lookup("call-fixture", "lookup", {"city": "Paris"})
+    assert cached == (None if anchor_has_caption else first)
+
+
 @pytest.mark.parametrize("protocol", COMPAT)
 @pytest.mark.parametrize("shape", ["absent", "invalid"])
 async def test_replay_does_not_infer_empty_thought_from_signature_alone(
