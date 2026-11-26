@@ -11,7 +11,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Sequence
 from dataclasses import dataclass
 from itertools import groupby
-from typing import Any
+from typing import Any, cast
 
 from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
@@ -672,6 +672,7 @@ async def handle_gemini_generate_content(
     *,
     stream: bool,
     anti_truncation: bool | None = None,
+    sdk_terminal: bool = False,
 ):
     observation = current_request.get()
     if observation is not None:
@@ -715,6 +716,7 @@ async def handle_gemini_generate_content(
             model_path=model_path,
             anti_truncation=anti_truncation,
             force_buffer=force_buffer,
+            sdk_terminal=sdk_terminal,
         )
 
     last_error: Exception | None = None
@@ -889,12 +891,16 @@ async def handle_gemini_generate_content(
 
 
 def _encode_sse(payload: dict[str, object]) -> str:
-    # separators：SSE 每帧省去 ", " 与 ": " 的空格（高频 token 流可观）
-    return (
-        "data: "
-        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        + "\n\n"
-    )
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if not encoded.isascii():
+        # google-genai's HTTPX transport splits decoded lines at these Unicode
+        # separators too. Escape them without changing values or other Unicode.
+        encoded = (
+            encoded.replace("\x85", r"\u0085")
+            .replace("\u2028", r"\u2028")
+            .replace("\u2029", r"\u2029")
+        )
+    return f"data: {encoded}\n\n"
 
 
 def _encode_ordered_parts(parts: Sequence[object]) -> list[dict[str, object]]:
@@ -991,6 +997,7 @@ def _usage_payload(
     finish_reason: str = "OTHER",
     model_version: str | None = None,
     response_id: str | None = None,
+    parts: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     effective_usage = final_usage or {
         "prompt_tokens": 0,
@@ -1003,7 +1010,7 @@ def _usage_payload(
     payload: dict[str, object] = {
         "candidates": [
             {
-                "content": {"role": "model", "parts": []},
+                "content": {"role": "model", "parts": parts if parts else []},
                 "finishReason": finish_reason,
                 "index": 0,
             }
@@ -1017,20 +1024,40 @@ def _usage_payload(
     return payload
 
 
-def _error_payload(exc: Exception) -> dict[str, object]:
-    code, msg, status_str = classify_gemini_error_payload(exc)
-    return {"error": {"code": code, "message": msg, "status": status_str}}
+def _native_content_parts(frame: dict[str, object]) -> list[dict[str, object]]:
+    # The attempt generator emits only single-candidate _content_frame payloads.
+    (candidate,) = cast(list[dict[str, object]], frame["candidates"])
+    content = cast(dict[str, object], candidate["content"])
+    return cast(list[dict[str, object]], content["parts"])
 
 
-_ERROR_TEXT_PREFIX = "[aistudio-api 请求失败"
+def _hold_sdk_tail(
+    frame: dict[str, object],
+) -> tuple[dict[str, object] | None, dict[str, object]]:
+    """Hold no more than one genuine Part, preserving its original fields."""
+    parts = _native_content_parts(frame)
+    if len(parts) <= 1:
+        return None, frame
+    tail = _content_frame([parts.pop()])
+    for key in ("modelVersion", "responseId"):
+        if key in frame:
+            tail[key] = frame[key]
+    return frame, tail
 
 
-def _error_text_payload(exc: Exception) -> dict[str, object] | None:
-    code, msg, status_str = classify_gemini_error_payload(exc)
-    if not msg:
-        msg = type(exc).__name__
-    text = f"{_ERROR_TEXT_PREFIX} {code} {status_str}] {msg}"
-    return _content_frame([{"text": text}])
+class _GeminiFailureFrame(dict[str, object]):
+    """Structured error with an optional native-only display diagnostic."""
+
+    __slots__ = ("native_diagnostic",)
+
+    def __init__(self, exc: Exception, *, explain_empty: bool) -> None:
+        code, message, status = classify_gemini_error_payload(exc)
+        super().__init__(error={"code": code, "message": message, "status": status})
+        self.native_diagnostic = (
+            f"[aistudio-api 请求失败 {code} {status}] {message or type(exc).__name__}"
+            if explain_empty
+            else None
+        )
 
 
 class GeminiStreamResponse(HeartbeatStreamingResponse):
@@ -1046,6 +1073,13 @@ class GeminiStreamResponse(HeartbeatStreamingResponse):
         async def encode() -> AsyncGenerator[str, None]:
             try:
                 async for frame in frames:
+                    if (
+                        isinstance(frame, _GeminiFailureFrame)
+                        and frame.native_diagnostic is not None
+                    ):
+                        yield _encode_sse(
+                            _content_frame([{"text": frame.native_diagnostic}])
+                        )
                     yield _encode_sse(frame)
             finally:
                 await frames.aclose()
@@ -1433,6 +1467,7 @@ def _build_gemini_streaming_response(
     model_path: str,
     anti_truncation: bool | None = None,
     force_buffer: bool = False,
+    sdk_terminal: bool = False,
 ) -> GeminiStreamResponse:
     """构建 Gemini 流式响应（暴露结构化 frames 供适配层消费）。"""
 
@@ -1450,6 +1485,7 @@ def _build_gemini_streaming_response(
         # 发生在首次赋值之前也不会出现未绑定名。
         serving_account_id: str | None = None
         state = _StreamAttemptState()
+        pending_sdk_frame: dict[str, object] | None = None
         try:
             logger.info(
                 "流式请求: model=%s, 轮数=%d",
@@ -1515,6 +1551,16 @@ def _build_gemini_streaming_response(
                     )
                     try:
                         async for frame in attempt_frames:
+                            if sdk_terminal:
+                                # Chat history in the Python Gemini SDK rejects
+                                # a content-free final event. Until EOF confirms
+                                # the last Part, wait one Part (not one turn).
+                                if pending_sdk_frame is not None:
+                                    has_yielded_any = True
+                                    yield pending_sdk_frame
+                                frame, pending_sdk_frame = _hold_sdk_tail(frame)
+                                if frame is None:
+                                    continue
                             has_yielded_any = True
                             yield frame
                         auth_manager.current_prepared = None
@@ -1528,6 +1574,12 @@ def _build_gemini_streaming_response(
                         await _close_stream_quietly(attempt_frames)
                         await _close_stream_quietly(anti_stream)
                 except Exception as exc:
+                    # A transport failure must not consume pending partial
+                    # output or let a retry mix it into a different attempt.
+                    if pending_sdk_frame is not None:
+                        has_yielded_any = True
+                        yield pending_sdk_frame
+                        pending_sdk_frame = None
                     last_stream_error = exc
                     serving_account_id = _observed_serving_account(serving_account_id)
                     auth_manager.serving_account_id = serving_account_id
@@ -1555,6 +1607,16 @@ def _build_gemini_streaming_response(
             if not stream_completed and last_stream_error is not None:
                 raise last_stream_error
             target_model = normalized.model if normalized else model_path
+            terminal_parts = None
+            if pending_sdk_frame is not None:
+                if state.has_yielded_data and state.final_finish_reason == "STOP":
+                    terminal_parts = _native_content_parts(pending_sdk_frame)
+                else:
+                    # Do not let the SDK store an incomplete, blocked or empty
+                    # response as a fully replayable turn.
+                    has_yielded_any = True
+                    yield pending_sdk_frame
+                pending_sdk_frame = None
             # 空回防护：流式完成但未产出任何内容时注入可见诊断文本，避免
             # 客户端收到 200 却“空回啥都没有”无从排查。
             if stream_completed and not state.has_yielded_data and not force_buffer:
@@ -1588,6 +1650,7 @@ def _build_gemini_streaming_response(
                     finish_reason=state.final_finish_reason,
                     model_version=target_model,
                     response_id=state.latest_response_id,
+                    parts=terminal_parts,
                 )
         except Exception as exc:
             # 异常路径的记账已由 handle_attempt_exception / handle_403 按
@@ -1596,14 +1659,9 @@ def _build_gemini_streaming_response(
             accounting_recorded = True
             elapsed_ms = (time.perf_counter() - stream_start_time) * 1000
             _log_stream_failure(exc, elapsed_ms, model_path, has_yielded_any)
-            # 错误透传：尚未输出任何内容时把失败原因作为可见文本 part 下发
-            # （部分客户端忽略 {"error":...} 表现为空回）；已输出时不追加，
-            # 保持正文纯净（仅下发结构化错误事件）。
-            if not has_yielded_any:
-                error_text_chunk = _error_text_payload(exc)
-                if error_text_chunk:
-                    yield error_text_chunk
-            yield _error_payload(exc)
+            # Some native clients ignore structured errors. Only the native
+            # encoder sees this diagnostic; compat adapters emit the error.
+            yield _GeminiFailureFrame(exc, explain_empty=not has_yielded_any)
         finally:
             # 客户端断连（GeneratorExit）/任务取消（CancelledError）都不是
             # Exception 子类，成功块与异常块都执行不到——此处兜底补记：已

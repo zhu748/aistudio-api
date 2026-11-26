@@ -854,7 +854,24 @@ def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioConte
     def result_run(content: GeminiContent) -> tuple[str, bool]:
         return content.role or "user", any(p.functionResponse for p in content.parts)
 
-    for (role, has_results), run in groupby(req.contents, key=result_run):
+    def is_blank_user_content(content: GeminiContent) -> bool:
+        # An empty user placeholder is not a new turn. Drop it before
+        # detecting result runs; later hollow cleanup cannot restore pairing.
+        # Explicit signature carriers and non-text payloads are not blank.
+        return (content.role or "user") == "user" and not any(
+            part.text
+            or part.thoughtSignature
+            or part.inlineData
+            or part.fileData
+            or part.functionCall
+            or part.functionResponse
+            or part.executableCode
+            or part.codeExecutionResult
+            for part in content.parts
+        )
+
+    nonblank = (item for item in req.contents if not is_blank_user_content(item))
+    for (role, has_results), run in groupby(nonblank, key=result_run):
         incoming = [p for content in run for p in content.parts]
         owners = _match_pending_calls(incoming, pending) if has_results else {}
         parts = [

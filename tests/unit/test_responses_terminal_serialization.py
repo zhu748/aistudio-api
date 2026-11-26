@@ -171,11 +171,11 @@ async def test_responses_terminal_serialization_follows_asgi_send(
     assert text_item["status"] == item_status
     if finish == "error_frame":
         assert response["error"] == {
-            "code": "rate_limit_error",
+            "code": "rate_limit_exceeded",
             "message": "fixture exhausted",
         }
     elif finish == "exception":
         assert response["error"] == {
-            "code": "internal_error",
+            "code": "server_error",
             "message": "ValueError: fixture interrupted",
         }

@@ -119,7 +119,7 @@ async def test_genai_sdk_aio_streaming(mock_client: MagicMock) -> None:
             ):
                 chunks.append(chunk)
 
-            assert len(chunks) == 4
+            assert len(chunks) == 3
 
             # Chunk 0: thinking
             assert chunks[0].candidates is not None
@@ -135,16 +135,14 @@ async def test_genai_sdk_aio_streaming(mock_client: MagicMock) -> None:
             assert chunks[1].candidates is not None
             assert chunks[1].candidates[0].index == 0
 
-            # Chunk 2: text part 2
+            # Chunk 2: text part 2 + usage + STOP finishReason
             assert chunks[2].text == "World!"
             assert chunks[2].candidates is not None
             assert chunks[2].candidates[0].index == 0
 
-            # Chunk 3: usage + STOP finishReason
-            assert chunks[3].candidates is not None
-            assert chunks[3].candidates[0].finish_reason == types.FinishReason.STOP
-            assert chunks[3].usage_metadata is not None
-            assert chunks[3].usage_metadata.total_token_count == 20
+            assert chunks[2].candidates[0].finish_reason == types.FinishReason.STOP
+            assert chunks[2].usage_metadata is not None
+            assert chunks[2].usage_metadata.total_token_count == 20
     finally:
         if custom_client is not None:
             await custom_client.aclose()

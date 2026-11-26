@@ -33,7 +33,6 @@ from aistudio_api.api.schemas import (
     GeminiPart,
 )
 from aistudio_api.api.schemas_compat import OpenAIResponsesRequest
-from aistudio_api.application.api_service_gemini import _ERROR_TEXT_PREFIX
 from aistudio_api.application.compat_service import (
     _as_dict,
     _as_int,
@@ -586,9 +585,15 @@ def build_responses_object(
 class _ResponsesStreamEmitter:
     """Responses SSE 事件发射器（事件形状对齐 openai-python 3.50.0）。"""
 
-    def __init__(self, response_id: str, requested_model: str) -> None:
+    def __init__(
+        self,
+        response_id: str,
+        requested_model: str,
+        prelude_sequence: Callable[[], int | None] | None = None,
+    ) -> None:
         self.response_id = response_id
         self.requested_model = requested_model
+        self.prelude_sequence = prelude_sequence
         self.created_at = int(time.time())
         self.seq = -1  # 首事件自增后为 0，与 SDK 从 0 递增一致
         self.output_index = -1
@@ -949,10 +954,10 @@ class _ResponsesStreamEmitter:
             "".join(self._reasoning_accumulated), "incomplete"
         )
         yield from self._close_message("".join(self._text_accumulated), "incomplete")
-        # 错误码语义对齐：Codex CLI 等客户端按 code 决定退避策略
-        # （429 → rate_limit_error 等），与 OpenAI/Claude 适配器同源映射。
-        from aistudio_api.application.compat_errors import _OPENAI_ERROR_TYPE
-
+        # The typed Responses error.code enum is not Chat's error.type.
+        response_code = {400: "invalid_prompt", 429: "rate_limit_exceeded"}.get(
+            code, "server_error"
+        )
         yield self.sse(
             "response.failed",
             {
@@ -961,7 +966,7 @@ class _ResponsesStreamEmitter:
                         status="failed", output=self._ordered_output()
                     ),
                     "error": {
-                        "code": _OPENAI_ERROR_TYPE.get(code, "server_error"),
+                        "code": response_code,
                         "message": message,
                     },
                 }
@@ -969,8 +974,16 @@ class _ResponsesStreamEmitter:
         )
 
     def timeout_error(self, message: str) -> list[str]:
-        # The shared request-timeout callback expects a finite list of frames.
-        return list(self.error(message))
+        sent = self.prelude_sequence() if self.prelude_sequence is not None else None
+        if sent is None:
+            return list(self.error(message, code=504))
+        # No output items have reached the client. Reuse the original ID
+        # but start from the sequence actually accepted by the outer sender.
+        emitter = _ResponsesStreamEmitter(self.response_id, self.requested_model)
+        emitter.created_at = self.created_at
+        emitter.seq = sent
+        opening = [emitter.created()] if sent == -1 else []
+        return [*opening, *emitter.error(message, code=504)]
 
     def _ordered_output(self) -> list[dict[str, object]]:
         """按实际打开顺序（output_index）产出 items 快照。"""
@@ -1004,15 +1017,30 @@ class _ResponsesStreamEmitter:
         )
 
 
+def build_responses_preparation_failure(
+    requested_model: str,
+    code: int,
+    message: str,
+    *,
+    register_failure: Callable[[Callable[[str], list[str]]], None],
+    prelude_sequence: Callable[[], int | None],
+) -> list[str]:
+    """Open and fail a Responses stream whose HTTP headers are already sent."""
+    emitter = _ResponsesStreamEmitter(_response_id(), requested_model, prelude_sequence)
+    register_failure(emitter.timeout_error)
+    return [emitter.created(), *emitter.error(message, code)]
+
+
 async def responses_stream_adapter(
     source: AsyncIterable[object],
     *,
     requested_model: str,
     register_failure: Callable[[Callable[[str], list[str]]], None] | None = None,
+    prelude_sequence: Callable[[], int | None] | None = None,
 ) -> AsyncGenerator[str, None]:
     """Gemini SSE → OpenAI Responses 语义事件流。"""
     response_id = _response_id()
-    emitter = _ResponsesStreamEmitter(response_id, requested_model)
+    emitter = _ResponsesStreamEmitter(response_id, requested_model, prelude_sequence)
     async with _stream_adapter_lifecycle(
         source, emitter.timeout_error, register_failure
     ):
@@ -1073,10 +1101,6 @@ async def responses_stream_adapter(
                         continue
                     text = part.get("text")
                     if isinstance(text, str):
-                        # 上游错误兜底文本（format_sse_error_text）不是正文：
-                        # 已输出错误事件的情况下不重复下发为 output_text
-                        if text.startswith(_ERROR_TEXT_PREFIX):
-                            continue
                         if part.get("thought") is True:
                             signature = part_payload_signature(part, "text")
                             if text or _is_signed_empty_thought(text, signature):
@@ -1103,6 +1127,7 @@ async def responses_stream_adapter(
 
 __all__ = [
     "build_responses_object",
+    "build_responses_preparation_failure",
     "responses_stream_adapter",
     "responses_to_gemini_request",
 ]

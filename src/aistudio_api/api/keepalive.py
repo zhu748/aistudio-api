@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 from collections.abc import Awaitable, Callable
 
 import anyio
@@ -19,6 +18,7 @@ STREAM_HEADERS = {
     "Cache-Control": "no-cache, no-transform",
     "X-Accel-Buffering": "no",
 }
+_PreparationError = Callable[[int, str], list[str]]
 
 
 class HeartbeatStreamingResponse(StreamingResponse):
@@ -119,7 +119,12 @@ class _DeferredResponse(HeartbeatStreamingResponse):
     """Own preparation until a response exists, then forward its body directly."""
 
     def __init__(
-        self, task: asyncio.Task[Response], request: Request, *, stream: bool
+        self,
+        task: asyncio.Task[Response],
+        request: Request,
+        *,
+        stream: bool,
+        preparation_error: _PreparationError | None,
     ) -> None:
         self.generation = task
         self.heartbeat = b": keepalive\n\n" if stream else b" \n"
@@ -131,7 +136,9 @@ class _DeferredResponse(HeartbeatStreamingResponse):
                     response = await task
                 except Exception as exc:
                     if stream:
-                        for chunk in _preparation_stream_error(request, exc):
+                        for chunk in _preparation_stream_error(
+                            request, exc, preparation_error
+                        ):
                             yield chunk
                     else:
                         yield _json_error(request, exc).body
@@ -162,40 +169,43 @@ class _DeferredResponse(HeartbeatStreamingResponse):
             await _cancel_generation(self.generation)
 
 
-def _json_error(request: Request, exc: Exception) -> JSONResponse:
-    # Lazy imports: protocol services also use HeartbeatStreamingResponse.
+def _record_error_details(exc: Exception) -> tuple[int, str, str]:
+    # Lazy import: the Gemini service also uses HeartbeatStreamingResponse.
     from aistudio_api.application.api_service_gemini import (
         classify_gemini_error_payload,
     )
-    from aistudio_api.application.compat_service import build_compat_error_response
 
     code, message, status = classify_gemini_error_payload(exc)
     record_result(
         "timeout" if code == 504 else "rate_limited" if code == 429 else "error",
         error=message,
     )
+    return code, message, status
+
+
+def _json_error(request: Request, exc: Exception) -> JSONResponse:
+    from aistudio_api.application.compat_service import build_compat_error_response
+
+    code, message, status = _record_error_details(exc)
     return build_compat_error_response(request, exc) or JSONResponse(
         {"error": {"code": code, "message": message, "status": status}},
         status_code=code,
     )
 
 
-def _preparation_stream_error(request: Request, exc: Exception) -> list[str]:
+def _preparation_stream_error(
+    request: Request,
+    exc: Exception,
+    preparation_error: _PreparationError | None,
+) -> list[str]:
     """Errors before protocol adapters start (and before any completion IDs exist)."""
+    if preparation_error is not None:
+        code, message, _ = _record_error_details(exc)
+        return preparation_error(code, message)
     response = _json_error(request, exc)
     payload = bytes(response.body).decode("utf-8")
     if request.url.path == "/v1/messages":
         return [f"event: error\ndata: {payload}\n\n"]
-    if request.url.path == "/v1/responses":
-        error = json.loads(payload)["error"]
-        event = {
-            "type": "error",
-            "code": str(error["code"]),
-            "message": error["message"],
-            "param": None,
-            "sequence_number": 0,
-        }
-        return [f"event: error\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"]
     return [f"data: {payload}\n\n", "data: [DONE]\n\n"]
 
 
@@ -204,12 +214,13 @@ async def keepalive_response(
     request: Request,
     *,
     stream: bool = False,
+    preparation_error: _PreparationError | None = None,
 ) -> Response:
     """Preserve fast statuses; cover slow preparation with protocol keepalives.
 
     After the first whitespace, HTTP 200 is committed. Late errors use the
-    protocol's JSON error body. SSE preparation errors use protocol error events
-    until the normal adapter registers its own completion-aware error handler.
+    protocol's JSON error body. SSE preparation errors use the route's terminal
+    protocol until its normal adapter registers a completion-aware handler.
     """
     if not stream and not settings.nonstream_keepalive:
         return await generate()
@@ -232,9 +243,11 @@ async def keepalive_response(
 
     if stream:
         request.state.stream_failure = lambda message: _preparation_stream_error(
-            request, HTTPException(504, detail=message)
+            request, HTTPException(504, detail=message), preparation_error
         )
     else:
         request.state.json_keepalive_failure = timeout_body
 
-    return _DeferredResponse(task, request, stream=stream)
+    return _DeferredResponse(
+        task, request, stream=stream, preparation_error=preparation_error
+    )

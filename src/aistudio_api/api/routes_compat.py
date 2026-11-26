@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -50,6 +51,7 @@ from aistudio_api.application.compat_service import (
 )
 from aistudio_api.application.responses_service import (
     build_responses_object,
+    build_responses_preparation_failure,
     responses_stream_adapter,
     responses_to_gemini_request,
 )
@@ -250,6 +252,12 @@ async def openai_responses(
         observation.requested_model = req.model
         observation.is_stream = req.stream
 
+    def register_failure(handler: Callable[[str], list[str]]) -> None:
+        http_request.state.stream_failure = handler
+
+    def prelude_sequence() -> int | None:
+        return getattr(http_request.state, "responses_prelude_sequence", None)
+
     async def respond():
         try:
             gemini_req, resolved_model = await responses_to_gemini_request(req)
@@ -282,9 +290,8 @@ async def openai_responses(
                         if isinstance(response, GeminiStreamResponse)
                         else response.body_iterator,
                         requested_model=req.model,
-                        register_failure=lambda handler: setattr(
-                            http_request.state, "stream_failure", handler
-                        ),
+                        register_failure=register_failure,
+                        prelude_sequence=prelude_sequence,
                     ),
                     media_type="text/event-stream",
                     headers=_STREAM_HEADERS,
@@ -301,7 +308,18 @@ async def openai_responses(
             },
         )
 
-    return await keepalive_response(respond, http_request, stream=req.stream)
+    return await keepalive_response(
+        respond,
+        http_request,
+        stream=req.stream,
+        preparation_error=lambda code, message: build_responses_preparation_failure(
+            req.model,
+            code,
+            message,
+            register_failure=register_failure,
+            prelude_sequence=prelude_sequence,
+        ),
+    )
 
 
 @router.post("/v1/messages")

@@ -158,20 +158,17 @@ def test_deeply_nested_tool_schema_falls_back_to_object() -> None:
     assert json.loads(schema_json) is not None
 
 
-# ─── OpenAI / Claude 适配器：上游错误兜底文本不混入正文 ───
+# ─── OpenAI / Claude: ordinary fallback text stays separate from errors ───
 
 
 @pytest.mark.asyncio
-async def test_openai_adapter_filters_error_text_frame() -> None:
-    from aistudio_api.application.api_service_gemini import _ERROR_TEXT_PREFIX
+async def test_openai_adapter_preserves_error_like_text_frame() -> None:
     from aistudio_api.application.compat_openai import openai_stream_adapter
 
+    prose = "[aistudio-api 请求失败] 是用户指南中解释的标签。"
+
     async def source():
-        yield {
-            "candidates": [
-                {"content": {"parts": [{"text": f"{_ERROR_TEXT_PREFIX} 503 X] boom"}]}}
-            ]
-        }
+        yield {"candidates": [{"content": {"parts": [{"text": prose}]}}]}
         yield {"error": {"code": 503, "message": "boom"}}
 
     chunks = [
@@ -181,21 +178,18 @@ async def test_openai_adapter_filters_error_text_frame() -> None:
         )
     ]
     joined = "".join(chunks)
-    assert "[aistudio-api 请求失败" not in joined
+    assert prose in joined
     assert "boom" in joined  # 错误块仍携带等价信息
 
 
 @pytest.mark.asyncio
-async def test_claude_adapter_filters_error_text_frame() -> None:
-    from aistudio_api.application.api_service_gemini import _ERROR_TEXT_PREFIX
+async def test_claude_adapter_preserves_error_like_text_frame() -> None:
     from aistudio_api.application.compat_claude import claude_stream_adapter
 
+    prose = "[aistudio-api 请求失败] 是用户指南中解释的标签。"
+
     async def source():
-        yield {
-            "candidates": [
-                {"content": {"parts": [{"text": f"{_ERROR_TEXT_PREFIX} 503 X] boom"}]}}
-            ]
-        }
+        yield {"candidates": [{"content": {"parts": [{"text": prose}]}}]}
         yield {"error": {"code": 503, "message": "boom"}}
 
     chunks = [
@@ -205,7 +199,7 @@ async def test_claude_adapter_filters_error_text_frame() -> None:
         )
     ]
     joined = "".join(chunks)
-    assert "[aistudio-api 请求失败" not in joined
+    assert prose in joined
     assert "boom" in joined
 
 
@@ -221,7 +215,7 @@ async def test_responses_error_event_maps_rate_limit_code() -> None:
 
     chunks = [c async for c in responses_stream_adapter(source(), requested_model="m")]
     joined = "".join(chunks)
-    assert '"code":"rate_limit_error"' in joined
+    assert '"code":"rate_limit_exceeded"' in joined
 
 
 # ─── 签名缓存：去抖落盘 + flush 兜底 ───

@@ -217,6 +217,9 @@ class RequestMiddleware:
             path.startswith(("/v1beta/", "/v1/messages"))
             or path in ("/v1/chat/completions", "/v1/responses")
         )
+        responses_call = model_call and path == "/v1/responses"
+        if responses_call:
+            scope["state"]["responses_prelude_sequence"] = -1
         # Management payloads can contain cookies, complete config and credentials.
         dump_enabled = model_call and (
             is_dump_requests_enabled() or is_dump_to_file_enabled()
@@ -435,10 +438,23 @@ class RequestMiddleware:
             if message["type"] == "http.response.body":
                 if not message.get("more_body", False):
                     observer.completed = True
-                if observer.is_stream and _is_terminal_event(
-                    path, message.get("body", b"")
-                ):
-                    observer.stream_terminal_sent = True
+                if observer.is_stream:
+                    body = message.get("body", b"")
+                    if _is_terminal_event(path, body):
+                        observer.stream_terminal_sent = True
+                    if (
+                        responses_call
+                        and scope["state"].get("responses_prelude_sequence") is not None
+                        and body.startswith(b"event: ")
+                    ):
+                        # Internal ASGI channels can serialize ahead of the
+                        # client. Track only the accepted opening events.
+                        if body.startswith(b"event: response.created\n"):
+                            scope["state"]["responses_prelude_sequence"] = 0
+                        elif body.startswith(b"event: response.in_progress\n"):
+                            scope["state"]["responses_prelude_sequence"] = 1
+                        else:
+                            scope["state"].pop("responses_prelude_sequence", None)
                 if (
                     model_call
                     and not observer.is_stream

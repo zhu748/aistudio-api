@@ -508,6 +508,8 @@ async def coalesce_tool_frames(
     async for frame in source:
         if "error" in frame:
             kept, _ = assembler.finish("OTHER")
+            # The retained display Parts no longer need the assembly state.
+            del assembler
             if kept:
                 yield {"candidates": [{"content": {"parts": kept}}]}
             yield frame
@@ -557,6 +559,9 @@ async def coalesce_tool_frames(
                 ],
             }
     kept, reason = assembler.finish(reason, error_on_empty_invalid=True)
+    # The terminal frame owns its Parts; don't keep assembly state while
+    # waiting for the client to read it.
+    del assembler
     yield {
         "candidates": [{**terminal, "content": {"parts": kept}, "finishReason": reason}]
     }

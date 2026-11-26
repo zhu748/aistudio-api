@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from collections.abc import AsyncIterator
 from copy import deepcopy
-from typing import TypeVar
+from pathlib import Path
+from typing import TypeVar, cast
 from unittest.mock import AsyncMock
 
 import httpx
+import httpx2
+import openai
 import pytest
 from fastapi import FastAPI
+from openai.types.responses import ResponseInputParam
 
 from aistudio_api.api.dependencies import get_client
 from aistudio_api.api.routes_compat import router as compat_router
@@ -39,6 +44,7 @@ _JSON = TypeVar("_JSON")
 class FixtureGateway:
     def __init__(self):
         self.history = ModelTurnHistory()
+        self.app = FastAPI()
         self.raw = ""
         self.last: list[AistudioContent] = []
         self.wire: list = []
@@ -77,7 +83,7 @@ async def route(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> AsyncIterator[tuple[httpx.AsyncClient, FixtureGateway]]:
     gateway = FixtureGateway()
-    app = FastAPI()
+    app = gateway.app
     app.include_router(compat_router)
     app.include_router(gemini_router)
     app.dependency_overrides[get_client] = lambda: gateway
@@ -608,3 +614,324 @@ async def test_native_warm_capture_never_replaces_explicit_signed_owners(
     gateway.reply(AistudioPart(text="Done."))
     await _request(client, "native", initial + echoed + _prompt("native", "Continue."))
     assert gateway.wire[1][0] == [part.to_wire() for part in explicit]
+
+
+def _new_worker(
+    gateway: FixtureGateway, monkeypatch: pytest.MonkeyPatch, path: Path
+) -> None:
+    tool_signatures.get_signature_cache().flush()
+    monkeypatch.setattr(
+        tool_signatures, "_cache_instance", tool_signatures.ThoughtSignatureCache(path)
+    )
+    gateway.history = ModelTurnHistory()
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+@pytest.mark.parametrize("earlier", ["call", "thought"])
+async def test_next_wire_requires_evidence_for_earlier_explicit_owner(
+    route, monkeypatch, tmp_path, surface, earlier
+):
+    client, gateway = route
+    initial = _prompt(surface, "Check the facts and summarize.")
+
+    async def request(history: list[dict[str, object]]) -> list[dict[str, object]]:
+        if surface != "responses":
+            return await _request(client, surface, history)
+        async with openai.AsyncOpenAI(
+            base_url="http://fixture.invalid/v1",
+            api_key="fixture",
+            http_client=httpx2.AsyncClient(transport=httpx2.ASGITransport(gateway.app)),
+            default_headers={"x-anti-truncation": "false"},
+            _strict_response_validation=True,
+            max_retries=0,
+        ) as sdk:
+            response = await sdk.responses.create(
+                model=MODEL, input=cast(ResponseInputParam, history)
+            )
+            return [item.model_dump(exclude_none=True) for item in response.output]
+
+    def reply(signature: str) -> None:
+        if earlier == "call":
+            gateway.reply(
+                AistudioPart(
+                    function_call=("lookup", {"city": "Paris"}, "A"),
+                    thought_signature=signature,
+                )
+            )
+        else:
+            gateway.reply(
+                AistudioPart(
+                    thought=True, text="Checking.", thought_signature=signature
+                ),
+                AistudioPart(text="Ready."),
+            )
+
+    # Two independent workers produced different explicit state for the
+    # same visible turn. Only the second worker observed a continuation.
+    _new_worker(gateway, monkeypatch, tmp_path / "foreign.json")
+    reply(SIG_B)
+    foreign = await request(initial)
+    owner_path = tmp_path / "owner.json"
+    _new_worker(gateway, monkeypatch, owner_path)
+    reply(SIG_A)
+    original = await request(initial)
+    assert foreign != original
+    followup = (
+        _outputs(surface, [("A", "Paris")])
+        if earlier == "call"
+        else _prompt(surface, "Summarize now.")
+    )
+    gateway.reply(
+        AistudioPart(
+            function_call=("summarize", {"n": 1}, "C"), thought_signature=SIG_C
+        )
+    )
+    second = _strip_signatures(await request(initial + original + followup))
+    outputs = _outputs(surface, [("C", "done")], "summarize")
+    for cold in (False, True):
+        if cold:
+            _new_worker(gateway, monkeypatch, owner_path)
+        gateway.reply(AistudioPart(text="Done."))
+        for first, expected_first, expected_second in (
+            (original, SIG_A, SIG_C),
+            (foreign, SIG_B, ""),
+        ):
+            await request(initial + first + followup + second + outputs)
+            assert [
+                p.thought_signature
+                for p in gateway.wire_parts(1)
+                if p.thought_signature
+            ] == [expected_first]
+            assert _wire_tools(gateway, 3, "function_call") == [
+                ("C", "summarize", {"n": 1}, expected_second),
+            ]
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+@pytest.mark.parametrize("keep_first_signature", [False, True])
+async def test_cold_restart_restores_every_exact_signed_sibling(
+    route, monkeypatch, tmp_path, surface, keep_first_signature
+):
+    client, gateway = route
+    initial = _prompt(surface, "Look up three cities.")
+    calls = [("A", "Paris", SIG_A), ("B", "Oslo", SIG_B), ("C", "Lima", None)]
+    gateway.reply(
+        *[
+            AistudioPart(
+                function_call=("lookup", {"city": city}, call_id),
+                thought_signature=signature,
+            )
+            for call_id, city, signature in calls
+        ]
+    )
+    model = await _request(client, surface, initial)
+    if keep_first_signature:
+        if surface == "native":
+            siblings = model[0]["parts"]
+        elif surface == "chat":
+            siblings = model[0]["tool_calls"]
+        elif surface == "claude":
+            siblings = model[0]["content"]
+        else:
+            siblings = model
+        assert isinstance(siblings, list)
+        _strip_signatures(siblings[1:])
+    else:
+        _strip_signatures(model)
+    outbound = (
+        initial
+        + model
+        + _outputs(surface, [(call_id, city) for call_id, city, _ in calls])
+    )
+    gateway.reply(AistudioPart(text="Done."))
+    for cold in (False, True):
+        if cold:
+            _new_worker(gateway, monkeypatch, tmp_path / "signatures.json")
+        await _request(client, surface, outbound)
+        assert _wire_tools(gateway, 1, "function_call") == [
+            (call_id, "lookup", {"city": city}, signature or "")
+            for call_id, city, signature in calls
+        ]
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+async def test_restart_does_not_mix_companion_ids_from_two_rerolls(
+    route, monkeypatch, tmp_path, surface
+):
+    client, gateway = route
+    initial = _prompt(surface, "Look up both cities.")
+    echoes = []
+    for ids, signatures in (
+        (("A-one", "B-one"), (SIG_A, SIG_B)),
+        (("A-two", "B-two"), (SIG_C, None)),
+    ):
+        gateway.reply(
+            *[
+                AistudioPart(
+                    function_call=("lookup", {"city": city}, call_id),
+                    thought_signature=signature,
+                )
+                for call_id, city, signature in zip(
+                    ids, ("Paris", "Oslo"), signatures, strict=True
+                )
+            ]
+        )
+        echoes.append(_strip_signatures(await _request(client, surface, initial)))
+    mixed = json.loads(json.dumps(echoes[1]).replace("A-two", "A-one"))
+    for cold in (False, True):
+        if cold:
+            _new_worker(gateway, monkeypatch, tmp_path / "signatures.json")
+        gateway.reply(AistudioPart(text="Done."))
+        for model, ids in (
+            (mixed, ("A-one", "B-two")),
+            (echoes[0], ("A-one", "B-one")),
+            (echoes[1], ("A-two", "B-two")),
+        ):
+            await _request(
+                client,
+                surface,
+                initial + model + _outputs(surface, [(i, "done") for i in ids]),
+            )
+            assert _wire_tools(gateway, 1, "function_call") == [
+                (i, "lookup", {"city": city}, "")
+                for i, city in zip(ids, ("Paris", "Oslo"), strict=True)
+            ]
+
+
+@pytest.mark.parametrize("surface", ["native", "chat", "responses"])
+async def test_tool_replay_respects_wire_visible_attachment_filename(
+    route, monkeypatch, tmp_path, surface
+):
+    client, gateway = route
+    data = "QUJD"
+    url = f"data:text/plain;base64,{data}"
+
+    def prompt(filename: str) -> list[dict[str, object]]:
+        if surface == "native":
+            return [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": "Classify the attached file."},
+                        {
+                            "inlineData": {
+                                "mimeType": "text/plain",
+                                "data": data,
+                                "filename": filename,
+                            }
+                        },
+                    ],
+                }
+            ]
+        if surface == "chat":
+            content = [
+                {"type": "text", "text": "Classify the attached file."},
+                {"type": "file", "file": {"filename": filename, "file_data": url}},
+            ]
+        else:
+            content = [
+                {"type": "input_text", "text": "Classify the attached file."},
+                {"type": "input_file", "filename": filename, "file_data": url},
+            ]
+        return [{"role": "user", "content": content}]
+
+    gateway.reply(
+        AistudioPart(function_call=("lookup", {}, "A"), thought_signature=SIG_A)
+    )
+    output = _strip_signatures(await _request(client, surface, prompt("invoice.txt")))
+    for cold in (False, True):
+        if cold:
+            _new_worker(gateway, monkeypatch, tmp_path / "signatures.json")
+        gateway.reply(AistudioPart(text="Done."))
+        for filename in ("invoice.txt", "notes.txt"):
+            await _request(
+                client,
+                surface,
+                prompt(filename) + output + _outputs(surface, [("A", "done")]),
+            )
+            assert gateway.wire[0][0][1][PartIndex.INLINE_DATA][-1] == filename
+            actual = _wire_tools(gateway, 1, "function_call")[0][-1]
+            if filename == "invoice.txt":
+                assert actual == SIG_A
+            else:
+                assert actual != SIG_A
+
+
+async def test_old_per_call_records_cannot_authorize_replay_or_expand_fallback(
+    route, monkeypatch, tmp_path
+):
+    client, gateway = route
+    initial = "Look up both."
+    calls = (("A", "Paris"), ("B", "Oslo"))
+
+    def old_digest(value: object) -> str:
+        canonical = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    user = old_digest(["", False, [["text", initial]]])
+    turn = old_digest(
+        [user, True, [["call", "lookup", {"city": city}] for _, city in calls]]
+    )
+    v1_path = tmp_path / "v1.json"
+    v1_path.write_text(
+        json.dumps(
+            {
+                "by_scoped_call_v1": {
+                    old_digest(
+                        ["A", "lookup", {"city": "Paris"}, f"models/{MODEL}", turn, 0]
+                    ): [
+                        "old-carrier",
+                        SIG_A,
+                    ]
+                }
+            }
+        )
+    )
+    _new_worker(gateway, monkeypatch, v1_path)
+    model = {
+        "role": "model",
+        "parts": [
+            {"functionCall": {"id": call_id, "name": "lookup", "args": {"city": city}}}
+            for call_id, city in calls
+        ],
+    }
+    gateway.reply(AistudioPart(text="Done."))
+    await _request(
+        client,
+        "native",
+        [*_prompt("native", initial), model, *_outputs("native", list(calls))],
+    )
+    assert _wire_tools(gateway, 1, "function_call") == [
+        ("A", "lookup", {"city": "Paris"}, ""),
+        ("B", "lookup", {"city": "Oslo"}, ""),
+    ]
+
+
+def test_persisted_cohort_is_bounded_and_writes_ambiguity_before_shutdown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setattr(
+        tool_signatures.ThoughtSignatureCache, "_MAX_REPLAY_BYTES", 1000
+    )
+    path = tmp_path / "cache.json"
+    cache = tool_signatures.ThoughtSignatureCache(path)
+
+    def proof(state: str) -> tool_signatures.TurnSignatureProof:
+        return tool_signatures.TurnSignatureProof(
+            state * 64, "a" * 64, None, ("b" * 64,), (SIG_A,)
+        )
+
+    for turn, state in (("first", "1"), ("second", "2"), ("third", "3")):
+        assert cache.remember_turn("scope", turn, proof(state))
+    cache.flush()
+    reloaded = tool_signatures.ThoughtSignatureCache(path)
+    assert reloaded.lookup_turn("scope", "first") == (False, None)
+    assert reloaded.lookup_turn("scope", "second") == (True, proof("2"))
+
+    assert not cache.remember_turn("scope", "third", proof("4"))
+    # No graceful shutdown/flush of the changed writer. The previous value
+    # must already be unusable when another process reads the file.
+    restarted = tool_signatures.ThoughtSignatureCache(path)
+    assert restarted.lookup_turn("scope", "third") == (True, None)

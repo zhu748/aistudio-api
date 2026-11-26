@@ -654,6 +654,11 @@ result = client.models.generate_content(
 print(result.text)
 ```
 
+原生流检测到 Python SDK 在 `X-Goog-Api-Client` 或 `User-Agent` 中的标准标记
+（`google-genai-sdk/` 与 `gl-python/`）时，会把成功响应的结束原因和用量合并
+到最后一个真实 Part，避免 `client.chats` 丢掉该轮历史。最多保留一个 Part，
+等待下一个 Part 或上游响应结束。其他客户端的原生流分帧不变。
+
 ---
 
 ### 工具调用 (Function Calling)

@@ -529,14 +529,21 @@ def _frame_parts(candidate: dict[str, object]) -> list[dict[str, object]]:
         if len(payloads) < 2 and not code:
             parts.append(part)
             continue
-        for key in payloads:
+        for key in ("text", "inlineData"):
+            if key not in part:
+                continue
             # Each split payload is a projection, not the signed Gemini Part.
             separate = {key: part[key]}
-            if key != "functionCall" and part.get("thought") is True:
+            if part.get("thought") is True:
                 separate["thought"] = True
             parts.append(separate)
         if code:
             parts.append({"text": code})
+        # Match the buffered adapters: presentation runs, including code
+        # output, precede a call carried by the same Part. Chat and Claude
+        # must check that text for a requested stop before releasing the call.
+        if "functionCall" in part:
+            parts.append({"functionCall": part["functionCall"]})
     return parts
 
 

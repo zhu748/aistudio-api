@@ -28,7 +28,6 @@ from aistudio_api.api.schemas import (
     GeminiTool,
 )
 from aistudio_api.api.schemas_compat import OpenAIChatCompletionRequest
-from aistudio_api.application.api_service_gemini import _ERROR_TEXT_PREFIX
 from aistudio_api.application.compat_errors import (
     _GEMINI_TO_OPENAI_FINISH,
     _OPENAI_ERROR_TYPE,
@@ -957,11 +956,6 @@ async def openai_stream_adapter(
                     text = part.get("text")
                     saw_body |= part.get("functionResponse") is not None
                     if isinstance(text, str):
-                        # 上游错误兑底文本（_error_text_payload）不是正文：
-                        # 随后的结构化错误帧已携带同等信息，重复下发会混进
-                        # assistant content（与 Responses 适配器同款过滤）。
-                        if text.startswith(_ERROR_TEXT_PREFIX):
-                            continue
                         if part.get("thought") is True:
                             signature = part_payload_signature(part, "text")
                             if stops.hit is None and (

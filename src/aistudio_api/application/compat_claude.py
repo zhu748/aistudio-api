@@ -27,7 +27,6 @@ from aistudio_api.api.schemas import (
     GeminiTool,
 )
 from aistudio_api.api.schemas_compat import ClaudeMessagesRequest
-from aistudio_api.application.api_service_gemini import _ERROR_TEXT_PREFIX
 from aistudio_api.application.compat_errors import (
     _CLAUDE_ERROR_TYPE,
     _CLAUDE_REFUSAL_FINISH,
@@ -971,12 +970,6 @@ async def claude_stream_adapter(
                                 for event in emitter.thinking_delta(text, signature):
                                     yield event
                         elif text:
-                            # 上游错误兑底文本（_error_text_payload）不是
-                            # 正文：随后的结构化错误事件已携带同等信息，重复
-                            # 下发会混进 assistant 正文（与 Responses 适配器
-                            # 同款过滤）。
-                            if text.startswith(_ERROR_TEXT_PREFIX):
-                                continue
                             # stop sequence 命中后丢弃后续正文（Claude 语义是
                             # 文本在 stop sequence 处截断，不透传其后内容）；
                             # 命中点在本帧中间时，命中点之前的文本仍需下发

@@ -47,6 +47,18 @@ def _parse_anti_truncation_header(request: Request) -> bool | None:
     return None
 
 
+def _uses_python_genai_sdk(request: Request) -> bool:
+    # google-genai's chat accumulator requires real candidate Parts in every
+    # chunk. Use its standard telemetry labels, only for the HTTP response.
+    for name in ("x-goog-api-client", "user-agent"):
+        labels = request.headers.get(name, "").lower().split()
+        if any(label.startswith("google-genai-sdk/") for label in labels) and any(
+            label.startswith("gl-python/") for label in labels
+        ):
+            return True
+    return False
+
+
 @router.post(
     "/v1beta/{model_path:path}:generateContent",
     response_model=GeminiGenerateContentResponse,
@@ -107,4 +119,5 @@ async def stream_generate_content(
         client,
         stream=True,
         anti_truncation=_parse_anti_truncation_header(http_request),
+        sdk_terminal=_uses_python_genai_sdk(http_request),
     )

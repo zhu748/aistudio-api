@@ -481,6 +481,13 @@ result = client.models.generate_content(
 print(result.text)
 ```
 
+For requests identified by the Python SDK's standard `google-genai-sdk/` and
+`gl-python/` labels in `X-Goog-Api-Client` or `User-Agent`, a successful
+native stream carries final usage and finish reason on its last real Part.
+This lets `client.chats` retain the turn. At most one Part waits for the next
+Part or the end of the upstream response. Other clients keep the usual native
+stream framing.
+
 ---
 
 ### Function Calling
