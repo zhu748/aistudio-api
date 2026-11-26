@@ -8,7 +8,7 @@ import json
 import random
 import re
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Sequence
 from dataclasses import dataclass
 from itertools import groupby
 from typing import Any
@@ -1331,6 +1331,15 @@ async def _retry_stream_attempt(
     return retry, transient_failures + increment
 
 
+def _consume_finished_parts(
+    parts: list[dict[str, object]],
+) -> Iterator[dict[str, object]]:
+    """Drain the assembler's owned result in order, releasing each sent Part."""
+    parts.reverse()
+    while parts:
+        yield parts.pop()
+
+
 async def _stream_attempt_frames(
     anti_stream: AsyncIterator[tuple[str, object | None]],
     state: _StreamAttemptState,
@@ -1368,8 +1377,9 @@ async def _stream_attempt_frames(
             elif event_type == "response_id":
                 state.latest_response_id = str(value)
             elif event_type == "tool_interruption":
-                for part in assembler.block_tools():
+                for part in _consume_finished_parts(assembler.block_tools()):
                     yield publish([part])
+                    del part
             else:
                 parts = _event_parts(event_type, value)
                 if any(
@@ -1378,18 +1388,26 @@ async def _stream_attempt_frames(
                 ):
                     state.final_finish_reason = "OTHER"
                 leading = assembler.feed(parts)
+                # A single source event can hold the whole ordered suffix.
+                # Only the assembler should retain it until classification.
+                del value, parts
                 if leading:
                     yield publish(leading)
+                    del leading
     except Exception:
         # Do not publish any tool from a failed transport. Display text already
         # accepted into the ordered suffix remains useful.
-        safe_suffix, _ = assembler.finish("OTHER")
-        for part in safe_suffix:
+        # Clear the assembly state even if the exception traceback holds it.
+        safe_suffix = assembler.block_tools()
+        for part in _consume_finished_parts(safe_suffix):
             yield publish([part])
         raise
 
     deferred, state.final_finish_reason = assembler.finish(state.final_finish_reason)
-    for part in deferred:
+    # The batch has already been validated atomically. Don't retain the
+    # original shards, or previously sent Parts, behind a slow client.
+    del assembler
+    for part in _consume_finished_parts(deferred):
         yield publish([part])
 
 
