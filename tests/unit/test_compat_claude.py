@@ -989,7 +989,6 @@ def test_build_claude_message_trailing_carrier_ignored_with_tool_use() -> None:
         [
             GeminiPartResponse(text="Plan the call.", thought=True),
             GeminiPartResponse(
-                text="",
                 functionCall=GeminiFunctionCallPayload(
                     name="get_weather", args={"city": "SF"}
                 ),

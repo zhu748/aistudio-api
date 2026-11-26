@@ -43,6 +43,7 @@ from aistudio_api.application.compat_shared import (
     _file_block_to_part,
     _frame_candidate,
     _frame_parts,
+    _is_signed_empty_thought,
     _iter_gemini_sse_frames,
     _iter_response_parts,
     _media_part_from_url,
@@ -53,7 +54,10 @@ from aistudio_api.application.compat_shared import (
     resolve_compat_model,
 )
 from aistudio_api.application.media_session import has_remote_media, media_session
-from aistudio_api.application.stream_utils import StopSequenceBuffer
+from aistudio_api.application.stream_utils import (
+    StopSequenceBuffer,
+    part_payload_signature,
+)
 from aistudio_api.domain.tool_signatures import (
     remember_function_signature as _remember_function_signature,
 )
@@ -342,17 +346,25 @@ async def openai_to_gemini_request(
             # 思考历史回传（DeepSeek 风格 reasoning_content / OpenRouter
             # reasoning 字符串形态）：转为 thought part 保留思考链，签名经
             # 消息级 extra_content 载体回读；缺失时不按思考文本猜测签名。
-            reasoning_text = message.reasoning_content or (
-                message.reasoning if isinstance(message.reasoning, str) else None
+            reasoning_signature = _read_signature(
+                {"extra_content": message.extra_content}
             )
-            if reasoning_text:
+            reasoning_text = message.reasoning_content
+            if not reasoning_text and not _is_signed_empty_thought(
+                reasoning_text, reasoning_signature
+            ):
+                reasoning_text = (
+                    message.reasoning if isinstance(message.reasoning, str) else None
+                )
+            if reasoning_text is not None and (
+                reasoning_text
+                or _is_signed_empty_thought(reasoning_text, reasoning_signature)
+            ):
                 parts.append(
                     GeminiPart(
                         text=reasoning_text,
                         thought=True,
-                        thoughtSignature=_read_signature(
-                            {"extra_content": message.extra_content}
-                        ),
+                        thoughtSignature=reasoning_signature,
                     )
                 )
             text = _openai_content_text(message.content)
@@ -640,7 +652,8 @@ def build_openai_completion(
     reasoning_parts: list[str] = []
     tool_calls: list[dict[str, object]] = []
     has_tool_calls = False
-    reasoning_signature: str | None = None
+    reasoning_signature = ""
+    saw_body = False
     # 与 Claude 侧同源的双重防御：上游若不执行 stopSequences（或拒绝该
     # 参数），停止词及其后的全部内容不得泄漏给客户端（Agent 客户端用
     # stop 切分输出/观察边界，泄漏会打穿解析）。
@@ -657,16 +670,15 @@ def build_openai_completion(
             # build_claude_message 同语义——客户端不应看到停止词之后的产物）。
             break
         text = getattr(part, "text", None)
-        part_signature = getattr(part, "thoughtSignature", None)
-        if isinstance(text, str) and text:
+        if isinstance(text, str):
             if getattr(part, "thought", None) is True:
-                reasoning_parts.append(text)
-                if (
-                    len(reasoning_parts) == 1
-                    and getattr(part, "functionCall", None) is None
-                ):
-                    reasoning_signature = _as_str(part_signature)
-            else:
+                signature = part_payload_signature(part, "text")
+                if text or _is_signed_empty_thought(text, signature):
+                    reasoning_parts.append(text)
+                    if len(reasoning_parts) == 1 and not saw_body:
+                        reasoning_signature = signature
+            elif text:
+                saw_body = True
                 filtered = stops.feed(text)
                 if filtered:
                     text_parts.append(filtered)
@@ -674,6 +686,7 @@ def build_openai_completion(
                     break
         inline = getattr(part, "inlineData", None)
         if inline is not None:
+            saw_body = True
             flush_pending()
             text_parts.append(
                 f"\n\n![image](data:{inline.mimeType};base64,{inline.data})"
@@ -683,8 +696,11 @@ def build_openai_completion(
             getattr(part, "executableCode", None),
             getattr(part, "codeExecutionResult", None),
         )
-        if code and (filtered_code := stops.feed(code)):
-            text_parts.append(filtered_code)
+        if code:
+            saw_body = True
+            if filtered_code := stops.feed(code):
+                text_parts.append(filtered_code)
+        saw_body |= getattr(part, "functionResponse", None) is not None
         if (
             function_call is not None
             and finish_reason_raw == "STOP"
@@ -692,6 +708,8 @@ def build_openai_completion(
         ):
             flush_pending()
             has_tool_calls = True
+            saw_body = True
+            signature = part_payload_signature(part, "functionCall")
             call_id = function_call.id or f"call_{secrets.token_hex(12)}"
             args = function_call.args if function_call.args is not None else {}
             if function_call.id is None:
@@ -700,11 +718,11 @@ def build_openai_completion(
                 # 按 id 回查必然 miss。补记一条对齐流式路径（coalesce 先定
                 # id、recorder 后记忆化）；remember 内部校验签名合法性。
                 _remember_function_signature(
-                    call_id, function_call.name, args, part_signature
+                    call_id, function_call.name, args, signature
                 )
             tool_calls.append(
                 {
-                    **_signature_extra(getattr(part, "thoughtSignature", None)),
+                    **_signature_extra(signature),
                     "id": call_id,
                     "type": "function",
                     "function": {
@@ -719,10 +737,11 @@ def build_openai_completion(
         "role": "assistant",
         "content": content_text,
     }
-    if reasoning_parts:
-        message["reasoning_content"] = "".join(reasoning_parts)
-        if len(reasoning_parts) == 1:
-            message.update(_signature_extra(reasoning_signature))
+    reasoning_text = "".join(reasoning_parts)
+    if len(reasoning_parts) == 1:
+        message.update(_signature_extra(reasoning_signature))
+    if reasoning_text or "extra_content" in message:
+        message["reasoning_content"] = reasoning_text
     if tool_calls:
         message["tool_calls"] = tool_calls
 
@@ -826,11 +845,12 @@ async def openai_stream_adapter(
     tool_index = 0
     has_tool_calls = False
     saw_error = False
-    # 思考链签名（纯文本轮尾部签名载体 / thought part 附带形态）与思考
-    # 增量是否已下发：签名在终结块的 delta.extra_content 下发，与
-    # tool_calls 签名同一载体形态，客户端合并 delta 后随消息回传。
-    reasoning_signature: str | None = None
+    # Chat replays a scalar reasoning field before all other assistant Parts.
+    # Sign only a single leading thought whose exact text can be replayed.
+    reasoning_signature = ""
     reasoning_count = 0
+    first_reasoning_empty = False
+    saw_body = False
 
     # 确定性关闭内层 SSE 生成器（3.6）：适配器自身异常或客户端断连时，
     # 不再依赖事件循环的异步生成器终结器延迟释放上游连接。
@@ -876,6 +896,7 @@ async def openai_stream_adapter(
                         if tail:
                             yield _sse(_chunk({"content": tail}, None))
                         has_tool_calls = True
+                        saw_body = True
                         call_id = _as_str(function_call.get("id")) or (
                             f"call_{secrets.token_hex(12)}"
                         )
@@ -889,7 +910,9 @@ async def openai_stream_adapter(
                                     "tool_calls": [
                                         {
                                             **_signature_extra(
-                                                part.get("thoughtSignature")
+                                                part_payload_signature(
+                                                    part, "functionCall"
+                                                )
                                             ),
                                             "index": tool_index,
                                             "id": call_id,
@@ -910,6 +933,7 @@ async def openai_stream_adapter(
                         continue
                     inline = _as_dict(part.get("inlineData"))
                     if inline:
+                        saw_body = True
                         if stops.hit is None:
                             # 同 functionCall 分支：先冲刷停止词缓冲中的部分
                             # 前缀，保持其在最终 content 字符串中的位置。
@@ -931,22 +955,31 @@ async def openai_stream_adapter(
                                 )
                         continue
                     text = part.get("text")
-                    part_signature = part.get("thoughtSignature")
-                    if isinstance(text, str) and text:
+                    saw_body |= part.get("functionResponse") is not None
+                    if isinstance(text, str):
                         # 上游错误兑底文本（_error_text_payload）不是正文：
                         # 随后的结构化错误帧已携带同等信息，重复下发会混进
                         # assistant content（与 Responses 适配器同款过滤）。
                         if text.startswith(_ERROR_TEXT_PREFIX):
                             continue
                         if part.get("thought") is True:
-                            if stops.hit is None:
-                                yield _sse(_chunk({"reasoning_content": text}, None))
+                            signature = part_payload_signature(part, "text")
+                            if stops.hit is None and (
+                                text or _is_signed_empty_thought(text, signature)
+                            ):
                                 reasoning_count += 1
                                 if reasoning_count == 1:
-                                    reasoning_signature = _as_str(part_signature)
+                                    first_reasoning_empty = not text
+                                    if not saw_body:
+                                        reasoning_signature = signature
+                                if text:
+                                    yield _sse(
+                                        _chunk({"reasoning_content": text}, None)
+                                    )
                             continue
-                        if stops.hit is not None:
+                        if stops.hit is not None or not text:
                             continue
+                        saw_body = True
                         filtered = stops.feed(text)
                         if filtered:
                             yield _sse(_chunk({"content": filtered}, None))
@@ -978,8 +1011,10 @@ async def openai_stream_adapter(
             _openai_usage_from_frame(usage_frame) if usage_frame is not None else None
         )
         final_delta: dict[str, object] = {}
-        if reasoning_count == 1:
+        if reasoning_count == 1 and reasoning_signature:
             final_delta.update(_signature_extra(reasoning_signature))
+            if first_reasoning_empty:
+                final_delta["reasoning_content"] = ""
         final_chunk = _chunk(final_delta, finish_reason)
         # OpenAI 语义：仅 include_usage=True 时发送 usage（且以 choices 为空的
         # 独立尾块形式）。False 时任何 chunk 都不得携带 usage 字段，否则 SDK

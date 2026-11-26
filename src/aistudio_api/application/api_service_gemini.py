@@ -54,6 +54,7 @@ from aistudio_api.application.chat_service import (
 from aistudio_api.application.stream_utils import (
     ToolResponseAssembler,
     has_response_content,
+    part_payload_signature,
 )
 from aistudio_api.domain.errors import (
     AistudioError,
@@ -927,7 +928,7 @@ def _observe_output_parts(parts: list[dict[str, object]]) -> None:
                 call.get("id"),
                 call.get("name"),
                 call.get("args"),
-                part.get("thoughtSignature"),
+                part_payload_signature(part, "functionCall"),
             )
 
 

@@ -43,6 +43,7 @@ from aistudio_api.application.compat_shared import (
     _convert_items_concurrently,
     _frame_candidate,
     _frame_parts,
+    _is_signed_empty_thought,
     _iter_gemini_sse_frames,
     _iter_response_parts,
     _media_part_from_url,
@@ -53,7 +54,10 @@ from aistudio_api.application.compat_shared import (
     resolve_compat_model,
 )
 from aistudio_api.application.media_session import has_remote_media, media_session
-from aistudio_api.application.stream_utils import StopSequenceBuffer
+from aistudio_api.application.stream_utils import (
+    StopSequenceBuffer,
+    part_payload_signature,
+)
 from aistudio_api.domain.tool_signatures import (
     remember_function_signature as _remember_function_signature,
 )
@@ -93,13 +97,14 @@ async def _claude_blocks_to_parts(
         if block_type == "text":
             parts.append(GeminiPart(text=_as_str(block.get("text"))))
         elif block_type == "thinking":
-            parts.append(
-                GeminiPart(
-                    text=_as_str(block.get("thinking")),
-                    thought=True,
-                    thoughtSignature=_read_claude_signature(block.get("signature")),
+            thinking = block.get("thinking")
+            signature = _read_claude_signature(block.get("signature"))
+            if isinstance(thinking, str) and (
+                thinking or _is_signed_empty_thought(thinking, signature)
+            ):
+                parts.append(
+                    GeminiPart(text=thinking, thought=True, thoughtSignature=signature)
                 )
-            )
         elif block_type == "image":
             source = _as_dict(block.get("source"))
             source_type = source.get("type")
@@ -473,13 +478,13 @@ def build_claude_message(
     has_tool_use = False
     for part in _iter_response_parts(response):
         text = getattr(part, "text", None)
-        part_signature = getattr(part, "thoughtSignature", None)
-        function_call = getattr(part, "functionCall", None)
-        if isinstance(text, str) and text:
-            if getattr(part, "thought", None) is True:
+        if isinstance(text, str):
+            is_thought = getattr(part, "thought", None) is True
+            signature = part_payload_signature(part, "text") if is_thought else ""
+            if is_thought and (text or _is_signed_empty_thought(text, signature)):
                 # A signed Part must match precisely one output block.
                 if (
-                    not part_signature
+                    not signature
                     and blocks
                     and blocks[-1].get("type") == "thinking"
                     and not blocks[-1].get("signature")
@@ -490,12 +495,10 @@ def build_claude_message(
                         {
                             "type": "thinking",
                             "thinking": text,
-                            "signature": _claude_signature(part_signature)
-                            if function_call is None
-                            else "",
+                            "signature": _claude_signature(signature),
                         }
                     )
-            else:
+            elif not is_thought and text:
                 blocks.append({"type": "text", "text": text})
         inline = getattr(part, "inlineData", None)
         if inline is not None:
@@ -515,8 +518,10 @@ def build_claude_message(
         )
         if code:
             blocks.append({"type": "text", "text": code})
+        function_call = getattr(part, "functionCall", None)
         if function_call is not None and finish_reason_raw == "STOP":
             has_tool_use = True
+            signature = part_payload_signature(part, "functionCall")
             call_id = function_call.id or f"toolu_{secrets.token_hex(12)}"
             args = _coerce_tool_args(function_call.args)
             if function_call.id is None:
@@ -527,11 +532,11 @@ def build_claude_message(
                 # 流式路径（coalesce 先定 id、recorder 后记忆化）对齐。
                 # remember 内部会校验签名合法性，无效签名静默跳过。
                 _remember_function_signature(
-                    call_id, function_call.name, args, part_signature
+                    call_id, function_call.name, args, signature
                 )
             blocks.append(
                 {
-                    **_signature_extra(getattr(part, "thoughtSignature", None)),
+                    **_signature_extra(signature),
                     "type": "tool_use",
                     "id": call_id,
                     "name": function_call.name,
@@ -698,16 +703,17 @@ class _ClaudeStreamEmitter:
             events += self._close_events()
         events += self._ensure_block("thinking")
         self.thinking_signature = signature
-        events.append(
-            self.sse(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": self.index,
-                    "delta": {"type": "thinking_delta", "thinking": text},
-                },
+        if text:
+            events.append(
+                self.sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": self.index,
+                        "delta": {"type": "thinking_delta", "thinking": text},
+                    },
+                )
             )
-        )
         return events
 
     def text_delta(self, text: str) -> list[str]:
@@ -942,7 +948,10 @@ async def claude_stream_adapter(
                         name = _as_str(function_call.get("name")) or "unknown"
                         args = function_call.get("args")
                         for event in emitter.tool_use(
-                            call_id, name, args, _as_str(part.get("thoughtSignature"))
+                            call_id,
+                            name,
+                            args,
+                            part_payload_signature(part, "functionCall"),
                         ):
                             yield event
                         continue
@@ -955,13 +964,13 @@ async def claude_stream_adapter(
                                 yield event
                         continue
                     text = part.get("text")
-                    if isinstance(text, str) and text:
+                    if isinstance(text, str):
                         if part.get("thought") is True:
-                            for event in emitter.thinking_delta(
-                                text, _as_str(part.get("thoughtSignature"))
-                            ):
-                                yield event
-                        else:
+                            signature = part_payload_signature(part, "text")
+                            if text or _is_signed_empty_thought(text, signature):
+                                for event in emitter.thinking_delta(text, signature):
+                                    yield event
+                        elif text:
                             # 上游错误兑底文本（_error_text_payload）不是
                             # 正文：随后的结构化错误事件已携带同等信息，重复
                             # 下发会混进 assistant 正文（与 Responses 适配器

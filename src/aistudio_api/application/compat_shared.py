@@ -39,9 +39,12 @@ from aistudio_api.application.media_session import (
 from aistudio_api.application.stream_utils import (
     SSEEventBuffer,
     coalesce_tool_frames,
+    part_payload_signature,
 )
 from aistudio_api.domain.tool_signatures import (
+    SKIP_THOUGHT_SIGNATURE,
     remember_function_signature as _remember_function_signature,
+    valid_thought_signature,
 )
 from aistudio_api.infrastructure.gateway.model_defaults import get_compat_settings
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -193,6 +196,15 @@ def _signature_extra(signature: object) -> dict[str, object]:
     if isinstance(signature, str) and signature:
         return {"extra_content": {"google": {"thought_signature": signature}}}
     return {}
+
+
+def _is_signed_empty_thought(text: object, signature: object) -> bool:
+    """Only an explicitly empty string with an opaque byte value is replayable."""
+    return (
+        text == ""
+        and signature != SKIP_THOUGHT_SIGNATURE
+        and valid_thought_signature(signature)
+    )
 
 
 def _read_signature(item: dict[str, object]) -> str | None:
@@ -408,7 +420,7 @@ def _iter_response_parts(
                 getattr(function_call, "id", None),
                 getattr(function_call, "name", None),
                 getattr(function_call, "args", None),
-                getattr(part, "thoughtSignature", None),
+                part_payload_signature(part, "functionCall"),
             )
     return parts
 
@@ -429,7 +441,7 @@ def _remember_frame_signatures(frame: dict[str, object]) -> None:
                 _as_str(function_call.get("id")) or None,
                 _as_str(function_call.get("name")) or None,
                 function_call.get("args"),
-                part.get("thoughtSignature"),
+                part_payload_signature(part, "functionCall"),
             )
 
 
@@ -518,13 +530,10 @@ def _frame_parts(candidate: dict[str, object]) -> list[dict[str, object]]:
             parts.append(part)
             continue
         for key in payloads:
-            # Native Parts keep their exact fields. A protocol which displays
-            # a caption separately must not clone its opaque signature onto it.
+            # Each split payload is a projection, not the signed Gemini Part.
             separate = {key: part[key]}
             if key != "functionCall" and part.get("thought") is True:
                 separate["thought"] = True
-            if key == "functionCall" and "thoughtSignature" in part:
-                separate["thoughtSignature"] = part["thoughtSignature"]
             parts.append(separate)
         if code:
             parts.append({"text": code})

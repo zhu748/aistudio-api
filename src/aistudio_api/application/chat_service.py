@@ -756,43 +756,6 @@ def _convert_part(
     _drop_hollow_and_merge_same_role 统一清理）。
     """
     parts: list[AistudioPart] = []
-    if part.text is not None and part.functionResponse is None:
-        parts.append(
-            AistudioPart(
-                text=part.text,
-                thought=bool(part.thought),
-                thought_signature=_valid_thought_signature_or_none(
-                    part.thoughtSignature
-                ),
-            )
-        )
-        return parts
-    if part.inlineData is not None and part.functionResponse is None:
-        img_data = (part.inlineData.mimeType, part.inlineData.data)
-        parts.append(
-            AistudioPart(
-                inline_data=img_data,
-                inline_filename=part.inlineData.filename,
-                thought_signature=_valid_thought_signature_or_none(
-                    part.thoughtSignature
-                ),
-            )
-        )
-        return parts
-    if part.functionCall is not None and part.functionResponse is None:
-        fc = part.functionCall
-        args_payload = fc.args if fc.args is not None else {}
-        parts.append(
-            AistudioPart(
-                function_call=(fc.name, args_payload, fc.id)
-                if fc.id
-                else (fc.name, args_payload),
-                thought_signature=_valid_thought_signature_or_none(
-                    part.thoughtSignature
-                ),
-            )
-        )
-        return parts
     if part.functionResponse is not None:
         fr = part.functionResponse
         resp_payload = fr.response if fr.response is not None else {}
@@ -846,35 +809,41 @@ def _convert_part(
                         )
                     )
         return parts
-    if part.executableCode is not None:
-        ec = part.executableCode
-        parts.append(
-            AistudioPart(
-                executable_code=(ec.language, ec.code),
-                thought_signature=_valid_thought_signature_or_none(
-                    part.thoughtSignature
-                ),
-            )
-        )
-        return parts
-    if part.codeExecutionResult is not None:
-        cer = part.codeExecutionResult
-        parts.append(
-            AistudioPart(
-                code_execution_result=(cer.outcome, cer.output),
-                thought_signature=_valid_thought_signature_or_none(
-                    part.thoughtSignature
-                ),
-            )
-        )
-        return parts
     if part.fileData is not None:
         raise ValueError("fileData is not supported yet")
-    if part.thoughtSignature:
-        signature = _valid_thought_signature_or_none(part.thoughtSignature)
-        if signature:
-            parts.append(AistudioPart(thought_signature=signature))
-    return parts
+
+    # Distinguish absent from empty text and keep the orthogonal wire fields
+    # together. An opaque signature authenticates the whole Part, not the
+    # first field that a converter happens to recognize.
+    native = AistudioPart(
+        text=part.text,
+        thought=bool(part.thought),
+        thought_signature=_valid_thought_signature_or_none(part.thoughtSignature),
+    )
+    if (inline := part.inlineData) is not None:
+        native.inline_data = (inline.mimeType, inline.data)
+        native.inline_filename = inline.filename
+    if (fc := part.functionCall) is not None:
+        args = fc.args if fc.args is not None else {}
+        native.function_call = (fc.name, args, fc.id) if fc.id else (fc.name, args)
+    if (code := part.executableCode) is not None:
+        native.executable_code = (code.language, code.code)
+        if code.id is not None or code.language.upper() not in (
+            "PYTHON",
+            "1",
+            "LANGUAGE_UNSPECIFIED",
+        ):
+            native.thought_signature = None
+    if (result := part.codeExecutionResult) is not None:
+        native.code_execution_result = (result.outcome, result.output)
+        if result.id is not None or result.outcome.upper() not in (
+            "OUTCOME_OK",
+            "OUTCOME_FAILED",
+            "OUTCOME_DEADLINE_EXCEEDED",
+        ):
+            # The typed wire encoder does not carry code IDs or other outcomes.
+            native.thought_signature = None
+    return [native] if native.text is not None or not _is_hollow_part(native) else []
 
 
 def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioContent]:

@@ -258,6 +258,33 @@ def has_response_content(part: dict[str, object]) -> bool:
     )
 
 
+def part_payload_signature(part: object, payload_key: str) -> str:
+    """A projection can carry the signature only for the whole owning Part."""
+
+    def get(key: str) -> object:
+        return part.get(key) if isinstance(part, dict) else getattr(part, key, None)
+
+    signature = get("thoughtSignature")
+    if not isinstance(signature, str) or not signature:
+        return ""
+    if payload_key == "functionCall" and get("thought") is True:
+        return ""
+    if get(payload_key) is None or any(
+        key != payload_key and get(key) is not None
+        for key in (
+            "text",
+            "inlineData",
+            "fileData",
+            "functionCall",
+            "functionResponse",
+            "executableCode",
+            "codeExecutionResult",
+        )
+    ):
+        return ""
+    return signature
+
+
 def _without_call(part: dict[str, object]) -> dict[str, object]:
     return {
         key: value

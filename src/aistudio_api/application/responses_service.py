@@ -50,8 +50,9 @@ from aistudio_api.application.compat_service import (
     normalize_reasoning_effort_word,
     resolve_compat_model,
 )
-from aistudio_api.application.compat_shared import _code_text
+from aistudio_api.application.compat_shared import _code_text, _is_signed_empty_thought
 from aistudio_api.application.media_session import has_remote_media, media_session
+from aistudio_api.application.stream_utils import part_payload_signature
 from aistudio_api.domain.tool_signatures import (
     remember_function_signature as _remember_function_signature,
 )
@@ -202,6 +203,14 @@ def _reasoning_summary_text(item: dict[str, object]) -> str:
     return "".join(texts)
 
 
+def _is_explicit_empty_summary(item: dict[str, object]) -> bool:
+    summary = item.get("summary")
+    if not isinstance(summary, list) or len(summary) != 1:
+        return False
+    entry = _as_dict(summary[0])
+    return entry.get("type") == "summary_text" and entry.get("text") == ""
+
+
 @media_session()
 async def responses_to_gemini_request(
     req: OpenAIResponsesRequest,
@@ -318,7 +327,11 @@ async def responses_to_gemini_request(
                 # 原样下发（与 function_call item 同一载体形态），伪造值在
                 # 规范化层校验显式载体；缺失时不可从其他摘要推断签名。
                 summary_text = _reasoning_summary_text(item)
-                if not summary_text:
+                signature = _read_signature(item)
+                if not summary_text and not (
+                    _is_explicit_empty_summary(item)
+                    and _is_signed_empty_thought(summary_text, signature)
+                ):
                     continue
                 contents.append(
                     GeminiContent(
@@ -327,7 +340,7 @@ async def responses_to_gemini_request(
                             GeminiPart(
                                 text=summary_text,
                                 thought=True,
-                                thoughtSignature=_read_signature(item),
+                                thoughtSignature=signature,
                             )
                         ],
                     )
@@ -436,15 +449,12 @@ class _ResponsesOutputBuilder:
     def add_part(self, part: object, *, allow_tools: bool) -> None:
         text = getattr(part, "text", None)
         function_call = getattr(part, "functionCall", None)
-        signature = getattr(part, "thoughtSignature", None)
-        if isinstance(text, str) and text:
+        if isinstance(text, str):
             if getattr(part, "thought", None) is True:
-                self._append(
-                    "reasoning",
-                    text,
-                    _as_str(signature) if function_call is None else "",
-                )
-            else:
+                signature = part_payload_signature(part, "text")
+                if text or _is_signed_empty_thought(text, signature):
+                    self._append("reasoning", text, signature)
+            elif text:
                 self._append("message", text)
         inline = getattr(part, "inlineData", None)
         if inline is not None:
@@ -458,6 +468,7 @@ class _ResponsesOutputBuilder:
             self._append("message", code)
         if function_call is not None and allow_tools:
             self._flush()
+            signature = part_payload_signature(part, "functionCall")
             call_id = function_call.id or _call_id()
             args = function_call.args if function_call.args is not None else {}
             if function_call.id is None:
@@ -681,9 +692,12 @@ class _ResponsesStreamEmitter:
         ]
 
     def reasoning_delta(self, text: str) -> list[str]:
+        events = self._open_reasoning()
+        if not text:
+            return events
         self._reasoning_accumulated.append(text)
         return [
-            *self._open_reasoning(),
+            *events,
             self.sse(
                 "response.reasoning_summary_text.delta",
                 {
@@ -1035,7 +1049,10 @@ async def responses_stream_adapter(
                         for event in emitter.boundary("function_call"):
                             yield event
                         for event in emitter.function_call(
-                            call_id, name, args, _as_str(part.get("thoughtSignature"))
+                            call_id,
+                            name,
+                            args,
+                            part_payload_signature(part, "functionCall"),
                         ):
                             yield event
                         continue
@@ -1055,20 +1072,19 @@ async def responses_stream_adapter(
                                 yield event
                         continue
                     text = part.get("text")
-                    part_signature = part.get("thoughtSignature")
-                    if isinstance(text, str) and text:
+                    if isinstance(text, str):
                         # 上游错误兜底文本（format_sse_error_text）不是正文：
                         # 已输出错误事件的情况下不重复下发为 output_text
                         if text.startswith(_ERROR_TEXT_PREFIX):
                             continue
                         if part.get("thought") is True:
-                            for event in emitter.boundary(
-                                "reasoning", _as_str(part_signature)
-                            ):
-                                yield event
-                            for event in emitter.reasoning_delta(text):
-                                yield event
-                        else:
+                            signature = part_payload_signature(part, "text")
+                            if text or _is_signed_empty_thought(text, signature):
+                                for event in emitter.boundary("reasoning", signature):
+                                    yield event
+                                for event in emitter.reasoning_delta(text):
+                                    yield event
+                        elif text:
                             for event in emitter.boundary("message"):
                                 yield event
                             for event in emitter.text_delta(text):
