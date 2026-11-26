@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import AsyncGenerator
-from typing import cast
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -544,9 +544,8 @@ def _rs_response() -> GeminiGenerateContentResponse:
 def test_responses_reasoning_item_carries_signature() -> None:
     """非流式:尾部签名载体随 reasoning item 的 extra_content 下发。"""
     resp_obj = build_responses_object(_rs_response(), "gemini-3.8-flash")
-    reasoning_item = next(
-        item for item in resp_obj["output"] if item.get("type") == "reasoning"
-    )
+    output = cast(list[dict[str, Any]], resp_obj["output"])
+    reasoning_item = next(item for item in output if item.get("type") == "reasoning")
     assert reasoning_item["summary"][0]["text"] == _RS_THINK
     google = reasoning_item["extra_content"]["google"]
     assert google["thought_signature"] == _RS_SIG
@@ -587,19 +586,18 @@ async def test_responses_request_reasoning_item_restored() -> None:
 @pytest.mark.asyncio
 async def test_responses_stream_reasoning_item_signature() -> None:
     """流式:尾部独立签名帧 → 关闭 reasoning item 时随 extra_content 下发。"""
-    frames = [
+    frames: list[dict[str, object]] = [
         {
             "candidates": [
-                {"content": {"role": "model", "parts": [
-                    {"text": _RS_THINK, "thought": True}
-                ]}}
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": _RS_THINK, "thought": True}],
+                    }
+                }
             ]
         },
-        {
-            "candidates": [
-                {"content": {"role": "model", "parts": [{"text": _RS_BODY}]}}
-            ]
-        },
+        {"candidates": [{"content": {"role": "model", "parts": [{"text": _RS_BODY}]}}]},
         {
             "candidates": [
                 {"content": {"role": "model", "parts": [{"thoughtSignature": _RS_SIG}]}}
@@ -613,7 +611,7 @@ async def test_responses_stream_reasoning_item_signature() -> None:
     done_items = []
     for sse in events:
         if "response.output_item.done" in sse:
-            data_line = next(l for l in sse.splitlines() if l.startswith("data: "))
+            data_line = next(ln for ln in sse.splitlines() if ln.startswith("data: "))
             done_items.append(json.loads(data_line.removeprefix("data: "))["item"])
     reasoning_done = [i for i in done_items if i.get("type") == "reasoning"]
     assert reasoning_done, "reasoning item 必须以 output_item.done 收尾"

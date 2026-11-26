@@ -1153,7 +1153,8 @@ def test_openai_completion_message_level_thinking_signature() -> None:
     extra_content 载体形态随消息下发,客户端原样回传时精确还原。
     """
     completion = build_openai_completion(_round2_response(), "gemini-3.8-flash", None)
-    message = cast(dict[str, Any], completion["choices"][0]["message"])
+    choices = cast(list[dict[str, Any]], completion["choices"])
+    message = cast(dict[str, Any], choices[0]["message"])
     assert message["reasoning_content"] == _ROUND2_THINK
     extra = cast(dict[str, Any], message.get("extra_content"))
     google = cast(dict[str, Any], extra.get("google"))
@@ -1163,12 +1164,15 @@ def test_openai_completion_message_level_thinking_signature() -> None:
 @pytest.mark.asyncio
 async def test_openai_stream_final_chunk_carries_thinking_signature() -> None:
     """流式:迟到签名(尾部独立签名帧,晚于正文)随终结块 delta 下发。"""
-    frames = [
+    frames: list[dict[str, object]] = [
         {
             "candidates": [
-                {"content": {"role": "model", "parts": [
-                    {"text": _ROUND2_THINK, "thought": True}
-                ]}}
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": _ROUND2_THINK, "thought": True}],
+                    }
+                }
             ]
         },
         {
@@ -1178,13 +1182,21 @@ async def test_openai_stream_final_chunk_carries_thinking_signature() -> None:
         },
         {
             "candidates": [
-                {"content": {"role": "model", "parts": [{"thoughtSignature": _ROUND2_SIG}]}}
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"thoughtSignature": _ROUND2_SIG}],
+                    }
+                }
             ]
         },
     ]
     chunks: list[str] = []
     async for sse in openai_stream_adapter(
-        _sse_frames(frames), requested_model="m", stop_sequences=None, include_usage=False
+        _sse_frames(frames),
+        requested_model="m",
+        stop_sequences=None,
+        include_usage=False,
     ):
         chunks.append(sse)
 
@@ -1197,7 +1209,9 @@ async def test_openai_stream_final_chunk_carries_thinking_signature() -> None:
     ]
     assert final, "流必须以带 finish_reason 的终结块收尾"
     delta = cast(dict[str, Any], final[-1]["choices"][0]["delta"])
-    google = cast(dict[str, Any], cast(dict[str, Any], delta.get("extra_content")).get("google"))
+    google = cast(
+        dict[str, Any], cast(dict[str, Any], delta.get("extra_content")).get("google")
+    )
     assert google.get("thought_signature") == _ROUND2_SIG
 
 

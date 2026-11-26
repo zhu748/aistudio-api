@@ -804,7 +804,7 @@ async def test_claude_stream_late_signature_backfills_closed_thinking() -> None:
     语义、不校验块是否已 stop：finish() 前对已关闭的 thinking 块补发真实
     签名，客户端最终拿到的就是真实值而非占位值。
     """
-    frames = [
+    frames: list[dict[str, object]] = [
         {
             "candidates": [
                 {
@@ -823,7 +823,12 @@ async def test_claude_stream_late_signature_backfills_closed_thinking() -> None:
         # 尾部独立签名帧（无 text/thought 标志）—— wire 抓包形态
         {
             "candidates": [
-                {"content": {"role": "model", "parts": [{"thoughtSignature": _SIGNATURE}]}}
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"thoughtSignature": _SIGNATURE}],
+                    }
+                }
             ]
         },
     ]
@@ -861,7 +866,7 @@ async def test_claude_stream_late_signature_backfills_closed_thinking() -> None:
 @pytest.mark.asyncio
 async def test_claude_late_signature_round_trips_to_upstream() -> None:
     """端到端：迟到签名恢复后，客户端原样回传 thinking 块能还原真实签名。"""
-    frames = [
+    frames: list[dict[str, object]] = [
         {
             "candidates": [
                 {
@@ -874,7 +879,12 @@ async def test_claude_late_signature_round_trips_to_upstream() -> None:
         },
         {
             "candidates": [
-                {"content": {"role": "model", "parts": [{"thoughtSignature": _SIGNATURE}]}}
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"thoughtSignature": _SIGNATURE}],
+                    }
+                }
             ]
         },
     ]
@@ -884,9 +894,9 @@ async def test_claude_late_signature_round_trips_to_upstream() -> None:
     ):
         if "signature_delta" in sse:
             event = json.loads(
-                next(l for l in sse.splitlines() if l.startswith("data: ")).removeprefix(
-                    "data: "
-                )
+                next(
+                    ln for ln in sse.splitlines() if ln.startswith("data: ")
+                ).removeprefix("data: ")
             )
             signature = event["delta"]["signature"]
 

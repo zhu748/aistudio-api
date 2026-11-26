@@ -1038,6 +1038,7 @@ async def responses_stream_adapter(
                                 yield event
                         continue
                     text = part.get("text")
+                    part_signature = part.get("thoughtSignature")
                     if isinstance(text, str) and text:
                         # 上游错误兜底文本（format_sse_error_text）不是正文：
                         # 已输出错误事件的情况下不重复下发为 output_text
@@ -1046,22 +1047,18 @@ async def responses_stream_adapter(
                         if part.get("thought") is True:
                             # thought part 自带签名（流式 pending 形态）：
                             # 一并归入思考链签名（关闭 reasoning item 时下发）
-                            signature = part.get("thoughtSignature")
-                            if isinstance(signature, str) and signature:
-                                emitter.thinking_signature = signature
+                            if isinstance(part_signature, str) and part_signature:
+                                emitter.thinking_signature = part_signature
                             for event in emitter.reasoning_delta(text):
                                 yield event
                         else:
                             for event in emitter.text_delta(text):
                                 yield event
-                    elif (
-                        isinstance(part.get("thoughtSignature"), str)
-                        and part.get("thoughtSignature")
-                    ):
+                    elif isinstance(part_signature, str) and part_signature:
                         # 独立签名帧 / 尾部空文本签名载体 part：思考链签名，
                         # 关闭 reasoning item 时随 extra_content 下发（FC 分支
                         # 已 continue，调用签名不并入思考链）。
-                        emitter.thinking_signature = part["thoughtSignature"]
+                        emitter.thinking_signature = part_signature
         except Exception as exc:
             logger.warning("Responses 流式转换异常: %s", exc)
             record_result(

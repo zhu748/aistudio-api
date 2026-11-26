@@ -668,6 +668,7 @@ def build_openai_completion(
             # build_claude_message 同语义——客户端不应看到停止词之后的产物）。
             break
         text = getattr(part, "text", None)
+        part_signature = getattr(part, "thoughtSignature", None)
         if isinstance(text, str) and text:
             if getattr(part, "thought", None) is True:
                 reasoning_parts.append(text)
@@ -706,13 +707,13 @@ def build_openai_completion(
             not text
             and function_call is None
             and inline is None
-            and isinstance(getattr(part, "thoughtSignature", None), str)
-            and getattr(part, "thoughtSignature", None)
+            and isinstance(part_signature, str)
+            and part_signature
         ):
             # 空文本纯签名 part（尾部签名载体）：thought part 自身不带签名
             # 时签名在这里到达，记录最后出现的值（Gemini 语义：最后一 part
             # 的签名是整轮的权威签名）。
-            trailing_signature = part.thoughtSignature
+            trailing_signature = part_signature
 
     flush_pending()
     content_text = "".join(text_parts)
@@ -930,6 +931,7 @@ async def openai_stream_adapter(
                                 )
                         continue
                     text = part.get("text")
+                    part_signature = part.get("thoughtSignature")
                     if isinstance(text, str) and text:
                         # 上游错误兑底文本（_error_text_payload）不是正文：
                         # 随后的结构化错误帧已携带同等信息，重复下发会混进
@@ -940,22 +942,18 @@ async def openai_stream_adapter(
                             if stops.hit is None:
                                 yield _sse(_chunk({"reasoning_content": text}, None))
                             saw_reasoning = True
-                            signature = part.get("thoughtSignature")
-                            if isinstance(signature, str) and signature:
-                                late_signature = signature
+                            if isinstance(part_signature, str) and part_signature:
+                                late_signature = part_signature
                             continue
                         if stops.hit is not None:
                             continue
                         filtered = stops.feed(text)
                         if filtered:
                             yield _sse(_chunk({"content": filtered}, None))
-                    elif (
-                        isinstance(part.get("thoughtSignature"), str)
-                        and part.get("thoughtSignature")
-                    ):
+                    elif isinstance(part_signature, str) and part_signature:
                         # 独立签名帧 / 尾部空文本签名载体 part：思考链签名，
                         # 记录后随终结块 delta 下发（无正文可混入，不产块）。
-                        late_signature = part["thoughtSignature"]
+                        late_signature = part_signature
         except Exception as exc:
             saw_error = True
             record_result(

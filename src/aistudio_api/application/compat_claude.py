@@ -440,15 +440,14 @@ def build_claude_message(
 
     for part in _iter_response_parts(response):
         text = getattr(part, "text", None)
+        part_signature = getattr(part, "thoughtSignature", None)
         if isinstance(text, str) and text:
             if getattr(part, "thought", None) is True:
                 blocks.append(
                     {
                         "type": "thinking",
                         "thinking": text,
-                        "signature": _claude_signature(
-                            getattr(part, "thoughtSignature", None)
-                        ),
+                        "signature": _claude_signature(part_signature),
                     }
                 )
             else:
@@ -486,13 +485,13 @@ def build_claude_message(
             not text
             and function_call is None
             and inline is None
-            and isinstance(getattr(part, "thoughtSignature", None), str)
-            and getattr(part, "thoughtSignature", None)
+            and isinstance(part_signature, str)
+            and part_signature
         ):
             # 空文本纯签名 part（尾部签名载体）：thought part 自身不带签名时
             # 签名在这里到达。记录最后出现的值（Gemini 语义：最后一 part 的
             # 签名是整轮的权威签名）。
-            trailing_signature = part.thoughtSignature
+            trailing_signature = part_signature
 
     stops = StopSequenceBuffer(stop_sequences)
     filtered: list[dict[str, object]] = []
