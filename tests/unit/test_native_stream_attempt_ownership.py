@@ -64,9 +64,10 @@ async def test_legacy_marker_is_not_an_independently_publishable_part(
 ):
     async def answer(**_kwargs):
         if placement == "behind_tool":
-            yield "tool_calls", [
-                {"id": "fixture", "name": "weather", "args": {"city": "Paris"}}
-            ]
+            yield (
+                "tool_calls",
+                [{"id": "fixture", "name": "weather", "args": {"city": "Paris"}}],
+            )
         else:
             yield "thought_signature", "b2xkZXItbGVnYWN5"
         yield "thought_signature", _MARK
