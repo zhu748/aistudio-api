@@ -52,6 +52,7 @@ class AccountResponse(BaseModel):
     group: str = "default"
     notes: str = ""
     proxy_url: str | None = None
+    verification_required: bool = False
 
 
 def to_account_response(
@@ -87,6 +88,7 @@ def to_account_response(
         group=getattr(account, "group", "default") or "default",
         notes=getattr(account, "notes", "") or "",
         proxy_url=proxy_url,
+        verification_required=bool(getattr(account, "verification_required", False)),
     )
 
 

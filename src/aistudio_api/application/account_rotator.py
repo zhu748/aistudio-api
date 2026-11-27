@@ -767,6 +767,9 @@ class AccountRotator:
                 "auth_user": account.auth_user,
                 "tier": tier_str,
                 "enabled": account.enabled,
+                "verification_required": bool(
+                    getattr(account, "verification_required", False)
+                ),
                 "group": account.group,
                 "notes": account.notes,
                 "requests": stats.total_requests,

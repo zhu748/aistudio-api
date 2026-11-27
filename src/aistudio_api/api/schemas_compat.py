@@ -29,6 +29,10 @@ class OpenAIChatMessage(BaseModel):
     reasoning_content: str | None = None
     reasoning: str | dict[str, object] | None = None
     extra_content: dict[str, object] | None = None
+    thought_signature: str | None = None
+    thoughtSignature: str | None = None
+    provider_specific_fields: dict[str, object] | None = None
+    reasoning_details: list[dict[str, object]] | None = None
 
 
 class OpenAIChatCompletionRequest(BaseModel):

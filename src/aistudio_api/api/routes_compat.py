@@ -285,6 +285,9 @@ async def openai_responses(
             stream=req.stream,
             anti_truncation=_parse_anti_truncation_header(http_request),
         )
+        include_encrypted_reasoning = bool(
+            req.include and "reasoning.encrypted_content" in req.include
+        )
         if req.stream:
             if isinstance(response, StreamingResponse):
                 return HeartbeatStreamingResponse(
@@ -295,13 +298,18 @@ async def openai_responses(
                         requested_model=req.model,
                         register_failure=register_failure,
                         delivery=delivery,
+                        include_encrypted_reasoning=include_encrypted_reasoning,
                     ),
                     media_type="text/event-stream",
                     headers=_STREAM_HEADERS,
                 )
         elif isinstance(response, GeminiGenerateContentResponse):
             return JSONResponse(
-                content=build_responses_object(response, requested_model=req.model)
+                content=build_responses_object(
+                    response,
+                    requested_model=req.model,
+                    include_encrypted_reasoning=include_encrypted_reasoning,
+                )
             )
         raise HTTPException(
             500,

@@ -3,13 +3,20 @@ import { ref, watch, onUnmounted } from 'vue'
 import { operationsApi } from '@/api/operations.ts'
 import type { LogEntry } from '@/types'
 import Button from '@/components/ui/Button.vue'
+import ThoughtSignatureBadges from '@/components/ThoughtSignatureBadges.vue'
 import { usePageRefresh } from '@/composables/usePageRefresh.ts'
 
 const entries = ref<LogEntry[]>([])
-const props = defineProps<{ category: string; requestId: string; model: string; accountId: string }>()
+const props = defineProps<{
+  category: string
+  requestId: string
+  model: string
+  accountId: string
+  initialSearch?: string
+}>()
 const total = ref(0)
 const page = ref(1)
-const search = ref('')
+const search = ref(props.initialSearch || '')
 const level = ref('INFO')
 const loading = ref(false)
 const error = ref('')
@@ -46,8 +53,21 @@ async function turn(delta: number) {
   page.value += delta
   await load()
 }
+function filterByFp(fp: string) {
+  search.value = fp
+  void load(true)
+}
 let sequence = 0
 usePageRefresh(load)
+watch(
+  () => props.initialSearch,
+  (val) => {
+    if (typeof val === 'string' && val !== search.value) {
+      search.value = val
+      void load(true)
+    }
+  },
+)
 watch(
   () => [props.category, props.requestId, props.model, props.accountId],
   () => {
@@ -111,14 +131,26 @@ onUnmounted(() => {
       <div
         v-for="(entry, index) in entries"
         :key="index"
-        class="py-2 border-b border-slate-800 whitespace-pre-wrap break-all"
+        class="py-2.5 border-b border-slate-800 break-words"
       >
-        <span class="text-slate-500">{{ entry.ts }}</span>
-        <span :class="entry.level === 'ERROR' ? 'text-rose-400' : 'text-sky-400'">[{{ entry.level }}]</span>
-        <span class="text-brand-300">{{ entry.model }}</span><span class="ml-2 text-slate-500">{{
-          entry.account_id
-        }}</span>
-        <p class="mt-1 leading-6 text-[13px]">
+        <div class="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+          <span class="text-slate-500">{{ entry.ts }}</span>
+          <span :class="entry.level === 'ERROR' ? 'text-rose-400' : entry.level === 'WARNING' ? 'text-amber-400' : 'text-sky-400'">[{{ entry.level }}]</span>
+          <span
+            v-if="entry.model"
+            class="text-brand-300"
+          >{{ entry.model }}</span>
+          <span
+            v-if="entry.account_id"
+            class="text-slate-500"
+          >{{ entry.account_id }}</span>
+        </div>
+        <ThoughtSignatureBadges
+          v-if="entry.sig_meta"
+          :meta="entry.sig_meta"
+          @filter-fp="filterByFp"
+        />
+        <p class="mt-1 leading-6 text-[13px] whitespace-pre-wrap break-words">
           {{ entry.message }}
         </p>
         <p
@@ -126,7 +158,13 @@ onUnmounted(() => {
           class="text-slate-500 mt-1"
         >
           <router-link
-            :to="{ path: '/requests', query: { request_id: entry.request_id } }"
+            :to="{
+              path: '/requests',
+              query: {
+                request_id: entry.request_id,
+                ...(entry.name === 'aistudio.thought_signature' ? { tab: 'signature' } : {}),
+              },
+            }"
             class="text-sky-400 hover:underline"
           >
             {{ entry.request_id }} ↗

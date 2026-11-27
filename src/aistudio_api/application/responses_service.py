@@ -45,7 +45,6 @@ from aistudio_api.application.compat_service import (
     _media_part_from_url,
     _openai_tool_choice_to_config,
     _openai_tools_to_gemini,
-    _read_signature,
     _signature_extra,
     _stream_adapter_lifecycle,
     normalize_reasoning_effort_word,
@@ -53,8 +52,12 @@ from aistudio_api.application.compat_service import (
 )
 from aistudio_api.application.compat_shared import (
     _code_text,
+    _dropped_part_reason,
     _is_signed_empty_thought,
     _parse_data_url,
+    _read_signature_with_source,
+    decode_signature_envelope,
+    encode_signature_envelope,
 )
 from aistudio_api.application.media_session import has_remote_media, media_session
 from aistudio_api.application.responses_delivery import (
@@ -66,6 +69,10 @@ from aistudio_api.domain.tool_signatures import (
     remember_function_signature as _remember_function_signature,
 )
 from aistudio_api.infrastructure.request_context import record_result
+from aistudio_api.infrastructure.signature_trace import (
+    get_signature_trace,
+    set_trace_protocol,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("compat.responses")
@@ -263,6 +270,7 @@ async def responses_to_gemini_request(
     req: OpenAIResponsesRequest,
 ) -> tuple[GeminiGenerateContentRequest, str]:
     """OpenAI Responses 请求 → (Gemini 请求, 解析后的模型名)。"""
+    trace = set_trace_protocol("responses")
     resolved_model = resolve_compat_model(req.model, channel="openai")
     if req.previous_response_id:
         raise ValueError(
@@ -342,23 +350,18 @@ async def responses_to_gemini_request(
                     parsed_args = args
                 if call_id:
                     tool_name_by_call_id[call_id] = name
-                contents.append(
-                    GeminiContent(
-                        role="model",
-                        parts=[
-                            GeminiPart(
-                                thoughtSignature=_read_signature(item),
-                                functionCall=GeminiFunctionCall(
-                                    name=name,
-                                    args=parsed_args
-                                    if isinstance(parsed_args, dict)
-                                    else {},
-                                    id=call_id or None,
-                                ),
-                            )
-                        ],
-                    )
+                sig, sig_source = _read_signature_with_source(item)
+                fc_part = GeminiPart(
+                    thoughtSignature=sig,
+                    functionCall=GeminiFunctionCall(
+                        name=name,
+                        args=parsed_args if isinstance(parsed_args, dict) else {},
+                        id=call_id or None,
+                    ),
                 )
+                if trace is not None and sig_source:
+                    trace.tag_inbound_source(fc_part, sig_source)
+                contents.append(GeminiContent(role="model", parts=[fc_part]))
             elif item_type == "function_call_output":
                 call_id = _as_str(item.get("call_id"))
                 if call_id in unfinished_call_ids:
@@ -381,30 +384,37 @@ async def responses_to_gemini_request(
                     )
                 )
             elif item_type == "reasoning":
-                # 思维链回传：思考摘要转 thought part 保留思考链（此前整项
-                # 静默丢弃，Codex CLI 等客户端重发的 reasoning 历史全部丢失）。
-                # 签名经 extra_content 精确回读——值由网关 reasoning item
-                # 原样下发（与 function_call item 同一载体形态），伪造值在
-                # 规范化层校验显式载体；缺失时不可从其他摘要推断签名。
+                # Preserve reasoning summary history and read echoed signatures from
+                # extra_content or our self-identifying encrypted_content envelope.
                 summary_text = _reasoning_summary_text(item)
-                signature = _read_signature(item)
+                signature, sig_source = _read_signature_with_source(item)
+                if not signature:
+                    raw_encrypted = item.get("encrypted_content")
+                    if isinstance(raw_encrypted, str) and raw_encrypted:
+                        decoded = decode_signature_envelope(raw_encrypted)
+                        if decoded:
+                            signature = decoded
+                            sig_source = "client_encrypted_content"
+                        elif trace is not None:
+                            trace.record_client_drop(
+                                carrier="thought",
+                                raw_signature=raw_encrypted,
+                                source="client_encrypted_content",
+                                note="foreign_encrypted_content_ignored",
+                            )
                 if not summary_text and not (
                     _is_explicit_empty_summary(item)
                     and _is_signed_empty_thought(summary_text, signature)
                 ):
                     continue
-                contents.append(
-                    GeminiContent(
-                        role="model",
-                        parts=[
-                            GeminiPart(
-                                text=summary_text,
-                                thought=True,
-                                thoughtSignature=signature,
-                            )
-                        ],
-                    )
+                reasoning_part = GeminiPart(
+                    text=summary_text,
+                    thought=True,
+                    thoughtSignature=signature,
                 )
+                if trace is not None and sig_source:
+                    trace.tag_inbound_source(reasoning_part, sig_source)
+                contents.append(GeminiContent(role="model", parts=[reasoning_part]))
             else:
                 logger.debug("忽略不支持的 Responses input item 类型: %s", item_type)
 
@@ -467,8 +477,9 @@ async def responses_to_gemini_request(
 class _ResponsesOutputBuilder:
     """Build separate output items in the order of consecutive Part runs."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, include_encrypted_reasoning: bool = False) -> None:
         self.output: list[dict[str, object]] = []
+        self._include_encrypted_reasoning = include_encrypted_reasoning
         self._kind = ""
         self._buffer: list[str] = []
         self._signature = ""
@@ -478,14 +489,25 @@ class _ResponsesOutputBuilder:
             return
         text = "".join(self._buffer)
         if self._kind == "reasoning":
-            self.output.append(
-                {
-                    **_signature_extra(self._signature),
-                    "id": _item_id("rs"),
-                    "type": "reasoning",
-                    "summary": [{"type": "summary_text", "text": text}],
-                }
-            )
+            item: dict[str, object] = {
+                **_signature_extra(self._signature),
+                "id": _item_id("rs"),
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": text}],
+            }
+            if self._include_encrypted_reasoning and self._signature:
+                item["encrypted_content"] = encode_signature_envelope(self._signature)
+            self.output.append(item)
+            if self._signature and (trace := get_signature_trace()) is not None:
+                trace.record_client_out_sig(
+                    carrier="thought",
+                    wire_field=(
+                        "extra_content+encrypted_content"
+                        if self._include_encrypted_reasoning
+                        else "extra_content"
+                    ),
+                    signature=self._signature,
+                )
         else:
             self.output.append(
                 {
@@ -509,11 +531,14 @@ class _ResponsesOutputBuilder:
     def add_part(self, part: object, *, allow_tools: bool) -> None:
         text = getattr(part, "text", None)
         function_call = getattr(part, "functionCall", None)
+        raw_sig = _as_str(getattr(part, "thoughtSignature", None))
+        emitted_sig = False
         if isinstance(text, str):
             if getattr(part, "thought", None) is True:
                 signature = part_payload_signature(part, "text")
                 if text or _is_signed_empty_thought(text, signature):
                     self._append("reasoning", text, signature)
+                    emitted_sig = bool(signature)
             elif text:
                 self._append("message", text)
         inline = getattr(part, "inlineData", None)
@@ -545,6 +570,29 @@ class _ResponsesOutputBuilder:
                     "name": function_call.name,
                     "arguments": json.dumps(args, ensure_ascii=False),
                 }
+            )
+            if signature:
+                emitted_sig = True
+                if (trace := get_signature_trace()) is not None:
+                    trace.record_client_out_sig(
+                        carrier="function_call",
+                        wire_field="extra_content",
+                        signature=signature,
+                        call_id=call_id,
+                        call_name=function_call.name,
+                    )
+        if raw_sig and not emitted_sig and (trace := get_signature_trace()) is not None:
+            carrier, reason = _dropped_part_reason(part)
+            trace.record_client_out_drop(
+                carrier=carrier,
+                signature=raw_sig,
+                reason=reason,
+                call_id=_as_str(getattr(function_call, "id", None))
+                if function_call is not None
+                else "",
+                call_name=_as_str(getattr(function_call, "name", None))
+                if function_call is not None
+                else "",
             )
 
     def build_output(self, status: str) -> list[dict[str, object]]:
@@ -612,7 +660,10 @@ def _incomplete_reason(finish_reason: str | None) -> str | None:
 
 
 def build_responses_object(
-    response: GeminiGenerateContentResponse, requested_model: str
+    response: GeminiGenerateContentResponse,
+    requested_model: str,
+    *,
+    include_encrypted_reasoning: bool = False,
 ) -> dict[str, object]:
     """Gemini 完整响应 → Responses ``response`` 对象（非流式）。"""
     finish_reason_raw: str | None = None
@@ -620,19 +671,24 @@ def build_responses_object(
     if candidates:
         finish_reason_raw = candidates[0].finishReason
 
-    builder = _ResponsesOutputBuilder()
+    builder = _ResponsesOutputBuilder(
+        include_encrypted_reasoning=include_encrypted_reasoning
+    )
     builder_allow_tools = finish_reason_raw == "STOP"
     for part in _iter_response_parts(response):
         builder.add_part(part, allow_tools=builder_allow_tools)
 
     incomplete_reason = _incomplete_reason(finish_reason_raw)
     status = "incomplete" if incomplete_reason else "completed"
+    output = builder.build_output(status)
+    if (trace := get_signature_trace()) is not None:
+        trace.emit_inbound_log()
     usage = _usage_payload_from_gemini(response.usageMetadata)
     return _base_response(
         _response_id(),
         requested_model,
         status=status,
-        output=builder.build_output(status),
+        output=output,
         usage=usage,
         incomplete_reason=incomplete_reason,
     )
@@ -651,10 +707,13 @@ class _ResponsesStreamEmitter:
         response_id: str,
         requested_model: str,
         delivery: ResponsesStreamDelivery | None = None,
+        *,
+        include_encrypted_reasoning: bool = False,
     ) -> None:
         self.response_id = response_id
         self.requested_model = requested_model
         self.delivery = delivery
+        self.include_encrypted_reasoning = include_encrypted_reasoning
         self.created_at = int(time.time())
         self.seq = -1  # 首事件自增后为 0，与 SDK 从 0 递增一致
         self.output_index = -1
@@ -876,6 +935,14 @@ class _ResponsesStreamEmitter:
             "name": name,
             "arguments": arguments,
         }
+        if signature and (trace := get_signature_trace()) is not None:
+            trace.record_client_out_sig(
+                carrier="function_call",
+                wire_field="extra_content",
+                signature=signature,
+                call_id=call_id,
+                call_name=name,
+            )
         self.item_order.append((fc_index, dict(item)))
         # The closing frames repeat the entire argument string. Keep the
         # snapshot above, but encode only the frame the HTTP consumer requests.
@@ -929,7 +996,7 @@ class _ResponsesStreamEmitter:
             return
         # Release the fragments but retain the joined value for timeout recovery.
         self._reasoning_accumulated[:] = [accumulated]
-        final_item = {
+        final_item: dict[str, object] = {
             **_signature_extra(self.thinking_signature),
             "id": self.reasoning_item_id,
             "type": "reasoning",
@@ -938,6 +1005,20 @@ class _ResponsesStreamEmitter:
             if stage is not PartStage.ABSENT
             else [],
         }
+        if self.include_encrypted_reasoning and self.thinking_signature:
+            final_item["encrypted_content"] = encode_signature_envelope(
+                self.thinking_signature
+            )
+        if self.thinking_signature and (trace := get_signature_trace()) is not None:
+            trace.record_client_out_sig(
+                carrier="thought",
+                wire_field=(
+                    "extra_content+encrypted_content"
+                    if self.include_encrypted_reasoning
+                    else "extra_content"
+                ),
+                signature=self.thinking_signature,
+            )
         self._replace_order_item(self.reasoning_item_id, final_item)
         if stage is PartStage.OPEN:
             yield self.sse(
@@ -1172,10 +1253,16 @@ async def responses_stream_adapter(
     requested_model: str,
     register_failure: Callable[[Callable[[str], list[str]]], None] | None = None,
     delivery: ResponsesStreamDelivery | None = None,
+    include_encrypted_reasoning: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Gemini SSE → OpenAI Responses 语义事件流。"""
     response_id = _response_id()
-    emitter = _ResponsesStreamEmitter(response_id, requested_model, delivery)
+    emitter = _ResponsesStreamEmitter(
+        response_id,
+        requested_model,
+        delivery,
+        include_encrypted_reasoning=include_encrypted_reasoning,
+    )
     async with _stream_adapter_lifecycle(
         source, emitter.timeout_error, register_failure
     ):
@@ -1204,23 +1291,43 @@ async def responses_stream_adapter(
                 if isinstance(usage_metadata, dict):
                     emitter.usage = _usage_payload_from_gemini(usage_metadata)
                 for part in _frame_parts(candidate):
+                    raw_sig = _as_str(part.get("thoughtSignature"))
                     function_call = part.get("functionCall")
                     if isinstance(function_call, dict):
                         call_id = _as_str(function_call.get("id")) or _call_id()
                         name = _as_str(function_call.get("name")) or "unknown"
                         args = function_call.get("args")
+                        sig = part_payload_signature(part, "functionCall")
+                        if (
+                            raw_sig
+                            and not sig
+                            and (trace := get_signature_trace()) is not None
+                        ):
+                            trace.record_client_out_drop(
+                                carrier="function_call",
+                                signature=raw_sig,
+                                reason="compound_part_unrepresentable",
+                                call_id=call_id,
+                                call_name=name,
+                            )
                         for event in emitter.boundary("function_call"):
                             yield event
                         for event in emitter.function_call(
                             call_id,
                             name,
                             args,
-                            part_payload_signature(part, "functionCall"),
+                            sig,
                         ):
                             yield event
                         continue
                     inline = _as_dict(part.get("inlineData"))
                     if inline:
+                        if raw_sig and (trace := get_signature_trace()) is not None:
+                            trace.record_client_out_drop(
+                                carrier="inline_data",
+                                signature=raw_sig,
+                                reason="inline_data_unrepresentable",
+                            )
                         # Responses 无原生图片 part：与 Chat 侧一致降级为
                         # markdown data-URL 占位，避免静默空回（单次构造，
                         # 累积由 text_delta 内部完成）
@@ -1239,15 +1346,52 @@ async def responses_stream_adapter(
                         if part.get("thought") is True:
                             signature = part_payload_signature(part, "text")
                             if text or _is_signed_empty_thought(text, signature):
+                                if (
+                                    raw_sig
+                                    and not signature
+                                    and (trace := get_signature_trace()) is not None
+                                ):
+                                    trace.record_client_out_drop(
+                                        carrier="thought",
+                                        signature=raw_sig,
+                                        reason="compound_part_unrepresentable",
+                                    )
                                 for event in emitter.boundary("reasoning", signature):
                                     yield event
                                 for event in emitter.reasoning_delta(text):
                                     yield event
+                            elif (
+                                raw_sig and (trace := get_signature_trace()) is not None
+                            ):
+                                trace.record_client_out_drop(
+                                    carrier="thought",
+                                    signature=raw_sig,
+                                    reason="compound_part_unrepresentable",
+                                )
                         elif text:
+                            if raw_sig and (trace := get_signature_trace()) is not None:
+                                trace.record_client_out_drop(
+                                    carrier="text",
+                                    signature=raw_sig,
+                                    reason="text_part_unrepresentable",
+                                )
                             for event in emitter.boundary("message"):
                                 yield event
                             for event in emitter.text_delta(text):
                                 yield event
+                        elif raw_sig and (trace := get_signature_trace()) is not None:
+                            trace.record_client_out_drop(
+                                carrier="tail_empty",
+                                signature=raw_sig,
+                                reason="tail_empty_unrepresentable",
+                            )
+                    elif raw_sig and (trace := get_signature_trace()) is not None:
+                        carrier, reason = _dropped_part_reason(part)
+                        trace.record_client_out_drop(
+                            carrier=carrier,
+                            signature=raw_sig,
+                            reason=reason,
+                        )
         except Exception as exc:
             logger.warning("Responses 流式转换异常: %s", exc)
             record_result(
@@ -1258,6 +1402,8 @@ async def responses_stream_adapter(
             return
         for event in emitter.finish():
             yield event
+        if (trace := get_signature_trace()) is not None:
+            trace.emit_inbound_log()
 
 
 __all__ = [

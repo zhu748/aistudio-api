@@ -75,10 +75,12 @@ async def try_switch_account(
     required_tiers: tuple[str, ...] | list[str] | None = None,
     *,
     is_session_expired: bool = False,
+    is_verification_required: bool = False,
 ) -> bool:
     """尝试切换到下一个对目标 model 可用的账号。防止并发级联切号。"""
     global _last_switch_time
     entry_time = time.time()
+    forbid_in_place = is_session_expired or is_verification_required
 
     if model and not required_tiers:
         from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
@@ -87,8 +89,8 @@ async def try_switch_account(
         if tiers:
             required_tiers = tuple(tiers)
 
-    # 乐观快速预检：若无需记录永久失效/短时隔离，且当前活跃账号已被并发请求切换至健康状态，直接免锁复用
-    if failed_account_id and not is_session_expired:
+    # 乐观快速预检：若无需记录永久失效/待验证禁用/短时隔离，且当前活跃账号已被并发请求切换至健康状态，直接免锁复用
+    if failed_account_id and not forbid_in_place:
         rotator = runtime_state.rotator
         account_service = runtime_state.account_service
         client = runtime_state.client
@@ -126,6 +128,32 @@ async def try_switch_account(
         current_active = account_service.get_active_account()
         current_id = current_active.id if current_active else None
 
+        # 遇到 Google 账号待验证限制时，立刻持久化禁用并打标待验证（幂等防并发重复写盘/记罚）
+        if failed_account_id and is_verification_required:
+            failed_acc = (
+                account_service.get_account(failed_account_id)
+                if hasattr(account_service, "get_account")
+                else None
+            )
+            already_marked = bool(
+                failed_acc is not None
+                and not failed_acc.enabled
+                and getattr(failed_acc, "verification_required", False)
+            )
+            if not already_marked:
+                if hasattr(account_service, "mark_account_verification_required"):
+                    account_service.mark_account_verification_required(
+                        failed_account_id, required=True, disable=True
+                    )
+                elif hasattr(account_service, "toggle_account_enabled"):
+                    account_service.toggle_account_enabled(failed_account_id, False)
+                rotator.record_auth_error(failed_account_id, model=model)
+                logger.warning(
+                    "账号 %s 需要完成 Google 验证，已自动禁用并标记为待验证: model=%s",
+                    failed_account_id,
+                    model,
+                )
+
         # 会话漂移校正：注册表活跃账号可能被「只改注册表不切会话」的路径
         # 改写（get_active_account 的禁用回退重写 active_account_id、
         # apply_preset 清空活跃标记后的回退等），此时下方双重检查只看注册表
@@ -157,7 +185,7 @@ async def try_switch_account(
         if (
             _last_switch_time >= entry_time
             and current_id
-            and (not is_session_expired or current_id != failed_account_id)
+            and (not forbid_in_place or current_id != failed_account_id)
             and (
                 not required_tiers
                 or (current_active and current_active.tier in required_tiers)
@@ -198,10 +226,16 @@ async def try_switch_account(
             current_account_id=current_id,
             failed_account_id=failed_account_id,
             required_tiers=required_tiers,
-            is_session_expired=is_session_expired,
+            is_session_expired=forbid_in_place,
         )
         if next_account is None:
-            if is_session_expired:
+            if is_verification_required:
+                logger.error(
+                    "账号 %s 待验证已禁用且无备用账号可用: model=%s",
+                    failed_account_id,
+                    model,
+                )
+            elif is_session_expired:
                 logger.error(
                     "账号 %s 登录态失效且无备用账号可用",
                     failed_account_id,
@@ -229,11 +263,15 @@ async def try_switch_account(
                     model,
                 )
             return result is not None
-        # 登录态失效严禁在原账号原地重试
-        if is_session_expired and (
+        # 登录态失效或待验证禁用严禁在原账号原地重试
+        if forbid_in_place and (
             failed_account_id == current_id or next_account.id == failed_account_id
         ):
-            logger.error("账号 %s 登录态已失效，跳过原地重试", failed_account_id)
+            logger.error(
+                "账号 %s %s，跳过原地重试",
+                failed_account_id,
+                "需要验证已禁用" if is_verification_required else "登录态已失效",
+            )
             return False
 
         # 单账号模式或所有其他账号均不可用时（非登录态失效，如偶发 403 鉴权波动），如果指定了 failed_account_id，强制刷新当前会话

@@ -285,6 +285,14 @@ class AccountService:
         """切换账号的启用/禁用状态。"""
         return self._store.toggle_account_enabled(account_id, enabled)
 
+    def mark_account_verification_required(
+        self, account_id: str, required: bool = True, *, disable: bool = True
+    ) -> AccountMeta | None:
+        """Mark an account as requiring verification and disable it."""
+        return self._store.mark_account_verification_required(
+            account_id, required=required, disable=disable
+        )
+
     def update_account_group(self, account_id: str, group: str) -> AccountMeta | None:
         """更新账号所属分组。"""
         return self._store.update_account_group(account_id, group)

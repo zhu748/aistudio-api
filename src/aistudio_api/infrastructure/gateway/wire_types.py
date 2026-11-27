@@ -24,7 +24,7 @@ def _normalize_standard_base64(value: str, *, pad_standard: bool = False) -> str
     校验，非法值原样返回交由后续层拒绝。
     """
     cleaned = "".join(value.split())
-    if len(cleaned) < 16:
+    if not cleaned or (not pad_standard and len(cleaned) < 16):
         return value
     has_urlsafe = "-" in cleaned or "_" in cleaned
     if not has_urlsafe and (not pad_standard or len(cleaned) % 4 == 0):

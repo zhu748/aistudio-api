@@ -30,6 +30,7 @@ from aistudio_api.infrastructure.gateway.wire_spec import (
     WIRE_FINISH_REASON_CONTINUING,
     WIRE_FINISH_REASON_STOP,
 )
+from aistudio_api.infrastructure.signature_trace import get_signature_trace
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("streaming")
@@ -70,6 +71,9 @@ class StreamingGateway:
         capture = (
             request.model_turn.capture() if request.model_turn is not None else None
         )
+        trace = get_signature_trace()
+        if trace is not None:
+            trace.reset_upstream_in()
         # 真实页面行为：GenerateContent 发出约 2.2s 后补一次 CountTokens
         # （当前用户轮次；Go 签名器 SendProtected 同源行为）。page_prompt
         # 在 prepare_request 已从 typed contents 提取，无需重新解析 body。
@@ -123,6 +127,8 @@ class StreamingGateway:
             candidate = parse_response_chunk(parsed_chunk)
             if capture is not None:
                 capture.add(candidate.raw_parts, latest_response_id)
+            if trace is not None and candidate.ordered_parts:
+                trace.record_upstream_in_parts(candidate.ordered_parts)
             finish = candidate.finish_reason if trusted_terminal else None
             if finish not in (
                 None,
@@ -288,6 +294,13 @@ class StreamingGateway:
             )
         if capture is not None and not tool_interrupted:
             capture.finish(latest_finish_reason)
+        elif trace is not None:
+            trace.record_cache_store(
+                cached_warm=False,
+                cached_cold=False,
+                status="skipped",
+                note="tool_interrupted" if tool_interrupted else "scope_incompatible",
+            )
         if latest_finish_reason is not None:
             yield ("finish_reason", latest_finish_reason)
         elif emitted_any_chunk:

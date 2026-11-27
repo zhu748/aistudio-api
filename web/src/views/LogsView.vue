@@ -2,6 +2,7 @@
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { RefreshCw, Trash2, Search, ArrowDownToLine, Radio, Pause } from 'lucide-vue-next'
 import HistoricalLogsPanel from '@/components/HistoricalLogsPanel.vue'
+import ThoughtSignatureBadges from '@/components/ThoughtSignatureBadges.vue'
 import { systemApi } from '@/api/system.ts'
 import { useAuthStore } from '@/stores/auth.ts'
 import { useToastStore } from '@/stores/toast.ts'
@@ -21,8 +22,8 @@ const total = ref(0)
 const capacity = ref(0)
 const loadError = ref('')
 const level = ref<string>('INFO')
-const searchInput = ref('')
-const search = ref('')
+const searchInput = ref(String(route.query.search || ''))
+const search = ref(String(route.query.search || ''))
 const order = ref<'desc' | 'asc'>('desc')
 const live = ref(true)
 const autoScroll = ref(false)
@@ -80,13 +81,26 @@ const visibleLogs = computed(() => {
   let list = entries.value
   if (needle) {
     list = list.filter((e) =>
-      `${e.message} ${e.name} ${e.level} ${e.request_id || ''} ${e.model || ''} ${e.account_id || ''}`
+      `${e.message} ${e.name} ${e.level} ${e.request_id || ''} ${e.model || ''} ${e.account_id || ''} ${e.sig_meta ? JSON.stringify(e.sig_meta) : ''}`
         .toLowerCase()
         .includes(needle),
     )
   }
   return order.value === 'desc' ? [...list].reverse() : list
 })
+
+function applyFingerprintFilter(fp: string) {
+  searchInput.value = fp
+  search.value = fp
+  if (category.value !== 'thought_signature') category.value = 'thought_signature'
+}
+
+const categoryDescriptions: Record<string, string> = {
+  model: '仅展示模型调用及其签名、切号和网络异常',
+  thought_signature: '专项追踪 thoughtSignature 客户端回传、温/冷缓存恢复、SKIP 兜底与上游收发指纹',
+  system: '系统操作、后台任务与服务诊断',
+  all: '模型请求、思维签名与系统诊断全量日志',
+}
 
 const keyMap = new WeakMap<LogEntry, number>()
 let seqCounter = 0
@@ -353,9 +367,15 @@ watch([category, requestFilter, modelFilter, accountFilter], () => {
   filterTimer = setTimeout(() => void connectStream(), 300)
 })
 watch(
-  () => route.query.request_id,
-  (value) => {
-    requestFilter.value = String(value || '')
+  () => [route.query.request_id, route.query.category, route.query.search],
+  ([reqId, cat, qSearch]) => {
+    if (reqId !== undefined) requestFilter.value = String(reqId || '')
+    if (typeof cat === 'string' && cat) category.value = cat
+    if (qSearch !== undefined) {
+      const val = String(qSearch || '')
+      searchInput.value = val
+      search.value = val
+    }
   },
 )
 watch(live, (enabled) => {
@@ -397,10 +417,11 @@ onUnmounted(() => {
   <div class="flex flex-col gap-3.5">
     <div class="surface-card rounded-xl p-4 space-y-3">
       <div class="flex flex-wrap items-center justify-between gap-3">
-        <div class="flex gap-1 rounded-lg bg-slate-100 p-1">
+        <div class="flex flex-wrap gap-1 rounded-lg bg-slate-100 p-1">
           <button
             v-for="item in [
               { id: 'model', label: '模型请求' },
+              { id: 'thought_signature', label: 'ThoughtSignature' },
               { id: 'system', label: '系统日志' },
               { id: 'all', label: '全部日志' },
             ]"
@@ -415,9 +436,7 @@ onUnmounted(() => {
           </button>
         </div>
         <p class="text-xs text-slate-500">
-          {{
-            category === 'model' ? '仅展示模型调用及其签名、切号和网络异常' : '系统操作、后台任务与服务诊断'
-          }}
+          {{ categoryDescriptions[category] || categoryDescriptions.all }}
         </p>
       </div>
       <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -459,6 +478,7 @@ onUnmounted(() => {
       :request-id="requestFilter"
       :model="modelFilter"
       :account-id="accountFilter"
+      :initial-search="search"
     />
     <template v-else>
       <!-- Consolidated Log Control Bar -->
@@ -562,7 +582,11 @@ onUnmounted(() => {
             <input
               v-model="searchInput"
               type="text"
-              placeholder="过滤内容、模型、账号、Request ID…"
+              :placeholder="
+                category === 'thought_signature'
+                  ? '过滤 8 位签名指纹 (fp)、载体、协议、模型、Request ID…'
+                  : '过滤内容、模型、账号、Request ID…'
+              "
               class="w-full bg-slate-50 border border-slate-200 rounded-lg pl-8 pr-3 py-1.5 text-xs font-mono text-slate-700 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all"
             >
           </div>
@@ -671,13 +695,28 @@ onUnmounted(() => {
             >{{ stageLabels[entry.stage] || entry.stage }}</span>
             <router-link
               v-if="entry.request_id && entry.category === 'model'"
-              :to="{ path: '/requests', query: { request_id: entry.request_id } }"
+              :to="{
+                path: '/requests',
+                query: {
+                  request_id: entry.request_id,
+                  ...(entry.name === 'aistudio.thought_signature' ? { tab: 'signature' } : {}),
+                },
+              }"
               class="text-sky-400 hover:underline text-xs font-mono"
               :title="entry.request_id"
             >
               {{ entry.request_id.slice(0, 16) }}… ↗
             </router-link>
-            <span class="text-slate-200 whitespace-pre-wrap break-words [overflow-wrap:anywhere] w-full leading-6 text-[13px]">
+            <div
+              v-if="entry.sig_meta"
+              class="w-full"
+            >
+              <ThoughtSignatureBadges
+                :meta="entry.sig_meta"
+                @filter-fp="applyFingerprintFilter"
+              />
+            </div>
+            <span class="text-slate-200 whitespace-pre-wrap break-words w-full leading-6 text-[13px]">
               {{ entry.message }}
             </span>
           </div>

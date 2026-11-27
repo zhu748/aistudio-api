@@ -35,6 +35,7 @@ from aistudio_api.infrastructure.gateway.wire_codec import (
 from aistudio_api.infrastructure.gateway.wire_parser import parse_text_output
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 from aistudio_api.infrastructure.request_context import current_request
+from aistudio_api.infrastructure.signature_trace import get_signature_trace
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("client")
@@ -170,9 +171,17 @@ class AIStudioClient:
                 ensure_ascii=False,
             ).encode()
         ).hexdigest()
+        trace = get_signature_trace(create=True)
+        if trace is not None:
+            trace.reset_attempt()
         effective_contents, turn_token, model_turn = self._model_turns.prepare(
             scope, effective_contents
         )
+        if trace is not None:
+            trace.record_upstream_out(
+                effective_contents, continuation_sent=bool(turn_token)
+            )
+            trace.emit_outbound_log()
         snapshot = await self._session.generate_snapshot(
             effective_contents, ctx=ctx, model=model
         )
@@ -420,6 +429,11 @@ class AIStudioClient:
                 _apply_function_name_restore(
                     candidate.function_calls, function_name_restore
                 )
+        trace = get_signature_trace()
+        if trace is not None and output.candidates:
+            trace.reset_upstream_in()
+            if ordered := output.candidates[0].ordered_parts:
+                trace.record_upstream_in_parts(ordered)
         if (
             effective_prep.model_turn is not None
             and output.candidates
@@ -428,6 +442,18 @@ class AIStudioClient:
             capture = effective_prep.model_turn.capture()
             capture.add(output.candidates[0].raw_parts, output.response_id)
             capture.finish(output.candidates[0].finish_reason)
+        elif trace is not None and output.candidates:
+            note = (
+                "tool_interrupted"
+                if output.candidates[0].tool_interrupted
+                else "scope_incompatible"
+            )
+            trace.record_cache_store(
+                cached_warm=False,
+                cached_cold=False,
+                status="skipped",
+                note=note,
+            )
         return output
 
 

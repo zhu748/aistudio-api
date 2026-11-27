@@ -27,21 +27,22 @@ class ContextFilter(logging.Filter):
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        return json.dumps(
-            {
-                "ts": self.formatTime(record, "%Y-%m-%d %H:%M:%S"),
-                "ts_ms": int(record.created * 1000),
-                "level": record.levelname,
-                "name": record.name,
-                "message": redact_text(record.getMessage())[:8192],
-                "request_id": getattr(record, "request_id", ""),
-                **{
-                    key: getattr(record, key, "system" if key == "category" else "")
-                    for key in ("category", "model", "account_id", "stage")
-                },
+        payload: dict[str, object] = {
+            "ts": self.formatTime(record, "%Y-%m-%d %H:%M:%S"),
+            "ts_ms": int(record.created * 1000),
+            "level": record.levelname,
+            "name": record.name,
+            "message": redact_text(record.getMessage())[:8192],
+            "request_id": getattr(record, "request_id", ""),
+            **{
+                key: getattr(record, key, "system" if key == "category" else "")
+                for key in ("category", "model", "account_id", "stage")
             },
-            ensure_ascii=False,
-        )
+        }
+        sig_meta = getattr(record, "sig_meta", None)
+        if isinstance(sig_meta, dict):
+            payload["sig_meta"] = sig_meta
+        return json.dumps(payload, ensure_ascii=False)
 
 
 class BoundedQueueHandler(logging.handlers.QueueHandler):

@@ -135,6 +135,7 @@ class AccountMeta:
     group: str = "default"
     notes: str = ""
     proxy_url: str | None = None
+    verification_required: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -169,6 +170,7 @@ class AccountMeta:
             proxy_url=str(data["proxy_url"])
             if data.get("proxy_url") is not None
             else None,
+            verification_required=bool(data.get("verification_required", False)),
         )
 
 
@@ -645,6 +647,11 @@ class AccountStore:
             group=resolved_group,
             notes=resolved_notes,
             proxy_url=resolved_proxy,
+            verification_required=(
+                existing_meta.verification_required
+                if existing_meta is not None and not resolved_enabled
+                else False
+            ),
         )
         account_dir.mkdir(parents=True, exist_ok=True)
         _atomic_write_json(account_dir / "auth.json", storage_state)
@@ -1020,6 +1027,29 @@ class AccountStore:
             if acc is None:
                 return None
             acc.enabled = not acc.enabled if enabled is None else bool(enabled)
+            if acc.enabled:
+                acc.verification_required = False
+            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+            meta_path = account_dir / "meta.json"
+            if meta_path.exists():
+                _atomic_write_json(meta_path, acc.to_dict())
+            self._save_registry(registry)
+            return acc
+
+    def mark_account_verification_required(
+        self, account_id: str, required: bool = True, *, disable: bool = True
+    ) -> AccountMeta | None:
+        """Mark an account as requiring Google verification and optionally disable it."""
+        with self._lock:
+            registry = self._load_registry()
+            acc = self._find_registered_account(registry, account_id)
+            if acc is None:
+                return None
+            acc.verification_required = bool(required)
+            if required and disable:
+                acc.enabled = False
+                if registry.active_account_id == acc.id:
+                    registry.active_account_id = None
             account_dir = _safe_account_dir(self._accounts_dir, acc.id)
             meta_path = account_dir / "meta.json"
             if meta_path.exists():
@@ -1077,6 +1107,8 @@ class AccountStore:
             for acc in registry.accounts.values():
                 if acc.group == group:
                     acc.enabled = enabled
+                    if enabled:
+                        acc.verification_required = False
                     account_dir = _safe_account_dir(self._accounts_dir, acc.id)
                     meta_path = account_dir / "meta.json"
                     if meta_path.exists():
@@ -1289,6 +1321,8 @@ class AccountStore:
                     should_enable = acc.id in preset.account_ids
 
                 acc.enabled = should_enable
+                if should_enable:
+                    acc.verification_required = False
                 account_dir = _safe_account_dir(self._accounts_dir, acc.id)
                 meta_path = account_dir / "meta.json"
                 if meta_path.exists():

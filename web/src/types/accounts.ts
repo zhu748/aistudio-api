@@ -10,6 +10,7 @@ export interface Account {
   cookie_id?: string | null
   tier?: string
   enabled: boolean
+  verification_required?: boolean
   group: string
   notes?: string
   proxy_url?: string | null

@@ -17,6 +17,8 @@ import {
   Tag,
   Check,
   Globe,
+  ShieldAlert,
+  ExternalLink,
 } from 'lucide-vue-next'
 import { useAccountsStore } from '@/stores/accounts.ts'
 
@@ -132,13 +134,15 @@ async function handleDetectTier() {
   <div
     class="relative bg-white border rounded-xl px-3.5 py-2.5 transition-all"
     :class="[
-      !isEnabled
-        ? 'border-slate-200/80 bg-slate-50/70 opacity-65'
-        : account.session_expired
-          ? 'border-rose-300 bg-rose-50/20'
-          : active
-            ? 'border-brand-400 bg-white ring-1 ring-brand-500/15 shadow-2xs'
-            : 'border-slate-200/90 hover:border-slate-300',
+      account.verification_required
+        ? 'border-orange-300 bg-orange-50/35'
+        : !isEnabled
+          ? 'border-slate-200/80 bg-slate-50/70 opacity-65'
+          : account.session_expired
+            ? 'border-rose-300 bg-rose-50/20'
+            : active
+              ? 'border-brand-400 bg-white ring-1 ring-brand-500/15 shadow-2xs'
+              : 'border-slate-200/90 hover:border-slate-300',
     ]"
   >
     <!-- Sub-Account Blade Row -->
@@ -177,13 +181,15 @@ async function handleDetectTier() {
         <span
           class="px-2 py-0.5 rounded-md text-[11px] font-mono font-bold shrink-0 tabular-nums"
           :class="[
-            !isEnabled
-              ? 'bg-slate-200 text-slate-500'
-              : account.session_expired
-                ? 'bg-rose-100 text-rose-800 border border-rose-200'
-                : active
-                  ? 'bg-slate-900 text-brand-400'
-                  : 'bg-slate-100 text-slate-700 border border-slate-200/80',
+            account.verification_required
+              ? 'bg-orange-100 text-orange-800 border border-orange-200'
+              : !isEnabled
+                ? 'bg-slate-200 text-slate-500'
+                : account.session_expired
+                  ? 'bg-rose-100 text-rose-800 border border-rose-200'
+                  : active
+                    ? 'bg-slate-900 text-brand-400'
+                    : 'bg-slate-100 text-slate-700 border border-slate-200/80',
           ]"
         >
           u/{{ account.auth_user }}
@@ -318,7 +324,15 @@ async function handleDetectTier() {
 
         <!-- Status Pill -->
         <div
-          v-if="!isEnabled"
+          v-if="account.verification_required"
+          class="inline-flex items-center gap-1 text-[11px] font-semibold text-orange-700 bg-orange-50 px-2 py-0.5 rounded-md border border-orange-200 whitespace-nowrap"
+          title="Google 要求先完成账号验证，已自动停用；前往 aistudio.google.com/verify-account 验证后重新启用即可恢复调度"
+        >
+          <ShieldAlert class="w-3 h-3 text-orange-600" />
+          <span>待验证</span>
+        </div>
+        <div
+          v-else-if="!isEnabled"
           class="inline-flex items-center gap-1 text-[11px] font-medium text-slate-500 bg-slate-100 px-2 py-0.5 rounded-md border border-slate-200"
         >
           <span>已停用</span>
@@ -354,8 +368,20 @@ async function handleDetectTier() {
 
         <!-- Compact Action Cluster -->
         <div class="flex items-center gap-1 lg:border-l lg:border-slate-100 lg:pl-2">
+          <a
+            v-if="account.verification_required"
+            href="https://aistudio.google.com/verify-account"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="px-2 py-1 text-[11px] font-medium text-orange-700 bg-orange-50 hover:bg-orange-100 border border-orange-200 rounded-md transition-colors inline-flex items-center gap-1 whitespace-nowrap"
+            title="打开 Google AI Studio 账号验证页面，验证后重新开启左侧开关即可恢复"
+          >
+            <ExternalLink class="w-3 h-3" />
+            <span>去验证</span>
+          </a>
+
           <button
-            v-if="account.session_expired"
+            v-if="account.session_expired && !account.verification_required"
             type="button"
             class="px-2 py-1 text-[11px] font-medium text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-md transition-colors cursor-pointer flex items-center gap-1"
             title="解除失效状态并重新探测激活"

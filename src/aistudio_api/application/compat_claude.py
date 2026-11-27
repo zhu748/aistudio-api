@@ -40,6 +40,7 @@ from aistudio_api.application.compat_shared import (
     _assert_media_size,
     _code_text,
     _convert_items_concurrently,
+    _dropped_part_reason,
     _frame_candidate,
     _frame_parts,
     _is_signed_empty_thought,
@@ -47,6 +48,7 @@ from aistudio_api.application.compat_shared import (
     _iter_response_parts,
     _media_part_from_url,
     _read_signature,
+    _read_signature_with_source,
     _signature_extra,
     _stream_adapter_lifecycle,
     _usage_from_gemini,
@@ -61,6 +63,10 @@ from aistudio_api.domain.tool_signatures import (
     remember_function_signature as _remember_function_signature,
 )
 from aistudio_api.infrastructure.request_context import record_result
+from aistudio_api.infrastructure.signature_trace import (
+    get_signature_trace,
+    set_trace_protocol,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("compat.claude")
@@ -88,6 +94,7 @@ async def _claude_blocks_to_parts(
                 blocks, tool_name_by_id=tool_name_by_id
             ),
         )
+    trace = get_signature_trace()
     parts: list[GeminiPart] = []
     for block in content:
         if not isinstance(block, dict):
@@ -97,13 +104,29 @@ async def _claude_blocks_to_parts(
             parts.append(GeminiPart(text=_as_str(block.get("text"))))
         elif block_type == "thinking":
             thinking = block.get("thinking")
-            signature = _read_claude_signature(block.get("signature"))
+            raw_sig = block.get("signature")
+            signature = _read_claude_signature(raw_sig)
+            if (
+                isinstance(raw_sig, str)
+                and raw_sig
+                and signature is None
+                and trace is not None
+            ):
+                trace.record_client_drop(
+                    carrier="thought",
+                    raw_signature=raw_sig,
+                    source="client_claude_envelope",
+                    note="foreign_claude_signature_ignored",
+                )
             if isinstance(thinking, str) and (
                 thinking or _is_signed_empty_thought(thinking, signature)
             ):
-                parts.append(
-                    GeminiPart(text=thinking, thought=True, thoughtSignature=signature)
+                thought_part = GeminiPart(
+                    text=thinking, thought=True, thoughtSignature=signature
                 )
+                if trace is not None and signature:
+                    trace.tag_inbound_source(thought_part, "client_claude_envelope")
+                parts.append(thought_part)
         elif block_type == "image":
             source = _as_dict(block.get("source"))
             source_type = source.get("type")
@@ -138,16 +161,18 @@ async def _claude_blocks_to_parts(
         elif block_type == "tool_use":
             name = _as_str(block.get("name")) or "unknown"
             tool_input = block.get("input")
-            parts.append(
-                GeminiPart(
-                    thoughtSignature=_read_signature(block),
-                    functionCall=GeminiFunctionCall(
-                        name=name,
-                        args=tool_input if tool_input is not None else {},
-                        id=_as_str(block.get("id")) or None,
-                    ),
-                )
+            sig, sig_source = _read_signature_with_source(block)
+            fc_part = GeminiPart(
+                thoughtSignature=sig,
+                functionCall=GeminiFunctionCall(
+                    name=name,
+                    args=tool_input if tool_input is not None else {},
+                    id=_as_str(block.get("id")) or None,
+                ),
             )
+            if trace is not None and sig_source:
+                trace.tag_inbound_source(fc_part, sig_source)
+            parts.append(fc_part)
         elif block_type == "tool_result":
             tool_use_id = _as_str(block.get("tool_use_id"))
             name = tool_name_by_id.get(tool_use_id, "unknown")
@@ -349,6 +374,7 @@ async def claude_to_gemini_request(
     req: ClaudeMessagesRequest,
 ) -> tuple[GeminiGenerateContentRequest, str]:
     """Claude Messages 请求 → (Gemini 请求, 解析后的模型名)。"""
+    set_trace_protocol("claude")
     resolved_model = resolve_compat_model(req.model, channel="claude")
     contents: list[GeminiContent] = []
     tool_name_by_id: dict[str, str] = {}
@@ -484,7 +510,10 @@ def build_claude_message(
     # Strings are gateway notices, not generated text subject to stop matching.
     blocks: list[dict[str, object] | str] = []
     has_tool_use = False
+    trace = get_signature_trace()
     for part in _iter_response_parts(response):
+        raw_sig = _as_str(getattr(part, "thoughtSignature", None))
+        emitted_sig = False
         text = getattr(part, "text", None)
         if isinstance(text, str):
             is_thought = getattr(part, "thought", None) is True
@@ -507,6 +536,7 @@ def build_claude_message(
                             "signature": _claude_signature(signature),
                         }
                     )
+                    emitted_sig = bool(signature)
             elif not is_thought and text:
                 blocks.append({"type": "text", "text": text})
         inline = getattr(part, "inlineData", None)
@@ -525,12 +555,7 @@ def build_claude_message(
             call_id = function_call.id or f"toolu_{secrets.token_hex(12)}"
             args = _coerce_tool_args(function_call.args)
             if function_call.id is None:
-                # 上游未带 call id：合成 toolu_ id 发生在 _iter_response_parts
-                # 的签名记忆化之后，缓存里没有该 id 的条目——客户端丢失
-                # extra_content 载体（Claude Code TS 侧可能剥离未知字段）时
-                # 按 id 回查必然 miss，只能退化为 SKIP 占位。补记一条，与
-                # 流式路径（coalesce 先定 id、recorder 后记忆化）对齐。
-                # remember 内部会校验签名合法性，无效签名静默跳过。
+                # Record synthesized call_id metadata for legacy lookup compatibility.
                 _remember_function_signature(
                     call_id, function_call.name, args, signature
                 )
@@ -542,6 +567,20 @@ def build_claude_message(
                     "name": function_call.name,
                     "input": args,
                 }
+            )
+            emitted_sig = bool(signature)
+        if raw_sig and not emitted_sig and trace is not None:
+            carrier, reason = _dropped_part_reason(part)
+            trace.record_client_out_drop(
+                carrier=carrier,
+                signature=raw_sig,
+                reason=reason,
+                call_id=_as_str(getattr(function_call, "id", None))
+                if function_call is not None
+                else "",
+                call_name=_as_str(getattr(function_call, "name", None))
+                if function_call is not None
+                else "",
             )
 
     stops = StopSequenceBuffer(stop_sequences)
@@ -558,7 +597,26 @@ def build_claude_message(
 
     for block in blocks:
         if stops.hit is not None:
-            break
+            if isinstance(block, dict) and trace is not None:
+                if block.get("type") == "thinking":
+                    dropped = _read_claude_signature(block.get("signature"))
+                    if dropped:
+                        trace.record_client_out_drop(
+                            carrier="thought",
+                            signature=dropped,
+                            reason="stop_truncated",
+                        )
+                elif block.get("type") == "tool_use":
+                    dropped = _read_signature(block)
+                    if dropped:
+                        trace.record_client_out_drop(
+                            carrier="function_call",
+                            signature=dropped,
+                            reason="stop_truncated",
+                            call_id=_as_str(block.get("id")),
+                            call_name=_as_str(block.get("name")),
+                        )
+            continue
         if isinstance(block, str):
             flush_pending()
             filtered.append({"type": "text", "text": block})
@@ -572,7 +630,28 @@ def build_claude_message(
             flush_pending()
             filtered.append(block)
             text_block_open = False
+            if trace is not None:
+                if block.get("type") == "thinking":
+                    emitted = _read_claude_signature(block.get("signature"))
+                    if emitted:
+                        trace.record_client_out_sig(
+                            carrier="thought",
+                            wire_field="thinking.signature",
+                            signature=emitted,
+                        )
+                elif block.get("type") == "tool_use":
+                    emitted = _read_signature(block)
+                    if emitted:
+                        trace.record_client_out_sig(
+                            carrier="function_call",
+                            wire_field="extra_content",
+                            signature=emitted,
+                            call_id=_as_str(block.get("id")),
+                            call_name=_as_str(block.get("name")),
+                        )
     flush_pending()
+    if trace is not None:
+        trace.emit_inbound_log()
     if stops.hit is not None and finish_reason_raw == "STOP":
         stop_reason, stop_seq = "stop_sequence", stops.hit
     else:
@@ -655,6 +734,12 @@ class _ClaudeStreamEmitter:
     def _close_events(self) -> list[str]:
         events: list[str] = []
         if self.open_kind == "thinking" and self.thinking_signature:
+            if (trace := get_signature_trace()) is not None:
+                trace.record_client_out_sig(
+                    carrier="thought",
+                    wire_field="thinking.signature",
+                    signature=self.thinking_signature,
+                )
             events.append(
                 self.sse(
                     "content_block_delta",
@@ -743,6 +828,14 @@ class _ClaudeStreamEmitter:
         events = self._close_events()
         self.index += 1
         self.has_tool_use = True
+        if signature and (trace := get_signature_trace()) is not None:
+            trace.record_client_out_sig(
+                carrier="function_call",
+                wire_field="extra_content",
+                signature=signature,
+                call_id=call_id,
+                call_name=name,
+            )
         events.append(
             self.sse(
                 "content_block_start",
@@ -910,7 +1003,15 @@ async def claude_stream_adapter(
                 if isinstance(usage_metadata, dict):
                     emitter.usage_frame = usage_metadata
                 for part in _frame_parts(candidate):
+                    raw_sig = _as_str(part.get("thoughtSignature"))
                     if stops.hit is not None:
+                        if raw_sig and (trace := get_signature_trace()) is not None:
+                            carrier, _ = _dropped_part_reason(part)
+                            trace.record_client_out_drop(
+                                carrier=carrier,
+                                signature=raw_sig,
+                                reason="stop_truncated",
+                            )
                         continue
                     function_call = _as_dict(part.get("functionCall"))
                     inline = _as_dict(part.get("inlineData"))
@@ -935,15 +1036,34 @@ async def claude_stream_adapter(
                             call_id = f"toolu_{secrets.token_hex(12)}"
                         name = _as_str(function_call.get("name")) or "unknown"
                         args = function_call.get("args")
+                        fc_sig = part_payload_signature(part, "functionCall")
+                        if (
+                            raw_sig
+                            and not fc_sig
+                            and (trace := get_signature_trace()) is not None
+                        ):
+                            trace.record_client_out_drop(
+                                carrier="function_call",
+                                signature=raw_sig,
+                                reason="compound_part_unrepresentable",
+                                call_id=call_id,
+                                call_name=name,
+                            )
                         for event in emitter.tool_use(
                             call_id,
                             name,
                             args,
-                            part_payload_signature(part, "functionCall"),
+                            fc_sig,
                         ):
                             yield event
                         continue
                     if has_inline_output:
+                        if raw_sig and (trace := get_signature_trace()) is not None:
+                            trace.record_client_out_drop(
+                                carrier="inline_data",
+                                signature=raw_sig,
+                                reason="inline_data_unrepresentable",
+                            )
                         mime = _as_str(inline.get("mimeType"))
                         for event in emitter.inline_output_notice(mime):
                             yield event
@@ -953,9 +1073,33 @@ async def claude_stream_adapter(
                         if part.get("thought") is True:
                             signature = part_payload_signature(part, "text")
                             if text or _is_signed_empty_thought(text, signature):
+                                if (
+                                    raw_sig
+                                    and not signature
+                                    and (trace := get_signature_trace()) is not None
+                                ):
+                                    trace.record_client_out_drop(
+                                        carrier="thought",
+                                        signature=raw_sig,
+                                        reason="compound_part_unrepresentable",
+                                    )
                                 for event in emitter.thinking_delta(text, signature):
                                     yield event
+                            elif (
+                                raw_sig and (trace := get_signature_trace()) is not None
+                            ):
+                                trace.record_client_out_drop(
+                                    carrier="thought",
+                                    signature=raw_sig,
+                                    reason="compound_part_unrepresentable",
+                                )
                         elif text:
+                            if raw_sig and (trace := get_signature_trace()) is not None:
+                                trace.record_client_out_drop(
+                                    carrier="text",
+                                    signature=raw_sig,
+                                    reason="text_part_unrepresentable",
+                                )
                             # stop sequence 命中后丢弃后续正文（Claude 语义是
                             # 文本在 stop sequence 处截断，不透传其后内容）；
                             # 命中点在本帧中间时，命中点之前的文本仍需下发
@@ -965,6 +1109,19 @@ async def claude_stream_adapter(
                                 continue
                             for event in emitter.text_delta(text):
                                 yield event
+                        elif raw_sig and (trace := get_signature_trace()) is not None:
+                            trace.record_client_out_drop(
+                                carrier="tail_empty",
+                                signature=raw_sig,
+                                reason="tail_empty_unrepresentable",
+                            )
+                    elif raw_sig and (trace := get_signature_trace()) is not None:
+                        carrier, reason = _dropped_part_reason(part)
+                        trace.record_client_out_drop(
+                            carrier=carrier,
+                            signature=raw_sig,
+                            reason=reason,
+                        )
         except Exception as exc:
             logger.warning("Claude 流式转换异常: %s", exc)
             record_result(
@@ -981,3 +1138,5 @@ async def claude_stream_adapter(
                 yield event
         for event in emitter.finish():
             yield event
+        if (trace := get_signature_trace()) is not None:
+            trace.emit_inbound_log()

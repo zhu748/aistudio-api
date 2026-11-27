@@ -18,6 +18,13 @@ class SessionExpiredError(AuthError):
     """明确被 Google 重定向至登录页（Cookie 真正失效）。"""
 
 
+class AccountVerificationRequiredError(AuthError):
+    """Google requires the account to complete verification before using Gemini API."""
+
+
+ACCOUNT_VERIFICATION_URL = "https://aistudio.google.com/verify-account"
+
+
 class UsageLimitExceeded(AistudioError):
     pass
 
@@ -110,6 +117,27 @@ def is_login_redirect_payload(text: str) -> bool:
     )
 
 
+def is_account_verification_required_message(text: str) -> bool:
+    """Detect Google's 403 account-verification gate message."""
+    if not text:
+        return False
+    lower = text.lower()
+    return (
+        "aistudio.google.com/verify-account" in lower
+        or "gemini-api/docs/verification" in lower
+        or "account must be verified" in lower
+        or ("verify your account" in lower and "gemini" in lower)
+    )
+
+
+def is_account_verification_required(exc: Exception) -> bool:
+    """Return True if an exception indicates the serving account requires verification."""
+    return isinstance(exc, AccountVerificationRequiredError) or (
+        isinstance(exc, AuthError)
+        and is_account_verification_required_message(str(exc))
+    )
+
+
 def classify_error(
     status: int, body: str, content_type: str = ""
 ) -> AistudioError | TransportError:
@@ -122,6 +150,10 @@ def classify_error(
     if grpc_code in (16, 401) or status == 401:
         return SessionExpiredError(f"认证失效 (HTTP 401): {clean_msg}")
     if grpc_code in (7, 403) or status == 403:
+        if is_account_verification_required_message(clean_msg):
+            return AccountVerificationRequiredError(
+                f"账号待验证 (HTTP 403): {clean_msg}"
+            )
         return AuthError(f"权限被拒绝 (HTTP 403): {clean_msg}")
     if is_html_payload(body, content_type):
         return TransportError(f"上游返回 HTML 错误页 (HTTP {status})")

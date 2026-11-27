@@ -50,7 +50,7 @@ function closeDetails() {
 
 // Search & status filter
 const searchKeyword = ref('')
-const statusFilter = ref<'all' | 'ready' | 'limited' | 'expired' | 'disabled'>('all')
+const statusFilter = ref<'all' | 'ready' | 'limited' | 'verification' | 'expired' | 'disabled'>('all')
 const selectedIds = ref<Set<string>>(new Set())
 const batchMode = ref(false)
 const batching = ref(false)
@@ -151,10 +151,13 @@ async function batch(action: 'enable' | 'disable' | 'probe') {
 const statusCounts = computed(() => {
   let ready = 0
   let limited = 0
+  let verification = 0
   let expired = 0
   let disabled = 0
   for (const acc of props.accounts) {
-    if (acc.enabled === false) {
+    if (acc.verification_required) {
+      verification += 1
+    } else if (acc.enabled === false) {
       disabled += 1
     } else if (acc.session_expired) {
       expired += 1
@@ -168,6 +171,7 @@ const statusCounts = computed(() => {
     all: props.accounts.length,
     ready,
     limited,
+    verification,
     expired,
     disabled,
   }
@@ -176,13 +180,16 @@ const statusCounts = computed(() => {
 const filteredAccounts = computed<AccountWithStats[]>(() => {
   const kw = searchKeyword.value.trim().toLowerCase()
   return props.accounts.filter((acc) => {
-    if (statusFilter.value === 'disabled') {
-      if (acc.enabled !== false) return false
+    if (statusFilter.value === 'verification') {
+      if (!acc.verification_required) return false
+    } else if (statusFilter.value === 'disabled') {
+      if (acc.enabled !== false || acc.verification_required) return false
     } else if (statusFilter.value === 'expired') {
-      if (acc.enabled === false || !acc.session_expired) return false
+      if (acc.enabled === false || acc.verification_required || !acc.session_expired) return false
     } else if (statusFilter.value === 'limited') {
       if (
         acc.enabled === false ||
+        acc.verification_required ||
         acc.session_expired ||
         (acc.availability !== 'partial' && acc.is_available !== false)
       )
@@ -190,6 +197,7 @@ const filteredAccounts = computed<AccountWithStats[]>(() => {
     } else if (statusFilter.value === 'ready') {
       if (
         acc.enabled === false ||
+        acc.verification_required ||
         acc.session_expired ||
         acc.availability === 'partial' ||
         acc.is_available === false
@@ -203,7 +211,8 @@ const filteredAccounts = computed<AccountWithStats[]>(() => {
     const inId = acc.id.toLowerCase().includes(kw)
     const inAuthUser = `u/${acc.auth_user}`.toLowerCase().includes(kw) || acc.auth_user === kw
     const inTier = (acc.tier || 'free').toLowerCase().includes(kw)
-    return inName || inEmail || inId || inAuthUser || inTier
+    const inVerify = Boolean(acc.verification_required && ('待验证'.includes(kw) || 'verify'.includes(kw)))
+    return inName || inEmail || inId || inAuthUser || inTier || inVerify
   })
 })
 
@@ -414,6 +423,20 @@ async function handleClearModelCooldown(accountId: string, model: string) {
             type="button"
             class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
             :class="
+              statusFilter === 'verification'
+                ? 'bg-white text-orange-700 font-semibold shadow-2xs'
+                : statusCounts.verification > 0
+                  ? 'text-orange-700 hover:text-orange-900'
+                  : 'text-slate-600 hover:text-slate-900'
+            "
+            @click="statusFilter = 'verification'"
+          >
+            待验证 ({{ statusCounts.verification }})
+          </button>
+          <button
+            type="button"
+            class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
+            :class="
               statusFilter === 'expired'
                 ? 'bg-white text-rose-700 font-semibold shadow-2xs'
                 : 'text-slate-600 hover:text-slate-900'
@@ -613,6 +636,20 @@ async function handleClearModelCooldown(accountId: string, model: string) {
             编辑资料
           </Button>
         </div>
+        <div
+          v-if="detailAccount.verification_required"
+          class="flex items-center justify-between gap-3 p-3 rounded-lg bg-orange-50 border border-orange-200 text-xs text-orange-800"
+        >
+          <span>该账号触发 Google 403 验证拦截，已自动禁用。请完成验证后重新启用该账号即可恢复调度。</span>
+          <a
+            href="https://aistudio.google.com/verify-account"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="shrink-0 px-2.5 py-1 rounded-md bg-white border border-orange-300 text-orange-700 font-medium hover:bg-orange-100 transition-colors whitespace-nowrap"
+          >
+            前往验证 ↗
+          </a>
+        </div>
         <p
           v-if="detailAccount.notes"
           class="p-3 rounded-lg bg-slate-50 text-sm text-slate-600 whitespace-pre-wrap"
@@ -624,15 +661,20 @@ async function handleClearModelCooldown(accountId: string, model: string) {
             <p class="text-xs text-slate-500">
               账号状态
             </p>
-            <p class="mt-1">
+            <p
+              class="mt-1"
+              :class="detailAccount.verification_required ? 'text-orange-700 font-semibold' : ''"
+            >
               {{
-                detailAccount.enabled === false
-                  ? '已停用'
-                  : detailAccount.session_expired
-                    ? '凭据失效'
-                    : detailAccount.availability === 'partial'
-                      ? '部分模型冷却'
-                      : '就绪'
+                detailAccount.verification_required
+                  ? '已停用 · 待验证'
+                  : detailAccount.enabled === false
+                    ? '已停用'
+                    : detailAccount.session_expired
+                      ? '凭据失效'
+                      : detailAccount.availability === 'partial'
+                        ? '部分模型冷却'
+                        : '就绪'
               }}
             </p>
           </div>

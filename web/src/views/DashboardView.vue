@@ -35,10 +35,13 @@ const poolSummary = computed(() => {
   const total = rows.length
   let ready = 0
   let limited = 0
+  let verificationRequired = 0
   let disabledOrExpired = 0
 
   for (const a of rows) {
-    if (a.enabled === false || a.session_expired) {
+    if (a.verification_required) {
+      verificationRequired += 1
+    } else if (a.enabled === false || a.session_expired) {
       disabledOrExpired += 1
     } else if (a.availability === 'partial' || a.is_available === false) {
       limited += 1
@@ -46,7 +49,7 @@ const poolSummary = computed(() => {
       ready += 1
     }
   }
-  return { total, ready, limited, disabledOrExpired }
+  return { total, ready, limited, verificationRequired, disabledOrExpired }
 })
 
 const successRateDisplay = computed(() => {
@@ -232,6 +235,17 @@ const rangeQuery = computed(() => ({
             >
               <span class="w-1.5 h-1.5 rounded-full bg-amber-500" />
               模型冷却 {{ poolSummary.limited }}
+            </span>
+            <span
+              v-if="poolSummary.verificationRequired > 0"
+              class="text-slate-300"
+            >·</span>
+            <span
+              v-if="poolSummary.verificationRequired > 0"
+              class="inline-flex items-center gap-1 text-orange-700 font-semibold whitespace-nowrap"
+            >
+              <span class="w-1.5 h-1.5 rounded-full bg-orange-500" />
+              待验证 {{ poolSummary.verificationRequired }}
             </span>
             <span class="text-slate-300">·</span>
             <span class="inline-flex items-center gap-1 text-slate-400 whitespace-nowrap">

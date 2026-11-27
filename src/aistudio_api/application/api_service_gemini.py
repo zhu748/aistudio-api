@@ -57,12 +57,14 @@ from aistudio_api.application.stream_utils import (
     part_payload_signature,
 )
 from aistudio_api.domain.errors import (
+    ACCOUNT_VERIFICATION_URL,
     AistudioError,
     AuthError,
     RequestError,
     SessionExpiredError,
     TransportError,
     UsageLimitExceeded,
+    is_account_verification_required,
     is_retryable_upstream_error,
     is_transient_rpc_error,
     parse_upstream_grpc_error,
@@ -86,6 +88,7 @@ from aistudio_api.infrastructure.request_context import (
     record_requested_parameters,
     record_result,
 )
+from aistudio_api.infrastructure.signature_trace import get_signature_trace
 from aistudio_api.infrastructure.utils.logger import get_logger
 from aistudio_api.infrastructure.waa.health import get_signer_health
 
@@ -140,6 +143,22 @@ class Auth403RetryManager:
         has_yielded_data: bool = False,
     ) -> bool:
         record_attempt_error(403, str(exc))
+        if is_account_verification_required(exc):
+            # Account-level verification gate: never blame the WAA signer or
+            # waste 403 replay/re-sign retries on the same unverified account.
+            self.current_prepared = None
+            account_svc = runtime_state.account_service
+            failed_id = self.serving_account_id
+            if not failed_id and account_svc:
+                active_acc = account_svc.get_active_account()
+                failed_id = active_acc.id if active_acc else None
+            return await _handle_account_verification_required(
+                exc,
+                failed_id=failed_id,
+                target_model=model,
+                has_yielded_data=has_yielded_data,
+            )
+
         signer_health = get_signer_health()
         if has_yielded_data:
             # 已产出数据后途断的 403：能产出即证明当次 proof 通过了
@@ -402,6 +421,62 @@ def classify_gemini_error_payload(exc: Exception) -> tuple[int, str, str]:
     return 500, "Internal server error", "INTERNAL"
 
 
+async def _handle_account_verification_required(
+    exc: Exception,
+    *,
+    failed_id: str | None,
+    target_model: str,
+    has_yielded_data: bool = False,
+    attempt: int | None = None,
+) -> bool:
+    """Disable and flag an unverified account, then switch to the next healthy account."""
+    account_svc = runtime_state.account_service
+    logger.warning(
+        "账号需要 Google 验证，自动禁用并标记待验证后切号: account=%s, model=%s, %s",
+        failed_id,
+        target_model,
+        exc,
+    )
+    if not has_yielded_data and await try_switch_account(
+        model=target_model,
+        failed_account_id=failed_id,
+        is_verification_required=True,
+    ):
+        if attempt is not None:
+            logger.info(
+                "账号 %s 已禁用并标为待验证，切换备用账号重试 (%d/%d)",
+                failed_id,
+                attempt + 1,
+                get_max_retries(),
+            )
+        else:
+            logger.info(
+                "账号 %s 已禁用并标为待验证，已切换备用账号重试: model=%s",
+                failed_id,
+                target_model,
+            )
+        return True
+
+    if failed_id and account_svc is not None:
+        if hasattr(account_svc, "mark_account_verification_required"):
+            account_svc.mark_account_verification_required(
+                failed_id, required=True, disable=True
+            )
+        elif hasattr(account_svc, "toggle_account_enabled"):
+            account_svc.toggle_account_enabled(failed_id, False)
+
+    raise HTTPException(
+        403,
+        detail={
+            "message": (
+                f"账号 {failed_id or '当前账号'} 需要完成 Google 验证且当前无可用备用账号，"
+                f"已自动禁用并标记为待验证。请前往 {ACCOUNT_VERIFICATION_URL} 完成验证后重新启用。"
+            ),
+            "type": "account_verification_required",
+        },
+    ) from exc
+
+
 async def handle_attempt_exception(
     exc: Exception,
     *,
@@ -495,6 +570,15 @@ async def handle_attempt_exception(
                 "type": "auth_error",
             },
         ) from exc
+
+    if is_account_verification_required(exc):
+        return await _handle_account_verification_required(
+            exc,
+            failed_id=failed_id,
+            target_model=target_model,
+            has_yielded_data=has_yielded_data,
+            attempt=attempt,
+        )
 
     if isinstance(exc, AuthError):
         logger.warning("账号权限被拒绝 (HTTP 403): %s", exc)
@@ -852,7 +936,11 @@ async def handle_gemini_generate_content(
             if observation and observation.account_id:
                 serving_account_id = observation.account_id
                 auth_manager.serving_account_id = serving_account_id
-            if isinstance(exc, AuthError) and not isinstance(exc, SessionExpiredError):
+            if is_account_verification_required(exc):
+                auth_manager.current_prepared = None
+            elif isinstance(exc, AuthError) and not isinstance(
+                exc, SessionExpiredError
+            ):
                 target_m = normalized.model if normalized else model_path
                 if await auth_manager.handle_403(exc, model=target_m, client=client):
                     continue
@@ -1060,6 +1148,75 @@ class _GeminiFailureFrame(dict[str, object]):
         )
 
 
+def record_native_gemini_parts(parts: Sequence[object]) -> None:
+    """Record client-emitted signatures for native Gemini responses."""
+    trace = get_signature_trace()
+    if trace is None:
+        return
+    for part in parts:
+        is_dict = isinstance(part, dict)
+        raw_sig = (
+            part.get("thoughtSignature")
+            if is_dict
+            else getattr(part, "thoughtSignature", None)
+        )
+        if not isinstance(raw_sig, str) or not raw_sig:
+            continue
+        fc = (
+            part.get("functionCall") if is_dict else getattr(part, "functionCall", None)
+        )
+        fr = (
+            part.get("functionResponse")
+            if is_dict
+            else getattr(part, "functionResponse", None)
+        )
+        inline = (
+            part.get("inlineData") if is_dict else getattr(part, "inlineData", None)
+        )
+        code = (
+            part.get("executableCode") or part.get("codeExecutionResult")
+            if is_dict
+            else getattr(part, "executableCode", None)
+            or getattr(part, "codeExecutionResult", None)
+        )
+        thought = (
+            part.get("thought") is True
+            if is_dict
+            else getattr(part, "thought", None) is True
+        )
+        text = part.get("text") if is_dict else getattr(part, "text", None)
+        carrier = (
+            "function_call"
+            if fc
+            else "function_response"
+            if fr
+            else "inline_data"
+            if inline
+            else "code"
+            if code
+            else "thought"
+            if thought
+            else "tail_empty"
+            if (text == "" or text is None)
+            else "text"
+        )
+        call_id = ""
+        call_name = ""
+        if isinstance(fc, dict):
+            call_id = str(fc.get("id") or "")
+            call_name = str(fc.get("name") or "")
+        elif fc is not None:
+            call_id = str(getattr(fc, "id", None) or "")
+            call_name = str(getattr(fc, "name", None) or "")
+        trace.record_client_out_sig(
+            carrier=carrier,
+            wire_field="thoughtSignature",
+            signature=raw_sig,
+            call_id=call_id,
+            call_name=call_name,
+        )
+
+
 class GeminiStreamResponse(HeartbeatStreamingResponse):
     """Expose structured frames to adapters; serialize only at the HTTP boundary."""
 
@@ -1071,8 +1228,27 @@ class GeminiStreamResponse(HeartbeatStreamingResponse):
         self.frames = frames
 
         async def encode() -> AsyncGenerator[str, None]:
+            saw_error = False
             try:
                 async for frame in frames:
+                    if isinstance(frame, _GeminiFailureFrame) or "error" in frame:
+                        saw_error = True
+                    else:
+                        candidates = frame.get("candidates")
+                        if isinstance(candidates, list) and candidates:
+                            first = candidates[0]
+                            content = (
+                                first.get("content")
+                                if isinstance(first, dict)
+                                else None
+                            )
+                            parts = (
+                                content.get("parts")
+                                if isinstance(content, dict)
+                                else None
+                            )
+                            if isinstance(parts, list) and parts:
+                                record_native_gemini_parts(parts)
                     if (
                         isinstance(frame, _GeminiFailureFrame)
                         and frame.native_diagnostic is not None
@@ -1081,6 +1257,8 @@ class GeminiStreamResponse(HeartbeatStreamingResponse):
                             _content_frame([{"text": frame.native_diagnostic}])
                         )
                     yield _encode_sse(frame)
+                if not saw_error and (trace := get_signature_trace()) is not None:
+                    trace.emit_inbound_log()
             finally:
                 await frames.aclose()
 
@@ -1333,7 +1511,9 @@ async def _retry_stream_attempt(
     handle_attempt_exception 的既有语义，含 HTTPException 转换）。已 yield
     过数据（has_yielded_data）后不可重试的守卫语义全部保持。
     """
-    if isinstance(exc, AuthError) and not isinstance(exc, SessionExpiredError):
+    if is_account_verification_required(exc):
+        auth_manager.current_prepared = None
+    elif isinstance(exc, AuthError) and not isinstance(exc, SessionExpiredError):
         # 403 全量经 handle_403 分流（含已产出数据的中途 403）：其
         # has_yielded_data 分支记 proof-accepted 信号并直接上抛。原先已
         # 产出后绕行 handle_attempt_exception 会对同一请求再记一次
@@ -1708,8 +1888,12 @@ async def handle_gemini_count_tokens(
         contents=effective_contents, systemInstruction=system_instruction
     )
 
-    for attempt in range(2):
+    count_attempts = max(2, get_max_retries())
+    for attempt in range(count_attempts):
         await ensure_active_account(attempt, model=clean_model)
+        _svc = runtime_state.account_service
+        _acc = _svc.get_active_account() if _svc else None
+        serving_account_id = _acc.id if _acc else None
         try:
             normalized = normalize_gemini_request(normalized_req, clean_model)
             # 系统指令计入统计：CountTokens body 无独立系统指令槽，把
@@ -1729,8 +1913,23 @@ async def handle_gemini_count_tokens(
             )
             return {"totalTokens": total}
         except AuthError as exc:
+            failed_id = _observed_serving_account(serving_account_id)
+            if is_account_verification_required(
+                exc
+            ) and await _handle_account_verification_required(
+                exc,
+                failed_id=failed_id,
+                target_model=clean_model,
+                has_yielded_data=False,
+                attempt=attempt,
+            ):
+                continue
             # 登录态/权限失败：换账号重试一次，仍失败则如实上抛。
-            if attempt == 0 and await try_switch_account(model=clean_model):
+            if attempt == 0 and await try_switch_account(
+                model=clean_model,
+                failed_account_id=failed_id,
+                is_session_expired=isinstance(exc, SessionExpiredError),
+            ):
                 logger.warning("countTokens 鉴权失败，已切换账号重试: %s", exc)
                 continue
             status_code, msg, status_str = classify_gemini_error_payload(exc)

@@ -44,6 +44,7 @@ class RequestContext:
     first_content_ms: float | None = None
     first_byte_ms: float | None = None
     status_code: int = 0
+    thought_signature: dict[str, object] | None = None
 
 
 def record_requested_parameters(parameters: dict[str, object]) -> None:

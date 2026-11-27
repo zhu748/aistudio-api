@@ -10,6 +10,7 @@
 - 客户端指定的思考强度或预算，以及实际发送的思考配置、Temperature、Top P、Top K、输出 Token 上限。
 - 首包、首次思考输出、首段回复和总耗时；输入、输出、思考、缓存和总 Token。
 - 执行时间线、逐次上游尝试及按 Request ID 关联的日志。
+- 「思维签名（thoughtSignature）」5 段全链路追踪：客户端回传载体与计数 → 网关温/冷缓存命中或 SKIP 补填 → 发往上游线缆槽位 14 → 上游返回载体与缓存写入 → 协议下发与丢弃原因，并以 8 位短指纹 `fp` 贯通跨轮回传校验（不含提示词或完整原文）。
 - 按需采集的客户端原始请求、脱敏响应，以及独立详情链接和 JSON 导出。
 
 首包指首次向客户端发送响应数据；首段回复指应用首次收到正文、图片或工具调用。思考输出单独计时。非流式和缓冲流式请求需等待完整内容，不能据此推断模型内部开始生成的时刻。上游未返回的用量显示为「—」，旧请求不会补造缺失参数。
@@ -24,7 +25,7 @@
 
 ## 日志分类
 
-运行日志默认打开「模型请求」，包含调用过程及相关签名、传输、切号错误。「系统日志」包含启动、后台任务、配置和管理操作。两种分类均支持实时与历史查询，并可按模型、账号和 Request ID 筛选。
+运行日志默认打开「模型请求」，包含调用过程及相关签名、传输、切号错误。「ThoughtSignature」分类专项过滤 `aistudio.thought_signature` 思维签名收发摘要，可直接按 8 位短指纹 `fp` 检索同一签名从「入站接收」到「下轮客户端回传/缓存恢复出站」的完整闭环，并高亮未签名 FC 风险、SKIP 兜底与协议不可表达丢弃。「系统日志」包含启动、后台任务、配置和管理操作。各分类均支持实时与历史查询，并可按模型、账号和 Request ID 筛选。
 
 实时缓冲与文件归档都是有界的，早期日志可能已轮转。旧归档没有分类字段，归入系统日志，可通过「全部日志」查找。
 
@@ -47,8 +48,8 @@
 | `GET /api/requests/options` | 模型、账号、密钥标识筛选选项 |
 | `GET /api/requests/{request_id}` | 单次调用元数据 |
 | `GET /api/requests/{request_id}/payload` | 客户端原始请求 `payload.client_request`、脱敏响应与采集状态 |
-| `GET /api/logs/stream?category=model` | 模型请求实时日志 |
-| `GET /api/logs/history?category=model&request_id=...&order=asc` | 调用关联归档日志 |
+| `GET /api/logs/stream?category=model` | 模型请求实时日志（支持 `category=thought_signature` 专项流） |
+| `GET /api/logs/history?category=model&request_id=...&order=asc` | 调用关联归档日志（支持 `category=thought_signature`） |
 
 `/api/requests` 与导出接口支持 `model`、`account_id`、`key_id`、`protocol`、`result`、`since`、`until`、`search`，以及 `retried=true`、`min_elapsed_ms`；`result=failed` 查询全部未成功调用。
 

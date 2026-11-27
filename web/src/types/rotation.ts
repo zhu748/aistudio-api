@@ -22,6 +22,7 @@ export interface AccountRotationStats {
   auth_user?: string
   tier?: string
   enabled?: boolean
+  verification_required?: boolean
   group?: string
   notes?: string
   requests: number

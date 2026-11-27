@@ -191,6 +191,30 @@ async def _stream_adapter_lifecycle(
         await _close_stream_quietly(source)
 
 
+def encode_signature_envelope(signature: object) -> str:
+    """Wrap an AI Studio thoughtSignature in a self-identifying Base64 JSON envelope.
+
+    Used by Claude thinking.signature and OpenAI Responses reasoning.encrypted_content
+    so foreign provider signatures are never mistakenly forwarded to Google upstream.
+    """
+    if not isinstance(signature, str) or not signature:
+        return ""
+    return base64.b64encode(
+        json.dumps({"aistudio_thought_signature": signature}).encode()
+    ).decode("ascii")
+
+
+def decode_signature_envelope(value: object) -> str | None:
+    """Extract an AI Studio thoughtSignature from our Base64 JSON envelope, or None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        envelope = json.loads(base64.b64decode(value, validate=True))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return _as_str(_as_dict(envelope).get("aistudio_thought_signature")) or None
+
+
 def _signature_extra(signature: object) -> dict[str, object]:
     """Opaque Gemini metadata which clients can return with tool history."""
     if isinstance(signature, str) and signature:
@@ -207,15 +231,66 @@ def _is_signed_empty_thought(text: object, signature: object) -> bool:
     )
 
 
-def _read_signature(item: dict[str, object]) -> str | None:
+def _read_signature_with_source(item: dict[str, object]) -> tuple[str | None, str]:
+    """Read an echoed thought signature from supported client carrier locations."""
     google = _as_dict(_as_dict(item.get("extra_content")).get("google"))
-    return (
-        _as_str(google.get("thought_signature"))
-        or _as_str(google.get("thoughtSignature"))
-        or _as_str(item.get("thought_signature"))
-        or _as_str(item.get("thoughtSignature"))
-        or None
+    sig = _as_str(google.get("thought_signature")) or _as_str(
+        google.get("thoughtSignature")
     )
+    if sig:
+        return sig, "client_extra_content"
+    provider = _as_dict(item.get("provider_specific_fields"))
+    sig = _as_str(provider.get("thought_signature")) or _as_str(
+        provider.get("thoughtSignature")
+    )
+    if sig:
+        return sig, "client_provider_fields"
+    sig = _as_str(item.get("thought_signature")) or _as_str(
+        item.get("thoughtSignature")
+    )
+    if sig:
+        return sig, "client_top_level"
+    function = _as_dict(item.get("function"))
+    sig = _as_str(function.get("thought_signature")) or _as_str(
+        function.get("thoughtSignature")
+    )
+    if sig:
+        return sig, "client_tool_function"
+    return None, ""
+
+
+def _read_signature(item: dict[str, object]) -> str | None:
+    return _read_signature_with_source(item)[0]
+
+
+def _dropped_part_reason(part: object) -> tuple[str, str]:
+    """Classify why a compat adapter could not attach a Part's upstream signature."""
+    is_dict = isinstance(part, dict)
+    fc = part.get("functionCall") if is_dict else getattr(part, "functionCall", None)
+    inline = part.get("inlineData") if is_dict else getattr(part, "inlineData", None)
+    code = (
+        part.get("executableCode") or part.get("codeExecutionResult")
+        if is_dict
+        else getattr(part, "executableCode", None)
+        or getattr(part, "codeExecutionResult", None)
+    )
+    thought = (
+        part.get("thought") is True
+        if is_dict
+        else getattr(part, "thought", None) is True
+    )
+    text = part.get("text") if is_dict else getattr(part, "text", None)
+    if fc:
+        return "function_call", "compound_part_unrepresentable"
+    if thought:
+        return "thought", "compound_part_unrepresentable"
+    if inline:
+        return "inline_data", "inline_data_unrepresentable"
+    if code:
+        return "code", "code_part_unrepresentable"
+    if text == "" or text is None:
+        return "tail_empty", "tail_empty_unrepresentable"
+    return "text", "text_part_unrepresentable"
 
 
 def _as_int(value: object) -> int | None:

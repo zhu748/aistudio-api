@@ -49,6 +49,7 @@ const filterKeys = Object.keys(filters.value) as (keyof typeof filters.value)[]
 const page = computed(() => Math.max(1, Math.floor(Number(route.query.page) || 1)))
 const pages = computed(() => Math.max(1, Math.ceil(total.value / 50)))
 const selectedId = computed(() => (typeof route.query.request_id === 'string' ? route.query.request_id : ''))
+const selectedTab = computed(() => (typeof route.query.tab === 'string' ? route.query.tab : ''))
 let sequence = 0
 
 function localDate(timestamp: string) {
@@ -132,6 +133,7 @@ function showDetail(row: RequestRecord) {
 function closeDetail() {
   const query = { ...route.query }
   delete query.request_id
+  delete query.tab
   void router.replace({ query })
 }
 async function exportRows() {
@@ -564,6 +566,7 @@ usePageRefresh(load)
     </div>
     <RequestDetail
       :request-id="selectedId"
+      :initial-tab="selectedTab"
       :key-names="options?.key_names"
       @close="closeDetail"
     />

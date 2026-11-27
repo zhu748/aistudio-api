@@ -12,8 +12,13 @@ from aistudio_api.api.response_models import GeminiGenerateContentResponse
 from aistudio_api.application.api_service_gemini import (
     handle_gemini_count_tokens,
     handle_gemini_generate_content,
+    record_native_gemini_parts,
 )
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
+from aistudio_api.infrastructure.signature_trace import (
+    get_signature_trace,
+    set_trace_protocol,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 from .dependencies import get_client
@@ -70,6 +75,7 @@ async def generate_content(
     client: AIStudioClient = Depends(get_client),
 ):
     clean_model = _sanitize_model_path(model_path)
+    set_trace_protocol("gemini")
     logger.debug("收到 generateContent 请求: model=%s", clean_model)
 
     async def respond():
@@ -81,6 +87,10 @@ async def generate_content(
             anti_truncation=_parse_anti_truncation_header(http_request),
         )
         assert isinstance(response, GeminiGenerateContentResponse)
+        if response.candidates and response.candidates[0].content:
+            record_native_gemini_parts(response.candidates[0].content.parts)
+        if (trace := get_signature_trace()) is not None:
+            trace.emit_inbound_log()
         # An absent field and a present empty-text signature carrier are
         # different Parts. Serialize only fields belonging to that Part.
         return JSONResponse(response.model_dump(mode="json", exclude_none=True))
@@ -112,6 +122,7 @@ async def stream_generate_content(
     client: AIStudioClient = Depends(get_client),
 ):
     clean_model = _sanitize_model_path(model_path)
+    set_trace_protocol("gemini")
     logger.debug("收到 streamGenerateContent 请求: model=%s", clean_model)
     return await handle_gemini_generate_content(
         clean_model,

@@ -61,6 +61,7 @@ from aistudio_api.infrastructure.gateway.wire_types import (
     ThinkingLevel,
     wire_function_name as _wire_function_name,
 )
+from aistudio_api.infrastructure.signature_trace import get_signature_trace
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("chat")
@@ -870,9 +871,83 @@ def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioConte
             for part in content.parts
         )
 
+    trace = get_signature_trace(create=True)
+    record_client_in = trace is not None and not trace._client_in_normalized
+    if trace is not None and record_client_in:
+        trace._client_in_normalized = True
+    model_turn_index = 0
+
     nonblank = (item for item in req.contents if not is_blank_user_content(item))
     for (role, has_results), run in groupby(nonblank, key=result_run):
         incoming = [p for content in run for p in content.parts]
+        if role == "model" and trace is not None and record_client_in:
+            model_turn_index += 1
+            trace.client_model_turns += 1
+            for part in incoming:
+                stripped_note = ""
+                if (
+                    part.functionResponse is not None
+                    and part.thoughtSignature
+                    and (
+                        part.fileData
+                        or part.functionCall
+                        or part.executableCode
+                        or part.codeExecutionResult
+                    )
+                ):
+                    stripped_note = "compound_part_stripped"
+                elif (
+                    (code := part.executableCode) is not None
+                    and part.thoughtSignature
+                    and (
+                        code.id is not None
+                        or code.language.upper()
+                        not in ("PYTHON", "1", "LANGUAGE_UNSPECIFIED")
+                    )
+                ):
+                    stripped_note = "lossy_code_stripped"
+                elif (
+                    (res := part.codeExecutionResult) is not None
+                    and part.thoughtSignature
+                    and (
+                        res.id is not None
+                        or res.outcome.upper()
+                        not in (
+                            "OUTCOME_OK",
+                            "OUTCOME_FAILED",
+                            "OUTCOME_DEADLINE_EXCEEDED",
+                        )
+                    )
+                ):
+                    stripped_note = "lossy_code_result_stripped"
+                fc = part.functionCall
+                carrier = (
+                    "function_call"
+                    if fc is not None
+                    else "function_response"
+                    if part.functionResponse is not None
+                    else "inline_data"
+                    if part.inlineData is not None
+                    else "code"
+                    if (
+                        part.executableCode is not None
+                        or part.codeExecutionResult is not None
+                    )
+                    else "thought"
+                    if part.thought
+                    else "tail_empty"
+                    if (part.text == "" or part.text is None)
+                    else "text"
+                )
+                trace.record_client_part(
+                    carrier=carrier,
+                    raw_signature=part.thoughtSignature,
+                    source=trace.lookup_inbound_source(part),
+                    call_id=fc.id or "" if fc is not None else "",
+                    call_name=fc.name if fc is not None else "",
+                    turn_index=model_turn_index,
+                    stripped_note=stripped_note,
+                )
         owners = _match_pending_calls(incoming, pending) if has_results else {}
         parts = [
             p
@@ -901,6 +976,18 @@ def _normalize_system_instruction(
     """
     if req.systemInstruction is None:
         return None
+    if (trace := get_signature_trace()) is not None:
+        for part in req.systemInstruction.parts:
+            if (
+                part.thoughtSignature
+                and _valid_thought_signature_or_none(part.thoughtSignature) is None
+            ):
+                trace.record_client_drop(
+                    carrier="system",
+                    raw_signature=part.thoughtSignature,
+                    source=trace.lookup_inbound_source(part),
+                    note="invalid_base64",
+                )
     return AistudioContent(
         role=req.systemInstruction.role or "user",
         parts=[

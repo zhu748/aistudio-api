@@ -6,22 +6,22 @@ Gemini finishReason 终结语义映射，以及全局异常处理器使用的
 
 - ``_GEMINI_TO_OPENAI_FINISH`` / ``_CLAUDE_REFUSAL_FINISH``：异常终结语义
 - ``_OPENAI_ERROR_TYPE`` / ``_CLAUDE_ERROR_TYPE``：HTTP 状态 → 协议错误类型
-- ``_CLAUDE_DUMMY_SIGNATURE`` 与 ``_claude_signature`` / ``_read_claude_signature``：
-  Claude thinking 占位签名的写入/回读（与占位常量直接绑定）
+- ``_claude_signature`` / ``_read_claude_signature``：
+  Claude thinking 签名信封的写入/回读（与 Responses encrypted_content 共用信封格式）
 - ``openai_error_payload`` / ``claude_error_payload`` / ``build_compat_error_response``
   等错误格式化入口（供 app.py / request_middleware.py 按路径分流）
 """
 
 from __future__ import annotations
 
-import base64
-import json
-
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from aistudio_api.application.compat_shared import _as_dict, _as_str
+from aistudio_api.application.compat_shared import (
+    decode_signature_envelope,
+    encode_signature_envelope,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("compat.errors")
@@ -105,21 +105,11 @@ _CLAUDE_ERROR_TYPE: dict[int, str] = {
 
 
 def _claude_signature(signature: object) -> str:
-    if not isinstance(signature, str) or not signature:
-        return ""
-    return base64.b64encode(
-        json.dumps({"aistudio_thought_signature": signature}).encode()
-    ).decode("ascii")
+    return encode_signature_envelope(signature)
 
 
 def _read_claude_signature(signature: object) -> str | None:
-    if not isinstance(signature, str) or not signature:
-        return None
-    try:
-        envelope = json.loads(base64.b64decode(signature, validate=True))
-    except (ValueError, UnicodeDecodeError):
-        return None
-    return _as_str(_as_dict(envelope).get("aistudio_thought_signature")) or None
+    return decode_signature_envelope(signature)
 
 
 def openai_error_payload(status: int, message: str) -> dict[str, object]:

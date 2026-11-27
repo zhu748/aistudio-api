@@ -80,6 +80,9 @@ class RingBufferHandler(logging.Handler):
                     for key, value in log_context().items()
                 },
             }
+            sig_meta = getattr(record, "sig_meta", None)
+            if isinstance(sig_meta, dict):
+                entry["sig_meta"] = sig_meta
             with _log_ring_lock:
                 _log_ring.append(entry)
             # 同步广播给实时订阅者（面板 SSE 日志流），与环形缓冲共享同一对象。
@@ -151,7 +154,12 @@ def matches_log_entry(
 ) -> bool:
     if not passes_min_level(str(entry.get("level", "INFO")), min_level):
         return False
-    if category in ("model", "system") and entry.get("category", "system") != category:
+    if category == "thought_signature":
+        if entry.get("name") != "aistudio.thought_signature":
+            return False
+    elif (
+        category in ("model", "system") and entry.get("category", "system") != category
+    ):
         return False
     if request_id and entry.get("request_id") != request_id:
         return False

@@ -5,6 +5,7 @@ import { operationsApi, type RequestRecord } from '@/api/operations.ts'
 import type { LogEntry } from '@/types'
 import Modal from '@/components/ui/Modal.vue'
 import Button from '@/components/ui/Button.vue'
+import ThoughtSignaturePanel from '@/components/ThoughtSignaturePanel.vue'
 import { useClipboard } from '@/composables/useClipboard.ts'
 import { usePolling } from '@/composables/usePolling.ts'
 import {
@@ -16,7 +17,7 @@ import {
   downloadJson,
 } from '@/utils/requests.ts'
 
-const props = defineProps<{ requestId: string; keyNames?: Record<string, string> }>()
+const props = defineProps<{ requestId: string; initialTab?: string; keyNames?: Record<string, string> }>()
 const emit = defineEmits<{ close: [] }>()
 const { copy } = useClipboard()
 const record = ref<RequestRecord | null>(null)
@@ -59,10 +60,18 @@ const effectiveThinking = computed(() => {
 })
 const tabs = [
   { id: 'overview', label: '调用概览' },
+  { id: 'signature', label: '思维签名' },
   { id: 'timeline', label: '执行过程' },
   { id: 'payload', label: '请求与响应' },
   { id: 'logs', label: '关联日志' },
 ]
+const validTabIds = new Set(tabs.map((item) => item.id))
+const sigTrace = computed(() => record.value?.thought_signature ?? null)
+const signatureHasRisk = computed(() => {
+  const t = sigTrace.value
+  if (!t) return false
+  return t.upstream_out.fc_unsigned > 0 || t.replay.conflicts > 0 || t.client_in.dropped > 0
+})
 let sequence = 0
 
 async function loadLogs() {
@@ -136,20 +145,25 @@ async function load() {
 }
 
 watch(
-  () => props.requestId,
-  () => {
-    sequence++
-    record.value = null
-    payload.value = null
-    upstream.value = null
-    logs.value = []
-    error.value = ''
-    logsError.value = ''
-    payloadError.value = ''
-    upstreamError.value = ''
-    logsPage.value = 1
-    tab.value = 'overview'
-    if (props.requestId) void load()
+  () => [props.requestId, props.initialTab] as const,
+  ([reqId, initTab], prev) => {
+    const prevId = prev?.[0]
+    if (reqId !== prevId) {
+      sequence++
+      record.value = null
+      payload.value = null
+      upstream.value = null
+      logs.value = []
+      error.value = ''
+      logsError.value = ''
+      payloadError.value = ''
+      upstreamError.value = ''
+      logsPage.value = 1
+      tab.value = initTab && validTabIds.has(initTab) ? initTab : 'overview'
+      if (reqId) void load()
+    } else if (initTab && validTabIds.has(initTab)) {
+      tab.value = initTab
+    }
   },
   { immediate: true },
 )
@@ -273,7 +287,11 @@ async function downloadUpstream() {
           "
           @click="tab = item.id"
         >
-          {{ item.label }}
+          <span>{{ item.label }}</span>
+          <span
+            v-if="item.id === 'signature' && signatureHasRisk"
+            class="inline-block w-1.5 h-1.5 rounded-full bg-rose-500 ml-1 align-middle"
+          />
         </button>
       </div>
       <div
@@ -310,6 +328,45 @@ async function downloadUpstream() {
               :key="key"
             >{{ label }}：{{ record.effective_parameters?.[key] ?? '上游默认 / 未记录' }}</span>
           </div>
+        </div>
+        <!-- Compact ThoughtSignature Summary Strip -->
+        <div
+          v-if="sigTrace"
+          class="rounded-xl border p-3.5 flex flex-wrap items-center justify-between gap-3 text-xs"
+          :class="
+            signatureHasRisk
+              ? 'border-rose-200 bg-rose-50/60 text-rose-900'
+              : sigTrace.replay.skip_fills > 0 || sigTrace.client_out.dropped > 0
+                ? 'border-amber-200 bg-amber-50/60 text-amber-900'
+                : 'border-slate-200 bg-slate-50/70 text-slate-700'
+          "
+        >
+          <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
+            <span class="font-semibold">思维签名</span>
+            <span class="font-mono">
+              回传 FC {{ sigTrace.client_in.fc_signed }}/{{ sigTrace.client_in.fc_total }}
+              · 思考 {{ sigTrace.client_in.thought_signed }}/{{ sigTrace.client_in.thought_total }}
+            </span>
+            <span class="font-mono">
+              恢复 温{{ sigTrace.replay.warm_hits }}/冷{{ sigTrace.replay.cold_hits }}/SKIP{{ sigTrace.replay.skip_fills }}
+            </span>
+            <span class="font-mono">
+              收发 上行{{ sigTrace.upstream_out.real_sigs }} → 返回{{ sigTrace.upstream_in.total_sigs }} → 下发{{ sigTrace.client_out.total_sigs }}
+            </span>
+            <span
+              v-if="sigTrace.upstream_out.fc_unsigned > 0"
+              class="font-semibold text-rose-700"
+            >
+              未签FC ×{{ sigTrace.upstream_out.fc_unsigned }}
+            </span>
+          </div>
+          <button
+            type="button"
+            class="text-brand-700 hover:underline font-medium cursor-pointer shrink-0"
+            @click="tab = 'signature'"
+          >
+            查看签名详情 →
+          </button>
         </div>
         <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
           <div
@@ -399,6 +456,11 @@ async function downloadUpstream() {
           Token 显示为「—」。
         </p>
       </div>
+      <ThoughtSignaturePanel
+        v-else-if="tab === 'signature'"
+        :trace="sigTrace"
+        :request-id="requestId"
+      />
       <div
         v-else-if="tab === 'timeline'"
         class="space-y-5"

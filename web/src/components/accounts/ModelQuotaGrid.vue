@@ -49,9 +49,10 @@ function getModelDetail(modelKey: string): ModelDailyDetail | null {
             </span>
             <div class="shrink-0 flex items-center gap-1">
               <span
-                v-if="account.enabled === false || account.session_expired"
-                class="text-xs text-slate-500"
-              >{{ account.enabled === false ? '已停用' : '凭据失效' }}</span>
+                v-if="account.verification_required || account.enabled === false || account.session_expired"
+                class="text-xs"
+                :class="account.verification_required ? 'text-orange-700 font-medium' : 'text-slate-500'"
+              >{{ account.verification_required ? '待验证' : account.enabled === false ? '已停用' : '凭据失效' }}</span>
               <button
                 v-else-if="account.model_cooldowns && account.model_cooldowns[String(modelKey)]"
                 type="button"

@@ -33,6 +33,7 @@ from aistudio_api.domain.tool_signatures import (
     get_signature_cache,
     valid_thought_signature_or_none,
 )
+from aistudio_api.infrastructure.signature_trace import get_signature_trace
 
 from .wire_codec import AistudioWireCodec
 from .wire_parser import parse_response_part, wire_size_estimate
@@ -442,6 +443,7 @@ class ModelTurnCapture:
     token: str | None = None
     _size: int = 0
     _disabled: bool = False
+    _disable_reason: str = ""
     # 进程启动时解析一次的档位上限（流式每 chunk 走 add，避免热路径重复
     # 读环境变量/env 解析；env 不会在运行中变更语义）。
     _max_turn_bytes: int = field(
@@ -463,18 +465,21 @@ class ModelTurnCapture:
             # client-replayable function results. Do not restore such turns.
             if parsed.inline_data is not None or parsed.function_response is not None:
                 self._disabled = True
+                self._disable_reason = "media_or_server_tool"
                 self.parts.clear()
                 return
             if parsed.function_call is not None and not isinstance(
                 parsed.function_call.get("args"), dict
             ):
                 self._disabled = True
+                self._disable_reason = "malformed_call"
                 self.parts.clear()
                 return
             if parsed.function_call is not None and not isinstance(
                 parsed.function_call.get("raw"), list
             ):
                 self._disabled = True
+                self._disable_reason = "malformed_call"
                 self.parts.clear()
                 return
             # 尺寸用廉价估计（流式每 chunk 走此路径）：精确上限由 store()
@@ -482,6 +487,7 @@ class ModelTurnCapture:
             self._size += wire_size_estimate(wire)
             if self._size > self._max_turn_bytes or len(self.parts) >= _MAX_TURN_PARTS:
                 self._disabled = True
+                self._disable_reason = "too_large"
                 self.parts.clear()
                 return
             self.parts.append(wire)
@@ -490,6 +496,28 @@ class ModelTurnCapture:
         # A truncated, blocked, failed or cancelled response must not replace
         # a complete historical turn. Each retry gets its own capture.
         if self._disabled or reason != 1 or not self.parts:
+            if (trace := get_signature_trace()) is not None:
+                if self._disabled:
+                    trace.record_cache_store(
+                        cached_warm=False,
+                        cached_cold=False,
+                        status="disabled",
+                        note=self._disable_reason or "disabled",
+                    )
+                elif reason != 1:
+                    trace.record_cache_store(
+                        cached_warm=False,
+                        cached_cold=False,
+                        status="skipped",
+                        note=f"finish_reason_{reason}",
+                    )
+                else:
+                    trace.record_cache_store(
+                        cached_warm=False,
+                        cached_cold=False,
+                        status="skipped",
+                        note="empty_parts",
+                    )
             return
         self.context.history.store(self.context, self.parts, self.token)
 
@@ -520,6 +548,8 @@ class ModelTurnHistory:
         start = 0
         compatible = True
         owners = None
+        trace = get_signature_trace()
+        model_turn_index = 0
         cache = (
             get_signature_cache() if any(c.role == "model" for c in contents) else None
         )
@@ -528,6 +558,31 @@ class ModelTurnHistory:
         )
         while start < len(contents):
             if not compatible:
+                if trace is not None:
+                    rem_start = start
+                    while rem_start < len(contents):
+                        is_model = contents[rem_start].role == "model"
+                        rem_end = rem_start + 1
+                        while (
+                            rem_end < len(contents)
+                            and (contents[rem_end].role == "model") == is_model
+                        ):
+                            rem_end += 1
+                        if is_model:
+                            model_turn_index += 1
+                            rem_calls = sum(
+                                1
+                                for content in contents[rem_start:rem_end]
+                                for part in content.parts
+                                if part.function_call is not None
+                            )
+                            trace.record_replay_turn(
+                                turn_index=model_turn_index,
+                                action="miss",
+                                reason="chain_broken",
+                                fc_count=rem_calls,
+                            )
+                        rem_start = rem_end
                 restored.extend(contents[start:])
                 break
             model = contents[start].role == "model"
@@ -541,6 +596,7 @@ class ModelTurnHistory:
             owners = _result_owners(parts) if model else None
             entry = None
             if model:
+                model_turn_index += 1
                 with self._lock:
                     entry = self._entries.get((scope, previous))
                     if entry is not None:
@@ -549,24 +605,40 @@ class ModelTurnHistory:
             if entry is not None:
                 assert owners is not None
                 raw, saved_token, _, state = entry
+                fc_count = sum(1 for part in parts if part.function_call is not None)
                 if raw is None:
+                    if trace is not None:
+                        trace.record_replay_turn(
+                            turn_index=model_turn_index,
+                            action="conflict",
+                            reason="warm_conflict_withheld",
+                            fc_count=fc_count,
+                        )
                     restored.extend(contents[start:end])
                     compatible = False
                     start = end
                     continue
                 saved: list[list[object]] = json.loads(raw)
                 echoed_thought = [part.text or "" for part in parts if part.thought]
-                if (
-                    (
-                        echoed_thought
-                        and _hash("".join(echoed_thought))
-                        != _thought_digest(map(parse_response_part, saved))
-                    )
-                    or not _explicit_owners_match(parts, saved)
-                    or not _echoed_call_ids_match(parts, saved, owners)
+                mismatch_reason = ""
+                if echoed_thought and _hash("".join(echoed_thought)) != _thought_digest(
+                    map(parse_response_part, saved)
                 ):
+                    mismatch_reason = "thought_digest_mismatch"
+                elif not _explicit_owners_match(parts, saved):
+                    mismatch_reason = "explicit_owner_mismatch"
+                elif not _echoed_call_ids_match(parts, saved, owners):
+                    mismatch_reason = "call_id_mismatch"
+                if mismatch_reason:
                     # Echoed thoughts or an explicit signature may identify a
                     # different roll with identical visible text.
+                    if trace is not None:
+                        trace.record_replay_turn(
+                            turn_index=model_turn_index,
+                            action="conflict",
+                            reason=mismatch_reason,
+                            fc_count=fc_count,
+                        )
                     restored.extend(contents[start:end])
                     compatible = False
                     start = end
@@ -600,8 +672,23 @@ class ModelTurnHistory:
                 restored.append(AistudioContent("model", rebuilt))
                 token = saved_token
                 previous = _with_observed_turn(previous, state, owners)
+                if trace is not None:
+                    restored_sigs = sum(
+                        1
+                        for p in rebuilt
+                        if p.thought_signature
+                        and p.thought_signature != SKIP_THOUGHT_SIGNATURE
+                    )
+                    trace.record_replay_turn(
+                        turn_index=model_turn_index,
+                        action="warm_hit",
+                        fc_count=fc_count,
+                        restored_sigs=restored_sigs,
+                        token_reused=bool(saved_token),
+                    )
             elif model:
                 assert owners is not None and cache is not None
+                fc_count = sum(1 for part in parts if part.function_call is not None)
                 found, proof = cache.lookup_turn(scope, previous)
                 if found:
                     if proof is not None and _verified_cohort(parts, owners, proof):
@@ -611,9 +698,32 @@ class ModelTurnHistory:
                             )
                         )
                         previous = _with_observed_turn(previous, proof.state, owners)
+                        if trace is not None:
+                            restored_sigs = sum(
+                                1
+                                for sig in proof.signatures
+                                if sig and sig != SKIP_THOUGHT_SIGNATURE
+                            )
+                            trace.record_replay_turn(
+                                turn_index=model_turn_index,
+                                action="cold_hit",
+                                fc_count=fc_count,
+                                restored_sigs=restored_sigs,
+                            )
                     else:
                         # Unverified or conflicting history cannot unlock any
                         # later turn, even though its visible digest matches.
+                        if trace is not None:
+                            trace.record_replay_turn(
+                                turn_index=model_turn_index,
+                                action="conflict",
+                                reason=(
+                                    "cold_conflict_withheld"
+                                    if proof is None
+                                    else "cold_cohort_mismatch"
+                                ),
+                                fc_count=fc_count,
+                            )
                         restored.extend(contents[start:end])
                         compatible = False
                 else:
@@ -631,19 +741,53 @@ class ModelTurnHistory:
                         )
                         for ordinal, call in enumerate(calls)
                     )
-                    if seen_old or any(
-                        part.thought
-                        or (
-                            part.thought_signature
-                            and part.thought_signature != SKIP_THOUGHT_SIGNATURE
-                        )
+                    has_explicit_real_sig = any(
+                        part.thought_signature
+                        and part.thought_signature != SKIP_THOUGHT_SIGNATURE
                         for part in parts
-                    ):
+                    )
+                    thoughts = [part.text or "" for part in parts if part.thought]
+                    if seen_old or has_explicit_real_sig:
+                        if trace is not None:
+                            trace.record_replay_turn(
+                                turn_index=model_turn_index,
+                                action="miss",
+                                reason=(
+                                    "legacy_seen_old"
+                                    if seen_old
+                                    else "explicit_sig_unobserved"
+                                ),
+                                fc_count=len(calls),
+                            )
                         restored.extend(contents[start:end])
                         compatible = False
+                    elif thoughts:
+                        # Unobserved turn with unsigned echoed thoughts (e.g.
+                        # after an account switch or dynamic system prompt
+                        # update): never fabricate SKIP_THOUGHT_SIGNATURE onto
+                        # sibling calls, while binding the exact thought digest
+                        # into the unobserved prefix so subsequent turns on the
+                        # new scope can still be cached and replayed safely.
+                        restored.extend(contents[start:end])
+                        previous = _hash(
+                            [previous, "unobserved", calls, _hash("".join(thoughts))]
+                        )
+                        if trace is not None:
+                            trace.record_replay_turn(
+                                turn_index=model_turn_index,
+                                action="miss",
+                                reason="unobserved_thought",
+                                fc_count=len(calls),
+                            )
                     else:
                         # Preserve the existing legacy behavior only for an
                         # unidentified batch, never for a failed proof.
+                        missing_fc = sum(
+                            1
+                            for part in parts
+                            if part.function_call is not None
+                            and not part.thought_signature
+                        )
                         restored.extend(
                             _fill_missing_calls(
                                 contents[start:end], repeat(SKIP_THOUGHT_SIGNATURE)
@@ -651,6 +795,14 @@ class ModelTurnHistory:
                         )
                         if calls:
                             previous = _hash([previous, "unobserved", calls])
+                        if trace is not None:
+                            trace.record_replay_turn(
+                                turn_index=model_turn_index,
+                                action="skip_fill" if missing_fc > 0 else "miss",
+                                reason="scope_miss",
+                                fc_count=len(calls),
+                                restored_sigs=missing_fc,
+                            )
             else:
                 restored.extend(contents[start:end])
             start = end
@@ -664,11 +816,19 @@ class ModelTurnHistory:
     def store(
         self, context: ModelTurnContext, parts: list[list[object]], token: str | None
     ) -> None:
+        trace = get_signature_trace()
         parsed = [parse_response_part(wire) for wire in parts]
         if token is None and not any(
             part.function_call is not None or part.thought or part.thought_signature
             for part in parsed
         ):
+            if trace is not None:
+                trace.record_cache_store(
+                    cached_warm=False,
+                    cached_cold=False,
+                    status="skipped",
+                    note="no_signable_content",
+                )
             return
         decoded = [self._codec.decode_part(wire) for wire in parts]
         # Preserve exact response slots for hashing and subsequent replay.
@@ -679,6 +839,13 @@ class ModelTurnHistory:
         encoded = raw.encode()
         size = len(encoded)
         if size > self._max_turn_bytes:
+            if trace is not None:
+                trace.record_cache_store(
+                    cached_warm=False,
+                    cached_cold=False,
+                    status="disabled",
+                    note="too_large",
+                )
             return
         state = hashlib.sha256(encoded).hexdigest()
         del encoded
@@ -690,7 +857,8 @@ class ModelTurnHistory:
             tuple(_signed_owners(parts, parsed)),
             signatures,
         )
-        if not get_signature_cache().remember_turn(context.scope, turn, proof):
+        cold_stored = get_signature_cache().remember_turn(context.scope, turn, proof)
+        if not cold_stored:
             raw, token, size = None, None, 0
         key = (context.scope, turn)
         with self._lock:
@@ -712,6 +880,21 @@ class ModelTurnHistory:
             ):
                 _, (_, _, removed, _) = self._entries.popitem(last=False)
                 self._bytes -= removed
+        if trace is not None:
+            warm_stored = raw is not None
+            if warm_stored and cold_stored:
+                trace.record_cache_store(
+                    cached_warm=True,
+                    cached_cold=True,
+                    status="stored",
+                )
+            else:
+                trace.record_cache_store(
+                    cached_warm=warm_stored,
+                    cached_cold=cold_stored,
+                    status="conflict",
+                    note="conflict_withheld",
+                )
 
     def clear(self) -> None:
         with self._lock:

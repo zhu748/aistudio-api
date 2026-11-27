@@ -39,6 +39,7 @@ from aistudio_api.application.compat_shared import (
     _assert_media_size,
     _code_text,
     _convert_items_concurrently,
+    _dropped_part_reason,
     _file_block_to_part,
     _frame_candidate,
     _frame_parts,
@@ -46,10 +47,11 @@ from aistudio_api.application.compat_shared import (
     _iter_gemini_sse_frames,
     _iter_response_parts,
     _media_part_from_url,
-    _read_signature,
+    _read_signature_with_source,
     _signature_extra,
     _stream_adapter_lifecycle,
     _usage_from_gemini,
+    decode_signature_envelope,
     resolve_compat_model,
 )
 from aistudio_api.application.media_session import has_remote_media, media_session
@@ -59,8 +61,14 @@ from aistudio_api.application.stream_utils import (
 )
 from aistudio_api.domain.tool_signatures import (
     remember_function_signature as _remember_function_signature,
+    valid_thought_signature,
 )
 from aistudio_api.infrastructure.request_context import record_result
+from aistudio_api.infrastructure.signature_trace import (
+    ThoughtSignatureTrace,
+    get_signature_trace,
+    set_trace_protocol,
+)
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("compat.openai")
@@ -304,11 +312,81 @@ def _openai_response_format_to_config(
     return {}
 
 
+def _parse_openai_reasoning_details(
+    details: list[dict[str, object]],
+    *,
+    tool_call_ids: set[str],
+    trace: ThoughtSignatureTrace | None,
+) -> tuple[list[tuple[str, str | None, str]], dict[str, str]]:
+    """Extract Google-compatible thought parts and tool-call signatures from reasoning_details."""
+    thoughts: list[tuple[str, str | None, str]] = []
+    tool_sigs: dict[str, str] = {}
+    for entry in details:
+        if not isinstance(entry, dict):
+            continue
+        entry_type = _as_str(entry.get("type")).strip().lower()
+        fmt = _as_str(entry.get("format")).strip().lower()
+        is_google_fmt = not fmt or "google" in fmt or "gemini" in fmt
+        if entry_type in ("reasoning.text", "reasoning.summary"):
+            text = (
+                _as_str(entry.get("text"))
+                if entry_type == "reasoning.text"
+                else _as_str(entry.get("summary"))
+            )
+            raw_sig = _as_str(entry.get("signature"))
+            sig: str | None = None
+            source = ""
+            if raw_sig:
+                decoded = decode_signature_envelope(raw_sig)
+                if decoded:
+                    sig = decoded
+                    source = "client_reasoning_details"
+                elif is_google_fmt and valid_thought_signature(raw_sig):
+                    sig = raw_sig
+                    source = "client_reasoning_details"
+                elif trace is not None:
+                    trace.record_client_drop(
+                        carrier="thought",
+                        raw_signature=raw_sig,
+                        source="client_reasoning_details",
+                        note="foreign_reasoning_details_ignored",
+                    )
+            if text or _is_signed_empty_thought(text, sig):
+                thoughts.append((text, sig, source))
+        elif entry_type == "reasoning.encrypted":
+            data = _as_str(entry.get("data"))
+            if not data:
+                continue
+            decoded = decode_signature_envelope(data)
+            candidate_sig: str | None = None
+            if decoded:
+                candidate_sig = decoded
+            elif is_google_fmt and valid_thought_signature(data):
+                candidate_sig = data
+            else:
+                if trace is not None:
+                    trace.record_client_drop(
+                        carrier="thought",
+                        raw_signature=data,
+                        source="client_reasoning_details",
+                        call_id=_as_str(entry.get("id")),
+                        note="foreign_reasoning_details_ignored",
+                    )
+                continue
+            entry_id = _as_str(entry.get("id"))
+            if entry_id and entry_id in tool_call_ids:
+                tool_sigs.setdefault(entry_id, candidate_sig)
+            elif _is_signed_empty_thought("", candidate_sig):
+                thoughts.append(("", candidate_sig, "client_reasoning_details"))
+    return thoughts, tool_sigs
+
+
 @media_session()
 async def openai_to_gemini_request(
     req: OpenAIChatCompletionRequest,
 ) -> tuple[GeminiGenerateContentRequest, str]:
     """OpenAI Chat Completions 请求 → (Gemini 请求, 解析后的模型名)。"""
+    trace = set_trace_protocol("openai")
     resolved_model = resolve_compat_model(req.model, channel="openai")
     if req.n not in (None, 1):
         raise ValueError("Only n=1 is supported")
@@ -342,12 +420,30 @@ async def openai_to_gemini_request(
             continue
         if role == "assistant":
             parts: list[GeminiPart] = []
-            # 思考历史回传（DeepSeek 风格 reasoning_content / OpenRouter
-            # reasoning 字符串形态）：转为 thought part 保留思考链，签名经
-            # 消息级 extra_content 载体回读；缺失时不按思考文本猜测签名。
-            reasoning_signature = _read_signature(
-                {"extra_content": message.extra_content}
+            # Read reasoning history and echoed signatures from message-level
+            # carriers (extra_content, provider_specific_fields, top-level aliases)
+            # as well as OpenRouter/Cline reasoning_details.
+            reasoning_signature, reasoning_sig_source = _read_signature_with_source(
+                {
+                    "extra_content": message.extra_content,
+                    "provider_specific_fields": message.provider_specific_fields,
+                    "thought_signature": message.thought_signature,
+                    "thoughtSignature": message.thoughtSignature,
+                }
             )
+            msg_tool_call_ids = {
+                _as_str(tc.get("id"))
+                for tc in (message.tool_calls or [])
+                if _as_str(tc.get("id"))
+            }
+            detail_thoughts: list[tuple[str, str | None, str]] = []
+            detail_tool_sigs: dict[str, str] = {}
+            if message.reasoning_details:
+                detail_thoughts, detail_tool_sigs = _parse_openai_reasoning_details(
+                    message.reasoning_details,
+                    tool_call_ids=msg_tool_call_ids,
+                    trace=trace,
+                )
             reasoning_text = message.reasoning_content
             if not reasoning_text and not _is_signed_empty_thought(
                 reasoning_text, reasoning_signature
@@ -359,13 +455,24 @@ async def openai_to_gemini_request(
                 reasoning_text
                 or _is_signed_empty_thought(reasoning_text, reasoning_signature)
             ):
-                parts.append(
-                    GeminiPart(
-                        text=reasoning_text,
-                        thought=True,
-                        thoughtSignature=reasoning_signature,
-                    )
+                thought_part = GeminiPart(
+                    text=reasoning_text,
+                    thought=True,
+                    thoughtSignature=reasoning_signature,
                 )
+                if trace is not None and reasoning_sig_source:
+                    trace.tag_inbound_source(thought_part, reasoning_sig_source)
+                parts.append(thought_part)
+            elif detail_thoughts:
+                for dt_text, dt_sig, dt_source in detail_thoughts:
+                    thought_part = GeminiPart(
+                        text=dt_text,
+                        thought=True,
+                        thoughtSignature=dt_sig,
+                    )
+                    if trace is not None and dt_source:
+                        trace.tag_inbound_source(thought_part, dt_source)
+                    parts.append(thought_part)
             text = _openai_content_text(message.content)
             if text:
                 parts.append(GeminiPart(text=text))
@@ -389,14 +496,19 @@ async def openai_to_gemini_request(
                 name = _as_str(function.get("name")) or "unknown"
                 args = _openai_tool_arguments(function.get("arguments"))
                 call_id = _as_str(tool_call.get("id"))
-                parts.append(
-                    GeminiPart(
-                        thoughtSignature=_read_signature(tool_call),
-                        functionCall=GeminiFunctionCall(
-                            name=name, args=args, id=call_id or None
-                        ),
-                    )
+                tc_sig, tc_source = _read_signature_with_source(tool_call)
+                if not tc_sig and call_id and call_id in detail_tool_sigs:
+                    tc_sig = detail_tool_sigs[call_id]
+                    tc_source = "client_reasoning_details"
+                fc_part = GeminiPart(
+                    thoughtSignature=tc_sig,
+                    functionCall=GeminiFunctionCall(
+                        name=name, args=args, id=call_id or None
+                    ),
                 )
+                if trace is not None and tc_source:
+                    trace.tag_inbound_source(fc_part, tc_source)
+                parts.append(fc_part)
                 if call_id:
                     tool_name_by_id[call_id] = name
             contents.append(
@@ -652,7 +764,9 @@ def build_openai_completion(
     tool_calls: list[dict[str, object]] = []
     has_tool_calls = False
     reasoning_signature = ""
+    dropped_thought_sigs: list[tuple[str, str]] = []
     saw_body = False
+    trace = get_signature_trace()
     # 与 Claude 侧同源的双重防御：上游若不执行 stopSequences（或拒绝该
     # 参数），停止词及其后的全部内容不得泄漏给客户端（Agent 客户端用
     # stop 切分输出/观察边界，泄漏会打穿解析）。
@@ -664,10 +778,15 @@ def build_openai_completion(
             text_parts.append(tail)
 
     for part in _iter_response_parts(response):
+        raw_sig = _as_str(getattr(part, "thoughtSignature", None))
         if stops.hit is not None:
-            # 停止词已命中：后续正文/图片/工具调用全部丢弃（与 Claude 侧
-            # build_claude_message 同语义——客户端不应看到停止词之后的产物）。
-            break
+            if raw_sig and trace is not None:
+                carrier, _ = _dropped_part_reason(part)
+                trace.record_client_out_drop(
+                    carrier=carrier, signature=raw_sig, reason="stop_truncated"
+                )
+            continue
+        emitted_sig = False
         text = getattr(part, "text", None)
         if isinstance(text, str):
             if getattr(part, "thought", None) is True:
@@ -676,13 +795,30 @@ def build_openai_completion(
                     reasoning_parts.append(text)
                     if len(reasoning_parts) == 1 and not saw_body:
                         reasoning_signature = signature
+                        emitted_sig = bool(signature)
+                    elif raw_sig:
+                        dropped_thought_sigs.append(
+                            (
+                                raw_sig,
+                                "multi_thought_scalar_limit"
+                                if signature
+                                else "compound_part_unrepresentable",
+                            )
+                        )
+                        emitted_sig = True
             elif text:
                 saw_body = True
                 filtered = stops.feed(text)
                 if filtered:
                     text_parts.append(filtered)
                 if stops.hit is not None:
-                    break
+                    if raw_sig and trace is not None:
+                        trace.record_client_out_drop(
+                            carrier="text",
+                            signature=raw_sig,
+                            reason="text_part_unrepresentable",
+                        )
+                    continue
         inline = getattr(part, "inlineData", None)
         if inline is not None:
             saw_body = True
@@ -712,10 +848,7 @@ def build_openai_completion(
             call_id = function_call.id or f"call_{secrets.token_hex(12)}"
             args = function_call.args if function_call.args is not None else {}
             if function_call.id is None:
-                # 上游未带 call id：合成 id 晚于 _iter_response_parts 的签名
-                # 记忆化，缓存无此条目——客户端未保留 extra_content 载体时
-                # 按 id 回查必然 miss。补记一条对齐流式路径（coalesce 先定
-                # id、recorder 后记忆化）；remember 内部校验签名合法性。
+                # Record synthesized call_id metadata for legacy lookup compatibility.
                 _remember_function_signature(
                     call_id, function_call.name, args, signature
                 )
@@ -730,6 +863,29 @@ def build_openai_completion(
                     },
                 }
             )
+            if signature:
+                emitted_sig = True
+                if trace is not None:
+                    trace.record_client_out_sig(
+                        carrier="function_call",
+                        wire_field="extra_content",
+                        signature=signature,
+                        call_id=call_id,
+                        call_name=function_call.name,
+                    )
+        if raw_sig and not emitted_sig and trace is not None:
+            carrier, reason = _dropped_part_reason(part)
+            trace.record_client_out_drop(
+                carrier=carrier,
+                signature=raw_sig,
+                reason=reason,
+                call_id=_as_str(getattr(function_call, "id", None))
+                if function_call is not None
+                else "",
+                call_name=_as_str(getattr(function_call, "name", None))
+                if function_call is not None
+                else "",
+            )
     flush_pending()
     content_text = "".join(text_parts)
     message: dict[str, object] = {
@@ -739,6 +895,24 @@ def build_openai_completion(
     reasoning_text = "".join(reasoning_parts)
     if len(reasoning_parts) == 1:
         message.update(_signature_extra(reasoning_signature))
+        if reasoning_signature and trace is not None:
+            trace.record_client_out_sig(
+                carrier="thought",
+                wire_field="extra_content",
+                signature=reasoning_signature,
+            )
+    elif reasoning_signature and trace is not None:
+        trace.record_client_out_drop(
+            carrier="thought",
+            signature=reasoning_signature,
+            reason="multi_thought_scalar_limit",
+        )
+    if trace is not None:
+        for dropped_sig, reason in dropped_thought_sigs:
+            trace.record_client_out_drop(
+                carrier="thought", signature=dropped_sig, reason=reason
+            )
+        trace.emit_inbound_log()
     if reasoning_text or "extra_content" in message:
         message["reasoning_content"] = reasoning_text
     if tool_calls:
@@ -850,6 +1024,8 @@ async def openai_stream_adapter(
     reasoning_count = 0
     first_reasoning_empty = False
     saw_body = False
+    trace = get_signature_trace()
+    dropped_thought_sigs: list[tuple[str, str]] = []
 
     # 确定性关闭内层 SSE 生成器（3.6）：适配器自身异常或客户端断连时，
     # 不再依赖事件循环的异步生成器终结器延迟释放上游连接。
@@ -883,9 +1059,16 @@ async def openai_stream_adapter(
                 if isinstance(usage_metadata, dict):
                     usage_frame = usage_metadata
                 for part in _frame_parts(candidate):
+                    raw_sig = _as_str(part.get("thoughtSignature"))
                     function_call = _as_dict(part.get("functionCall"))
                     if function_call:
                         if stops.hit is not None:
+                            if raw_sig and trace is not None:
+                                trace.record_client_out_drop(
+                                    carrier="function_call",
+                                    signature=raw_sig,
+                                    reason="stop_truncated",
+                                )
                             continue
                         # 被停止词缓冲扣留的部分前缀属于此前的正文：必须先于
                         # 工具调用下发（与 Claude 侧 compat_claude 及非流式
@@ -903,16 +1086,30 @@ async def openai_stream_adapter(
                         args = function_call.get("args")
                         if args is None:
                             args = {}
+                        fc_sig = part_payload_signature(part, "functionCall")
+                        if trace is not None:
+                            if fc_sig:
+                                trace.record_client_out_sig(
+                                    carrier="function_call",
+                                    wire_field="extra_content",
+                                    signature=fc_sig,
+                                    call_id=call_id,
+                                    call_name=name,
+                                )
+                            elif raw_sig:
+                                trace.record_client_out_drop(
+                                    carrier="function_call",
+                                    signature=raw_sig,
+                                    reason="compound_part_unrepresentable",
+                                    call_id=call_id,
+                                    call_name=name,
+                                )
                         yield _sse(
                             _chunk(
                                 {
                                     "tool_calls": [
                                         {
-                                            **_signature_extra(
-                                                part_payload_signature(
-                                                    part, "functionCall"
-                                                )
-                                            ),
+                                            **_signature_extra(fc_sig),
                                             "index": tool_index,
                                             "id": call_id,
                                             "type": "function",
@@ -933,6 +1130,12 @@ async def openai_stream_adapter(
                     inline = _as_dict(part.get("inlineData"))
                     if inline:
                         saw_body = True
+                        if raw_sig and trace is not None:
+                            trace.record_client_out_drop(
+                                carrier="inline_data",
+                                signature=raw_sig,
+                                reason="inline_data_unrepresentable",
+                            )
                         if stops.hit is None:
                             # 同 functionCall 分支：先冲刷停止词缓冲中的部分
                             # 前缀，保持其在最终 content 字符串中的位置。
@@ -966,17 +1169,65 @@ async def openai_stream_adapter(
                                     first_reasoning_empty = not text
                                     if not saw_body:
                                         reasoning_signature = signature
+                                    elif raw_sig:
+                                        dropped_thought_sigs.append(
+                                            (raw_sig, "multi_thought_scalar_limit")
+                                        )
+                                    if raw_sig and not signature:
+                                        dropped_thought_sigs.append(
+                                            (raw_sig, "compound_part_unrepresentable")
+                                        )
+                                elif raw_sig:
+                                    dropped_thought_sigs.append(
+                                        (
+                                            raw_sig,
+                                            "multi_thought_scalar_limit"
+                                            if signature
+                                            else "compound_part_unrepresentable",
+                                        )
+                                    )
                                 if text:
                                     yield _sse(
                                         _chunk({"reasoning_content": text}, None)
                                     )
+                            elif raw_sig and trace is not None:
+                                trace.record_client_out_drop(
+                                    carrier="thought",
+                                    signature=raw_sig,
+                                    reason=(
+                                        "stop_truncated"
+                                        if stops.hit is not None
+                                        else "compound_part_unrepresentable"
+                                    ),
+                                )
                             continue
                         if stops.hit is not None or not text:
+                            if raw_sig and trace is not None:
+                                trace.record_client_out_drop(
+                                    carrier="tail_empty" if not text else "text",
+                                    signature=raw_sig,
+                                    reason=(
+                                        "stop_truncated"
+                                        if stops.hit is not None
+                                        else "tail_empty_unrepresentable"
+                                    ),
+                                )
                             continue
+                        if raw_sig and trace is not None:
+                            trace.record_client_out_drop(
+                                carrier="text",
+                                signature=raw_sig,
+                                reason="text_part_unrepresentable",
+                            )
                         saw_body = True
                         filtered = stops.feed(text)
                         if filtered:
                             yield _sse(_chunk({"content": filtered}, None))
+                    elif raw_sig and trace is not None:
+                        carrier, reason = _dropped_part_reason(part)
+                        trace.record_client_out_drop(
+                            carrier=carrier, signature=raw_sig, reason=reason
+                        )
         except Exception as exc:
             saw_error = True
             record_result(
@@ -1009,6 +1260,24 @@ async def openai_stream_adapter(
             final_delta.update(_signature_extra(reasoning_signature))
             if first_reasoning_empty:
                 final_delta["reasoning_content"] = ""
+            if trace is not None:
+                trace.record_client_out_sig(
+                    carrier="thought",
+                    wire_field="extra_content",
+                    signature=reasoning_signature,
+                )
+        elif reasoning_signature and trace is not None:
+            trace.record_client_out_drop(
+                carrier="thought",
+                signature=reasoning_signature,
+                reason="multi_thought_scalar_limit",
+            )
+        if trace is not None:
+            for dropped_sig, reason in dropped_thought_sigs:
+                trace.record_client_out_drop(
+                    carrier="thought", signature=dropped_sig, reason=reason
+                )
+            trace.emit_inbound_log()
         final_chunk = _chunk(final_delta, finish_reason)
         # OpenAI 语义：仅 include_usage=True 时发送 usage（且以 choices 为空的
         # 独立尾块形式）。False 时任何 chunk 都不得携带 usage 字段，否则 SDK

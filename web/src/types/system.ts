@@ -51,12 +51,49 @@ export interface AvailableModelItem {
   displayName: string
 }
 
+export interface ThoughtSignatureLogMeta {
+  direction: 'outbound' | 'inbound'
+  protocol: string
+  status: 'ok' | 'fallback' | 'warn' | 'partial' | 'dropped'
+  attempt?: number
+  // Outbound fields
+  client_model_turns?: number
+  client_fc_total?: number
+  client_fc_signed?: number
+  client_fc_missing?: number
+  client_thought_signed?: number
+  client_tail_signed?: number
+  client_dropped?: number
+  client_sources?: string[]
+  warm_hits?: number
+  cold_hits?: number
+  skip_fills?: number
+  conflicts?: number
+  misses?: number
+  continuation_reused?: boolean
+  upstream_real?: number
+  upstream_skip?: number
+  upstream_fc_unsigned?: number
+  // Inbound fields
+  upstream_total?: number
+  by_carrier?: Record<string, number>
+  cached_warm?: boolean
+  cached_cold?: boolean
+  cache_status?: string
+  cache_note?: string
+  client_total?: number
+  client_carriers?: string[]
+  drop_reasons?: string[]
+  fingerprints?: string[]
+}
+
 export interface LogEntry {
   category?: 'model' | 'system'
   model?: string
   account_id?: string
   stage?: string
   request_id?: string
+  sig_meta?: ThoughtSignatureLogMeta
   ts: string
   ts_ms: number
   level: string
