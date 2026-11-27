@@ -17,9 +17,10 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import time
-from collections.abc import AsyncGenerator, AsyncIterable, Callable
+from collections.abc import AsyncGenerator, AsyncIterable, Callable, Iterator
 
 from aistudio_api.api.response_models import (
     GeminiGenerateContentResponse,
@@ -30,10 +31,10 @@ from aistudio_api.api.schemas import (
     GeminiFunctionResponse,
     GeminiGenerateContentRequest,
     GeminiGenerationConfig,
+    GeminiInlineData,
     GeminiPart,
 )
 from aistudio_api.api.schemas_compat import OpenAIResponsesRequest
-from aistudio_api.application.api_service_gemini import _ERROR_TEXT_PREFIX
 from aistudio_api.application.compat_service import (
     _as_dict,
     _as_int,
@@ -50,7 +51,17 @@ from aistudio_api.application.compat_service import (
     normalize_reasoning_effort_word,
     resolve_compat_model,
 )
+from aistudio_api.application.compat_shared import (
+    _code_text,
+    _is_signed_empty_thought,
+    _parse_data_url,
+)
 from aistudio_api.application.media_session import has_remote_media, media_session
+from aistudio_api.application.responses_delivery import (
+    PartStage,
+    ResponsesStreamDelivery,
+)
+from aistudio_api.application.stream_utils import part_payload_signature
 from aistudio_api.domain.tool_signatures import (
     remember_function_signature as _remember_function_signature,
 )
@@ -58,6 +69,8 @@ from aistudio_api.infrastructure.request_context import record_result
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("compat.responses")
+_STANDARD_BASE64 = re.compile(r"[A-Za-z0-9+/]++={0,2}")
+_UNFINISHED_CALL_STATUSES = ("incomplete", "in_progress")
 
 # Responses reasoning.effort → Gemini reasoningEffort：统一走
 # normalize_reasoning_effort_word（与 chat completions 侧同一套词表，
@@ -167,24 +180,60 @@ def _content_text(content: object) -> str:
     return ""
 
 
-def _tool_output_text(output: object) -> dict[str, object]:
-    """``function_call_output.output``（str 或 content 数组）→ functionResponse 载荷。"""
+def _tool_output_payload(
+    output: object,
+) -> tuple[dict[str, object], list[GeminiPart]]:
+    """Keep text and bounded local media attached to their own function result."""
     if isinstance(output, str):
-        return {"result": output}
-    if isinstance(output, list):
-        texts: list[str] = []
-        for part in output:
-            if not isinstance(part, dict):
+        return {"result": output}, []
+    texts: list[str] = []
+    media: list[GeminiPart] = []
+    if not isinstance(output, list):
+        return {"result": ""}, media
+    for index, part in enumerate(output):
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type in ("output_text", "input_text", "text"):
+            texts.append(_as_str(part.get("text")))
+        elif part_type in ("input_image", "input_file"):
+            field = "image_url" if part_type == "input_image" else "file_data"
+            path = f"function_call_output.output[{index}].{field}"
+            # The ordinary image helper also fetches HTTP URLs. Tool output
+            # accepts only self-contained attachments, with no extra I/O.
+            reference = _as_str(part.get(field)).strip()
+            if reference[:5].lower() != "data:":
+                texts.append(
+                    "[image omitted]"
+                    if part_type == "input_image"
+                    else "[file omitted]"
+                )
                 continue
-            part_type = part.get("type")
-            if part_type in ("output_text", "input_text", "text"):
-                texts.append(_as_str(part.get("text")))
-            elif part_type == "input_image":
-                # 图片无 functionResponse 通道：占位提示模型（静默丢弃
-                # 会让模型以为结果缺失而重复调用）
-                texts.append("[image omitted]")
-        return {"result": "\n".join(t for t in texts if t) or ""}
-    return {"result": ""}
+            parsed = _parse_data_url(reference)
+            if parsed is None:
+                raise ValueError(f"{path} must be an inline base64 data URL")
+            mime, data = parsed
+            # Bound and account first; check alphabet/padding without decoding
+            # another copy of the full attachment.
+            if len(data) % 4 or _STANDARD_BASE64.fullmatch(data) is None:
+                raise ValueError(f"{path} contains invalid base64 data")
+            if not mime.isascii() or (
+                part_type == "input_image" and not mime.lower().startswith("image/")
+            ):
+                raise ValueError(f"{path} has an invalid media type")
+            filename = (
+                _as_str(part.get("filename")).strip()
+                if part_type == "input_file"
+                else ""
+            )
+            media.append(
+                GeminiPart(
+                    inlineData=GeminiInlineData(
+                        mimeType=mime, data=data, filename=filename or None
+                    )
+                )
+            )
+    return {"result": "\n".join(t for t in texts if t)}, media
 
 
 def _reasoning_summary_text(item: dict[str, object]) -> str:
@@ -199,6 +248,14 @@ def _reasoning_summary_text(item: dict[str, object]) -> str:
             if text:
                 texts.append(text)
     return "".join(texts)
+
+
+def _is_explicit_empty_summary(item: dict[str, object]) -> bool:
+    summary = item.get("summary")
+    if not isinstance(summary, list) or len(summary) != 1:
+        return False
+    entry = _as_dict(summary[0])
+    return entry.get("type") == "summary_text" and entry.get("text") == ""
 
 
 @media_session()
@@ -219,14 +276,22 @@ async def responses_to_gemini_request(
     system_texts: list[str] = [req.instructions] if req.instructions else []
     tool_name_by_call_id: dict[str, str] = {}
 
-    # 第一遍：扫 function_call items 建 call_id → 函数名映射（容忍乱序历史）
+    # Index call ownership first because a result may precede its call.
+    replayable_call_ids: set[str] = set()
+    unfinished_call_ids: set[str] = set()
     for item in req.input if isinstance(req.input, list) else []:
         if not isinstance(item, dict) or item.get("type") != "function_call":
             continue
         call_id = _as_str(item.get("call_id"))
-        name = _as_str(item.get("name"))
-        if call_id and name:
+        if not call_id:
+            continue
+        if item.get("status") in _UNFINISHED_CALL_STATUSES:
+            unfinished_call_ids.add(call_id)
+            continue
+        replayable_call_ids.add(call_id)
+        if name := _as_str(item.get("name")):
             tool_name_by_call_id[call_id] = name
+    unfinished_call_ids.difference_update(replayable_call_ids)
 
     if req.input is None and not req.instructions:
         raise ValueError("input is required when instructions is empty")
@@ -262,6 +327,8 @@ async def responses_to_gemini_request(
                         GeminiContent(role="user", parts=parts or [GeminiPart(text="")])
                     )
             elif item_type == "function_call":
+                if item.get("status") in _UNFINISHED_CALL_STATUSES:
+                    continue
                 name = _as_str(item.get("name")) or "unknown"
                 call_id = _as_str(item.get("call_id"))
                 args = item.get("arguments")
@@ -294,8 +361,10 @@ async def responses_to_gemini_request(
                 )
             elif item_type == "function_call_output":
                 call_id = _as_str(item.get("call_id"))
+                if call_id in unfinished_call_ids:
+                    continue
                 name = tool_name_by_call_id.get(call_id, "unknown")
-                payload = _tool_output_text(item.get("output"))
+                payload, media = _tool_output_payload(item.get("output"))
                 contents.append(
                     GeminiContent(
                         role="user",
@@ -305,6 +374,7 @@ async def responses_to_gemini_request(
                                     name=name,
                                     response=payload,
                                     id=call_id or None,
+                                    parts=media or None,
                                 )
                             )
                         ],
@@ -315,10 +385,13 @@ async def responses_to_gemini_request(
                 # 静默丢弃，Codex CLI 等客户端重发的 reasoning 历史全部丢失）。
                 # 签名经 extra_content 精确回读——值由网关 reasoning item
                 # 原样下发（与 function_call item 同一载体形态），伪造值在
-                # 规范化层被校验丢弃，不会触达上游；缺失时由规范化层按思考
-                # 全文查 thinking 缓存回注。
+                # 规范化层校验显式载体；缺失时不可从其他摘要推断签名。
                 summary_text = _reasoning_summary_text(item)
-                if not summary_text:
+                signature = _read_signature(item)
+                if not summary_text and not (
+                    _is_explicit_empty_summary(item)
+                    and _is_signed_empty_thought(summary_text, signature)
+                ):
                     continue
                 contents.append(
                     GeminiContent(
@@ -327,7 +400,7 @@ async def responses_to_gemini_request(
                             GeminiPart(
                                 text=summary_text,
                                 thought=True,
-                                thoughtSignature=_read_signature(item),
+                                thoughtSignature=signature,
                             )
                         ],
                     )
@@ -392,126 +465,94 @@ async def responses_to_gemini_request(
 
 
 class _ResponsesOutputBuilder:
-    """把 Gemini 输出 parts 聚合为 Responses output items。"""
+    """Build separate output items in the order of consecutive Part runs."""
 
     def __init__(self) -> None:
-        self.reasoning_texts: list[str] = []
-        self.text_parts: list[str] = []
-        self.function_calls: list[dict[str, object]] = []
-        # 思考链签名（thought part 自带 / 尾部空文本签名载体）：随 reasoning
-        # item 的 extra_content 下发（与 function_call item 同一载体形态）。
-        # FC part 的签名只属于调用本身，不并入（上游 FC 轮思考摘要无签名）。
-        self.thinking_signature: str | None = None
+        self.output: list[dict[str, object]] = []
+        self._kind = ""
+        self._buffer: list[str] = []
+        self._signature = ""
 
-    def add_part(self, part: object, *, allow_tools: bool = True) -> None:
-        text = getattr(part, "text", None)
-        if (
-            getattr(part, "functionCall", None) is None
-            and getattr(part, "inlineData", None) is None
-        ):
-            signature = getattr(part, "thoughtSignature", None)
-            if (
-                isinstance(signature, str)
-                and signature
-                # 纯文本轮的尾部签名载体必然不与 functionCall 共存（wire
-                # 抓包形态）；含调用的响应里裸签名无法排除是调用签名迟到，
-                # 误当思考链签名下发会在回传时挂到 thought part 上，可能
-                # 触发上游 "Corrupted thought signature."（与 Chat/Claude
-                # 侧同款判别）。
-                and (text or not self.function_calls)
-            ):
-                self.thinking_signature = signature
-        if isinstance(text, str) and text:
-            if getattr(part, "thought", None) is True:
-                self.reasoning_texts.append(text)
-            else:
-                self.text_parts.append(text)
-        inline = getattr(part, "inlineData", None)
-        if inline is not None:
-            # Responses 协议无原生图片 part：降级为 markdown 占位（与
-            # Chat 侧 data-URL markdown 行为对齐），静默丢弃是最差选择
-            self.text_parts.append(
-                f"\n\n![image](data:{inline.mimeType};base64,{inline.data})"
-            )
-        function_call = getattr(part, "functionCall", None)
-        if function_call is not None and allow_tools:
-            call_id = function_call.id or _call_id()
-            if function_call.id is None:
-                # 上游未带 call id：合成 id 晚于 _iter_response_parts 的签名
-                # 记忆化，缓存无此条目——客户端未保留 extra_content 载体时
-                # 按 id 回查必然 miss。补记一条对齐流式路径（coalesce 先定
-                # id、recorder 后记忆化）；remember 内部校验签名合法性。
-                _remember_function_signature(
-                    call_id,
-                    function_call.name,
-                    function_call.args if function_call.args is not None else {},
-                    getattr(part, "thoughtSignature", None),
-                )
-            self.function_calls.append(
+    def _flush(self) -> None:
+        if not self._buffer:
+            return
+        text = "".join(self._buffer)
+        if self._kind == "reasoning":
+            self.output.append(
                 {
-                    **_signature_extra(getattr(part, "thoughtSignature", None)),
-                    "id": _item_id("fc"),
-                    "call_id": call_id,
-                    "name": function_call.name,
-                    "arguments": json.dumps(
-                        function_call.args if function_call.args is not None else {},
-                        ensure_ascii=False,
-                    ),
-                }
-            )
-
-    def build_output(self, status: str) -> list[dict[str, object]]:
-        """产出 Responses output items（reasoning → message → function_call 顺序）。"""
-        output: list[dict[str, object]] = []
-        if self.reasoning_texts:
-            output.append(
-                {
-                    # 思考链签名随 reasoning item 往返：客户端原样重发该项时
-                    # 签名经 extra_content 精确回读，思考链验证不丢失
-                    **_signature_extra(self.thinking_signature),
+                    **_signature_extra(self._signature),
                     "id": _item_id("rs"),
                     "type": "reasoning",
-                    "summary": [
-                        {
-                            "type": "summary_text",
-                            "text": "".join(self.reasoning_texts),
-                        }
-                    ],
+                    "summary": [{"type": "summary_text", "text": text}],
                 }
             )
-        if self.text_parts:
-            output.append(
+        else:
+            self.output.append(
                 {
                     "id": _item_id("msg"),
                     "type": "message",
                     "role": "assistant",
-                    "status": status,
                     "content": [
-                        {
-                            "type": "output_text",
-                            "text": "".join(self.text_parts),
-                            "annotations": [],
-                        }
+                        {"type": "output_text", "text": text, "annotations": []}
                     ],
                 }
             )
-        for call in self.function_calls:
-            output.append(
+        self._buffer.clear()
+
+    def _append(self, kind: str, text: str, signature: str = "") -> None:
+        if self._kind != kind or self._signature or signature:
+            self._flush()
+        self._kind = kind
+        self._signature = signature
+        self._buffer.append(text)
+
+    def add_part(self, part: object, *, allow_tools: bool) -> None:
+        text = getattr(part, "text", None)
+        function_call = getattr(part, "functionCall", None)
+        if isinstance(text, str):
+            if getattr(part, "thought", None) is True:
+                signature = part_payload_signature(part, "text")
+                if text or _is_signed_empty_thought(text, signature):
+                    self._append("reasoning", text, signature)
+            elif text:
+                self._append("message", text)
+        inline = getattr(part, "inlineData", None)
+        if inline is not None:
+            self._append(
+                "message", f"\n\n![image](data:{inline.mimeType};base64,{inline.data})"
+            )
+        if code := _code_text(
+            getattr(part, "executableCode", None),
+            getattr(part, "codeExecutionResult", None),
+        ):
+            self._append("message", code)
+        if function_call is not None and allow_tools:
+            self._flush()
+            signature = part_payload_signature(part, "functionCall")
+            call_id = function_call.id or _call_id()
+            args = function_call.args if function_call.args is not None else {}
+            if function_call.id is None:
+                _remember_function_signature(
+                    call_id, function_call.name, args, signature
+                )
+            self.output.append(
                 {
-                    **{
-                        key: value
-                        for key, value in call.items()
-                        if key == "extra_content"
-                    },
-                    "id": call["id"],
+                    **_signature_extra(signature),
+                    "id": _item_id("fc"),
                     "type": "function_call",
                     "status": "completed",
-                    "call_id": call["call_id"],
-                    "name": call["name"],
-                    "arguments": call["arguments"],
+                    "call_id": call_id,
+                    "name": function_call.name,
+                    "arguments": json.dumps(args, ensure_ascii=False),
                 }
             )
-        return output
+
+    def build_output(self, status: str) -> list[dict[str, object]]:
+        self._flush()
+        for item in self.output:
+            if item["type"] == "message":
+                item["status"] = status
+        return self.output
 
 
 def _base_response(
@@ -563,9 +604,11 @@ def _usage_payload_from_gemini(usage_metadata: object) -> dict[str, int]:
 
 
 def _incomplete_reason(finish_reason: str | None) -> str | None:
-    if finish_reason in (None, "", "STOP"):
+    if finish_reason == "STOP":
         return None
-    return _FINISH_TO_INCOMPLETE_REASON.get(finish_reason, "max_output_tokens")
+    return _FINISH_TO_INCOMPLETE_REASON.get(
+        finish_reason or "OTHER", "max_output_tokens"
+    )
 
 
 def build_responses_object(
@@ -578,10 +621,7 @@ def build_responses_object(
         finish_reason_raw = candidates[0].finishReason
 
     builder = _ResponsesOutputBuilder()
-    # 异常终结下丢弃工具调用（截断的并行调用集合可能不完整，有意与
-    # 流式侧不对称）：见回归测试 test_non_streaming_interrupted_calls_
-    # are_not_executable。
-    builder_allow_tools = finish_reason_raw in (None, "STOP")
+    builder_allow_tools = finish_reason_raw == "STOP"
     for part in _iter_response_parts(response):
         builder.add_part(part, allow_tools=builder_allow_tools)
 
@@ -606,9 +646,15 @@ def build_responses_object(
 class _ResponsesStreamEmitter:
     """Responses SSE 事件发射器（事件形状对齐 openai-python 3.50.0）。"""
 
-    def __init__(self, response_id: str, requested_model: str) -> None:
+    def __init__(
+        self,
+        response_id: str,
+        requested_model: str,
+        delivery: ResponsesStreamDelivery | None = None,
+    ) -> None:
         self.response_id = response_id
         self.requested_model = requested_model
+        self.delivery = delivery
         self.created_at = int(time.time())
         self.seq = -1  # 首事件自增后为 0，与 SDK 从 0 递增一致
         self.output_index = -1
@@ -624,9 +670,7 @@ class _ResponsesStreamEmitter:
         self.finish_reason_raw: str | None = None
         self.usage: dict[str, int] | None = None
         self.saw_error = False
-        # 思考链签名（thought part 附带 / 尾部空文本签名载体 part）：
-        # 关闭 reasoning item 时随 extra_content 下发（与 function_call
-        # item 同一载体形态），供客户端重发该 item 时精确回读。
+        # Only a signature attached to this reasoning Part can be emitted here.
         self.thinking_signature: str | None = None
         # 累积文本（output_text.done / completed 快照需要完整文本）
         self._text_accumulated: list[str] = []
@@ -636,11 +680,14 @@ class _ResponsesStreamEmitter:
         self.seq += 1
         frame = {"type": event_type, "sequence_number": self.seq, **payload}
         # separators：SSE 每帧省去 ", " 与 ": " 的空格（约 2-4% 字节/分配）
-        return (
+        encoded = (
             f"event: {event_type}\ndata: "
             + json.dumps(frame, ensure_ascii=False, separators=(",", ":"))
             + "\n\n"
         )
+        if self.delivery is not None and isinstance(delta := payload.get("delta"), str):
+            self.delivery.encoded_delta(delta)
+        return encoded
 
     def _response_snapshot(
         self,
@@ -714,9 +761,12 @@ class _ResponsesStreamEmitter:
         ]
 
     def reasoning_delta(self, text: str) -> list[str]:
+        events = self._open_reasoning()
+        if not text:
+            return events
         self._reasoning_accumulated.append(text)
         return [
-            *self._open_reasoning(),
+            *events,
             self.sse(
                 "response.reasoning_summary_text.delta",
                 {
@@ -789,9 +839,28 @@ class _ResponsesStreamEmitter:
         )
         return events
 
+    def boundary(self, kind: str, signature: str = "") -> Iterator[str]:
+        # Never place text/reasoning on both sides of a function call inside
+        # the same output item. A signed reasoning Part also owns its own item.
+        if self.reasoning_item_id and (
+            kind != "reasoning" or signature or self.thinking_signature
+        ):
+            yield from self._close_reasoning("".join(self._reasoning_accumulated))
+            self.reasoning_item_id = None
+            self.reasoning_index = None
+            self._reasoning_accumulated.clear()
+            self.thinking_signature = None
+        if self.message_item_id and kind != "message":
+            yield from self._close_message("".join(self._text_accumulated))
+            self.message_item_id = None
+            self.message_index = None
+            self._text_accumulated.clear()
+        if kind == "reasoning":
+            self.thinking_signature = signature
+
     def function_call(
         self, call_id: str, name: str, args: object, signature: str = ""
-    ) -> list[str]:
+    ) -> Iterator[str]:
         self.output_index += 1
         fc_index = self.output_index
         item_id = _item_id("fc")
@@ -808,62 +877,70 @@ class _ResponsesStreamEmitter:
             "arguments": arguments,
         }
         self.item_order.append((fc_index, dict(item)))
-        return [
-            self.sse(
-                "response.output_item.added",
-                {
-                    "output_index": fc_index,
-                    "item": {
-                        **_signature_extra(signature),
-                        "id": item_id,
-                        "type": "function_call",
-                        "status": "in_progress",
-                        "call_id": call_id,
-                        "name": name,
-                        "arguments": "",
-                    },
+        # The closing frames repeat the entire argument string. Keep the
+        # snapshot above, but encode only the frame the HTTP consumer requests.
+        # Only the completed argument carrier can expose its signature.
+        yield self.sse(
+            "response.output_item.added",
+            {
+                "output_index": fc_index,
+                "item": {
+                    "id": item_id,
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": "",
                 },
-            ),
-            self.sse(
-                "response.function_call_arguments.delta",
-                {
-                    "item_id": item_id,
-                    "output_index": fc_index,
-                    "delta": arguments,
-                },
-            ),
-            self.sse(
-                "response.function_call_arguments.done",
-                {
-                    "item_id": item_id,
-                    "output_index": fc_index,
-                    "arguments": arguments,
-                },
-            ),
-            self.sse(
-                "response.output_item.done",
-                {
-                    "output_index": fc_index,
-                    "item": dict(item),
-                },
-            ),
-        ]
+            },
+        )
+        yield self.sse(
+            "response.function_call_arguments.delta",
+            {
+                "item_id": item_id,
+                "output_index": fc_index,
+                "delta": arguments,
+            },
+        )
+        yield self.sse(
+            "response.function_call_arguments.done",
+            {
+                "item_id": item_id,
+                "output_index": fc_index,
+                "arguments": arguments,
+            },
+        )
+        yield self.sse(
+            "response.output_item.done",
+            {
+                "output_index": fc_index,
+                "item": dict(item),
+            },
+        )
 
     def _close_reasoning(
-        self, accumulated: str, status: str = "completed"
-    ) -> list[str]:
+        self,
+        accumulated: str,
+        status: str = "completed",
+        *,
+        stage: PartStage = PartStage.OPEN,
+    ) -> Iterator[str]:
         if self.reasoning_item_id is None:
-            return []
+            return
+        # Release the fragments but retain the joined value for timeout recovery.
+        self._reasoning_accumulated[:] = [accumulated]
         final_item = {
             **_signature_extra(self.thinking_signature),
             "id": self.reasoning_item_id,
             "type": "reasoning",
             "status": status,
-            "summary": [{"type": "summary_text", "text": accumulated}],
+            "summary": [{"type": "summary_text", "text": accumulated}]
+            if stage is not PartStage.ABSENT
+            else [],
         }
         self._replace_order_item(self.reasoning_item_id, final_item)
-        return [
-            self.sse(
+        if stage is PartStage.OPEN:
+            yield self.sse(
                 "response.reasoning_summary_text.done",
                 {
                     "item_id": self.reasoning_item_id,
@@ -871,8 +948,9 @@ class _ResponsesStreamEmitter:
                     "summary_index": 0,
                     "text": accumulated,
                 },
-            ),
-            self.sse(
+            )
+        if stage in (PartStage.OPEN, PartStage.TEXT_DONE):
+            yield self.sse(
                 "response.reasoning_summary_part.done",
                 {
                     "item_id": self.reasoning_item_id,
@@ -880,28 +958,34 @@ class _ResponsesStreamEmitter:
                     "summary_index": 0,
                     "part": {"type": "summary_text", "text": accumulated},
                 },
-            ),
-            self.sse(
-                "response.output_item.done",
-                {"output_index": self.reasoning_index, "item": dict(final_item)},
-            ),
-        ]
+            )
+        yield self.sse(
+            "response.output_item.done",
+            {"output_index": self.reasoning_index, "item": dict(final_item)},
+        )
 
-    def _close_message(self, accumulated: str, status: str = "completed") -> list[str]:
+    def _close_message(
+        self,
+        accumulated: str,
+        status: str = "completed",
+        *,
+        stage: PartStage = PartStage.OPEN,
+    ) -> Iterator[str]:
         if self.message_item_id is None:
-            return []
+            return
+        self._text_accumulated[:] = [accumulated]
         final_item = {
             "id": self.message_item_id,
             "type": "message",
             "role": "assistant",
             "status": status,
-            "content": [
-                {"type": "output_text", "text": accumulated, "annotations": []}
-            ],
+            "content": [{"type": "output_text", "text": accumulated, "annotations": []}]
+            if stage is not PartStage.ABSENT
+            else [],
         }
         self._replace_order_item(self.message_item_id, final_item)
-        return [
-            self.sse(
+        if stage is PartStage.OPEN:
+            yield self.sse(
                 "response.output_text.done",
                 {
                     "item_id": self.message_item_id,
@@ -910,8 +994,9 @@ class _ResponsesStreamEmitter:
                     "text": accumulated,
                     "logprobs": [],
                 },
-            ),
-            self.sse(
+            )
+        if stage in (PartStage.OPEN, PartStage.TEXT_DONE):
+            yield self.sse(
                 "response.content_part.done",
                 {
                     "item_id": self.message_item_id,
@@ -923,12 +1008,11 @@ class _ResponsesStreamEmitter:
                         "annotations": [],
                     },
                 },
-            ),
-            self.sse(
-                "response.output_item.done",
-                {"output_index": self.message_index, "item": dict(final_item)},
-            ),
-        ]
+            )
+        yield self.sse(
+            "response.output_item.done",
+            {"output_index": self.message_index, "item": dict(final_item)},
+        )
 
     def _replace_order_item(self, item_id: str, final_item: dict[str, object]) -> None:
         """把 item_order 中该 item 的占位快照替换为关闭时的完整内容。"""
@@ -937,70 +1021,149 @@ class _ResponsesStreamEmitter:
                 self.item_order[pos] = (index, final_item)
                 return
 
-    def error(self, message: str, code: int = 500) -> list[str]:
+    def error(self, message: str, code: int = 500) -> Iterator[str]:
         if self.saw_error:
-            return []
+            return
         self.saw_error = True
         # 先收束已打开的 item（以已累积内容 done）：OpenAI 真实行为是
         # 关闭 items 后再发 response.failed，停在 in_progress 的 item
         # 会让 SDK 累积器对账失败
-        events = self._close_reasoning(
+        yield from self._close_reasoning(
             "".join(self._reasoning_accumulated), "incomplete"
         )
-        events += self._close_message("".join(self._text_accumulated), "incomplete")
-        # 错误码语义对齐：Codex CLI 等客户端按 code 决定退避策略
-        # （429 → rate_limit_error 等），与 OpenAI/Claude 适配器同源映射。
-        from aistudio_api.application.compat_errors import _OPENAI_ERROR_TYPE
+        yield from self._close_message("".join(self._text_accumulated), "incomplete")
+        yield self._failed(message, code)
 
-        events.append(
-            self.sse(
-                "response.failed",
-                {
-                    "response": {
-                        **self._response_snapshot(
-                            status="failed", output=self._ordered_output()
-                        ),
-                        "error": {
-                            "code": _OPENAI_ERROR_TYPE.get(code, "server_error"),
-                            "message": message,
-                        },
-                    }
-                },
-            )
+    def _failed(self, message: str, code: int) -> str:
+        # The typed Responses error.code enum is not Chat's error.type.
+        response_code = {400: "invalid_prompt", 429: "rate_limit_exceeded"}.get(
+            code, "server_error"
         )
-        return events
+        return self.sse(
+            "response.failed",
+            {
+                "response": {
+                    **self._response_snapshot(
+                        status="failed", output=self._ordered_output()
+                    ),
+                    "error": {
+                        "code": response_code,
+                        "message": message,
+                    },
+                }
+            },
+        )
+
+    def _delivered_text(self, item: dict[str, object], length: int) -> str:
+        if not length:
+            return ""
+        reasoning = item["type"] == "reasoning"
+        parts = item["summary" if reasoning else "content"]
+        if isinstance(parts, list) and parts and isinstance(parts[0], dict):
+            # The producer may already have closed this item and advanced.
+            return _as_str(parts[0].get("text"))[:length]
+        fragments = self._reasoning_accumulated if reasoning else self._text_accumulated
+        prefix = []
+        for fragment in fragments:
+            prefix.append(fragment[:length])
+            length -= len(prefix[-1])
+            if not length:
+                break
+        return "".join(prefix)
+
+    def timeout_error(self, message: str) -> list[str]:
+        sent = self.delivery
+        if sent is None:
+            return list(self.error(message, code=504))
+        if not sent.begin_failure():
+            return []
+        emitter = _ResponsesStreamEmitter(self.response_id, self.requested_model)
+        emitter.created_at = self.created_at
+        emitter.seq = sent.sequence
+        chunks = [emitter.created()] if sent.sequence == -1 else []
+        # Items are opened serially and in output_index order. Already closed
+        # snapshots are immutable; only the final accepted item may be partial.
+        index = sent.output_index
+        emitter.item_order = self.item_order[: index + 1]
+        if index >= 0 and sent.last != b"response.output_item.done":
+            _, item = emitter.item_order[-1]
+            item_id = _as_str(item["id"])
+            if item["type"] == "function_call":
+                # No synthetic arguments.done: an unfinished call is not an
+                # instruction to execute, even if the producer knew more.
+                partial = {
+                    **item,
+                    "status": "incomplete",
+                    "arguments": _as_str(item["arguments"])[: sent.characters],
+                }
+                partial.pop("extra_content", None)
+                emitter.item_order[-1] = (index, partial)
+                chunks.append(
+                    emitter.sse(
+                        "response.output_item.done",
+                        {"output_index": index, "item": partial},
+                    )
+                )
+            else:
+                text = self._delivered_text(item, sent.characters)
+                stage = sent.part_stage()
+                if item["type"] == "reasoning":
+                    emitter.reasoning_item_id, emitter.reasoning_index = item_id, index
+                    chunks.extend(
+                        emitter._close_reasoning(text, "incomplete", stage=stage)
+                    )
+                else:
+                    emitter.message_item_id, emitter.message_index = item_id, index
+                    chunks.extend(
+                        emitter._close_message(text, "incomplete", stage=stage)
+                    )
+        chunks.append(emitter._failed(message, 504))
+        return chunks
 
     def _ordered_output(self) -> list[dict[str, object]]:
         """按实际打开顺序（output_index）产出 items 快照。"""
         return [item for _, item in sorted(self.item_order, key=lambda pair: pair[0])]
 
-    def finish(self) -> list[str]:
+    def finish(self) -> Iterator[str]:
         """收束全部打开的 item 并下发终结事件。"""
         if self.saw_error:
-            return []
+            return
         incomplete_reason = _incomplete_reason(self.finish_reason_raw)
         final_status = "incomplete" if incomplete_reason else "completed"
-        events = self._close_reasoning(
+        # Serialize one event per iteration, so protocol-required copies of the
+        # same text do not pile up while the preceding ASGI send is pending.
+        yield from self._close_reasoning(
             "".join(self._reasoning_accumulated), final_status
         )
-        events += self._close_message("".join(self._text_accumulated), final_status)
+        yield from self._close_message("".join(self._text_accumulated), final_status)
         output = self._ordered_output()
         event_type = (
             "response.incomplete" if incomplete_reason else "response.completed"
         )
-        events.append(
-            self.sse(
-                event_type,
-                {
-                    "response": self._response_snapshot(
-                        status=final_status,
-                        output=output,
-                        incomplete_reason=incomplete_reason,
-                    )
-                },
-            )
+        yield self.sse(
+            event_type,
+            {
+                "response": self._response_snapshot(
+                    status=final_status,
+                    output=output,
+                    incomplete_reason=incomplete_reason,
+                )
+            },
         )
-        return events
+
+
+def build_responses_preparation_failure(
+    requested_model: str,
+    code: int,
+    message: str,
+    *,
+    register_failure: Callable[[Callable[[str], list[str]]], None],
+    delivery: ResponsesStreamDelivery | None,
+) -> list[str]:
+    """Open and fail a Responses stream whose HTTP headers are already sent."""
+    emitter = _ResponsesStreamEmitter(_response_id(), requested_model, delivery)
+    register_failure(emitter.timeout_error)
+    return [emitter.created(), *emitter.error(message, code)]
 
 
 async def responses_stream_adapter(
@@ -1008,11 +1171,14 @@ async def responses_stream_adapter(
     *,
     requested_model: str,
     register_failure: Callable[[Callable[[str], list[str]]], None] | None = None,
+    delivery: ResponsesStreamDelivery | None = None,
 ) -> AsyncGenerator[str, None]:
     """Gemini SSE → OpenAI Responses 语义事件流。"""
     response_id = _response_id()
-    emitter = _ResponsesStreamEmitter(response_id, requested_model)
-    async with _stream_adapter_lifecycle(source, emitter.error, register_failure):
+    emitter = _ResponsesStreamEmitter(response_id, requested_model, delivery)
+    async with _stream_adapter_lifecycle(
+        source, emitter.timeout_error, register_failure
+    ):
         yield emitter.created()
         yield emitter.in_progress()
         from aistudio_api.application.compat_service import (
@@ -1022,7 +1188,6 @@ async def responses_stream_adapter(
         )
 
         try:
-            saw_function_call = False
             async for frame in _iter_gemini_sse_frames(source):
                 error_obj = frame.get("error")
                 if isinstance(error_obj, dict):
@@ -1041,12 +1206,16 @@ async def responses_stream_adapter(
                 for part in _frame_parts(candidate):
                     function_call = part.get("functionCall")
                     if isinstance(function_call, dict):
-                        saw_function_call = True
                         call_id = _as_str(function_call.get("id")) or _call_id()
                         name = _as_str(function_call.get("name")) or "unknown"
                         args = function_call.get("args")
+                        for event in emitter.boundary("function_call"):
+                            yield event
                         for event in emitter.function_call(
-                            call_id, name, args, _as_str(part.get("thoughtSignature"))
+                            call_id,
+                            name,
+                            args,
+                            part_payload_signature(part, "functionCall"),
                         ):
                             yield event
                         continue
@@ -1058,41 +1227,27 @@ async def responses_stream_adapter(
                         mime = _as_str(inline.get("mimeType")) or "image/png"
                         data = _as_str(inline.get("data"))
                         if data:
+                            for event in emitter.boundary("message"):
+                                yield event
                             for event in emitter.text_delta(
                                 f"\n\n![image](data:{mime};base64,{data})"
                             ):
                                 yield event
                         continue
                     text = part.get("text")
-                    part_signature = part.get("thoughtSignature")
-                    if isinstance(text, str) and text:
-                        # 上游错误兜底文本（format_sse_error_text）不是正文：
-                        # 已输出错误事件的情况下不重复下发为 output_text
-                        if text.startswith(_ERROR_TEXT_PREFIX):
-                            continue
+                    if isinstance(text, str):
                         if part.get("thought") is True:
-                            # thought part 自带签名（流式 pending 形态）：
-                            # 一并归入思考链签名（关闭 reasoning item 时下发）
-                            if isinstance(part_signature, str) and part_signature:
-                                emitter.thinking_signature = part_signature
-                            for event in emitter.reasoning_delta(text):
+                            signature = part_payload_signature(part, "text")
+                            if text or _is_signed_empty_thought(text, signature):
+                                for event in emitter.boundary("reasoning", signature):
+                                    yield event
+                                for event in emitter.reasoning_delta(text):
+                                    yield event
+                        elif text:
+                            for event in emitter.boundary("message"):
                                 yield event
-                        else:
                             for event in emitter.text_delta(text):
                                 yield event
-                    elif (
-                        isinstance(part_signature, str)
-                        and part_signature
-                        # 独立签名帧 / 尾部空文本签名载体 part：思考链签名，
-                        # 关闭 reasoning item 时随 extra_content 下发（FC 分支
-                        # 已 continue，调用签名不并入思考链）。含工具调用的
-                        # 流里裸签名无法排除是调用签名迟到（纯文本轮尾部
-                        # 载体必然无 FC，wire 抓包形态）——误当思考链签名
-                        # 下发会在回传时挂到 thought part，可能触发上游
-                        # "Corrupted thought signature."。
-                        and not saw_function_call
-                    ):
-                        emitter.thinking_signature = part_signature
         except Exception as exc:
             logger.warning("Responses 流式转换异常: %s", exc)
             record_result(
@@ -1107,6 +1262,7 @@ async def responses_stream_adapter(
 
 __all__ = [
     "build_responses_object",
+    "build_responses_preparation_failure",
     "responses_stream_adapter",
     "responses_to_gemini_request",
 ]

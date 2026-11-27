@@ -19,20 +19,20 @@
 
 from __future__ import annotations
 
-import json
 import secrets
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from aistudio_api.application.chat_service import (
     NormalizedGeminiRequest,
     encode_function_declaration_to_wire,
 )
-from aistudio_api.domain.models import ModelOutput
+from aistudio_api.domain.models import ModelOutput, ResponsePart
 from aistudio_api.infrastructure.gateway.model_defaults import (
     get_anti_truncation_settings,
     resolve_model_defaults,
 )
+from aistudio_api.infrastructure.gateway.wire_spec import WIRE_FINISH_REASON_STOP
 from aistudio_api.infrastructure.gateway.wire_types import (
     AistudioContent,
     AistudioPart,
@@ -377,61 +377,88 @@ def prepare_anti_truncation(
 # ---------------------------------------------------------------------------
 
 
-def _extract_call_content(call: dict[str, object]) -> str:
-    """从单个合成函数调用中提取 content 文本，兼容 dict args 与 JSON 字符串。"""
-    args = call.get("args")
-    if isinstance(args, dict):
-        content = args.get("content")
-        return content if isinstance(content, str) else ""
-    raw_arguments = call.get("arguments")
-    if isinstance(raw_arguments, str) and raw_arguments.strip():
-        try:
-            parsed = json.loads(raw_arguments)
-        except json.JSONDecodeError:
+def _presentation_id(call: dict[str, object]) -> str:
+    primary = call.get("call_id")
+    alternate = call.get("id")
+    if isinstance(primary, str) and primary:
+        if isinstance(alternate, str) and alternate and alternate != primary:
             return ""
-        if isinstance(parsed, dict):
-            content = parsed.get("content")
-            return content if isinstance(content, str) else ""
-    return ""
+        return primary
+    return alternate if isinstance(alternate, str) else ""
 
 
 def restore_anti_truncation_output(
     output: ModelOutput, ctx: AntiTruncationContext
 ) -> None:
-    """非流式响应还原：把合成工具调用参数中的正文搬回 ``candidate.text``。"""
+    """Decode completed presentation calls in their original output positions."""
     if not ctx.active or not output.candidates:
         return
     candidate = output.candidates[0]
-    if not candidate.function_calls:
+    if not any(call.get("name") == ctx.tool_name for call in candidate.function_calls):
         return
 
-    restored_parts: list[str] = []
+    original = candidate.ordered_parts
+    source = (
+        original
+        if original is not None
+        else [ResponsePart(function_call=call) for call in candidate.function_calls]
+    )
+    tracker = _PresentationTracker(ctx.tool_name)
+    # Keep the original delta positions, but buffer only deltas whose
+    # display argument object eventually completes.
+    positions: dict[int, tuple[_PresentationCallState, str]] = {}
     real_calls: list[dict[str, object]] = []
-    for call in candidate.function_calls:
-        if str(call.get("name") or "") == ctx.tool_name:
-            ctx.synthetic_seen = True
-            content = _extract_call_content(call)
-            if content:
-                restored_parts.append(content)
-        else:
+    stripped: list[ResponsePart] | None = None
+    for index, part in enumerate(source):
+        call = part.function_call
+        if call is None:
+            continue
+        update = tracker.feed(call)
+        if update is None:
             real_calls.append(call)
+            continue
+        state, delta = update
+        if state is not None and delta:
+            positions[index] = state, delta
+        if original is not None:
+            if stripped is None:
+                stripped = original.copy()
+            # An internal call's signature is not a signature for its text.
+            stripped[index] = replace(part, function_call=None, thought_signature="")
 
+    ctx.synthetic_seen = tracker.seen
     if not ctx.synthetic_seen:
-        return  # 模型未走工具通道，纯文本原样透传。
-
-    if len(restored_parts) > 1:
-        ctx.multiple_calls = True
+        return
+    ctx.multiple_calls = tracker.count > 1
+    if ctx.multiple_calls:
         logger.warning(
             "抗截断传输出现多次合成调用，已按顺序拼接: tool=%s, calls=%d",
             ctx.tool_name,
-            len(restored_parts),
+            tracker.count,
         )
-
-    if restored_parts:
-        # 与上游 JS 语义一致：工具通道的正文整体替换纯文本通道内容。
-        candidate.text = "".join(restored_parts)
-        ctx.restored = True
     candidate.function_calls = real_calls
+    restored = {i: delta for i, (state, delta) in positions.items() if state.complete}
+    ctx.restored = bool(restored)
+    if candidate.finish_reason == WIRE_FINISH_REASON_STOP and tracker.incomplete(
+        plain_won=bool(candidate.text) and not ctx.restored
+    ):
+        candidate.finish_reason = _INCOMPLETE_PRESENTATION_FINISH
+    if ctx.restored:
+        candidate.text = "".join(restored.values())
+
+    if stripped is not None:
+        ordered: list[ResponsePart] = []
+        for index, part in enumerate(stripped):
+            if delta := restored.get(index):
+                ordered.append(
+                    ResponsePart(
+                        text=delta, text_present=True, wire_chunk=part.wire_chunk
+                    )
+                )
+            if ctx.restored and part.text_present and not part.thought:
+                part = _without_plain_text(part)
+            ordered.append(part)
+        candidate.ordered_parts = ordered
 
     logger.info(
         "抗截断非流式还原完成: restored=%s, real_calls=%d, text_len=%d",
@@ -455,6 +482,9 @@ _ESCAPES = {
     "r": "\r",
     "t": "\t",
 }
+
+
+_MAX_CONTENT_DECODER_DEPTH = 64
 
 
 class ContentDecoder:
@@ -512,7 +542,7 @@ class ContentDecoder:
         else:
             out.append(ch)
 
-    def _start_value(self, ch: str, content: bool) -> None:
+    def _start_value(self, ch: str, content: bool, stack_limit: int) -> None:
         if content:
             if self.found or ch != '"':
                 self._fail()
@@ -524,7 +554,7 @@ class ContentDecoder:
             self.escape = False
             self.hex = None
         elif ch in "{[":
-            if len(self.stack) >= 64:
+            if len(self.stack) >= stack_limit:
                 self._fail()
                 return
             self.stack.append(
@@ -544,8 +574,9 @@ class ContentDecoder:
         else:
             self._fail()
 
-    def feed(self, text: str) -> str:
+    def feed(self, text: str, *, stack_limit: int = _MAX_CONTENT_DECODER_DEPTH) -> str:
         """喂入一段参数字符串碎片，返回本次新识别出的 content 增量文本。"""
+        stack_limit = min(stack_limit, _MAX_CONTENT_DECODER_DEPTH)
         out: list[str] = []
         i = 0
         n = len(text)
@@ -620,7 +651,7 @@ class ContentDecoder:
                 break
             if not self.root_started:
                 self.root_started = True
-                if ch != "{":
+                if ch != "{" or stack_limit <= 0:
                     self._fail()
                     break
                 self.stack.append({"type": "{", "state": "keyOrEnd", "key": ""})
@@ -665,7 +696,7 @@ class ContentDecoder:
                 is_root = (
                     len(self.stack) == 1 and ftype == "{" and frame["key"] == "content"
                 )
-                self._start_value(ch, is_root)
+                self._start_value(ch, is_root, stack_limit)
             i += 1
         return "".join(out)
 
@@ -685,60 +716,216 @@ def _is_valid_number(token: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class _StreamCallState:
-    """单个合成调用的累积状态（自适应"全量重发 / 增量追加"两种上游行为）。"""
+# Limits on response-local display decoder state, independent of the
+# executable-call assembler and any provider/request limits.
+_MAX_PRESENTATION_CALLS = 256
+_MAX_PRESENTATION_IDS = 512
+_MAX_PRESENTATION_ID_CHARS = 1024
+_MAX_PRESENTATION_DELTAS = 16_384
+_MAX_PRESENTATION_PARSER_FRAMES = 4096
+_MAX_PRESENTATION_PREFIX_BYTES = 64 * 1024
+_MAX_PRESENTATION_CALL_BYTES = 16 * 1024 * 1024
+_MAX_PRESENTATION_TOTAL_BYTES = 64 * 1024 * 1024
+_INCOMPLETE_PRESENTATION_FINISH = 10  # MALFORMED_FUNCTION_CALL
 
-    call_id: str | None = None
+
+def _presentation_raw(call: dict[str, object]) -> object:
+    args = call.get("args")
+    return args if isinstance(args, (dict, str)) else call.get("arguments")
+
+
+def _presentation_size(text: str) -> int:
+    return len(text) if text.isascii() else len(text.encode("utf-8", "surrogatepass"))
+
+
+@dataclass(slots=True)
+class _PresentationCallState:
+    """One display call's argument decoder and retained prefix."""
+
+    call_id: str
     fragments: list[str] = field(default_factory=list)
-    size: int = 0
+    kept_bytes: int = 0
     decoder: ContentDecoder = field(default_factory=ContentDecoder)
     signature_emitted: bool = False
-    # 上游一旦下发过可完整解析的 dict 参数，后续字符串分片视为冗余重发。
     dict_seen: bool = False
+    over_limit: bool = False
 
     @property
     def complete(self) -> bool:
-        return self.dict_seen or self.decoder.valid
+        return not self.over_limit and (self.dict_seen or self.decoder.valid)
 
-    def append(self, text: str) -> None:
-        if text:
-            self.fragments.append(text)
-            self.size += len(text)
+    def decode(self, raw: object, *, stack_limit: int) -> tuple[str, str | None]:
+        """Return an uncommitted delta and an optional replacement prefix."""
+        if isinstance(raw, dict):
+            content = raw.get("content")
+            self.dict_seen = isinstance(content, str)
+            return _content_delta(self, content if isinstance(content, str) else "")
+        if not isinstance(raw, str) or not raw or self.decoder.invalid:
+            return "", None
+        delta = self.decoder.feed(raw, stack_limit=stack_limit)
+        if self.decoder.invalid:
+            self.decoder.stack.clear()  # An invalid raw stream cannot resume.
+            logger.warning("抗截断流式参数 JSON 识别失败，跳过后续解码")
+            return "", None
+        return delta, None
 
 
-def _merge_content(state: _StreamCallState, new: str) -> str:
-    """合并新到的 content 片段，返回应作为正文增量下发的新文本。
-
-    去重判定按片段游标推进（``new.startswith(frag, offset)`` 为 C 级比较，
-    且前缀长于 new 时 O(1) 失配），不再每事件 ``"".join`` 全量拼接——
-    增量追加模式下每个事件都重新拼接全部历史片段是 O(总字节×事件数)
-    的二次开销（长回答 + 多分片场景实测可达 MB 级冗余拷贝/事件）。
-    """
-    if not state.fragments:
-        state.append(new)
-        return new
+def _content_delta(state: _PresentationCallState, new: str) -> tuple[str, str | None]:
+    """Keep the existing incremental/snapshot semantics without joining history."""
     offset = 0
-    matched_all = True
-    for frag in state.fragments:
-        if new.startswith(frag, offset):
-            offset += len(frag)
-        else:
-            matched_all = False
-            break
-    if matched_all:
-        # 全量重发语义：new 以「到目前为止的完整正文」为前缀。
-        if len(new) > state.size:
-            # 只补发后缀。
-            suffix = new[offset:]
-            state.fragments = [new]
-            state.size = len(new)
-            return suffix
-        # 与已累积内容完全相同的全量重发：无增量。
-        return ""
-    # 增量追加模式。
-    state.append(new)
-    return new
+    for fragment in state.fragments:
+        if not new.startswith(fragment, offset):
+            return new, None
+        offset += len(fragment)
+    if len(new) > offset:
+        return new[offset:], new
+    return "", None
+
+
+def _unconfirmed_display_name(call: dict[str, object], tool_name: str) -> bool:
+    name = call.get("name")
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and tool_name.startswith(name)
+        and not {"args", "arguments"} & call.keys()
+    )
+
+
+class _PresentationTracker:
+    """Bounded per-response display identities; never infer a nameless ID."""
+
+    def __init__(self, tool_name: str, *, legacy_stream_fallback: bool = False) -> None:
+        self.tool_name = tool_name
+        self.seen = False
+        self._legacy_stream_fallback = legacy_stream_fallback
+        self._states: list[_PresentationCallState] = []
+        # None marks an explicit ordinary owner: do not borrow its ID for display.
+        self._by_id: dict[str, _PresentationCallState | None] = {}
+        self._current: _PresentationCallState | None = None
+        self._limited = self._conflict = False
+        self._bytes = self._deltas = self._parser_frames = 0
+
+    @property
+    def count(self) -> int:
+        return len(self._states)
+
+    def interrupt(self) -> None:
+        # Do not attribute sparse frames across an interrupted boundary.
+        self._by_id.clear()
+        self._current = None
+
+    def incomplete(self, *, plain_won: bool) -> bool:
+        return (
+            self.seen
+            and not plain_won
+            and (
+                self._limited
+                or self._conflict
+                or any(not state.complete for state in self._states)
+            )
+        )
+
+    def owns(self, call: dict[str, object]) -> bool:
+        name = call.get("name")
+        if name == self.tool_name:
+            return True
+        ident = _presentation_id(call)
+        if not ident or len(ident) > _MAX_PRESENTATION_ID_CHARS:
+            return False
+        existing = self._by_id.get(ident)
+        if name is None or name == "":
+            return existing is not None
+        if (
+            isinstance(name, str)
+            and (
+                existing is not None
+                or not _unconfirmed_display_name(call, self.tool_name)
+            )
+            and (ident in self._by_id or len(self._by_id) < _MAX_PRESENTATION_IDS)
+        ):
+            if self._current is existing:
+                self._current = None
+            self._by_id[ident] = None
+        return False
+
+    def feed(
+        self, call: dict[str, object]
+    ) -> tuple[_PresentationCallState | None, str] | None:
+        # None means "ordinary"; a pair with no state is an internal call
+        # which must stay internal even when there is no safe budget/binding.
+        if not self.owns(call):
+            return None
+        self.seen = True
+        if self._limited:
+            return None, ""
+
+        ident = _presentation_id(call)
+        state = self._by_id.get(ident)
+        if ident and state is None:
+            if ident in self._by_id:
+                self._conflict = True
+                return None, ""
+            if (
+                len(ident) > _MAX_PRESENTATION_ID_CHARS
+                or len(self._by_id) >= _MAX_PRESENTATION_IDS
+            ):
+                self._limited = True
+                return None, ""
+        # Do not extend the existing streaming fallback to nameless frames
+        # or change the buffered treatment of independent ID-less objects.
+        if (
+            state is None
+            and self._legacy_stream_fallback
+            and self._current is not None
+            and (not ident or not self._current.call_id)
+        ):
+            state = self._current
+        if state is None:
+            if len(self._states) >= _MAX_PRESENTATION_CALLS:
+                self._limited = True
+                return None, ""
+            state = _PresentationCallState(call_id=ident)
+            self._states.append(state)
+        if ident:
+            state.call_id = ident
+            self._by_id[ident] = state
+        self._current = state
+
+        raw = _presentation_raw(call)
+        if state.dict_seen and isinstance(raw, str):
+            # A raw replay cannot amend an already received structured object.
+            return state, ""
+        text = raw.get("content") if isinstance(raw, dict) else raw
+        if isinstance(text, str) and (
+            len(text) > _MAX_PRESENTATION_CALL_BYTES
+            or _presentation_size(text) > _MAX_PRESENTATION_CALL_BYTES
+        ):
+            self._limited = state.over_limit = True
+            return state, ""
+        # A stream can open many JSON objects before yielding its first text.
+        # Share a structural budget across those parsers, before they allocate.
+        before = len(state.decoder.stack)
+        stack_limit = _MAX_PRESENTATION_PARSER_FRAMES - self._parser_frames + before
+        delta, snapshot = state.decode(raw, stack_limit=stack_limit)
+        self._parser_frames += len(state.decoder.stack) - before
+        if delta:
+            size = _presentation_size(delta)
+            if (
+                self._deltas >= _MAX_PRESENTATION_DELTAS
+                or state.kept_bytes + size > _MAX_PRESENTATION_CALL_BYTES
+                or self._bytes + size > _MAX_PRESENTATION_TOTAL_BYTES
+            ):
+                self._limited = state.over_limit = True
+                return state, ""
+            if snapshot is None:
+                state.fragments.append(delta)
+            else:
+                state.fragments = [snapshot]
+            state.kept_bytes += size
+            self._bytes += size
+            self._deltas += 1
+        return state, delta
 
 
 async def _close_stream_quietly(stream: object) -> None:
@@ -774,6 +961,58 @@ async def restore_anti_truncation_stream(
         await _close_stream_quietly(events)
 
 
+def _without_plain_text(part: ResponsePart) -> ResponsePart:
+    signature = (
+        part.thought_signature
+        if (
+            part.function_call
+            or part.function_response
+            or part.image
+            or part.executable_code is not None
+            or part.code_execution_result is not None
+        )
+        else ""
+    )
+    return replace(part, text="", text_present=False, thought_signature=signature)
+
+
+async def _ordered_transport_events(
+    events: AsyncIterator[tuple[str, object | None]], tracker: _PresentationTracker
+) -> AsyncIterator[tuple[str, object | None]]:
+    """Expose only this variant's internal display calls to its decoder."""
+    async for kind, payload in events:
+        if kind == "tool_interruption":
+            tracker.interrupt()
+        if kind != "ordered_parts" or not isinstance(payload, list):
+            yield kind, payload
+            continue
+        ordered: list[ResponsePart] = []
+        for part in payload:
+            if not isinstance(part, ResponsePart):
+                continue
+            call = part.function_call
+            if call is not None and (
+                tracker.owns(call) or _unconfirmed_display_name(call, tracker.tool_name)
+            ):
+                ordered.append(replace(part, function_call=None, thought_signature=""))
+                yield kind, ordered
+                ordered = []
+                yield (
+                    "tool_calls",
+                    [
+                        {
+                            key: value
+                            for key, value in call.items()
+                            if key != "thought_signature"
+                        }
+                    ],
+                )
+            else:
+                ordered.append(part)
+        if ordered:
+            yield kind, ordered
+
+
 async def _restore_anti_truncation_stream_inner(
     events: AsyncIterator[tuple[str, object | None]],
     ctx: AntiTruncationContext,
@@ -784,62 +1023,32 @@ async def _restore_anti_truncation_stream_inner(
         return
 
     channel: str | None = None  # None | "plain" | "synthetic"
-    call_state: _StreamCallState | None = None
-    prior_calls_complete = True
+    tracker = _PresentationTracker(ctx.tool_name, legacy_stream_fallback=True)
     real_calls_seen = False
-    # 暂缓透传的「疑似名称分片」：若流结束时既未被证明是合成名前缀，
-    # 也未等到带参数的完整帧，必须在 done 前冲刷——否则一次真实的
-    # 工具调用（上游恰好只发了名称分片）会被静默吞掉
+    # Preserve the existing deferral for explicit, incomplete names; a
+    # nameless frame is not evidence of a presentation prefix.
     held_prefix_calls: list[dict[str, object]] = []
+    held_prefix_bytes = 0
+    prefix_limited = False
 
-    def handle_synthetic_call(call: dict[str, object]) -> str | None:
-        """处理一个合成调用分片，返回待下发的正文增量（可能为空）。"""
-        nonlocal call_state, prior_calls_complete
-
-        ctx.synthetic_seen = True
-        call_id = call.get("call_id") or call.get("id")
-        call_id_str = str(call_id) if call_id is not None else None
-        if call_state is None or (
-            call_id_str is not None
-            and call_state.call_id is not None
-            and call_state.call_id != call_id_str
-        ):
-            if call_state is not None:
-                prior_calls_complete = prior_calls_complete and call_state.complete
-                if call_state.size:
-                    ctx.multiple_calls = True
-            call_state = _StreamCallState(call_id=call_id_str)
-        elif call_state.call_id is None and call_id_str is not None:
-            call_state.call_id = call_id_str
-
-        delta: str
-        args = call.get("args")
-        if isinstance(args, dict):
-            content = args.get("content")
-            call_state.dict_seen = isinstance(content, str)
-            delta = _merge_content(
-                call_state, content if isinstance(content, str) else ""
-            )
-        else:
-            raw_fragment = args if isinstance(args, str) else call.get("arguments")
-            if not isinstance(raw_fragment, str) or not raw_fragment:
-                delta = ""
-            elif call_state.dict_seen:
-                # dict 参数已完整收到，字符串分片是冗余重发。
-                delta = ""
-            else:
-                # 上游以 JSON 字符串形式分片下发参数。
-                delta = call_state.decoder.feed(raw_fragment)
-                if call_state.decoder.invalid:
-                    logger.warning("抗截断流式参数 JSON 识别失败，跳过后续解码")
-                    return None
-                if delta:
-                    # 与 dict 路径共享累积状态：若上游随后补发完整
-                    # dict 参数帧，_merge_content 可据此去重。
-                    call_state.append(delta)
-        return delta if delta else None
-
-    async for event_type, payload in events:
+    async for event_type, payload in _ordered_transport_events(events, tracker):
+        if event_type == "ordered_parts" and isinstance(payload, list):
+            ordered = []
+            for part in payload:
+                if not isinstance(part, ResponsePart):
+                    continue
+                if part.function_call:
+                    real_calls_seen = True
+                if part.text and not part.thought:
+                    if channel == "synthetic":
+                        part = _without_plain_text(part)
+                    else:
+                        channel = "plain"
+                        ctx.plain_seen = True
+                ordered.append(part)
+            if ordered:
+                yield event_type, ordered
+            continue
         if event_type == "body":
             if channel == "synthetic":
                 # 工具频道已胜出，抑制其后的纯文本回声。
@@ -853,64 +1062,88 @@ async def _restore_anti_truncation_stream_inner(
         if event_type == "tool_calls" and isinstance(payload, list):
             passthrough: list[dict[str, object]] = []
             text_delta: str | None = None
-            signature: str | None = None
+            signature: tuple[_PresentationCallState, str] | None = None
             for call in payload:
                 if not isinstance(call, dict):
                     continue
-                name = str(call.get("name") or "")
-                if name == ctx.tool_name:
-                    delta = handle_synthetic_call(call)
+                update = tracker.feed(call)
+                if update is not None:
+                    state, delta = update
+                    ctx.synthetic_seen = tracker.seen
+                    ctx.multiple_calls = tracker.count > 1
                     if delta:
                         text_delta = (text_delta or "") + delta
                     sig = call.get("thought_signature")
-                    if isinstance(sig, str) and sig:
-                        signature = sig
-                elif (
-                    (not name or ctx.tool_name.startswith(name))
-                    and "args" not in call
-                    and "arguments" not in call
-                ):
+                    if state is not None and isinstance(sig, str) and sig:
+                        signature = state, sig
+                elif _unconfirmed_display_name(call, ctx.tool_name):
                     # 名称尚为合成名前缀且未带参数：疑似名称分片，暂缓透传。
                     # 若后续等到带参数的完整帧（或合成调用胜出），该分片
                     # 证明是前缀碎片，丢弃即正确；否则在 done 前冲刷。
-                    held_prefix_calls.append(call)
+                    if channel == "synthetic" or prefix_limited:
+                        continue
+                    # A deferred name needs only the fields used to serialize
+                    # it, not the original provider array or unknown fields.
+                    prefix = {"name": str(call["name"])}
+                    ident = call.get("call_id") or call.get("id")
+                    sig = call.get("thought_signature")
+                    if isinstance(ident, str) and ident:
+                        prefix["call_id"] = ident
+                    if isinstance(sig, str) and sig:
+                        prefix["thought_signature"] = sig
+                    remaining = _MAX_PRESENTATION_PREFIX_BYTES - held_prefix_bytes
+                    size = sum(len(value) for value in prefix.values())
+                    if size <= remaining:
+                        size = sum(
+                            _presentation_size(value) for value in prefix.values()
+                        )
+                    if (
+                        len(held_prefix_calls) >= _MAX_PRESENTATION_CALLS
+                        or size > remaining
+                    ):
+                        prefix_limited = True
+                        held_prefix_calls.clear()
+                    else:
+                        held_prefix_bytes += size
+                        held_prefix_calls.append(dict(prefix))
                     continue
                 else:
                     real_calls_seen = True
                     # 带参数/完整名的真实调用到达：此前暂缓的名称分片
                     # 确系前缀碎片，安全丢弃
                     held_prefix_calls.clear()
+                    held_prefix_bytes = 0
+                    prefix_limited = False
                     passthrough.append(call)
             if text_delta is not None:
                 if channel == "plain":
                     logger.info("抗截断：纯文本频道已胜出，抑制工具通道重复正文")
                 else:
                     channel = "synthetic"
-                    if (
-                        signature
-                        and call_state is not None
-                        and not call_state.signature_emitted
-                    ):
-                        call_state.signature_emitted = True
-                        yield "thought_signature", signature
+                    if signature is not None:
+                        state, value = signature
+                        if not state.signature_emitted:
+                            state.signature_emitted = True
+                            yield "thought_signature", value
                     yield "body", text_delta
             if passthrough:
                 yield "tool_calls", passthrough
             continue
 
         if event_type == "finish_reason":
-            if (
-                channel == "synthetic"
-                and not real_calls_seen
-                and prior_calls_complete
-                and call_state is not None
-                and call_state.complete
-                and isinstance(payload, int)
-                and payload in (10, 12, 13)
+            if tracker.incomplete(plain_won=channel == "plain") or (
+                prefix_limited and channel != "synthetic"
             ):
-                # 仅当参数完整且合法时，MALFORMED / UNEXPECTED / TOO_MANY 属于
-                # 工具协议视角的收尾码，对正文通道应归一为 STOP。
-                payload = 1
+                # A successful upstream terminal cannot certify invalid local
+                # display assembly. Never reinterpret an upstream failure.
+                if (
+                    isinstance(payload, int)
+                    and not isinstance(payload, bool)
+                    and payload == WIRE_FINISH_REASON_STOP
+                ):
+                    payload = _INCOMPLETE_PRESENTATION_FINISH
+                elif payload == "STOP":
+                    payload = "MALFORMED_FUNCTION_CALL"
             yield event_type, payload
             continue
 

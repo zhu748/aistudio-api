@@ -20,6 +20,7 @@ from aistudio_api.application.compat_service import (
     openai_to_gemini_request,
 )
 from aistudio_api.application.responses_service import responses_to_gemini_request
+from aistudio_api.domain import tool_signatures
 from aistudio_api.domain.errors import TransportError
 from aistudio_api.infrastructure.gateway import model_turns as module
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
@@ -295,13 +296,17 @@ def test_rerolls_keep_distinct_turns_and_never_reuse_a_later_unknown_turn_token(
     assert history.prepare("scope", unknown)[1] is None
 
 
-@pytest.mark.parametrize("changed", ["client", "prompt", "arguments", "text", "order"])
+@pytest.mark.parametrize(
+    "changed", ["client", "prompt", "whitespace", "arguments", "text", "order"]
+)
 def test_changed_conversation_does_not_restore_another_state(changed):
     history = ModelTurnHistory()
     contents = echo(remember(history))
     scope = "other" if changed == "client" else "scope"
     if changed == "prompt":
         contents[0].parts[0].text = "different initial prompt"
+    elif changed == "whitespace":
+        contents[0].parts[0].text = f"  {PROMPT}"
     elif changed == "arguments":
         contents[1].parts[0].function_call = (
             "context",
@@ -408,6 +413,61 @@ def test_explicit_different_signature_is_preserved():
         restored[1].parts[0].thought_signature == contents[1].parts[0].thought_signature
     )
     assert not restored[1].parts[0].thought
+
+
+def test_echoed_reasoning_conflict_preserves_original_request():
+    history = ModelTurnHistory()
+    raw = [
+        AistudioPart(
+            text="newer thought", thought=True, thought_signature=SIGNATURE
+        ).to_wire(),
+        AistudioPart(text="same visible answer").to_wire(),
+    ]
+    user = remember(history, parts=raw)
+    original = AistudioContent(
+        "model",
+        [
+            AistudioPart(text="older thought", thought=True),
+            AistudioPart(text="same visible answer"),
+        ],
+    )
+    restored, token, context = history.prepare(
+        "scope",
+        [*user, original, AistudioContent("user", [AistudioPart(text="next")])],
+    )
+    assert restored[1] is original
+    assert token is None
+    assert context is None
+
+
+def test_identical_captures_restore_parts_without_choosing_between_tokens():
+    history = ModelTurnHistory()
+    initial = remember(history)
+    remember(history, token="v1_" + "b" * 24)
+    restored, token, _ = history.prepare("scope", echo(initial))
+    assert restored[1].parts[0].thought
+    assert token is None
+
+
+def test_scoped_turn_precedes_conflicting_per_call_cache(monkeypatch, tmp_path):
+    history = ModelTurnHistory()
+    cache = tool_signatures.ThoughtSignatureCache(tmp_path / "signatures.json")
+    monkeypatch.setattr(tool_signatures, "_cache_instance", cache)
+    other = base64.b64encode(b"unrelated fixture state").decode()
+    for i, (name, args) in enumerate(CALLS):
+        cache.remember(f"echo-{i}", name, args, other)
+    raw = [
+        AistudioPart(
+            function_call=(name, args, f"upstream-{i}"),
+            thought_signature=SIGNATURE if i == 0 else None,
+        ).to_wire()
+        for i, (name, args) in enumerate(CALLS)
+    ]
+    contents = echo(remember(history, parts=raw))
+    restored, token, _ = history.prepare("scope", contents)
+    assert token == TOKEN
+    assert [part.thought_signature for part in restored[1].parts] == [SIGNATURE, None]
+    assert [part.thought_signature for part in contents[1].parts] == [None, None]
 
 
 def test_cache_capacity_and_memory_are_bounded(monkeypatch):

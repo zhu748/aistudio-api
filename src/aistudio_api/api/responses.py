@@ -11,7 +11,7 @@ from aistudio_api.api.response_models import (
     GeminiPartResponse,
     GeminiUsageMetadata,
 )
-from aistudio_api.domain.models import GeneratedImage
+from aistudio_api.domain.models import GeneratedImage, ResponsePart
 
 
 def _coerce_usage_int(value: object) -> int:
@@ -74,6 +74,79 @@ def _image_inline_data(image: GeneratedImage) -> GeminiInlineDataResponse:
     if data is None:
         data = base64.b64encode(image.data).decode("ascii")
     return GeminiInlineDataResponse(mimeType=image.mime, data=data)
+
+
+def _tool_part_fields(value: dict[str, object], payload_key: str) -> dict[str, object]:
+    """Keep sparse wire updates sparse until the response-level assembly."""
+    fields: dict[str, object] = {}
+    name = value.get("name")
+    if isinstance(name, str) and name:
+        fields["name"] = name
+    call_id = value.get("call_id") or value.get("id")
+    if isinstance(call_id, str) and call_id:
+        fields["id"] = call_id
+    for key in (payload_key, "args", "arguments"):
+        if key in value and value[key] is not None:
+            fields[payload_key] = value[key]
+            break
+    return fields
+
+
+_CODE_LANGUAGES = {0: "LANGUAGE_UNSPECIFIED", 1: "PYTHON"}
+_CODE_OUTCOMES = {
+    0: "OUTCOME_UNSPECIFIED",
+    1: "OUTCOME_OK",
+    2: "OUTCOME_FAILED",
+    3: "OUTCOME_DEADLINE_EXCEEDED",
+}
+
+
+def _code_fields(
+    raw: object, enums: dict[int, str], kind: str, payload_key: str
+) -> dict[str, object] | None:
+    if isinstance(raw, str):
+        return {kind: enums[0], payload_key: raw}
+    if isinstance(raw, list) and len(raw) > 1 and isinstance(raw[1], str):
+        tag = raw[0]
+        status = enums.get(tag, enums[0]) if isinstance(tag, int) else enums[0]
+        fields: dict[str, object] = {kind: status, payload_key: raw[1]}
+        if len(raw) > 2 and isinstance(raw[2], str) and raw[2]:
+            fields["id"] = raw[2]
+        return fields
+    return None
+
+
+def encode_response_part(part: ResponsePart) -> dict[str, object]:
+    """Render a decoded Part without folding it into neighboring parts."""
+    fields: dict[str, object] = {}
+    if part.text_present:
+        fields["text"] = part.text
+    if part.thought:
+        fields["thought"] = True
+    if part.thought_signature:
+        fields["thoughtSignature"] = part.thought_signature
+    if part.image is not None:
+        fields["inlineData"] = _image_inline_data(part.image).model_dump()
+    if part.function_call is not None:
+        fields["functionCall"] = _tool_part_fields(part.function_call, "args")
+    if part.function_response is not None:
+        response = _tool_part_fields(part.function_response, "response")
+        if response.get("name"):
+            fields["functionResponse"] = response
+    for raw, key, enums, kind, payload in (
+        (part.executable_code, "executableCode", _CODE_LANGUAGES, "language", "code"),
+        (
+            part.code_execution_result,
+            "codeExecutionResult",
+            _CODE_OUTCOMES,
+            "outcome",
+            "output",
+        ),
+    ):
+        code = _code_fields(raw, enums, kind, payload)
+        if code is not None:
+            fields[key] = code
+    return fields
 
 
 def to_gemini_parts(

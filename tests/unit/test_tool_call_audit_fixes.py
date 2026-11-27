@@ -97,8 +97,7 @@ def test_b1_invalid_signature_only_part_is_dropped():
     sigs = _wire_signatures(normalized)
     assert INVALID_SIG not in sigs
     assert "%%%corrupted%%%" not in sigs
-    # 无签名 functionCall 走 SKIP 兜底
-    assert "skip_thought_signature_validator" in sigs
+    assert not sigs  # 规范化只保留明确提供的合规签名。
 
 
 def test_b1_valid_signature_only_part_is_preserved():
@@ -581,8 +580,8 @@ async def test_mixed_id_dict_snapshot_completes_chain():
     assert calls[0]["args"] == {"city": "Tokyo"}
 
 
-async def test_b2_changed_completed_call_keeps_delivered_version():
-    """上游修改已完成调用：保留已投递版本并告警，不再硬失败。"""
+async def test_stable_id_uses_latest_snapshot_before_publication():
+    """No call was published yet, so a later same-ID correction can win."""
     frames = [
         frame
         async for frame in coalesce_tool_frames(
@@ -628,7 +627,7 @@ async def test_b2_changed_completed_call_keeps_delivered_version():
     ]
     calls = [p["functionCall"] for p in _parts_of(frames) if "functionCall" in p]
     assert len(calls) == 1
-    assert calls[0]["args"] == {"city": "old"}
+    assert calls[0]["args"] == {"city": "new"}
 
 
 # ---------------------------------------------------------------------------

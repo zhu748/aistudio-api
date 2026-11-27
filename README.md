@@ -571,7 +571,7 @@ curl http://localhost:8080/v1/messages \
 
 - `model` 填 `claude-*` 家族名会自动映射到 `config.yaml` 中 `compat.claude.default_model`（也可直接填 Gemini 模型名）；
 - 流式返回完整 Claude 事件序列（`message_start` / `content_block_delta` / `message_delta` / `message_stop`），思考链走 thinking 块；
-- 工具（`tools` / `tool_choice`）、`thinking.budget_tokens`（自动换算为 Gemini 思考等级）、图片 / PDF 块、`stop_sequences` 均已支持；
+- 工具（`tools` / `tool_choice`）、`thinking.budget_tokens`（自动换算为 Gemini 思考等级）、图片 / PDF 输入、`stop_sequences` 均已支持。Claude Messages 不支持二进制图片输出，适配层会返回简短文本提示；如需图片原始数据，请使用原生 Gemini 端点；
 - `POST /v1/messages/count_tokens` 提供粗略 token 估算，`GET /v1/models` 在携带 `anthropic-version` 头时返回 Claude 格式。
 </details>
 
@@ -593,6 +593,7 @@ curl http://localhost:8080/v1/responses \
 
 - OpenAI 新一代 Responses 协议（openai-python / Codex CLI 等客户端使用），事件形状与官方 SDK `types/responses/*` 逐字段对齐；
 - `input` 支持字符串或 item 数组（`message` / `function_call` / `function_call_output`），`instructions` 映射为 system instruction；
+- `function_call_output.output` 支持文本以及受体积限制的内联图片（`input_image.image_url`）和文件（`input_file.file_data`，保留 `filename`）。请使用 Base64 data URL；工具结果里的远程 URL 和文件 ID 不会被下载，改用文本标记说明省略；
 - 流式返回语义化事件序列（`response.created` → `response.output_item.added` → `response.output_text.delta` → `response.completed`），`sequence_number` 从 0 连续递增；思考链走 `response.reasoning_summary_text.delta`，工具调用走 `response.function_call_arguments.delta/done`；
 - `reasoning.effort`（`minimal`/`low`/`medium`/`high`/`xhigh`/`max`）、`text.format`（JSON 模式 / JSON Schema）、function tools 均已支持；上游截断 / 安全拦截时正确下发 `response.incomplete`（含 `incomplete_details.reason`）；
 - 模型名映射与 Chat Completions 共用 `compat.openai.default_model` 配置。
@@ -653,6 +654,11 @@ result = client.models.generate_content(
 )
 print(result.text)
 ```
+
+原生流检测到 Python SDK 在 `X-Goog-Api-Client` 或 `User-Agent` 中的标准标记
+（`google-genai-sdk/` 与 `gl-python/`）时，会把成功响应的结束原因和用量合并
+到最后一个真实 Part，避免 `client.chats` 丢掉该轮历史。最多保留一个 Part，
+等待下一个 Part 或上游响应结束。其他客户端的原生流分帧不变。
 
 ---
 

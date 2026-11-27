@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import cast
 from uuid import uuid4
 
+import anyio
 from fastapi import HTTPException
 from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -39,6 +40,7 @@ from aistudio_api.infrastructure.utils.logger import (
 from aistudio_api.infrastructure.utils.redaction import redact_text
 
 logger = get_logger("requests")
+_DOWNSTREAM_DISCONNECT = "Downstream disconnected (client or reverse proxy)"
 
 
 # ── 小内存容器的 RSS 高水位治理 ──────────────────────────────────────────────
@@ -103,13 +105,16 @@ def _release_allocator_memory(received_bytes: int, sent_bytes: int) -> None:
 
 
 def _is_terminal_event(path: str, body: bytes) -> bool:
-    """Recognize complete frames emitted by our compatibility adapters.
+    """Recognize complete terminal frames emitted by our model routes.
 
-    Only inspect SSE control lines, never model text inside JSON. Adapters emit
-    each event in one ASGI body message, including large tool argument events.
+    Our encoders emit each event in one ASGI body message. Inspect protocol
+    fields, not model text or tool arguments.
     """
     if path == "/v1/chat/completions":
-        return body == b"data: [DONE]\n\n"
+        # Official Chat clients raise and close on a top-level error without
+        # consuming [DONE]. Our encoder places that object first; a nested
+        # tool argument or text containing "error" cannot match this prefix.
+        return body == b"data: [DONE]\n\n" or body.startswith(b'data: {"error":{')
     if path == "/v1/messages":
         return body.startswith((b"event: message_stop\n", b"event: error\n"))
     if path == "/v1/responses":
@@ -121,6 +126,29 @@ def _is_terminal_event(path: str, body: bytes) -> bool:
                 b"event: error\n",
             )
         )
+    if path.startswith("/v1beta/") and path.endswith(":streamGenerateContent"):
+        if body.startswith(b'data: {"error":'):
+            return True
+        # The ordinary usage/finish frame is compact and has no output parts.
+        if body.startswith(
+            b'data: {"candidates":[{"content":{"role":"model","parts":[]},"finishReason":'
+        ):
+            return True
+        # Buffered variants may send the terminal metadata with their output.
+        # Avoid parsing ordinary content frames; a tool's nested finishReason
+        # must not certify that the surrounding stream has finished.
+        if body.startswith(b"data: ") and b'"finishReason":' in body:
+            try:
+                frame = json.loads(body[6:])
+            except ValueError:
+                return False
+            candidates = frame.get("candidates") if isinstance(frame, dict) else None
+            return (
+                isinstance(candidates, list)
+                and bool(candidates)
+                and isinstance(candidates[0], dict)
+                and bool(candidates[0].get("finishReason"))
+            )
     return False
 
 
@@ -138,6 +166,8 @@ class _ResponseObserver:
     sending: bool = False
     json_payload_sent: bool = False
     stream_terminal_sent: bool = False
+    delivered_outcome: tuple[str, str, str] | None = None
+    client_disconnected: bool = False
     is_stream: bool = False
     first_byte_ms: float | None = None
     received_bytes: int = 0
@@ -151,6 +181,10 @@ class _ResponseObserver:
     request_body: bytearray = field(default_factory=bytearray)
     response_body: bytearray = field(default_factory=bytearray)
     response_headers: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def response_delivered(self) -> bool:
+        return self.completed or self.json_payload_sent or self.stream_terminal_sent
 
 
 class RequestMiddleware:
@@ -183,6 +217,9 @@ class RequestMiddleware:
             path.startswith(("/v1beta/", "/v1/messages"))
             or path in ("/v1/chat/completions", "/v1/responses")
         )
+        responses_call = model_call and path == "/v1/responses"
+        if responses_call:
+            scope["state"]["responses_accept_event"] = None
         # Management payloads can contain cookies, complete config and credentials.
         dump_enabled = model_call and (
             is_dump_requests_enabled() or is_dump_to_file_enabled()
@@ -210,6 +247,8 @@ class RequestMiddleware:
         admitted = False
         request_timeout = asyncio.timeout(settings.request_timeout)
         history_start: asyncio.Task[None] | None = None
+        disconnect_scope = anyio.CancelScope() if model_call else None
+        disconnect_watch: asyncio.Task[Message] | None = None
 
         async def reply(code: int, message: str) -> None:
             from aistudio_api.application.compat_service import (
@@ -268,13 +307,35 @@ class RequestMiddleware:
                 }
             )
 
-        async def observed_receive() -> Message:
+        def mark_disconnect() -> None:
+            if observer.response_delivered or observer.client_disconnected:
+                return
+            observer.client_disconnected = True
+            context.result, context.error = "cancelled", _DOWNSTREAM_DISCONNECT
+            if model_call:
+                request_event("disconnected", context.error)
+
+        async def watch_disconnect(cancel_scope: anyio.CancelScope) -> Message:
+            # Once the last request-body message has been consumed, this is
+            # the sole reader of the server's receive channel. In particular,
+            # no heartbeat or concurrent Starlette receive call is required.
             message = await receive()
             if message["type"] == "http.disconnect" and not observer.completed:
-                context.result = "cancelled"
-                context.error = "Downstream disconnected (client or reverse proxy)"
-                if model_call:
-                    request_event("disconnected", context.error)
+                mark_disconnect()
+                # Release work still running even if its terminal event was
+                # already sent; in that case leave the delivered result alone.
+                cancel_scope.cancel()
+            return message
+
+        async def observed_receive() -> Message:
+            nonlocal disconnect_watch
+            if disconnect_watch is not None:
+                # Starlette cancels its own receive waiters when a response
+                # completes. That must not cancel the shared watcher.
+                return await asyncio.shield(disconnect_watch)
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                mark_disconnect()
             elif message["type"] == "http.request":
                 body = message.get("body", b"")
                 observer.received_bytes += len(body)
@@ -311,6 +372,10 @@ class RequestMiddleware:
                         observer.request_body_truncated = True
                 if observer.received_bytes > body_limit:
                     raise HTTPException(413, "Request body exceeds configured limit")
+                if observer.request_body_complete and disconnect_scope is not None:
+                    disconnect_watch = asyncio.create_task(
+                        watch_disconnect(disconnect_scope)
+                    )
             return message
 
         async def observed_send(message: Message) -> None:
@@ -363,25 +428,55 @@ class RequestMiddleware:
                     async with asyncio.timeout(settings.stream_send_timeout):
                         await send(message)
                 except TimeoutError as exc:
-                    context.result = "cancelled"
-                    context.error = "Downstream response send timed out"
-                    raise OSError(context.error) from exc
+                    detail = "Downstream response send timed out"
+                    if not observer.response_delivered:
+                        context.result, context.error = "cancelled", detail
+                    raise OSError(detail) from exc
             else:
                 await send(message)
             observer.sending = False
             if message["type"] == "http.response.body":
                 if not message.get("more_body", False):
                     observer.completed = True
-                if observer.is_stream and _is_terminal_event(
-                    path, message.get("body", b"")
-                ):
-                    observer.stream_terminal_sent = True
+                if observer.is_stream:
+                    body = message.get("body", b"")
+                    if _is_terminal_event(path, body):
+                        observer.stream_terminal_sent = True
+                    if responses_call and body.startswith(b"event: response."):
+                        # Internal ASGI channels may run ahead. Commit protocol
+                        # progress only after the outer transport accepted it.
+                        accepted = scope["state"].get("responses_accept_event")
+                        if callable(accepted):
+                            accepted(body)
                 if (
-                    not observer.is_stream
-                    and scope.get("state", {}).get("json_keepalive_failure")
-                    and message.get("body", b"").strip()
+                    model_call
+                    and not observer.is_stream
+                    and message.get("body", b"")
+                    and (
+                        # A buffered keepalive writes its complete JSON after
+                        # zero or more whitespace chunks, with no fixed size.
+                        (
+                            scope.get("state", {}).get("json_keepalive_failure")
+                            and message["body"].strip()
+                        )
+                        # Ordinary JSON may reach its full declared size before
+                        # middleware sends the empty HTTP closing message.
+                        or (
+                            observer.response_headers.get(
+                                "content-type", ""
+                            ).startswith("application/json")
+                            and observer.response_headers.get("content-length")
+                            == str(observer.sent_bytes)
+                        )
+                    )
                 ):
                     observer.json_payload_sent = True
+                if observer.response_delivered and observer.delivered_outcome is None:
+                    observer.delivered_outcome = (
+                        context.result,
+                        context.error,
+                        context.finish_reason,
+                    )
 
         try:
             # Reserve a slot before the first await, including history I/O.
@@ -420,13 +515,28 @@ class RequestMiddleware:
                     ):
                         await reply(413, "Request body exceeds configured limit")
                         return
-                    await self.app(scope, observed_receive, observed_send)
+                    assert disconnect_scope is not None
+                    with disconnect_scope:
+                        await self.app(scope, observed_receive, observed_send)
             else:
                 await self.app(scope, observed_receive, observed_send)
         except asyncio.CancelledError:
-            context.result = "cancelled"
+            if not observer.response_delivered:
+                context.result = "cancelled"
             raise
         except TimeoutError:
+            if observer.client_disconnected:
+                return
+            if observer.response_delivered:
+                if observer.sending:
+                    # The earlier terminal/JSON send succeeded. The trailing
+                    # write may have partially completed: don't try it again.
+                    raise OSError(
+                        "Timeout interrupted trailing downstream send"
+                    ) from None
+                if not observer.completed:
+                    await observed_send({"type": "http.response.body", "body": b""})
+                return
             if not request_timeout.expired():
                 context.result, context.error = "error", "Upstream operation timed out"
                 logger.exception("Request raised an upstream timeout")
@@ -441,13 +551,6 @@ class RequestMiddleware:
                 context.result = "cancelled"
                 context.error = "Request timeout interrupted downstream send"
                 raise OSError(context.error) from None
-            if observer.completed:
-                return
-            if observer.json_payload_sent or observer.stream_terminal_sent:
-                # The result or terminal event has reached ASGI send. Only end
-                # HTTP; appending an error would corrupt or contradict it.
-                await observed_send({"type": "http.response.body", "body": b""})
-                return
             context.result, context.error = "timeout", "Request exceeded total timeout"
             if not observer.response_started:
                 await reply(504, context.error)
@@ -482,13 +585,18 @@ class RequestMiddleware:
                     }
                 )
         except (OSError, ClientDisconnect):
-            context.result = "cancelled"
-            if not context.error:
-                context.error = "Downstream disconnected (client or reverse proxy)"
-            raise
+            if not observer.response_delivered:
+                context.result = "cancelled"
+                if not context.error:
+                    context.error = _DOWNSTREAM_DISCONNECT
+            if not observer.client_disconnected:
+                raise
         except Exception:
-            context.result, context.error = "error", "Internal server error"
+            if not observer.response_delivered:
+                context.result, context.error = "error", "Internal server error"
             logger.exception("Request failed")
+            if observer.client_disconnected:
+                return
             if not observer.response_started:
                 await reply(500, context.error)
             else:
@@ -497,17 +605,36 @@ class RequestMiddleware:
             if admitted:
                 self.active -= 1
             try:
+                if disconnect_watch is not None:
+                    disconnect_watch.cancel()
+                    with anyio.CancelScope(shield=True):
+                        await asyncio.gather(disconnect_watch, return_exceptions=True)
                 elapsed_ms = (time.perf_counter() - started) * 1000
+                if observer.client_disconnected:
+                    # Account/quota bookkeeping in generator teardown may
+                    # record that upstream handled the call. It cannot turn
+                    # an undelivered response into client-visible success.
+                    context.result, context.error = "cancelled", _DOWNSTREAM_DISCONNECT
+                    context.finish_reason = ""
+                elif context.result == "cancelled" and observer.delivered_outcome:
+                    # An inner response writer may also report its own send
+                    # timeout. That cannot revoke an earlier successful send.
+                    context.result, context.error, context.finish_reason = (
+                        observer.delivered_outcome
+                    )
                 if not context.result:
                     context.result = (
                         "rate_limited"
                         if observer.status == 429
                         else "success"
-                        if observer.completed and observer.status < 400
+                        if observer.response_delivered and observer.status < 400
                         else "error"
                     )
-                if not observer.completed and context.result == "success":
-                    context.result = "cancelled"
+                if not observer.response_delivered:
+                    if context.result == "success":
+                        context.result = "cancelled"
+                    if context.result == "cancelled":
+                        context.finish_reason = ""
                 if model_call and admitted:
                     from aistudio_api.api.state import runtime_state
 
@@ -564,6 +691,13 @@ class RequestMiddleware:
             finally:
                 if model_call and admitted:
                     unregister_request(context.request_id)
+                if responses_call:
+                    # After the final send and cleanup, an idle HTTP connection
+                    # can still hold this scope. Don't let its callbacks pin the
+                    # Responses emitter and its accumulated output.
+                    scope["state"].pop("stream_failure", None)
+                    scope["state"].pop("responses_accept_event", None)
+                if model_call and admitted:
                     # 大请求收尾后归还 glibc 堆碎片（小内存容器 RSS 高水位
                     # 治理，详见 _release_allocator_memory）；放行务落账之后。
                     _release_allocator_memory(

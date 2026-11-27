@@ -8,9 +8,15 @@ from __future__ import annotations
 
 import json
 
-from aistudio_api.domain.models import Candidate, GeneratedImage, ModelOutput
+from aistudio_api.domain.models import (
+    Candidate,
+    GeneratedImage,
+    ModelOutput,
+    ResponsePart,
+)
 from aistudio_api.infrastructure.gateway.wire_spec import (
     WIRE_FINISH_REASON_CONTINUING,
+    WIRE_FINISH_REASON_STOP,
     PartIndex,
 )
 from aistudio_api.infrastructure.utils.common import (
@@ -129,30 +135,6 @@ def _coerce_int(value: object) -> int | None:
     return None
 
 
-class ResponsePart:
-    """Internal intermediate representation of a decoded wire part."""
-
-    def __init__(
-        self,
-        text: str = "",
-        inline_data: tuple[str, str] | None = None,
-        thought: bool = False,
-        function_call: dict[str, object] | None = None,
-        function_response: dict[str, object] | None = None,
-        thought_signature: str = "",
-        executable_code: object | None = None,
-        code_execution_result: object | None = None,
-    ):
-        self.text = text
-        self.inline_data = inline_data
-        self.thought = thought
-        self.function_call = function_call
-        self.function_response = function_response
-        self.thought_signature = thought_signature
-        self.executable_code = executable_code
-        self.code_execution_result = code_execution_result
-
-
 def parse_response_part(raw_part: object) -> ResponsePart:
     if not isinstance(raw_part, list):
         return ResponsePart()
@@ -245,11 +227,12 @@ def parse_response_part(raw_part: object) -> ResponsePart:
         else None
     )
 
+    text = (
+        raw_part[WIRE_PART_TEXT_INDEX] if len(raw_part) > WIRE_PART_TEXT_INDEX else None
+    )
     return ResponsePart(
-        text=raw_part[WIRE_PART_TEXT_INDEX]
-        if len(raw_part) > WIRE_PART_TEXT_INDEX
-        and isinstance(raw_part[WIRE_PART_TEXT_INDEX], str)
-        else "",
+        text=text if isinstance(text, str) else "",
+        text_present=isinstance(text, str),
         inline_data=inline_data,
         thought=thought,
         function_call=function_call,
@@ -466,7 +449,7 @@ def parse_chunk_usage(chunk: object) -> dict[str, object]:
 
 
 def parse_response_chunk(chunk: list[object]) -> Candidate:
-    candidate = Candidate()
+    candidate = Candidate(ordered_parts=[])
     if (
         not isinstance(chunk, list)
         or not chunk
@@ -500,6 +483,7 @@ def parse_response_chunk(chunk: list[object]) -> Candidate:
     thought_signature = ""
     code_outputs: list[str] = []
 
+    ordered_parts: list[ResponsePart] = []
     for raw_part in raw_parts if isinstance(raw_parts, list) else []:
         if isinstance(raw_part, list):
             candidate.raw_parts.append(raw_part)
@@ -516,17 +500,16 @@ def parse_response_chunk(chunk: list[object]) -> Candidate:
                     if isinstance(raw_bytes, (bytes, bytearray))
                     else b""
                 )
-                decoded_images.append(
-                    GeneratedImage(
-                        mime=str(img.get("mime", "image/jpeg")),
-                        data=b_data,
-                        size=int(str(img.get("size", 0))),
-                        thought_signature=part.thought_signature or "",
-                        # 保留上游原始 base64：出站编码直接复用，消除
-                        # b64decode→b64encode 全量往返。
-                        raw_b64=str(part.inline_data[1]),
-                    )
+                part.image = GeneratedImage(
+                    mime=str(img.get("mime", "image/jpeg")),
+                    data=b_data,
+                    size=int(str(img.get("size", 0))),
+                    thought_signature=part.thought_signature or "",
+                    # 保留上游原始 base64：出站编码直接复用，消除
+                    # b64decode→b64encode 全量往返。
+                    raw_b64=str(part.inline_data[1]),
                 )
+                decoded_images.append(part.image)
             if part.thought:
                 reasoning_images.extend(decoded_images)
             else:
@@ -547,6 +530,16 @@ def parse_response_chunk(chunk: list[object]) -> Candidate:
                 thinking_parts.append(part.text)
             else:
                 text_parts.append(part.text)
+        if (
+            part.text_present
+            or part.image
+            or part.function_call
+            or part.function_response
+            or part.thought_signature
+            or part.executable_code is not None
+            or part.code_execution_result is not None
+        ):
+            ordered_parts.append(part)
 
     candidate.text = "".join(text_parts)
     candidate.thinking = "".join(thinking_parts)
@@ -556,6 +549,7 @@ def parse_response_chunk(chunk: list[object]) -> Candidate:
     candidate.function_responses = function_responses
     candidate.thought_signature = thought_signature
     candidate.code_output = "\n".join(code_outputs)
+    candidate.ordered_parts = ordered_parts
     candidate.finish_reason = (
         raw_candidate[WIRE_CANDIDATE_FINISH_REASON]
         if len(raw_candidate) > WIRE_CANDIDATE_FINISH_REASON
@@ -616,13 +610,14 @@ def parse_text_output(raw: str) -> ModelOutput:
     if not chunks:
         return output
 
-    merged = Candidate()
+    ordered_parts: list[ResponsePart] = []
+    merged = Candidate(ordered_parts=ordered_parts)
     text_parts: list[str] = []
     thinking_parts: list[str] = []
     code_output_parts: list[str] = []
     retain_parts = True
     replay_bytes = 0
-    for chunk in chunks:
+    for chunk_index, chunk in enumerate(chunks):
         usage = parse_chunk_usage(chunk)
         if usage:
             output.usage = usage
@@ -631,6 +626,10 @@ def parse_text_output(raw: str) -> ModelOutput:
             if isinstance(raw_rid, str) and raw_rid:
                 output.response_id = raw_rid
         parsed = parse_response_chunk(chunk)
+        if parsed.ordered_parts:
+            for part in parsed.ordered_parts:
+                part.wire_chunk = chunk_index
+                ordered_parts.append(part)
         if parsed.images or parsed.reasoning_images or parsed.function_responses:
             retain_parts = False
             merged.raw_parts.clear()
@@ -674,6 +673,7 @@ def parse_text_output(raw: str) -> ModelOutput:
             # 续写中间态编码，不是终止结论；聚合并把它们当终点会把
             # 续写中间态伪装成 FINISH_REASON_UNSPECIFIED 下发给客户端。
             merged.finish_reason = parsed.finish_reason
+            merged.tool_interrupted |= parsed.finish_reason != WIRE_FINISH_REASON_STOP
         if parsed.finish_message:
             merged.finish_message = parsed.finish_message
         if parsed.safety_ratings:

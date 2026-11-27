@@ -3,7 +3,7 @@
 覆盖：/config 代理凭据掩码、API Key 回退会话写保护清单、countTokens
 空轮 400、stream_parser 闭合 chunk 修复回退、schema 深嵌套彻底降级、
 OpenAI/Claude 适配器错误兜底文本过滤、Responses 错误码映射、签名缓存
-去抖落盘、pending_signature 不覆盖 part 自带签名、历史日志 ts_ms 兜底。
+去抖落盘、签名事件不覆盖 part 自带签名、历史日志 ts_ms 兜底。
 """
 
 from __future__ import annotations
@@ -158,20 +158,17 @@ def test_deeply_nested_tool_schema_falls_back_to_object() -> None:
     assert json.loads(schema_json) is not None
 
 
-# ─── OpenAI / Claude 适配器：上游错误兜底文本不混入正文 ───
+# ─── OpenAI / Claude: ordinary fallback text stays separate from errors ───
 
 
 @pytest.mark.asyncio
-async def test_openai_adapter_filters_error_text_frame() -> None:
-    from aistudio_api.application.api_service_gemini import _ERROR_TEXT_PREFIX
+async def test_openai_adapter_preserves_error_like_text_frame() -> None:
     from aistudio_api.application.compat_openai import openai_stream_adapter
 
+    prose = "[aistudio-api 请求失败] 是用户指南中解释的标签。"
+
     async def source():
-        yield {
-            "candidates": [
-                {"content": {"parts": [{"text": f"{_ERROR_TEXT_PREFIX} 503 X] boom"}]}}
-            ]
-        }
+        yield {"candidates": [{"content": {"parts": [{"text": prose}]}}]}
         yield {"error": {"code": 503, "message": "boom"}}
 
     chunks = [
@@ -181,21 +178,18 @@ async def test_openai_adapter_filters_error_text_frame() -> None:
         )
     ]
     joined = "".join(chunks)
-    assert "[aistudio-api 请求失败" not in joined
+    assert prose in joined
     assert "boom" in joined  # 错误块仍携带等价信息
 
 
 @pytest.mark.asyncio
-async def test_claude_adapter_filters_error_text_frame() -> None:
-    from aistudio_api.application.api_service_gemini import _ERROR_TEXT_PREFIX
+async def test_claude_adapter_preserves_error_like_text_frame() -> None:
     from aistudio_api.application.compat_claude import claude_stream_adapter
 
+    prose = "[aistudio-api 请求失败] 是用户指南中解释的标签。"
+
     async def source():
-        yield {
-            "candidates": [
-                {"content": {"parts": [{"text": f"{_ERROR_TEXT_PREFIX} 503 X] boom"}]}}
-            ]
-        }
+        yield {"candidates": [{"content": {"parts": [{"text": prose}]}}]}
         yield {"error": {"code": 503, "message": "boom"}}
 
     chunks = [
@@ -205,7 +199,7 @@ async def test_claude_adapter_filters_error_text_frame() -> None:
         )
     ]
     joined = "".join(chunks)
-    assert "[aistudio-api 请求失败" not in joined
+    assert prose in joined
     assert "boom" in joined
 
 
@@ -221,7 +215,7 @@ async def test_responses_error_event_maps_rate_limit_code() -> None:
 
     chunks = [c async for c in responses_stream_adapter(source(), requested_model="m")]
     joined = "".join(chunks)
-    assert '"code":"rate_limit_error"' in joined
+    assert '"code":"rate_limit_exceeded"' in joined
 
 
 # ─── 签名缓存：去抖落盘 + flush 兜底 ───
@@ -257,11 +251,8 @@ def test_signature_cache_compact_persistence(tmp_path: Path) -> None:
     assert json.loads(raw)["by_call"]
 
 
-# ─── pending_signature 不覆盖 part 自带签名 ───
-
-
-def test_pending_signature_does_not_override_part_signature() -> None:
-    from aistudio_api.application.api_service_gemini import _event_payload
+def test_opaque_signature_only_stays_on_its_source_event() -> None:
+    from aistudio_api.application.api_service_gemini import _event_parts
 
     call = {
         "call_id": "c1",
@@ -269,18 +260,12 @@ def test_pending_signature_does_not_override_part_signature() -> None:
         "args": {"q": "x"},
         "thought_signature": SIGNATURE,
     }
-    payload = _event_payload("tool_calls", [call], thought_signature="OTHERSIG==")
-    part = payload["candidates"][0]["content"]["parts"][0]  # type: ignore[index]
-    assert part["thoughtSignature"] == SIGNATURE
-
-
-def test_pending_signature_fills_missing_part_signature() -> None:
-    from aistudio_api.application.api_service_gemini import _event_payload
-
-    call = {"call_id": "c1", "name": "f", "args": {"q": "x"}}
-    payload = _event_payload("tool_calls", [call], thought_signature="OTHERSIG==")
-    part = payload["candidates"][0]["content"]["parts"][0]  # type: ignore[index]
-    assert part["thoughtSignature"] == "OTHERSIG=="
+    assert _event_parts("thought_signature", "OTHERSIG==") == [
+        {"thoughtSignature": "OTHERSIG=="}
+    ]
+    assert _event_parts("tool_calls", [call])[0]["thoughtSignature"] == SIGNATURE
+    del call["thought_signature"]
+    assert "thoughtSignature" not in _event_parts("tool_calls", [call])[0]
 
 
 # ─── 历史日志缺 ts_ms 不再 500 ───

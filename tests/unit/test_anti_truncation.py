@@ -441,7 +441,7 @@ async def test_stream_restore_string_fragments():
             ("tool_calls", [{"name": "router_emit", "arguments": '{"content": "Hel'}]),
             ("tool_calls", [{"name": "router_emit", "arguments": "lo wor"}]),
             ("tool_calls", [{"name": "router_emit", "arguments": 'ld"}'}]),
-            ("finish_reason", 10),
+            ("finish_reason", 1),
             ("usage", None),
             ("done", None),
         ),
@@ -452,7 +452,7 @@ async def test_stream_restore_string_fragments():
     assert "".join(bodies) == "Hello world"
     # 合成调用不外泄为 tool_calls 事件。
     assert all(t != "tool_calls" for t, _ in out)
-    # 工具协议收尾码归一为 STOP(1)。
+    # A complete presentation preserves the provider's STOP.
     fr = [p for t, p in out if t == "finish_reason"]
     assert fr == [1]
     assert ctx.restored is True

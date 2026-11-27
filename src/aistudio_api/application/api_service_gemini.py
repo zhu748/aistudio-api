@@ -8,9 +8,10 @@ import json
 import random
 import re
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any
+from itertools import groupby
+from typing import Any, cast
 
 from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
@@ -22,7 +23,11 @@ from aistudio_api.api.response_models import (
     GeminiGenerateContentResponse,
     GeminiPartResponse,
 )
-from aistudio_api.api.responses import to_gemini_parts, to_gemini_usage_metadata
+from aistudio_api.api.responses import (
+    encode_response_part,
+    to_gemini_parts,
+    to_gemini_usage_metadata,
+)
 from aistudio_api.api.schemas import (
     GeminiCountTokensRequest,
     GeminiGenerateContentRequest,
@@ -46,6 +51,11 @@ from aistudio_api.application.chat_service import (
     NormalizedGeminiRequest,
     normalize_gemini_request,
 )
+from aistudio_api.application.stream_utils import (
+    ToolResponseAssembler,
+    has_response_content,
+    part_payload_signature,
+)
 from aistudio_api.domain.errors import (
     AistudioError,
     AuthError,
@@ -57,7 +67,7 @@ from aistudio_api.domain.errors import (
     is_transient_rpc_error,
     parse_upstream_grpc_error,
 )
-from aistudio_api.domain.models import ModelOutput
+from aistudio_api.domain.models import GeneratedImage, ModelOutput, ResponsePart
 from aistudio_api.domain.tool_signatures import (
     remember_function_signature as _remember_function_signature,
 )
@@ -304,7 +314,7 @@ WIRE_TO_GEMINI_FINISH_REASON: dict[int, str] = {
 
 def to_gemini_finish_reason(wire_code: int | None) -> str:
     if wire_code is None:
-        return "STOP"
+        return "OTHER"
     return WIRE_TO_GEMINI_FINISH_REASON.get(wire_code, "FINISH_REASON_UNSPECIFIED")
 
 
@@ -610,51 +620,42 @@ async def handle_attempt_exception(
 def _build_gemini_response_from_output(
     output: ModelOutput, model_version: str
 ) -> GeminiGenerateContentResponse:
-    """把缓冲完成的 ModelOutput 组装为 Gemini 完整响应（非流式 JSON 与
-    缓冲变体的单条 SSE 事件共用）。"""
-    # 签名缓存回填：原生路径的 lookup 挂在 normalize_gemini_request，
-    # 此前却只在 compat 层 remember（只取不存）——纯原生 /v1beta 用户
-    # 丢签名后永远只能走 SKIP 字面量。
-    for call in output.function_calls:
-        if isinstance(call, dict):
-            raw_call_id = call.get("call_id") or call.get("id")
-            raw_name = call.get("name")
-            _remember_function_signature(
-                raw_call_id if isinstance(raw_call_id, str) else None,
-                raw_name if isinstance(raw_name, str) else None,
-                call.get("args"),
-                call.get("thought_signature"),
+    """Publish completed ordered output for JSON and the buffered SSE variant."""
+    candidate = output.candidates[0] if output.candidates else None
+    reason = to_gemini_finish_reason(candidate.finish_reason if candidate else None)
+    assembler = ToolResponseAssembler()
+    if candidate is not None and candidate.tool_interrupted:
+        assembler.block_tools()
+    if candidate is not None and candidate.ordered_parts is not None:
+        leading: list[dict[str, object]] = []
+        for _, group in groupby(
+            candidate.ordered_parts, key=lambda part: part.wire_chunk
+        ):
+            leading.extend(assembler.feed(_encode_ordered_parts(list(group))))
+    else:
+        parts = [
+            part.model_dump(mode="json", exclude_none=True)
+            for part in to_gemini_parts(
+                output.text or output.code_output,
+                function_calls=output.function_calls,
+                function_responses=output.function_responses,
+                thinking=output.thinking,
+                images=output.images,
+                reasoning_images=output.reasoning_images,
+                thought_signature=candidate.thought_signature if candidate else "",
             )
-    if output.thinking or output.reasoning_images:
-        record_output_timing("thinking")
-    if (
-        output.text
-        or output.function_calls
-        or output.function_responses
-        or output.images
-    ):
-        record_output_timing("body")
+        ]
+        leading = assembler.feed(parts)
+    deferred, reason = assembler.finish(reason)
+    parts = leading + deferred
+    _observe_output_parts(parts)
     return GeminiGenerateContentResponse(
         candidates=[
             GeminiCandidateResponse(
                 content=GeminiContentResponse(
-                    parts=to_gemini_parts(
-                        output.text,
-                        function_calls=output.function_calls,
-                        function_responses=output.function_responses,
-                        thinking=output.thinking,
-                        images=output.images,
-                        reasoning_images=output.reasoning_images,
-                        thought_signature=(
-                            output.candidates[0].thought_signature
-                            if output.candidates
-                            else ""
-                        ),
-                    ),
+                    parts=[GeminiPartResponse.model_validate(part) for part in parts],
                 ),
-                finishReason=to_gemini_finish_reason(
-                    output.candidates[0].finish_reason if output.candidates else None
-                ),
+                finishReason=reason,
                 index=0,
             )
         ],
@@ -671,6 +672,7 @@ async def handle_gemini_generate_content(
     *,
     stream: bool,
     anti_truncation: bool | None = None,
+    sdk_terminal: bool = False,
 ):
     observation = current_request.get()
     if observation is not None:
@@ -714,6 +716,7 @@ async def handle_gemini_generate_content(
             model_path=model_path,
             anti_truncation=anti_truncation,
             force_buffer=force_buffer,
+            sdk_terminal=sdk_terminal,
         )
 
     last_error: Exception | None = None
@@ -769,17 +772,10 @@ async def handle_gemini_generate_content(
             auth_manager.current_prepared = None
             restore_anti_truncation_output(output, at_ctx)
 
-            final_fr = to_gemini_finish_reason(
-                output.candidates[0].finish_reason if output.candidates else None
-            )
+            response_obj = _build_gemini_response_from_output(output, normalized.model)
+            final_fr = response_obj.candidates[0].finishReason or "OTHER"
             # 空回防护：上游 200 但零内容时留下明确日志，便于面板排查
-            has_any_output = bool(
-                output.text
-                or output.function_calls
-                or output.function_responses
-                or output.images
-                or output.reasoning_images
-            )
+            has_any_output = _has_buffered_output(response_obj)
             if not has_any_output:
                 logger.warning(
                     "上游返回 200 但内容为空（可能是上游风控拦截或安全策略）: "
@@ -820,7 +816,6 @@ async def handle_gemini_generate_content(
                 pt,
                 ct,
             )
-            response_obj = _build_gemini_response_from_output(output, normalized.model)
             # 空回防护：上游 200 但零内容时注入可见诊断文本，避免客户端空回无从排查
             if not has_any_output:
                 diagnostic = (
@@ -896,67 +891,96 @@ async def handle_gemini_generate_content(
 
 
 def _encode_sse(payload: dict[str, object]) -> str:
-    # separators：SSE 每帧省去 ", " 与 ": " 的空格（高频 token 流可观）
-    return (
-        "data: "
-        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        + "\n\n"
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if not encoded.isascii():
+        # google-genai's HTTPX transport splits decoded lines at these Unicode
+        # separators too. Escape them without changing values or other Unicode.
+        encoded = (
+            encoded.replace("\x85", r"\u0085")
+            .replace("\u2028", r"\u2028")
+            .replace("\u2029", r"\u2029")
+        )
+    return f"data: {encoded}\n\n"
+
+
+def _encode_ordered_parts(parts: Sequence[object]) -> list[dict[str, object]]:
+    return [
+        encoded
+        for part in parts
+        if isinstance(part, ResponsePart) and (encoded := encode_response_part(part))
+    ]
+
+
+def _has_buffered_output(response: GeminiGenerateContentResponse) -> bool:
+    return any(
+        part.text
+        or part.inlineData
+        or part.functionCall
+        or part.functionResponse
+        or part.executableCode
+        or part.codeExecutionResult
+        for candidate in response.candidates
+        for part in candidate.content.parts
     )
 
 
-def _event_payload(
-    event_type: str,
-    text: object,
+def _observe_output_parts(parts: list[dict[str, object]]) -> None:
+    for part in parts:
+        if has_response_content(part):
+            record_output_timing("thinking" if part.get("thought") is True else "body")
+        call = part.get("functionCall")
+        if isinstance(call, dict):
+            _remember_function_signature(
+                call.get("id"),
+                call.get("name"),
+                call.get("args"),
+                part_payload_signature(part, "functionCall"),
+            )
+
+
+def _event_parts(event_type: str, value: object) -> list[dict[str, object]]:
+    if not value:
+        return []
+    if event_type == "ordered_parts" and isinstance(value, list):
+        return _encode_ordered_parts(value)
+    if event_type == "thought_signature":
+        return [{"thoughtSignature": str(value)}]
+    if event_type == "body":
+        return [{"text": str(value)}]
+    if event_type == "thinking":
+        return [{"text": str(value), "thought": True}]
+    if event_type == "tool_calls" and isinstance(value, list):
+        # The transport variant's internal decoder still passes sparse call
+        # updates through this event shape; do not supply name/arg defaults.
+        return [
+            encode_response_part(
+                ResponsePart(
+                    function_call=call,
+                    thought_signature=str(call.get("thought_signature") or ""),
+                )
+            )
+            for call in value
+            if isinstance(call, dict)
+        ]
+    if event_type in {"images", "reasoning_images"} and isinstance(value, list):
+        images = [image for image in value if isinstance(image, GeneratedImage)]
+        return [
+            part.model_dump(mode="json", exclude_none=True)
+            for part in to_gemini_parts(
+                "",
+                images=images if event_type == "images" else None,
+                reasoning_images=images if event_type == "reasoning_images" else None,
+            )
+        ]
+    return []
+
+
+def _content_frame(
+    parts: list[dict[str, object]],
     *,
     model_version: str | None = None,
     response_id: str | None = None,
-    thought_signature: str | None = None,
-) -> dict[str, object] | None:
-    if not text:
-        return None
-
-    parts: list[dict[str, object]] = []
-    if event_type == "signature":
-        parts.append({"thoughtSignature": str(text)})
-    elif event_type == "body":
-        p: dict[str, object] = {"text": str(text)}
-        if thought_signature:
-            p["thoughtSignature"] = thought_signature
-        parts.append(p)
-    elif event_type == "thinking":
-        p = {"text": str(text), "thought": True}
-        if thought_signature:
-            p["thoughtSignature"] = thought_signature
-        parts.append(p)
-    elif event_type == "tool_calls":
-        fc_list = text if isinstance(text, list) else []
-        parts = [
-            part.model_dump(mode="json", exclude_none=True)
-            for part in to_gemini_parts("", function_calls=fc_list)
-        ]
-        # pending_signature 只作兑底：part 自带签名时不得覆盖（覆盖会让
-        # 客户端收到的签名与签名缓存记住的不一致，破坏思考链回传）。
-        if thought_signature and parts and not parts[0].get("thoughtSignature"):
-            parts[0]["thoughtSignature"] = thought_signature
-    elif event_type == "images":
-        img_list = text if isinstance(text, list) else []
-        parts = [
-            part.model_dump(mode="json", exclude_none=True)
-            for part in to_gemini_parts("", images=img_list)
-        ]
-        if thought_signature and parts and not parts[0].get("thoughtSignature"):
-            parts[0]["thoughtSignature"] = thought_signature
-    elif event_type == "reasoning_images":
-        r_img_list = text if isinstance(text, list) else []
-        parts = [
-            part.model_dump(mode="json", exclude_none=True)
-            for part in to_gemini_parts("", reasoning_images=r_img_list)
-        ]
-        if thought_signature and parts and not parts[0].get("thoughtSignature"):
-            parts[0]["thoughtSignature"] = thought_signature
-    else:
-        return None
-
+) -> dict[str, object]:
     payload: dict[str, object] = {
         "candidates": [{"content": {"role": "model", "parts": parts}, "index": 0}]
     }
@@ -970,9 +994,10 @@ def _event_payload(
 def _usage_payload(
     final_usage: dict[str, object] | None,
     *,
-    finish_reason: str = "STOP",
+    finish_reason: str = "OTHER",
     model_version: str | None = None,
     response_id: str | None = None,
+    parts: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     effective_usage = final_usage or {
         "prompt_tokens": 0,
@@ -985,7 +1010,7 @@ def _usage_payload(
     payload: dict[str, object] = {
         "candidates": [
             {
-                "content": {"role": "model", "parts": []},
+                "content": {"role": "model", "parts": parts if parts else []},
                 "finishReason": finish_reason,
                 "index": 0,
             }
@@ -999,20 +1024,40 @@ def _usage_payload(
     return payload
 
 
-def _error_payload(exc: Exception) -> dict[str, object]:
-    code, msg, status_str = classify_gemini_error_payload(exc)
-    return {"error": {"code": code, "message": msg, "status": status_str}}
+def _native_content_parts(frame: dict[str, object]) -> list[dict[str, object]]:
+    # The attempt generator emits only single-candidate _content_frame payloads.
+    (candidate,) = cast(list[dict[str, object]], frame["candidates"])
+    content = cast(dict[str, object], candidate["content"])
+    return cast(list[dict[str, object]], content["parts"])
 
 
-_ERROR_TEXT_PREFIX = "[aistudio-api 请求失败"
+def _hold_sdk_tail(
+    frame: dict[str, object],
+) -> tuple[dict[str, object] | None, dict[str, object]]:
+    """Hold no more than one genuine Part, preserving its original fields."""
+    parts = _native_content_parts(frame)
+    if len(parts) <= 1:
+        return None, frame
+    tail = _content_frame([parts.pop()])
+    for key in ("modelVersion", "responseId"):
+        if key in frame:
+            tail[key] = frame[key]
+    return frame, tail
 
 
-def _error_text_payload(exc: Exception) -> dict[str, object] | None:
-    code, msg, status_str = classify_gemini_error_payload(exc)
-    if not msg:
-        msg = type(exc).__name__
-    text = f"{_ERROR_TEXT_PREFIX} {code} {status_str}] {msg}"
-    return _event_payload("body", text)
+class _GeminiFailureFrame(dict[str, object]):
+    """Structured error with an optional native-only display diagnostic."""
+
+    __slots__ = ("native_diagnostic",)
+
+    def __init__(self, exc: Exception, *, explain_empty: bool) -> None:
+        code, message, status = classify_gemini_error_payload(exc)
+        super().__init__(error={"code": code, "message": message, "status": status})
+        self.native_diagnostic = (
+            f"[aistudio-api 请求失败 {code} {status}] {message or type(exc).__name__}"
+            if explain_empty
+            else None
+        )
 
 
 class GeminiStreamResponse(HeartbeatStreamingResponse):
@@ -1028,6 +1073,13 @@ class GeminiStreamResponse(HeartbeatStreamingResponse):
         async def encode() -> AsyncGenerator[str, None]:
             try:
                 async for frame in frames:
+                    if (
+                        isinstance(frame, _GeminiFailureFrame)
+                        and frame.native_diagnostic is not None
+                    ):
+                        yield _encode_sse(
+                            _content_frame([{"text": frame.native_diagnostic}])
+                        )
                     yield _encode_sse(frame)
             finally:
                 await frames.aclose()
@@ -1048,16 +1100,14 @@ class _StreamAttemptState:
 
     has_yielded_data: bool = False
     final_usage: dict[str, object] | None = None
-    final_finish_reason: str = "STOP"
+    final_finish_reason: str = "OTHER"
     latest_response_id: str | None = None
-    pending_signature: str | None = None
 
     def reset(self) -> None:
         self.has_yielded_data = False
         self.final_usage = None
-        self.final_finish_reason = "STOP"
+        self.final_finish_reason = "OTHER"
         self.latest_response_id = None
-        self.pending_signature = None
 
 
 def _stream_request_kwargs(normalized: NormalizedGeminiRequest) -> dict[str, Any]:
@@ -1096,7 +1146,7 @@ def _empty_stream_diagnostic_payload(
     finish_reason: str,
 ) -> dict[str, object] | None:
     """空回防护帧：把可见诊断文本编码为候选 SSE 帧。"""
-    return _event_payload("body", _empty_stream_diagnostic(finish_reason))
+    return _content_frame([{"text": _empty_stream_diagnostic(finish_reason)}])
 
 
 def _finalize_buffered_output(
@@ -1118,17 +1168,9 @@ def _finalize_buffered_output(
     """
     restore_anti_truncation_output(output, at_ctx)
     final_usage = output.usage if isinstance(output.usage, dict) else None
-    final_finish_reason = to_gemini_finish_reason(
-        output.candidates[0].finish_reason if output.candidates else None
-    )
     buffered_resp = _build_gemini_response_from_output(output, model)
-    buffered_has_output = bool(
-        output.text
-        or output.function_calls
-        or output.function_responses
-        or output.images
-        or output.reasoning_images
-    )
+    final_finish_reason = buffered_resp.candidates[0].finishReason or "OTHER"
+    buffered_has_output = _has_buffered_output(buffered_resp)
     if not buffered_has_output:
         logger.warning(
             "抗截断缓冲变体返回 200 但内容为空（可能是风控拦截）: model=%s, finish=%s",
@@ -1146,29 +1188,6 @@ def _finalize_buffered_output(
         buffered_resp,
         buffered_has_output,
     )
-
-
-def _remember_stream_tool_signatures(
-    text: object, pending_signature: str | None
-) -> None:
-    """签名缓存回填（原生流式路径，与 _build_gemini_response_from_output 同
-    标准）：tool_calls 事件载荷是 function_call dict 列表，签名内嵌在 dict
-    或前置 pending_signature 中。
-    """
-    if not isinstance(text, list):
-        return
-    for call_index, call in enumerate(text):
-        if not isinstance(call, dict):
-            continue
-        signature = call.get("thought_signature") or (
-            pending_signature if call_index == 0 else None
-        )
-        _remember_function_signature(
-            call.get("call_id") or call.get("id"),
-            call.get("name"),
-            call.get("args"),
-            signature,
-        )
 
 
 def _record_usage_observation(usage: dict[str, object] | None) -> None:
@@ -1347,63 +1366,98 @@ async def _retry_stream_attempt(
     return retry, transient_failures + increment
 
 
+def _consume_finished_parts(
+    parts: list[dict[str, object]],
+) -> Iterator[dict[str, object]]:
+    """Drain the assembler's owned result in order, releasing each sent Part."""
+    parts.reverse()
+    while parts:
+        yield parts.pop()
+
+
 async def _stream_attempt_frames(
     anti_stream: AsyncIterator[tuple[str, object | None]],
     state: _StreamAttemptState,
     model: str,
     stream_start_time: float,
 ) -> AsyncGenerator[dict[str, object], None]:
-    """消费单次尝试的上游事件流，产出对外 SSE 帧（yield 顺序与拆分前一致）。
+    """Publish leading content live, then the ordered tool suffix upon STOP."""
+    assembler = ToolResponseAssembler()
+    legacy_prefix: dict[str, object] | None = None
+    seen_part = published_part = False
 
-    usage / finish_reason / response_id 事件不产帧，只更新尝试状态；
-    thought_signature 在首个内容帧前缓存（pending_signature），其后独立成
-    帧；其余内容事件编码为候选帧，首个内容帧附带 TTFT 日志与签名缓存回填。
-    """
-    async for event_type, text in anti_stream:
-        if event_type == "usage":
-            state.final_usage = text if isinstance(text, dict) else None
-            _record_usage_observation(state.final_usage)
-        elif event_type == "finish_reason":
-            if text not in _IGNORED_WIRE_FINISH_REASONS:
-                state.final_finish_reason = (
-                    to_gemini_finish_reason(text)
-                    if isinstance(text, int)
-                    else str(text)
+    def publish(parts: list[dict[str, object]]) -> dict[str, object]:
+        nonlocal legacy_prefix, published_part
+        if legacy_prefix is not None:
+            parts = [legacy_prefix, *parts]
+            legacy_prefix = None
+        published_part = True
+        _observe_output_parts(parts)
+        if any(has_response_content(part) for part in parts):
+            if not state.has_yielded_data:
+                logger.info(
+                    "流式首包到达: model=%s, ttft=%.1fms",
+                    model,
+                    (time.perf_counter() - stream_start_time) * 1000,
                 )
-        elif event_type == "response_id":
-            state.latest_response_id = str(text)
-        elif event_type == "thought_signature":
-            if state.has_yielded_data:
-                signature_frame = _event_payload(
-                    "signature",
-                    text,
-                    model_version=model,
-                    response_id=state.latest_response_id,
-                )
-                if signature_frame:
-                    yield signature_frame
+            state.has_yielded_data = True
+        return _content_frame(
+            parts, model_version=model, response_id=state.latest_response_id
+        )
+
+    try:
+        async for event_type, value in anti_stream:
+            if event_type == "usage":
+                state.final_usage = value if isinstance(value, dict) else None
+                _record_usage_observation(state.final_usage)
+            elif event_type == "finish_reason":
+                if isinstance(value, int) and not isinstance(value, bool):
+                    if value not in _IGNORED_WIRE_FINISH_REASONS:
+                        state.final_finish_reason = to_gemini_finish_reason(value)
+                elif isinstance(value, str) and value:
+                    state.final_finish_reason = value
+            elif event_type == "response_id":
+                state.latest_response_id = str(value)
+            elif event_type == "thought_signature" and not published_part:
+                # This legacy event is metadata, not an ordered wire Part.
+                # Only publish a leading marker with a Part of this attempt;
+                # never move a later marker ahead of an unconfirmed call.
+                if not seen_part and isinstance(value, str) and value:
+                    legacy_prefix = {"thoughtSignature": value}
+            elif event_type == "tool_interruption":
+                for part in _consume_finished_parts(assembler.block_tools()):
+                    yield publish([part])
+                    del part
             else:
-                state.pending_signature = str(text)
-        else:
-            chunk = _event_payload(
-                event_type,
-                text,
-                model_version=model,
-                response_id=state.latest_response_id,
-                thought_signature=state.pending_signature,
-            )
-            if chunk:
-                _remember_stream_tool_signatures(text, state.pending_signature)
-                state.pending_signature = None
-                record_output_timing(event_type)
-                if not state.has_yielded_data:
-                    logger.info(
-                        "流式首包到达: model=%s, ttft=%.1fms",
-                        model,
-                        (time.perf_counter() - stream_start_time) * 1000,
-                    )
-                state.has_yielded_data = True
-                yield chunk
+                parts = _event_parts(event_type, value)
+                seen_part |= bool(parts)
+                if any(
+                    has_response_content(part) or "functionCall" in part
+                    for part in parts
+                ):
+                    state.final_finish_reason = "OTHER"
+                leading = assembler.feed(parts)
+                # A single source event can hold the whole ordered suffix.
+                # Only the assembler should retain it until classification.
+                del value, parts
+                if leading:
+                    yield publish(leading)
+                    del leading
+    except Exception:
+        # Do not publish any tool from a failed transport. Display text already
+        # accepted into the ordered suffix remains useful.
+        # Clear the assembly state even if the exception traceback holds it.
+        safe_suffix = assembler.block_tools()
+        for part in _consume_finished_parts(safe_suffix):
+            yield publish([part])
+        raise
+
+    deferred, state.final_finish_reason = assembler.finish(state.final_finish_reason)
+    # The batch has already been validated atomically. Don't retain the
+    # original shards, or previously sent Parts, behind a slow client.
+    del assembler
+    for part in _consume_finished_parts(deferred):
+        yield publish([part])
 
 
 def _build_gemini_streaming_response(
@@ -1413,6 +1467,7 @@ def _build_gemini_streaming_response(
     model_path: str,
     anti_truncation: bool | None = None,
     force_buffer: bool = False,
+    sdk_terminal: bool = False,
 ) -> GeminiStreamResponse:
     """构建 Gemini 流式响应（暴露结构化 frames 供适配层消费）。"""
 
@@ -1430,6 +1485,7 @@ def _build_gemini_streaming_response(
         # 发生在首次赋值之前也不会出现未绑定名。
         serving_account_id: str | None = None
         state = _StreamAttemptState()
+        pending_sdk_frame: dict[str, object] | None = None
         try:
             logger.info(
                 "流式请求: model=%s, 轮数=%d",
@@ -1495,6 +1551,16 @@ def _build_gemini_streaming_response(
                     )
                     try:
                         async for frame in attempt_frames:
+                            if sdk_terminal:
+                                # Chat history in the Python Gemini SDK rejects
+                                # a content-free final event. Until EOF confirms
+                                # the last Part, wait one Part (not one turn).
+                                if pending_sdk_frame is not None:
+                                    has_yielded_any = True
+                                    yield pending_sdk_frame
+                                frame, pending_sdk_frame = _hold_sdk_tail(frame)
+                                if frame is None:
+                                    continue
                             has_yielded_any = True
                             yield frame
                         auth_manager.current_prepared = None
@@ -1508,6 +1574,12 @@ def _build_gemini_streaming_response(
                         await _close_stream_quietly(attempt_frames)
                         await _close_stream_quietly(anti_stream)
                 except Exception as exc:
+                    # A transport failure must not consume pending partial
+                    # output or let a retry mix it into a different attempt.
+                    if pending_sdk_frame is not None:
+                        has_yielded_any = True
+                        yield pending_sdk_frame
+                        pending_sdk_frame = None
                     last_stream_error = exc
                     serving_account_id = _observed_serving_account(serving_account_id)
                     auth_manager.serving_account_id = serving_account_id
@@ -1522,7 +1594,10 @@ def _build_gemini_streaming_response(
                         client=client,
                         model_path=model_path,
                         normalized=normalized,
-                        has_yielded_data=state.has_yielded_data,
+                        # A published opaque-only Part already commits the
+                        # native turn. Keep this retry boundary separate from
+                        # has_yielded_data, which measures usable model output.
+                        has_yielded_data=has_yielded_any,
                         serving_account_id=serving_account_id,
                     )
                     if retry:
@@ -1532,6 +1607,16 @@ def _build_gemini_streaming_response(
             if not stream_completed and last_stream_error is not None:
                 raise last_stream_error
             target_model = normalized.model if normalized else model_path
+            terminal_parts = None
+            if pending_sdk_frame is not None:
+                if state.has_yielded_data and state.final_finish_reason == "STOP":
+                    terminal_parts = _native_content_parts(pending_sdk_frame)
+                else:
+                    # Do not let the SDK store an incomplete, blocked or empty
+                    # response as a fully replayable turn.
+                    has_yielded_any = True
+                    yield pending_sdk_frame
+                pending_sdk_frame = None
             # 空回防护：流式完成但未产出任何内容时注入可见诊断文本，避免
             # 客户端收到 200 却“空回啥都没有”无从排查。
             if stream_completed and not state.has_yielded_data and not force_buffer:
@@ -1559,12 +1644,14 @@ def _build_gemini_streaming_response(
                 state.final_finish_reason,
                 state.final_usage,
             )
-            yield _usage_payload(
-                state.final_usage,
-                finish_reason=state.final_finish_reason,
-                model_version=target_model,
-                response_id=state.latest_response_id,
-            )
+            if not force_buffer:
+                yield _usage_payload(
+                    state.final_usage,
+                    finish_reason=state.final_finish_reason,
+                    model_version=target_model,
+                    response_id=state.latest_response_id,
+                    parts=terminal_parts,
+                )
         except Exception as exc:
             # 异常路径的记账已由 handle_attempt_exception / handle_403 按
             # 尝试完成，这里只负责错误事件下发；先置位标记，防止断连打断
@@ -1572,14 +1659,9 @@ def _build_gemini_streaming_response(
             accounting_recorded = True
             elapsed_ms = (time.perf_counter() - stream_start_time) * 1000
             _log_stream_failure(exc, elapsed_ms, model_path, has_yielded_any)
-            # 错误透传：尚未输出任何内容时把失败原因作为可见文本 part 下发
-            # （部分客户端忽略 {"error":...} 表现为空回）；已输出时不追加，
-            # 保持正文纯净（仅下发结构化错误事件）。
-            if not has_yielded_any:
-                error_text_chunk = _error_text_payload(exc)
-                if error_text_chunk:
-                    yield error_text_chunk
-            yield _error_payload(exc)
+            # Some native clients ignore structured errors. Only the native
+            # encoder sees this diagnostic; compat adapters emit the error.
+            yield _GeminiFailureFrame(exc, explain_empty=not has_yielded_any)
         finally:
             # 客户端断连（GeneratorExit）/任务取消（CancelledError）都不是
             # Exception 子类，成功块与异常块都执行不到——此处兜底补记：已

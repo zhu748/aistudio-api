@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections import Counter, defaultdict
+from itertools import groupby
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from aistudio_api.api.schemas import (
+        GeminiContent,
         GeminiFunctionResponse,
         GeminiGenerateContentRequest,
         GeminiPart,
@@ -40,9 +43,6 @@ from aistudio_api.application.schema_wire_codec import (  # noqa: F401
     encode_schema_to_wire,
 )
 from aistudio_api.domain.tool_signatures import (
-    SKIP_THOUGHT_SIGNATURE,
-    lookup_function_signature as _lookup_function_signature,
-    lookup_thinking_signature as _lookup_thinking_signature,
     tool_history_text,
     valid_thought_signature_or_none as _valid_thought_signature_or_none,
 )
@@ -674,38 +674,80 @@ def _rewrite_model_tail_for_continuation(
     return contents, system_instruction
 
 
-def _match_pending_call(
-    fr: GeminiFunctionResponse, pending_calls: list[tuple[str | None, str]]
-) -> int | None:
-    """按 ID（并行调用）或名称/唯一挂起项匹配 functionResponse。
+_ToolOwner = tuple[str | None, str]
 
-    IDs identify parallel calls. When an endpoint omits IDs, use the only
-    pending call or the next matching name. 无任何匹配时返回 None（调用方
-    回落 tool_history 转录形态）。
+
+def _match_pending_calls(
+    parts: list[GeminiPart], pending: list[_ToolOwner]
+) -> dict[int, _ToolOwner]:
+    """Resolve exact pairs before considering any ID-less result.
+
+    Remaining same-name results with no reliable ID keep their supplied order
+    and do not acquire guessed IDs. Orphans keep their payload as transcript.
     """
-    matched = next(
-        (
-            i
-            for i, (call_id, _) in enumerate(pending_calls)
-            if fr.id and call_id == fr.id
-        ),
-        None,
-    )
-    if matched is None:
-        matched = next(
-            (
-                i
-                for i, (call_id, name) in enumerate(pending_calls)
-                if not (fr.id and call_id)
-                and (fr.name == name or (not fr.name and len(pending_calls) == 1))
-            ),
-            None,
-        )
-    return matched
+    if not pending:
+        return {}
+    results = {
+        i: part.functionResponse
+        for i, part in enumerate(parts)
+        if part.functionResponse is not None
+    }
+    call_ids = Counter(call_id for call_id, _ in pending if call_id)
+    result_ids = Counter(fr.id for fr in results.values() if fr.id)
+    call_by_id = {call_id: i for i, (call_id, _) in enumerate(pending) if call_id}
+    owners: dict[int, _ToolOwner] = {}
+    consumed: set[int] = set()
+    named: dict[str, list[tuple[int, GeminiFunctionResponse]]] = defaultdict(list)
+    unnamed: list[tuple[int, GeminiFunctionResponse]] = []
+
+    for index, fr in results.items():
+        if fr.id and (call_ids[fr.id] > 1 or result_ids[fr.id] > 1):
+            continue
+        if fr.id and fr.id in call_by_id:
+            owner = call_by_id[fr.id]
+            owners[index] = pending[owner]
+            consumed.add(owner)
+        elif fr.name:
+            named[fr.name].append((index, fr))
+        else:
+            unnamed.append((index, fr))
+
+    by_name: dict[str, list[int]] = defaultdict(list)
+    for index, (_, name) in enumerate(pending):
+        if index not in consumed:
+            by_name[name].append(index)
+
+    for name, outputs in named.items():
+        possible = by_name.get(name, [])
+        unnamed_ids = [i for i in possible if not pending[i][0]]
+        unbound = [(i, fr.id) for i, fr in outputs if fr.id]
+        if len(unnamed_ids) == len(unbound) == 1:
+            index, result_id = unbound[0]
+            owner = unnamed_ids[0]
+            owners[index] = (result_id, name)
+            consumed.add(owner)
+            possible = [i for i in possible if i != owner]
+
+        positional = [index for index, fr in outputs if not fr.id]
+        if len(possible) == len(positional) == 1:
+            owners[positional[0]] = pending[possible[0]]
+            consumed.add(possible[0])
+        else:
+            for index, owner in zip(positional, possible, strict=False):
+                owners[index] = (None, name)
+                consumed.add(owner)
+
+    if len(unnamed) == 1 and len(consumed) + 1 == len(pending):
+        owner = next(i for i in range(len(pending)) if i not in consumed)
+        call_id, name = pending[owner]
+        index, fr = unnamed[0]
+        if not (fr.id and call_id):
+            owners[index] = (fr.id or call_id, name)
+    return owners
 
 
 def _convert_part(
-    part: GeminiPart, pending_calls: list[tuple[str | None, str]]
+    part: GeminiPart, result_owner: _ToolOwner | None = None
 ) -> list[AistudioPart]:
     """单个 Gemini part → AistudioPart 列表（functionResponse 附图会展开多部件）。
 
@@ -714,174 +756,139 @@ def _convert_part(
     _drop_hollow_and_merge_same_role 统一清理）。
     """
     parts: list[AistudioPart] = []
-    if part.text is not None:
-        is_thought = bool(part.thought)
-        parts.append(
-            AistudioPart(
-                text=part.text,
-                thought=is_thought,
-                thought_signature=_valid_thought_signature_or_none(
-                    part.thoughtSignature
-                )
-                # 思考文本无有效签名时按全文精确匹配回注 thinking 缓存
-                # （客户端回传 reasoning_content 等丢失签名载体的场景，
-                # 与 functionCall 的缓存回注同一兜底哲学）。
-                or (_lookup_thinking_signature(part.text) if is_thought else None),
-            )
-        )
-        return parts
-    if part.inlineData is not None:
-        img_data = (part.inlineData.mimeType, part.inlineData.data)
-        parts.append(
-            AistudioPart(
-                inline_data=img_data,
-                inline_filename=part.inlineData.filename,
-                thought_signature=_valid_thought_signature_or_none(
-                    part.thoughtSignature
-                ),
-            )
-        )
-        return parts
-    if part.functionCall is not None:
-        fc = part.functionCall
-        args_payload = fc.args if fc.args is not None else {}
-        signature = (
-            _valid_thought_signature_or_none(part.thoughtSignature)
-            or _lookup_function_signature(fc.id, fc.name, args_payload)
-            or SKIP_THOUGHT_SIGNATURE
-        )
-        pending_calls.append((fc.id, fc.name))
-        parts.append(
-            AistudioPart(
-                function_call=(fc.name, args_payload, fc.id)
-                if fc.id
-                else (fc.name, args_payload),
-                thought_signature=signature,
-            )
-        )
-        return parts
     if part.functionResponse is not None:
         fr = part.functionResponse
         resp_payload = fr.response if fr.response is not None else {}
-        matched = _match_pending_call(fr, pending_calls)
-        if matched is None:
+        inline = part.inlineData
+        result = AistudioPart(
+            text=part.text,
+            inline_data=(inline.mimeType, inline.data) if inline else None,
+            inline_filename=inline.filename if inline else None,
+            thought=bool(part.thought),
+        )
+        if result_owner is None:
             parts.append(
                 AistudioPart(
                     text=tool_history_text("tool_result", fr.name, fr.id, resp_payload)
                 )
             )
+            if part.text is not None or inline is not None:
+                parts.append(result)
         else:
-            call_id, name = pending_calls.pop(matched)
-            result_id = fr.id or call_id
-            parts.append(
-                AistudioPart(
-                    function_response=(name, resp_payload, result_id)
-                    if result_id
-                    else (name, resp_payload),
-                )
+            result_id, name = result_owner
+            result.function_response = (
+                (name, resp_payload, result_id) if result_id else (name, resp_payload)
             )
+            if not (
+                part.fileData
+                or part.functionCall
+                or part.executableCode
+                or part.codeExecutionResult
+            ):
+                result.thought_signature = _valid_thought_signature_or_none(
+                    part.thoughtSignature
+                )
+            parts.append(result)
         if fr.parts:
             for subpart in fr.parts:
-                if subpart.inlineData is not None:
-                    img_data = (
-                        subpart.inlineData.mimeType,
-                        subpart.inlineData.data,
-                    )
+                child_inline = subpart.inlineData
+                if child_inline is not None or subpart.text is not None:
                     parts.append(
                         AistudioPart(
-                            inline_data=img_data,
-                            # 工具结果附图的签名同样必须过校验：伪
-                            # 签名会触发上游 400 "Corrupted thought
-                            # signature."（密码学校验，2026-11 实验）
+                            text=subpart.text,
+                            inline_data=(child_inline.mimeType, child_inline.data)
+                            if child_inline
+                            else None,
+                            inline_filename=child_inline.filename
+                            if child_inline
+                            else None,
+                            thought=bool(subpart.thought),
                             thought_signature=_valid_thought_signature_or_none(
                                 subpart.thoughtSignature
                             ),
                         )
                     )
-                elif subpart.text is not None:
-                    parts.append(AistudioPart(text=subpart.text))
-        return parts
-    if part.executableCode is not None:
-        ec = part.executableCode
-        parts.append(
-            AistudioPart(
-                executable_code=(ec.language, ec.code),
-                thought_signature=_valid_thought_signature_or_none(
-                    part.thoughtSignature
-                ),
-            )
-        )
-        return parts
-    if part.codeExecutionResult is not None:
-        cer = part.codeExecutionResult
-        parts.append(
-            AistudioPart(
-                code_execution_result=(cer.outcome, cer.output),
-                thought_signature=_valid_thought_signature_or_none(
-                    part.thoughtSignature
-                ),
-            )
-        )
         return parts
     if part.fileData is not None:
         raise ValueError("fileData is not supported yet")
-    if part.thoughtSignature:
-        signature = _valid_thought_signature_or_none(part.thoughtSignature)
-        if signature:
-            parts.append(AistudioPart(thought_signature=signature))
-    return parts
 
-
-def _backfill_thinking_signatures(contents: list[AistudioContent]) -> None:
-    """思考链签名整轮兜底回注（合并相邻同角色轮之后）。
-
-    签名缓存键是**整轮思考全文**（响应侧把该轮全部 thought part 拼接后
-    收口缓存）。客户端把单个 thinking 块拆分成多块回传、或把一轮思考
-    分散到多条 assistant 消息时，``_convert_part`` 的逐 part 精确匹配会
-    全部 miss。合并后按整轮拼接文本再查一次，命中则挂到最后一个
-    thought part（Gemini 语义：末位 part 的签名是整轮权威签名）。
-    任一 thought part 已带有效签名（客户端 envelope 载体回传成功）时
-    不介入——部分保留部分回注的混合形态无从判定归属。
-    """
-    for content in contents:
-        if content.role != "model":
-            continue
-        thought_indices = [
-            index for index, part in enumerate(content.parts) if part.thought
-        ]
-        if not thought_indices or any(
-            content.parts[index].thought_signature for index in thought_indices
+    # Distinguish absent from empty text and keep the orthogonal wire fields
+    # together. An opaque signature authenticates the whole Part, not the
+    # first field that a converter happens to recognize.
+    native = AistudioPart(
+        text=part.text,
+        thought=bool(part.thought),
+        thought_signature=_valid_thought_signature_or_none(part.thoughtSignature),
+    )
+    if (inline := part.inlineData) is not None:
+        native.inline_data = (inline.mimeType, inline.data)
+        native.inline_filename = inline.filename
+    if (fc := part.functionCall) is not None:
+        args = fc.args if fc.args is not None else {}
+        native.function_call = (fc.name, args, fc.id) if fc.id else (fc.name, args)
+    if (code := part.executableCode) is not None:
+        native.executable_code = (code.language, code.code)
+        if code.id is not None or code.language.upper() not in (
+            "PYTHON",
+            "1",
+            "LANGUAGE_UNSPECIFIED",
         ):
-            continue
-        joined = "".join(content.parts[index].text or "" for index in thought_indices)
-        signature = _lookup_thinking_signature(joined)
-        if signature:
-            content.parts[thought_indices[-1]].thought_signature = signature
+            native.thought_signature = None
+    if (result := part.codeExecutionResult) is not None:
+        native.code_execution_result = (result.outcome, result.output)
+        if result.id is not None or result.outcome.upper() not in (
+            "OUTCOME_OK",
+            "OUTCOME_FAILED",
+            "OUTCOME_DEADLINE_EXCEEDED",
+        ):
+            # The typed wire encoder does not carry code IDs or other outcomes.
+            native.thought_signature = None
+    return [native] if native.text is not None or not _is_hollow_part(native) else []
 
 
 def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioContent]:
-    """contents → AistudioContent 轮次列表（含 pending call 追踪与剥离残留清理）。
-
-    Only orphan/reordered results need a transcript. Unsigned calls retain
-    their native structure using the explicit skip-signature literal.
-    user 轮（无 functionResponse）清空挂起调用表，保证跨轮不误匹配。
-    剥离残留清理：丢弃全空轮（WAA 403）并合并相邻同角色轮，
-    详见 _drop_hollow_and_merge_same_role docstring。
-    """
+    """Normalize logical turns without changing call/result or attachment order."""
     contents: list[AistudioContent] = []
-    pending_calls: list[tuple[str | None, str]] = []
+    pending: list[_ToolOwner] = []
 
-    for content in req.contents:
-        role = content.role or "user"
-        if role == "user" and not any(p.functionResponse for p in content.parts):
-            pending_calls.clear()
+    def result_run(content: GeminiContent) -> tuple[str, bool]:
+        return content.role or "user", any(p.functionResponse for p in content.parts)
+
+    def is_blank_user_content(content: GeminiContent) -> bool:
+        # An empty user placeholder is not a new turn. Drop it before
+        # detecting result runs; later hollow cleanup cannot restore pairing.
+        # Explicit signature carriers and non-text payloads are not blank.
+        return (content.role or "user") == "user" and not any(
+            part.text
+            or part.thoughtSignature
+            or part.inlineData
+            or part.fileData
+            or part.functionCall
+            or part.functionResponse
+            or part.executableCode
+            or part.codeExecutionResult
+            for part in content.parts
+        )
+
+    nonblank = (item for item in req.contents if not is_blank_user_content(item))
+    for (role, has_results), run in groupby(nonblank, key=result_run):
+        incoming = [p for content in run for p in content.parts]
+        owners = _match_pending_calls(incoming, pending) if has_results else {}
         parts = [
-            p for part in content.parts for p in _convert_part(part, pending_calls)
+            p
+            for i, part in enumerate(incoming)
+            for p in _convert_part(part, owners.get(i))
         ]
+        if role == "model":
+            pending = [
+                (call[2] if len(call) > 2 else None, call[0])
+                for part in parts
+                if (call := part.function_call) is not None
+            ]
+        elif has_results or role == "user":
+            pending = []
         contents.append(AistudioContent(role=role, parts=parts))
-    merged = _drop_hollow_and_merge_same_role(contents)
-    _backfill_thinking_signatures(merged)
-    return merged
+    return _drop_hollow_and_merge_same_role(contents)
 
 
 def _normalize_system_instruction(

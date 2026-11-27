@@ -49,7 +49,7 @@ async def test_genai_sdk_aio_non_streaming(mock_client: MagicMock) -> None:
     """Test async non-streaming generation with official Google GenAI SDK."""
     mock_client.generate_content = AsyncMock(
         return_value=ModelOutput(
-            candidates=[Candidate(text="Hello from AI Studio!")],
+            candidates=[Candidate(text="Hello from AI Studio!", finish_reason=1)],
             usage={
                 "prompt_tokens": 10,
                 "completion_tokens": 20,
@@ -95,6 +95,7 @@ async def test_genai_sdk_aio_streaming(mock_client: MagicMock) -> None:
         yield ("thinking", "Thinking about the greeting...")
         yield ("body", "Hello ")
         yield ("body", "World!")
+        yield ("finish_reason", 1)
         yield (
             "usage",
             {
@@ -118,7 +119,7 @@ async def test_genai_sdk_aio_streaming(mock_client: MagicMock) -> None:
             ):
                 chunks.append(chunk)
 
-            assert len(chunks) == 4
+            assert len(chunks) == 3
 
             # Chunk 0: thinking
             assert chunks[0].candidates is not None
@@ -134,16 +135,14 @@ async def test_genai_sdk_aio_streaming(mock_client: MagicMock) -> None:
             assert chunks[1].candidates is not None
             assert chunks[1].candidates[0].index == 0
 
-            # Chunk 2: text part 2
+            # Chunk 2: text part 2 + usage + STOP finishReason
             assert chunks[2].text == "World!"
             assert chunks[2].candidates is not None
             assert chunks[2].candidates[0].index == 0
 
-            # Chunk 3: usage + STOP finishReason
-            assert chunks[3].candidates is not None
-            assert chunks[3].candidates[0].finish_reason == types.FinishReason.STOP
-            assert chunks[3].usage_metadata is not None
-            assert chunks[3].usage_metadata.total_token_count == 20
+            assert chunks[2].candidates[0].finish_reason == types.FinishReason.STOP
+            assert chunks[2].usage_metadata is not None
+            assert chunks[2].usage_metadata.total_token_count == 20
     finally:
         if custom_client is not None:
             await custom_client.aclose()
@@ -168,6 +167,7 @@ async def test_genai_sdk_function_calling_and_response_flow(
                 candidates=[
                     Candidate(
                         text="",
+                        finish_reason=1,
                         function_calls=[
                             {
                                 "name": "get_current_weather",
@@ -181,7 +181,8 @@ async def test_genai_sdk_function_calling_and_response_flow(
         return ModelOutput(
             candidates=[
                 Candidate(
-                    text="The current weather in San Francisco is sunny and 18°C."
+                    text="The current weather in San Francisco is sunny and 18°C.",
+                    finish_reason=1,
                 )
             ],
             usage={"prompt_tokens": 25, "completion_tokens": 15, "total_tokens": 40},

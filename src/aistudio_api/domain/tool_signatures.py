@@ -16,6 +16,7 @@ import json
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from pathlib import Path
 
 SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
@@ -66,14 +67,58 @@ def tool_history_text(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class TurnSignatureProof:
+    """One observed complete turn: only digests and per-call signatures."""
+
+    state: str
+    cohort: str | None
+    thought: str | None
+    owners: tuple[str, ...]
+    signatures: tuple[str | None, ...] = field(repr=False)
+
+    def as_record(self) -> tuple[object, ...]:
+        return self.state, self.cohort, self.thought, self.owners, self.signatures
+
+
+def _is_digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(ch in "0123456789abcdef" for ch in value)
+    )
+
+
+def _read_turn_proof(value: object) -> TurnSignatureProof | None:
+    if not isinstance(value, list) or len(value) != 5:
+        return None
+    state, cohort, thought, owners, signatures = value
+    if (
+        not _is_digest(state)
+        or (cohort is not None and not _is_digest(cohort))
+        or (thought is not None and not _is_digest(thought))
+        or not isinstance(owners, list)
+        or not all(_is_digest(owner) for owner in owners)
+        or not isinstance(signatures, list)
+        or not all(
+            sig is None
+            or (sig != SKIP_THOUGHT_SIGNATURE and valid_thought_signature(sig))
+            for sig in signatures
+        )
+    ):
+        return None
+    return TurnSignatureProof(state, cohort, thought, tuple(owners), tuple(signatures))
+
+
 class ThoughtSignatureCache:
-    """Bounded persistent LRU keyed by call ID, name and canonical arguments.
+    """Bounded persistent cache with a separate replay-provenance namespace.
 
     Keys are hashed to avoid persisting prompts or tool arguments. Legacy
-    by-name/by-ID entries cannot establish an exact match and are not loaded.
+    records have no history scope and can never be promoted to replay records.
     """
 
     _MAX_ENTRIES = 2048
+    _MAX_REPLAY_BYTES = 8 * 1024 * 1024
     # 记住签名后的落盘去抖：缓存最多 2048 条（数百 KB～MB 级 JSON），
     # 每次全量序列化 + 原子重写是同步 I/O，remember 跑在事件循环线程的
     # 热路径上（每个 tool_calls 帧一次），串行锁 + 重复落盘会把并发请求
@@ -81,11 +126,20 @@ class ThoughtSignatureCache:
     # 进程退出时 atexit 兜底刷盘（窗口内丢的签名仅退化为 SKIP 字面量，
     # 非关键数据）。
     _SAVE_DEBOUNCE_SECONDS = 2.0
+    _REPLAY_NAMESPACE = "by_scoped_turn_v2"
+    _OLD_REPLAY_NAMESPACE = "by_scoped_call_v1"
 
     def __init__(self, path=None) -> None:
         self._path = Path(path) if path is not None else None
         self._lock = threading.Lock()
         self._signatures: OrderedDict[str, str] = OrderedDict()
+        # Proofs fit in their own byte budget; a None proof is a conflict
+        # marker, not a miss. Older per-call rows can only withhold fallback.
+        self._turns: OrderedDict[str, tuple[TurnSignatureProof | None, int]] = (
+            OrderedDict()
+        )
+        self._old_scoped: OrderedDict[str, None] = OrderedDict()
+        self._replay_bytes = 0
         self._loaded = False
         self._load_error_logged = False
         self._dirty = False
@@ -95,11 +149,19 @@ class ThoughtSignatureCache:
     # -- 公共接口 ----------------------------------------------------------
 
     @staticmethod
-    def _key(call_id: str | None, name: str | None, arguments: object) -> str | None:
+    def _key(
+        call_id: str | None,
+        name: str | None,
+        arguments: object,
+        old_position: tuple[str, str, int] | None = None,
+    ) -> str | None:
         if not call_id or not name:
             return None
+        fields = [call_id, name, arguments if arguments is not None else {}]
+        if old_position is not None:
+            fields.extend(old_position)
         canonical = json.dumps(
-            [call_id, name, arguments if arguments is not None else {}],
+            fields,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -109,7 +171,7 @@ class ThoughtSignatureCache:
     def remember(
         self, call_id: str | None, name: str | None, arguments: object, signature: str
     ) -> None:
-        """Cache an upstream signature for this exact call, excluding sentinels."""
+        """Record legacy response metadata without replay provenance."""
         key = self._key(call_id, name, arguments)
         if (
             key is None
@@ -121,25 +183,76 @@ class ThoughtSignatureCache:
             self._ensure_loaded()
             self._signatures[key] = signature
             self._signatures.move_to_end(key)
-            while len(self._signatures) > self._MAX_ENTRIES:
+            self._mark_dirty_locked()
+
+    @staticmethod
+    def _turn_key(scope: str, turn: str) -> str:
+        return hashlib.sha256(json.dumps([scope, turn]).encode()).hexdigest()
+
+    def remember_turn(self, scope: str, turn: str, proof: TurnSignatureProof) -> bool:
+        """Record a complete cohort; False means conflicting observations."""
+        key = self._turn_key(scope, turn)
+        size = self._proof_size(proof)
+        with self._lock:
+            self._ensure_loaded()
+            old = self._turns.get(key)
+            if old is not None:
+                self._turns.move_to_end(key)
+                if old[0] == proof or old[0] is None:
+                    return old[0] is not None
+                self._replay_bytes -= old[1]
+                size = self._proof_size(None)
+                self._turns[key] = (None, size)
+            elif size > self._MAX_REPLAY_BYTES:
+                # Oversize records remain eligible for the bounded hot LRU.
+                return True
+            else:
+                self._turns[key] = (proof, size)
+            self._replay_bytes += size
+            # A known conflict must not leave an older value usable on restart.
+            self._mark_dirty_locked(force=old is not None)
+            return old is None
+
+    @staticmethod
+    def _proof_size(proof: TurnSignatureProof | None) -> int:
+        # Digests and valid Base64 signatures are ASCII. Include framing and
+        # their key in the budget without serializing twice in the hot path.
+        if proof is None:
+            return 72
+        return (
+            290
+            + 67 * len(proof.owners)
+            + sum(5 if sig is None else len(sig) + 3 for sig in proof.signatures)
+        )
+
+    def _trim_locked(self) -> None:
+        while self._turns and self._replay_bytes > self._MAX_REPLAY_BYTES:
+            _, (_, size) = self._turns.popitem(last=False)
+            self._replay_bytes -= size
+        while (
+            len(self._signatures) + len(self._old_scoped) + len(self._turns)
+            > self._MAX_ENTRIES
+        ):
+            # Legacy metadata must not evict replay provenance.
+            if self._signatures:
                 self._signatures.popitem(last=False)
-            # 首次变脏时定死落盘路径：若推迟到退出钩子（atexit）才解析，
-            # 测试 monkeypatch 的 env 可能已还原，退出 flush 会写到真实
-            # 仓库 data/（跨运行状态串扰，已实测发生过）。此刻解析拿到的
-            # 是「当前生效」的 data 目录，与后续 save/atexit 一致。
-            try:
-                if self._path is None:
-                    self._path = self._resolve_path()
-            except Exception:
-                self._path = None
-            self._dirty = True
-            now = time.monotonic()
-            if (
-                now - self._last_save >= self._SAVE_DEBOUNCE_SECONDS
-                and self._save_locked()
-            ):
-                self._last_save = now
-                self._dirty = False
+            elif self._old_scoped:
+                self._old_scoped.popitem(last=False)
+            else:
+                _, (_, size) = self._turns.popitem(last=False)
+                self._replay_bytes -= size
+
+    def _mark_dirty_locked(self, *, force: bool = False) -> None:
+        self._trim_locked()
+        # Bind the data directory now, not after the request/test environment
+        # disappears at atexit. _ensure_loaded has already resolved the path.
+        self._dirty = True
+        now = time.monotonic()
+        if (
+            force or now - self._last_save >= self._SAVE_DEBOUNCE_SECONDS
+        ) and self._save_locked():
+            self._last_save = now
+            self._dirty = False
 
     def flush(self) -> None:
         """落盘窗口内累积的脏数据（优雅关停或退出钩子调用）。"""
@@ -157,7 +270,7 @@ class ThoughtSignatureCache:
     def lookup(
         self, call_id: str | None, name: str | None, arguments: object
     ) -> str | None:
-        """Restore only a signature for matching ID, name and arguments."""
+        """Inspect legacy, unscoped metadata; not suitable for replay."""
         key = self._key(call_id, name, arguments)
         if key is None:
             return None
@@ -167,6 +280,42 @@ class ThoughtSignatureCache:
             if sig is not None:
                 self._signatures.move_to_end(key)
             return sig
+
+    def lookup_turn(
+        self, scope: str, turn: str
+    ) -> tuple[bool, TurnSignatureProof | None]:
+        """Distinguish a miss from withheld, conflicting turn evidence."""
+        key = self._turn_key(scope, turn)
+        with self._lock:
+            self._ensure_loaded()
+            record = self._turns.get(key)
+            if record is None:
+                return False, None
+            self._turns.move_to_end(key)
+            return True, record[0]
+
+    def has_old_observations(self) -> bool:
+        with self._lock:
+            self._ensure_loaded()
+            return bool(self._old_scoped)
+
+    def saw_old_call(
+        self,
+        scope: str,
+        turn: str,
+        ordinal: int,
+        call_id: str | None,
+        name: str,
+        arguments: object,
+    ) -> bool:
+        """A v1 row cannot be replayed or treated as a new fallback case."""
+        key = self._key(call_id, name, arguments, (scope, turn, ordinal))
+        with self._lock:
+            self._ensure_loaded()
+            if key is None or key not in self._old_scoped:
+                return False
+            self._old_scoped.move_to_end(key)
+            return True
 
     # -- 持久化 ------------------------------------------------------------
 
@@ -192,6 +341,27 @@ class ThoughtSignatureCache:
                         self._signatures[key] = value
                         if len(self._signatures) > self._MAX_ENTRIES:
                             self._signatures.popitem(last=False)
+            if not isinstance(data, dict):
+                return
+            old_scoped = data.get(self._OLD_REPLAY_NAMESPACE)
+            if isinstance(old_scoped, dict):
+                for key in old_scoped:
+                    if isinstance(key, str) and _is_digest(key):
+                        self._old_scoped[key] = None
+                        self._trim_locked()
+            scoped = data.get(self._REPLAY_NAMESPACE)
+            if isinstance(scoped, dict):
+                for key, value in scoped.items():
+                    if not isinstance(key, str) or not _is_digest(key):
+                        continue
+                    # A malformed observed row can never authorize replay.
+                    proof = _read_turn_proof(value)
+                    size = self._proof_size(proof)
+                    if size > self._MAX_REPLAY_BYTES:
+                        continue
+                    self._turns[key] = (proof, size)
+                    self._replay_bytes += size
+                    self._trim_locked()
         except (OSError, ValueError):
             # 首次运行 / 文件损坏：从空缓存开始即可
             pass
@@ -208,7 +378,14 @@ class ThoughtSignatureCache:
 
             atomic_write_json(
                 path,
-                {"by_call": dict(self._signatures)},
+                {
+                    "by_call": dict(self._signatures),
+                    self._OLD_REPLAY_NAMESPACE: dict(self._old_scoped),
+                    self._REPLAY_NAMESPACE: {
+                        key: proof.as_record() if proof is not None else None
+                        for key, (proof, _) in self._turns.items()
+                    },
+                },
                 private=True,
                 compact=True,
             )
@@ -261,43 +438,3 @@ def remember_function_signature(
     if valid_thought_signature(signature):
         assert isinstance(signature, str)
         get_signature_cache().remember(call_id, name, arguments, signature)
-
-
-def lookup_function_signature(
-    call_id: str | None, name: str | None, arguments: object
-) -> str | None:
-    """Restore a signature for the exact historical call."""
-    if not call_id and not name:
-        return None
-    return get_signature_cache().lookup(call_id, name, arguments)
-
-
-# ---------------------------------------------------------------------------
-# 思考链（thinking）签名缓存：按思考摘要全文哈希精确匹配
-# ---------------------------------------------------------------------------
-
-
-def _thinking_digest(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def remember_thinking_signature(text: str, signature: object) -> None:
-    """缓存纯文本轮的 thinking 签名，键为思考摘要全文哈希。
-
-    与函数调用签名共用同一缓存实例与持久化文件：键经固定的 "thinking"
-    伪调用标识 + 文本哈希隔离，哈希键不落任何明文思考内容（与既有
-    隐私设计一致）。供客户端回传思考文本（OpenAI reasoning_content /
-    Responses reasoning item）但丢失签名载体时回注，保证思考链签名
-    在跨重启、账号轮换（model_turns 回放失配）窗口内仍可恢复。
-    """
-    if not text or not valid_thought_signature(signature):
-        return
-    assert isinstance(signature, str)
-    remember_function_signature("thinking", _thinking_digest(text), None, signature)
-
-
-def lookup_thinking_signature(text: str) -> str | None:
-    """按思考摘要全文精确匹配恢复 thinking 签名（无匹配返回 None）。"""
-    if not text:
-        return None
-    return lookup_function_signature("thinking", _thinking_digest(text), None)

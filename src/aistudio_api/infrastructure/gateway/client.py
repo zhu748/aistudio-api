@@ -16,7 +16,7 @@ from aistudio_api.domain.errors import (
     is_html_payload,
     is_login_redirect_payload,
 )
-from aistudio_api.domain.models import ModelOutput
+from aistudio_api.domain.models import ModelOutput, ResponsePart
 from aistudio_api.infrastructure.account.cookie_parser import get_visit_id
 from aistudio_api.infrastructure.gateway.model_turns import (
     ModelTurnContext,
@@ -331,6 +331,20 @@ class AIStudioClient:
             async for event in gateway_stream:
                 if function_name_restore and event[0] == "tool_calls":
                     _apply_function_name_restore(event[1], function_name_restore)
+                elif (
+                    function_name_restore
+                    and event[0] == "ordered_parts"
+                    and isinstance(event[1], list)
+                ):
+                    _apply_function_name_restore(
+                        [
+                            part.function_call
+                            for part in event[1]
+                            if isinstance(part, ResponsePart)
+                            and part.function_call is not None
+                        ],
+                        function_name_restore,
+                    )
                 yield event
         finally:
             await gateway_stream.aclose()
@@ -406,7 +420,11 @@ class AIStudioClient:
                 _apply_function_name_restore(
                     candidate.function_calls, function_name_restore
                 )
-        if effective_prep.model_turn is not None and output.candidates:
+        if (
+            effective_prep.model_turn is not None
+            and output.candidates
+            and not output.candidates[0].tool_interrupted
+        ):
             capture = effective_prep.model_turn.capture()
             capture.add(output.candidates[0].raw_parts, output.response_id)
             capture.finish(output.candidates[0].finish_reason)

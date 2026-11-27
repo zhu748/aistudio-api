@@ -27,7 +27,6 @@ from aistudio_api.api.schemas import (
     GeminiTool,
 )
 from aistudio_api.api.schemas_compat import ClaudeMessagesRequest
-from aistudio_api.application.api_service_gemini import _ERROR_TEXT_PREFIX
 from aistudio_api.application.compat_errors import (
     _CLAUDE_ERROR_TYPE,
     _CLAUDE_REFUSAL_FINISH,
@@ -39,9 +38,11 @@ from aistudio_api.application.compat_shared import (
     _as_int,
     _as_str,
     _assert_media_size,
+    _code_text,
     _convert_items_concurrently,
     _frame_candidate,
     _frame_parts,
+    _is_signed_empty_thought,
     _iter_gemini_sse_frames,
     _iter_response_parts,
     _media_part_from_url,
@@ -52,12 +53,12 @@ from aistudio_api.application.compat_shared import (
     resolve_compat_model,
 )
 from aistudio_api.application.media_session import has_remote_media, media_session
-from aistudio_api.application.stream_utils import StopSequenceBuffer
+from aistudio_api.application.stream_utils import (
+    StopSequenceBuffer,
+    part_payload_signature,
+)
 from aistudio_api.domain.tool_signatures import (
-    SKIP_THOUGHT_SIGNATURE,
-    lookup_function_signature as _lookup_function_signature,
     remember_function_signature as _remember_function_signature,
-    valid_thought_signature as _valid_thought_signature,
 )
 from aistudio_api.infrastructure.request_context import record_result
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -95,13 +96,14 @@ async def _claude_blocks_to_parts(
         if block_type == "text":
             parts.append(GeminiPart(text=_as_str(block.get("text"))))
         elif block_type == "thinking":
-            parts.append(
-                GeminiPart(
-                    text=_as_str(block.get("thinking")),
-                    thought=True,
-                    thoughtSignature=_read_claude_signature(block.get("signature")),
+            thinking = block.get("thinking")
+            signature = _read_claude_signature(block.get("signature"))
+            if isinstance(thinking, str) and (
+                thinking or _is_signed_empty_thought(thinking, signature)
+            ):
+                parts.append(
+                    GeminiPart(text=thinking, thought=True, thoughtSignature=signature)
                 )
-            )
         elif block_type == "image":
             source = _as_dict(block.get("source"))
             source_type = source.get("type")
@@ -136,19 +138,9 @@ async def _claude_blocks_to_parts(
         elif block_type == "tool_use":
             name = _as_str(block.get("name")) or "unknown"
             tool_input = block.get("input")
-            signature = _read_signature(block)
-            if not _valid_thought_signature(signature):
-                # 客户端丢失签名（Claude 协议 tool_use 无官方字段）→ 缓存回注
-                signature = _lookup_function_signature(
-                    _as_str(block.get("id")) or None,
-                    name,
-                    tool_input if tool_input is not None else {},
-                )
-            if not _valid_thought_signature(signature):
-                signature = SKIP_THOUGHT_SIGNATURE
             parts.append(
                 GeminiPart(
-                    thoughtSignature=signature,
+                    thoughtSignature=_read_signature(block),
                     functionCall=GeminiFunctionCall(
                         name=name,
                         args=tool_input if tool_input is not None else {},
@@ -455,7 +447,7 @@ def _claude_stop_reason(
 ) -> tuple[str, str | None]:
     """Gemini finishReason → Claude stop_reason 纯映射；停止序列命中由调用方
     （StopSequenceBuffer 的 stop_hit）先行判定，不再具备重复扫描语义。"""
-    raw = finish_reason or "STOP"
+    raw = finish_reason or "OTHER"
     # 安全/异常拦截优先于 tool_use，避免把被风控终止的响应误报成正常工具调用。
     if raw in _CLAUDE_REFUSAL_FINISH:
         return "refusal", None
@@ -470,6 +462,14 @@ def _claude_stop_reason(
     return "end_turn", None
 
 
+def _inline_output_notice(media_type: str) -> str:
+    kind = "Image" if media_type.lower().startswith("image/") else "Inline media"
+    return (
+        f"[{kind} output is unavailable in the Claude Messages format. "
+        "Use the native Gemini endpoint for binary output.]"
+    )
+
+
 def build_claude_message(
     response: GeminiGenerateContentResponse,
     requested_model: str,
@@ -481,58 +481,47 @@ def build_claude_message(
     if candidates:
         finish_reason_raw = candidates[0].finishReason
 
-    blocks: list[dict[str, object]] = []
+    # Strings are gateway notices, not generated text subject to stop matching.
+    blocks: list[dict[str, object] | str] = []
     has_tool_use = False
-    # 尾部空文本签名载体 part 携带的签名（to_gemini_parts 保留的 wire 抓包
-    # 形态：纯文本轮的 thought 签名挂在最后一个空 text part，而非 thought
-    # part 本体）。Claude 协议中只有 thinking 块有 signature 字段，收尾时
-    # 回填最后一个 thinking 块，否则客户端回传时思考链签名丢失。
-    trailing_signature: str | None = None
-
     for part in _iter_response_parts(response):
         text = getattr(part, "text", None)
-        part_signature = getattr(part, "thoughtSignature", None)
-        if isinstance(text, str) and text:
-            if getattr(part, "thought", None) is True:
-                # 连续 thought part 合并为单个 thinking 块（对齐流式形态：
-                # 流式 thinking_delta 全部落在同一 content block）。Anthropic
-                # 官方响应同样是「每个思考段一个块」而非逐 part 一块；块内
-                # 签名取段内最后到达的真实值（Gemini 末位签名权威语义），
-                # 这也使块文本与思考签名缓存的整段拼接键一致，客户端回传
-                # 时缓存回注才能命中。
-                if blocks and blocks[-1].get("type") == "thinking":
-                    blocks[-1]["thinking"] = _as_str(blocks[-1].get("thinking")) + text
-                    if isinstance(part_signature, str) and part_signature:
-                        blocks[-1]["signature"] = _claude_signature(part_signature)
+        if isinstance(text, str):
+            is_thought = getattr(part, "thought", None) is True
+            signature = part_payload_signature(part, "text") if is_thought else ""
+            if is_thought and (text or _is_signed_empty_thought(text, signature)):
+                # A signed Part must match precisely one output block.
+                previous = blocks[-1] if blocks else None
+                if (
+                    not signature
+                    and isinstance(previous, dict)
+                    and previous.get("type") == "thinking"
+                    and not previous.get("signature")
+                ):
+                    previous["thinking"] = _as_str(previous.get("thinking")) + text
                 else:
                     blocks.append(
                         {
                             "type": "thinking",
                             "thinking": text,
-                            "signature": _claude_signature(part_signature),
+                            "signature": _claude_signature(signature),
                         }
                     )
-            else:
+            elif not is_thought and text:
                 blocks.append({"type": "text", "text": text})
         inline = getattr(part, "inlineData", None)
-        if inline is not None:
-            blocks.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": inline.mimeType,
-                        "data": inline.data,
-                    },
-                }
-            )
+        if inline is not None and inline.data:
+            blocks.append(_inline_output_notice(inline.mimeType))
+        code = _code_text(
+            getattr(part, "executableCode", None),
+            getattr(part, "codeExecutionResult", None),
+        )
+        if code:
+            blocks.append({"type": "text", "text": code})
         function_call = getattr(part, "functionCall", None)
-        # 异常终结（MAX_TOKENS/SAFETY/未知枚举）下丢弃工具调用：截断的
-        # 并行调用集合可能不完整，执行部分调用集有副作用风险——有意与
-        # 流式侧（已冲刷内容无法撤回）不对称，见回归测试
-        # test_non_streaming_interrupted_calls_are_not_executable。
-        if function_call is not None and finish_reason_raw in (None, "STOP"):
+        if function_call is not None and finish_reason_raw == "STOP":
             has_tool_use = True
+            signature = part_payload_signature(part, "functionCall")
             call_id = function_call.id or f"toolu_{secrets.token_hex(12)}"
             args = _coerce_tool_args(function_call.args)
             if function_call.id is None:
@@ -543,41 +532,26 @@ def build_claude_message(
                 # 流式路径（coalesce 先定 id、recorder 后记忆化）对齐。
                 # remember 内部会校验签名合法性，无效签名静默跳过。
                 _remember_function_signature(
-                    call_id, function_call.name, args, part_signature
+                    call_id, function_call.name, args, signature
                 )
             blocks.append(
                 {
-                    **_signature_extra(getattr(part, "thoughtSignature", None)),
+                    **_signature_extra(signature),
                     "type": "tool_use",
                     "id": call_id,
                     "name": function_call.name,
                     "input": args,
                 }
             )
-        elif (
-            not text
-            and function_call is None
-            and inline is None
-            and isinstance(part_signature, str)
-            and part_signature
-            # 纯文本轮的尾部签名载体必然不与 functionCall 共存（wire 抓包
-            # 形态）；含工具调用的响应里裸签名无法排除是调用签名迟到，
-            # 回填到 thinking 块会在客户端回传时挂到 thought part 上，
-            # 可能触发上游 "Corrupted thought signature."，宁缺勿错。
-            and not has_tool_use
-        ):
-            # 空文本纯签名 part（尾部签名载体）：thought part 自身不带签名时
-            # 签名在这里到达。记录最后出现的值（Gemini 语义：最后一 part 的
-            # 签名是整轮的权威签名）。
-            trailing_signature = part_signature
 
     stops = StopSequenceBuffer(stop_sequences)
     filtered: list[dict[str, object]] = []
+    text_block_open = False
 
     def flush_pending() -> None:
         tail = stops.feed("", final=True)
         if tail:
-            if filtered and filtered[-1].get("type") == "text":
+            if text_block_open:
                 filtered[-1]["text"] = _as_str(filtered[-1].get("text")) + tail
             else:
                 filtered.append({"type": "text", "text": tail})
@@ -585,25 +559,21 @@ def build_claude_message(
     for block in blocks:
         if stops.hit is not None:
             break
-        if block.get("type") == "text":
+        if isinstance(block, str):
+            flush_pending()
+            filtered.append({"type": "text", "text": block})
+            text_block_open = False
+        elif block.get("type") == "text":
             text = stops.feed(_as_str(block.get("text")))
             if text:
                 filtered.append({**block, "text": text})
+                text_block_open = True
         else:
             flush_pending()
             filtered.append(block)
+            text_block_open = False
     flush_pending()
-    blocks = filtered
-    if trailing_signature is not None:
-        for block in reversed(blocks):
-            if block.get("type") != "thinking":
-                continue
-            # 仅占位/空签名被回填：thinking part 自带真实签名（信封形态）时
-            # 不覆盖（to_gemini_parts 保证两者互斥，此处为防御性判定）。
-            if _read_claude_signature(_as_str(block.get("signature"))) is None:
-                block["signature"] = _claude_signature(trailing_signature)
-            break
-    if stops.hit is not None:
+    if stops.hit is not None and finish_reason_raw == "STOP":
         stop_reason, stop_seq = "stop_sequence", stops.hit
     else:
         stop_reason, stop_seq = _claude_stop_reason(
@@ -616,7 +586,7 @@ def build_claude_message(
         "type": "message",
         "role": "assistant",
         "model": requested_model,
-        "content": blocks or [{"type": "text", "text": ""}],
+        "content": filtered or [{"type": "text", "text": ""}],
         "stop_reason": stop_reason,
         "stop_sequence": stop_seq,
         "usage": usage_payload,
@@ -645,13 +615,6 @@ class _ClaudeStreamEmitter:
         # 在 stop sequence 处截断文本，透传其后内容会让客户端拿到多余文本）
         self.stop_hit: str | None = None
         self.thinking_signature = ""
-        # 最近一个 thinking 块的索引与迟到签名：上游把纯文本轮的真实签名
-        # 放在流末尾的尾部空文本 part（晚于全部正文到达），此时 thinking 块
-        # 已按占位签名关闭。Anthropic SDK（含 Claude Code）按索引应用
-        # signature_delta 且为赋值语义、不校验块是否已 stop——finish() 前
-        # 对该块补发真实签名即可覆盖先前下发的占位值。
-        self.thinking_index: int | None = None
-        self.late_signature: str | None = None
 
     def sse(self, event: str, payload: dict[str, object]) -> str:
         # separators：SSE 每帧省去 ", " 与 ": " 的空格（约 2-4% 字节/分配）
@@ -691,7 +654,7 @@ class _ClaudeStreamEmitter:
 
     def _close_events(self) -> list[str]:
         events: list[str] = []
-        if self.open_kind == "thinking":
+        if self.open_kind == "thinking" and self.thinking_signature:
             events.append(
                 self.sse(
                     "content_block_delta",
@@ -724,7 +687,6 @@ class _ClaudeStreamEmitter:
         block: dict[str, object]
         if kind == "thinking":
             self.thinking_signature = ""
-            self.thinking_index = self.index
             block = {"type": "thinking", "thinking": "", "signature": ""}
         else:
             block = {"type": "text", "text": ""}
@@ -741,18 +703,23 @@ class _ClaudeStreamEmitter:
         self.open_kind = kind
         return events
 
-    def thinking_delta(self, text: str) -> list[str]:
-        events = self._ensure_block("thinking")
-        events.append(
-            self.sse(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": self.index,
-                    "delta": {"type": "thinking_delta", "thinking": text},
-                },
+    def thinking_delta(self, text: str, signature: str = "") -> list[str]:
+        events: list[str] = []
+        if self.open_kind == "thinking" and (signature or self.thinking_signature):
+            events += self._close_events()
+        events += self._ensure_block("thinking")
+        self.thinking_signature = signature
+        if text:
+            events.append(
+                self.sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": self.index,
+                        "delta": {"type": "thinking_delta", "thinking": text},
+                    },
+                )
             )
-        )
         return events
 
     def text_delta(self, text: str) -> list[str]:
@@ -815,32 +782,12 @@ class _ClaudeStreamEmitter:
         )
         return events
 
-    def image(self, media_type: str, data: str) -> list[str]:
+    def inline_output_notice(self, media_type: str) -> list[str]:
+        # An image block is valid input, but not valid Messages output.
+        # Keep the replacement text distinct from surrounding generated text.
         events = self._close_events()
-        self.index += 1
-        events.append(
-            self.sse(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": self.index,
-                    "content_block": {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": data,
-                        },
-                    },
-                },
-            )
-        )
-        events.append(
-            self.sse(
-                "content_block_stop",
-                {"type": "content_block_stop", "index": self.index},
-            )
-        )
+        events += self.text_delta(_inline_output_notice(media_type))
+        events += self._close_events()
         return events
 
     def error(self, status: int, message: str) -> list[str]:
@@ -864,27 +811,7 @@ class _ClaudeStreamEmitter:
         events = self._close_events()
         if self.saw_error:
             return events
-        # 迟到签名回填：thinking 块已带占位签名关闭（或仍处于打开状态但
-        # 尚无签名），真实签名在正文之后才到达。此时补发 signature_delta
-        # 覆盖占位值（SDK 赋值语义，最后到达者生效）。
-        if self.late_signature is not None and self.thinking_index is not None:
-            events.append(
-                self.sse(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": self.thinking_index,
-                        "delta": {
-                            "type": "signature_delta",
-                            "signature": _claude_signature(self.late_signature),
-                        },
-                    },
-                )
-            )
-            self.late_signature = None
-        # stop sequence 已在流中命中：直接用命中值（full_text 已被截断，
-        # 重扫文本判定必然失败）
-        if self.stop_hit is not None:
+        if self.stop_hit is not None and self.finish_reason_raw == "STOP":
             stop_reason: str = "stop_sequence"
             stop_seq: str | None = self.stop_hit
         else:
@@ -985,9 +912,12 @@ async def claude_stream_adapter(
                 for part in _frame_parts(candidate):
                     if stops.hit is not None:
                         continue
+                    function_call = _as_dict(part.get("functionCall"))
+                    inline = _as_dict(part.get("inlineData"))
+                    has_inline_output = bool(_as_str(inline.get("data")))
                     if (
-                        part.get("functionCall")
-                        or part.get("inlineData")
+                        function_call
+                        or has_inline_output
                         or part.get("thought") is True
                     ):
                         # A retained text prefix belongs before this next block.
@@ -999,7 +929,6 @@ async def claude_stream_adapter(
                         if tail:
                             for event in emitter.text_delta(tail):
                                 yield event
-                    function_call = _as_dict(part.get("functionCall"))
                     if function_call:
                         call_id = _as_str(function_call.get("id"))
                         if not call_id:
@@ -1007,33 +936,26 @@ async def claude_stream_adapter(
                         name = _as_str(function_call.get("name")) or "unknown"
                         args = function_call.get("args")
                         for event in emitter.tool_use(
-                            call_id, name, args, _as_str(part.get("thoughtSignature"))
+                            call_id,
+                            name,
+                            args,
+                            part_payload_signature(part, "functionCall"),
                         ):
                             yield event
                         continue
-                    inline = _as_dict(part.get("inlineData"))
-                    if inline:
-                        mime = _as_str(inline.get("mimeType")) or "image/png"
-                        data = _as_str(inline.get("data"))
-                        if data:
-                            for event in emitter.image(mime, data):
-                                yield event
+                    if has_inline_output:
+                        mime = _as_str(inline.get("mimeType"))
+                        for event in emitter.inline_output_notice(mime):
+                            yield event
                         continue
                     text = part.get("text")
-                    if isinstance(text, str) and text:
+                    if isinstance(text, str):
                         if part.get("thought") is True:
-                            for event in emitter.thinking_delta(text):
-                                yield event
-                            signature = part.get("thoughtSignature")
-                            if isinstance(signature, str):
-                                emitter.thinking_signature = signature
-                        else:
-                            # 上游错误兑底文本（_error_text_payload）不是
-                            # 正文：随后的结构化错误事件已携带同等信息，重复
-                            # 下发会混进 assistant 正文（与 Responses 适配器
-                            # 同款过滤）。
-                            if text.startswith(_ERROR_TEXT_PREFIX):
-                                continue
+                            signature = part_payload_signature(part, "text")
+                            if text or _is_signed_empty_thought(text, signature):
+                                for event in emitter.thinking_delta(text, signature):
+                                    yield event
+                        elif text:
                             # stop sequence 命中后丢弃后续正文（Claude 语义是
                             # 文本在 stop sequence 处截断，不透传其后内容）；
                             # 命中点在本帧中间时，命中点之前的文本仍需下发
@@ -1043,25 +965,6 @@ async def claude_stream_adapter(
                                 continue
                             for event in emitter.text_delta(text):
                                 yield event
-                    elif isinstance(part.get("thoughtSignature"), str):
-                        if emitter.open_kind == "thinking":
-                            # 分解形态：thought part 自带签名被内部管线拆成
-                            # 相邻两帧（thinking 帧 + 裸签名帧），块仍打开，
-                            # 直接归属当前思考块。
-                            emitter.thinking_signature = str(part["thoughtSignature"])
-                        elif (
-                            emitter.thinking_index is not None
-                            # 迟到签名只可能在纯文本轮（尾部签名载体，wire
-                            # 抓包形态必然无 FC）；含工具调用的流里裸签名
-                            # 无法排除是调用签名晚于内容边界冲刷到达——回填
-                            # 到 thinking 块会在回传时挂到 thought part 上，
-                            # 可能触发上游 "Corrupted thought signature."。
-                            and not emitter.has_tool_use
-                        ):
-                            # 迟到签名：thinking 块已关闭（上游把纯文本轮的
-                            # 真实签名放在正文之后的尾部空文本 part）。记录到
-                            # finish() 统一补发，见 _ClaudeStreamEmitter 注释。
-                            emitter.late_signature = str(part["thoughtSignature"])
         except Exception as exc:
             logger.warning("Claude 流式转换异常: %s", exc)
             record_result(

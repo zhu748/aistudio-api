@@ -153,6 +153,15 @@ async def test_slow_preparation_errors_remain_protocol_events(
     if protocol == "chat":
         assert response.text.endswith("data: [DONE]\n\n")
         assert events[-1]["error"]["code"] == (400 if failure == "validation" else 504)
+    elif protocol == "responses":
+        assert [event["type"] for event in events] == [
+            "response.created",
+            "response.failed",
+        ]
+        assert events[0]["response"]["id"] == events[1]["response"]["id"]
+        assert events[1]["response"]["error"]["code"] == (
+            "invalid_prompt" if failure == "validation" else "server_error"
+        )
     else:
         assert events[-1]["type"] == "error"
         assert "event: error" in response.text

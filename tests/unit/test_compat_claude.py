@@ -23,6 +23,7 @@ from aistudio_api.api.response_models import (
     GeminiUsageMetadata,
 )
 from aistudio_api.api.schemas_compat import ClaudeMessagesRequest
+from aistudio_api.application.chat_service import normalize_gemini_request
 from aistudio_api.application.compat_claude import _claude_blocks_to_parts
 from aistudio_api.application.compat_errors import _read_claude_signature
 from aistudio_api.application.compat_service import (
@@ -32,6 +33,7 @@ from aistudio_api.application.compat_service import (
     claude_to_gemini_request,
 )
 from aistudio_api.domain.models import Candidate, ModelOutput
+from aistudio_api.infrastructure.gateway.model_turns import ModelTurnHistory
 
 
 @pytest.fixture
@@ -97,17 +99,16 @@ async def test_claude_request_basic_conversion() -> None:
 
 
 @pytest.mark.asyncio
-async def test_claude_request_tool_roundtrip() -> None:
-    # 2026-11-14：上游对客户端函数同样强制 thought_signature —— 模拟
-    # 响应侧已缓存该 tool_use 的签名（客户端丢失后由网关回注）。
+async def test_claude_request_tool_roundtrip(monkeypatch, tmp_path) -> None:
+    # A fixture knows the old unscoped entry but no original conversation.
     import base64
 
-    from aistudio_api.domain.tool_signatures import remember_function_signature
+    from aistudio_api.domain import tool_signatures
 
     cached_sig = base64.b64encode(b"sig-for-toolu-01ABC").decode()
-    remember_function_signature(
-        "toolu_01ABC", "get_weather", {"location": "Tokyo"}, cached_sig
-    )
+    cache = tool_signatures.ThoughtSignatureCache(tmp_path / "signatures.json")
+    monkeypatch.setattr(tool_signatures, "_cache_instance", cache)
+    cache.remember("toolu_01ABC", "get_weather", {"location": "Tokyo"}, cached_sig)
     req = ClaudeMessagesRequest.model_validate(
         {
             "model": "gemini-3.8-flash",
@@ -164,7 +165,7 @@ async def test_claude_request_tool_roundtrip() -> None:
     gemini_req, resolved = await claude_to_gemini_request(req)
 
     assert resolved == "gemini-3.8-flash"
-    # assistant: text + tool_use（签名由缓存回注）
+    # Assistant text and tool_use retain their structure without legacy replay.
     assistant_parts = gemini_req.contents[0].parts
     assert assistant_parts[0].text == "I'll check the weather."
     fc = assistant_parts[1].functionCall
@@ -172,7 +173,10 @@ async def test_claude_request_tool_roundtrip() -> None:
     assert fc.name == "get_weather"
     assert fc.args == {"location": "Tokyo"}
     assert fc.id == "toolu_01ABC"
-    assert assistant_parts[1].thoughtSignature == cached_sig
+    assert assistant_parts[1].thoughtSignature is None
+    normalized = normalize_gemini_request(gemini_req, resolved)
+    outbound, _, _ = ModelTurnHistory().prepare(resolved, normalized.contents)
+    assert outbound[0].parts[1].thought_signature != cached_sig
     # user: tool_result（含图片展开）
     user_parts = gemini_req.contents[1].parts
     fr = user_parts[0].functionResponse
@@ -286,7 +290,7 @@ def test_build_claude_message_blocks_and_stop_reason() -> None:
     assert message["model"] == "claude-sonnet-4-5"
     assert message["content"][0]["type"] == "thinking"
     assert message["content"][0]["thinking"] == "Thinking hard"
-    assert message["content"][0]["signature"]
+    assert message["content"][0]["signature"] == ""
     assert message["content"][1] == {"type": "text", "text": "The answer"}
     assert message["stop_reason"] == "end_turn"
     assert message["usage"] == {"input_tokens": 7, "output_tokens": 11}
@@ -322,8 +326,10 @@ def test_build_claude_message_image_and_refusal() -> None:
         finish_reason="SAFETY",
     )
     message = cast(dict[str, Any], build_claude_message(response, "m", None))
-    assert message["content"][0]["type"] == "image"
-    assert message["content"][0]["source"]["media_type"] == "image/png"
+    block = message["content"][0]
+    assert block["type"] == "text"
+    assert "Image output is unavailable" in block["text"]
+    assert "iVBORw0KGgo=" not in block["text"]
     assert message["stop_reason"] == "refusal"
 
 
@@ -340,7 +346,13 @@ async def test_claude_stream_adapter_full_sequence() -> None:
                 {
                     "content": {
                         "role": "model",
-                        "parts": [{"text": "Deep thought", "thought": True}],
+                        "parts": [
+                            {
+                                "text": "Deep thought",
+                                "thought": True,
+                                "thoughtSignature": _SIGNATURE,
+                            }
+                        ],
                     },
                     "index": 0,
                 }
@@ -424,7 +436,7 @@ async def test_claude_stream_adapter_full_sequence() -> None:
     # thinking 块关闭前补 signature_delta
     signature_delta = parsed[4]
     assert signature_delta["delta"]["type"] == "signature_delta"
-    assert signature_delta["delta"]["signature"]
+    assert _read_claude_signature(signature_delta["delta"]["signature"]) == _SIGNATURE
     assert parsed[5]["type"] == "content_block_stop"
 
     text_start = parsed[6]
@@ -581,7 +593,7 @@ async def test_e2e_claude_non_streaming(
 ) -> None:
     mock_client.generate_content = AsyncMock(
         return_value=ModelOutput(
-            candidates=[Candidate(text="Claude compat reply")],
+            candidates=[Candidate(text="Claude compat reply", finish_reason=1)],
             usage={"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10},
         )
     )
@@ -759,13 +771,8 @@ def test_claude_stop_reason_refusal_beats_tool_use() -> None:
 _SIGNATURE = base64.b64encode(b"upstream-signature-fixture-0123456789").decode()
 
 
-def test_build_claude_message_trailing_signature_carrier_restored() -> None:
-    """纯文本轮的尾部空文本签名载体必须回填 thinking 块。
-
-    wire 抓包形态（WIRE_SPECIFICATION.md §6.5）：思考摘要 + 文本 + 尾部
-    空文本签名 part。旧实现只读非空 text part，载体 part 被静默跳过，
-    thinking 块只能带占位签名，客户端回传后思考链签名丢失。
-    """
+def test_build_claude_message_trailing_signature_stays_separate() -> None:
+    """A separate Gemini carrier is not a signature for a Claude thought."""
     response = _gemini_response(
         [
             GeminiPartResponse(text="Thinking hard", thought=True),
@@ -777,7 +784,7 @@ def test_build_claude_message_trailing_signature_carrier_restored() -> None:
     thinking_block = message["content"][0]
     assert thinking_block["type"] == "thinking"
     restored = _read_claude_signature(thinking_block["signature"])
-    assert restored == _SIGNATURE
+    assert restored is None
 
 
 def test_build_claude_message_trailing_carrier_keeps_real_part_signature() -> None:
@@ -797,13 +804,10 @@ def test_build_claude_message_trailing_carrier_keeps_real_part_signature() -> No
 
 
 @pytest.mark.asyncio
-async def test_claude_stream_late_signature_backfills_closed_thinking() -> None:
-    """流式迟到签名（尾部空文本 part 晚于正文到达）必须补发 signature_delta。
-
-    Anthropic SDK（含 Claude Code）按索引应用 signature_delta 且为赋值
-    语义、不校验块是否已 stop：finish() 前对已关闭的 thinking 块补发真实
-    签名，客户端最终拿到的就是真实值而非占位值。
-    """
+async def test_claude_stream_does_not_reopen_closed_thinking_for_late_signature() -> (
+    None
+):
+    """Never send a late detached signature delta for a closed block."""
     frames: list[dict[str, object]] = [
         {
             "candidates": [
@@ -846,33 +850,26 @@ async def test_claude_stream_late_signature_backfills_closed_thinking() -> None:
         and event["delta"]["type"] == "signature_delta"
         and event["index"] == 0
     ]
-    # 关闭时的占位 + finish 前的迟到真实值；SDK 赋值语义取最后到达者
-    assert len(signature_deltas) >= 2
-    assert _read_claude_signature(signature_deltas[-1]) == _SIGNATURE
-    # 补发必须发生在 message_delta 之前，事件流仍以 message_stop 收尾
-    message_delta_idx = next(
-        i for i, event in enumerate(parsed) if event["type"] == "message_delta"
-    )
-    late_idx = max(
-        i
-        for i, event in enumerate(parsed)
-        if event["type"] == "content_block_delta"
-        and event["delta"]["type"] == "signature_delta"
-    )
-    assert late_idx < message_delta_idx
+    assert signature_deltas == []
     assert parsed[-1]["type"] == "message_stop"
 
 
 @pytest.mark.asyncio
-async def test_claude_late_signature_round_trips_to_upstream() -> None:
-    """端到端：迟到签名恢复后，客户端原样回传 thinking 块能还原真实签名。"""
+async def test_claude_attached_signature_round_trips_to_matching_part() -> None:
+    """An explicit Part signature round-trips; separate carriers do not."""
     frames: list[dict[str, object]] = [
         {
             "candidates": [
                 {
                     "content": {
                         "role": "model",
-                        "parts": [{"text": "Thinking hard", "thought": True}],
+                        "parts": [
+                            {
+                                "text": "Thinking hard",
+                                "thought": True,
+                                "thoughtSignature": _SIGNATURE,
+                            }
+                        ],
                     }
                 }
             ]
@@ -882,8 +879,9 @@ async def test_claude_late_signature_round_trips_to_upstream() -> None:
                 {
                     "content": {
                         "role": "model",
-                        "parts": [{"thoughtSignature": _SIGNATURE}],
-                    }
+                        "parts": [{"thoughtSignature": "b3RoZXI="}],
+                    },
+                    "finishReason": "STOP",
                 }
             ]
         },
@@ -992,7 +990,6 @@ def test_build_claude_message_trailing_carrier_ignored_with_tool_use() -> None:
         [
             GeminiPartResponse(text="Plan the call.", thought=True),
             GeminiPartResponse(
-                text="",
                 functionCall=GeminiFunctionCallPayload(
                     name="get_weather", args={"city": "SF"}
                 ),
