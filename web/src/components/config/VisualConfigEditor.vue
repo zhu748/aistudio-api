@@ -25,6 +25,8 @@ import {
   Search,
   ChevronsUpDown,
 } from 'lucide-vue-next'
+import { errorMessage } from '@/utils/errors.ts'
+import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 
 const props = defineProps<{
   initialYaml?: string
@@ -36,6 +38,11 @@ const emit = defineEmits<{
 
 const toast = useToastStore()
 const { confirm } = useConfirm()
+
+const editorTabs = [
+  { value: 'visual', label: '可视化面板', icon: SlidersHorizontal },
+  { value: 'yaml', label: 'YAML 源码', icon: FileCode },
+]
 
 const activeTab = ref<'visual' | 'yaml'>('visual')
 const rawYaml = ref(props.initialYaml || '')
@@ -80,7 +87,7 @@ function parseYamlToState(content: string): boolean {
     yamlParseError.value = null
     return true
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : 'YAML 解析失败'
+    const msg = errorMessage(err, 'YAML 解析失败')
     yamlParseError.value = msg
     return false
   }
@@ -297,7 +304,7 @@ async function handleSave() {
     toast.success('配置已保存并完成热重载')
     emit('saved')
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : '保存配置失败'
+    const msg = errorMessage(err, '保存配置失败')
     toast.error(msg)
   } finally {
     saving.value = false
@@ -385,27 +392,13 @@ onBeforeRouteLeave(async (_to, _from, next) => {
           <span>参数字典</span>
         </Button>
 
-        <!-- Tab Pill Toggle -->
-        <div class="flex items-center bg-slate-100 p-1 rounded-lg text-xs font-medium">
-          <button
-            type="button"
-            class="px-2.5 py-1 rounded-md transition-all flex items-center gap-1.5 cursor-pointer"
-            :class="activeTab === 'visual' ? 'bg-white text-slate-900 shadow-2xs font-semibold' : 'text-slate-500 hover:text-slate-900'"
-            @click="switchTab('visual')"
-          >
-            <SlidersHorizontal class="w-3.5 h-3.5" />
-            <span>可视化面板</span>
-          </button>
-          <button
-            type="button"
-            class="px-2.5 py-1 rounded-md transition-all flex items-center gap-1.5 cursor-pointer"
-            :class="activeTab === 'yaml' ? 'bg-white text-slate-900 shadow-2xs font-semibold' : 'text-slate-500 hover:text-slate-900'"
-            @click="switchTab('yaml')"
-          >
-            <FileCode class="w-3.5 h-3.5" />
-            <span>YAML 源码</span>
-          </button>
-        </div>
+        <SegmentedControl
+          :model-value="activeTab"
+          :options="editorTabs"
+          container-class="flex items-center bg-slate-100 p-1 rounded-lg text-xs font-medium"
+          item-class="px-2.5 py-1 rounded-md transition-all flex items-center gap-1.5 cursor-pointer"
+          @update:model-value="switchTab($event as 'visual' | 'yaml')"
+        />
 
         <Button
           variant="ghost"

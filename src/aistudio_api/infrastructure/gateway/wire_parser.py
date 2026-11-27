@@ -19,10 +19,7 @@ from aistudio_api.infrastructure.gateway.wire_spec import (
     WIRE_FINISH_REASON_STOP,
     PartIndex,
 )
-from aistudio_api.infrastructure.utils.common import (
-    decode_base64_images,
-    extract_outer_json,
-)
+from aistudio_api.infrastructure.utils.common import extract_outer_json
 
 _ROLE_NAMES = frozenset({"model", "user", "system", "assistant"})
 _MAX_REPLAY_BYTES = 4 * 1024 * 1024
@@ -489,31 +486,17 @@ def parse_response_chunk(chunk: list[object]) -> Candidate:
             candidate.raw_parts.append(raw_part)
         part = parse_response_part(raw_part)
         if part.inline_data:
-            decoded = decode_base64_images(
-                [{"mime": part.inline_data[0], "data": part.inline_data[1]}]
+            # 上游原始 base64 直接作为主数据源：解码推迟到 GeneratedImage.data
+            # 首次被访问，解析热路径不再为无人消费的 bytes 白付全量解码。
+            part.image = GeneratedImage(
+                mime=str(part.inline_data[0]),
+                raw_b64=str(part.inline_data[1]),
+                thought_signature=part.thought_signature or "",
             )
-            decoded_images: list[GeneratedImage] = []
-            for img in decoded:
-                raw_bytes = img.get("bytes")
-                b_data = (
-                    bytes(raw_bytes)
-                    if isinstance(raw_bytes, (bytes, bytearray))
-                    else b""
-                )
-                part.image = GeneratedImage(
-                    mime=str(img.get("mime", "image/jpeg")),
-                    data=b_data,
-                    size=int(str(img.get("size", 0))),
-                    thought_signature=part.thought_signature or "",
-                    # 保留上游原始 base64：出站编码直接复用，消除
-                    # b64decode→b64encode 全量往返。
-                    raw_b64=str(part.inline_data[1]),
-                )
-                decoded_images.append(part.image)
             if part.thought:
-                reasoning_images.extend(decoded_images)
+                reasoning_images.append(part.image)
             else:
-                images.extend(decoded_images)
+                images.append(part.image)
         for code in (part.executable_code, part.code_execution_result):
             if isinstance(code, list) and len(code) > 1 and isinstance(code[1], str):
                 code_outputs.append(code[1])

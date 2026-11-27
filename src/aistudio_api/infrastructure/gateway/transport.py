@@ -37,6 +37,7 @@ from aistudio_api.infrastructure.proxy_bridge import (
     resolve_proxy_url_async,
     resolve_proxy_url_cached,
 )
+from aistudio_api.infrastructure.utils.common import mask_proxy_userinfo
 from aistudio_api.infrastructure.utils.logger import get_logger
 from aistudio_api.infrastructure.utils.upstream_dump import (
     save_upstream_exchange,
@@ -565,7 +566,7 @@ def _mask_proxy_url(proxy_url: str | None) -> str:
     """脱敏代理地址中的账号密码，避免日志泄漏凭据。"""
     if not proxy_url:
         return "(直连)"
-    return re.sub(r"//[^@/]+@", "//***@", str(proxy_url))
+    return mask_proxy_userinfo(str(proxy_url))
 
 
 # ---------------------------------------------------------------------------

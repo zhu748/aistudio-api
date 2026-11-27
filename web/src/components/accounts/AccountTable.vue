@@ -18,6 +18,9 @@ import CookieGroupBlock from './CookieGroupBlock.vue'
 import AccountRow from './AccountRow.vue'
 import Button from '@/components/ui/Button.vue'
 import { Cookie, Search, Layers, Clock, Trash2, Plus, ChevronsUpDown } from 'lucide-vue-next'
+import { errorMessage } from '@/utils/errors.ts'
+import { AI_STUDIO_VERIFY_URL } from '@/utils/constants.ts'
+import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 
 const props = defineProps<{
   accounts: AccountWithStats[]
@@ -177,6 +180,59 @@ const statusCounts = computed(() => {
   }
 })
 
+type StatusKey = 'all' | 'ready' | 'limited' | 'verification' | 'expired' | 'disabled'
+
+const statusOptions = computed<
+  { value: StatusKey; label: string; count: number; activeClass: string; idleClass?: string; itemClass?: string }[]
+>(() => [
+  {
+    value: 'all',
+    label: '全部',
+    count: statusCounts.value.all,
+    activeClass: 'bg-white text-slate-900 font-semibold shadow-2xs',
+  },
+  {
+    value: 'ready',
+    label: '就绪',
+    count: statusCounts.value.ready,
+    activeClass: 'bg-white text-emerald-700 font-semibold shadow-2xs',
+  },
+  {
+    value: 'limited',
+    label: '受限',
+    count: statusCounts.value.limited,
+    activeClass: 'bg-white text-amber-700 font-semibold shadow-2xs',
+  },
+  {
+    value: 'verification',
+    label: '待验证',
+    count: statusCounts.value.verification,
+    activeClass: 'bg-white text-orange-700 font-semibold shadow-2xs',
+    idleClass:
+      statusCounts.value.verification > 0
+        ? 'text-orange-700 hover:text-orange-900'
+        : 'text-slate-600 hover:text-slate-900',
+  },
+  {
+    value: 'expired',
+    label: '失效',
+    count: statusCounts.value.expired,
+    activeClass: 'bg-white text-rose-700 font-semibold shadow-2xs',
+  },
+  {
+    value: 'disabled',
+    label: '停用',
+    count: statusCounts.value.disabled,
+    activeClass: 'bg-white text-slate-800 shadow-2xs',
+    idleClass: 'text-slate-500',
+    itemClass: 'px-2.5 py-1 rounded-md cursor-pointer',
+  },
+])
+
+function setStatusFilter(value: string) {
+  statusFilter.value = value as StatusKey
+}
+
 const filteredAccounts = computed<AccountWithStats[]>(() => {
   const kw = searchKeyword.value.trim().toLowerCase()
   return props.accounts.filter((acc) => {
@@ -313,7 +369,7 @@ async function handleCleanupGhosts() {
     }
     await accountsStore.fetchAll()
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : '清理失败'
+    const msg = errorMessage(err, '清理失败')
     toast.error(msg)
   } finally {
     cleaningGhosts.value = false
@@ -382,78 +438,13 @@ async function handleClearModelCooldown(accountId: string, model: string) {
         </div>
 
         <!-- Status Segmented Control with Live Counts -->
-        <div class="flex items-center bg-slate-200/60 p-0.5 rounded-lg text-xs font-medium tabular-nums">
-          <button
-            type="button"
-            class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-            :class="
-              statusFilter === 'all'
-                ? 'bg-white text-slate-900 font-semibold shadow-2xs'
-                : 'text-slate-600 hover:text-slate-900'
-            "
-            @click="statusFilter = 'all'"
-          >
-            全部 ({{ statusCounts.all }})
-          </button>
-          <button
-            type="button"
-            class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-            :class="
-              statusFilter === 'ready'
-                ? 'bg-white text-emerald-700 font-semibold shadow-2xs'
-                : 'text-slate-600 hover:text-slate-900'
-            "
-            @click="statusFilter = 'ready'"
-          >
-            就绪 ({{ statusCounts.ready }})
-          </button>
-          <button
-            type="button"
-            class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-            :class="
-              statusFilter === 'limited'
-                ? 'bg-white text-amber-700 font-semibold shadow-2xs'
-                : 'text-slate-600 hover:text-slate-900'
-            "
-            @click="statusFilter = 'limited'"
-          >
-            受限 ({{ statusCounts.limited }})
-          </button>
-          <button
-            type="button"
-            class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-            :class="
-              statusFilter === 'verification'
-                ? 'bg-white text-orange-700 font-semibold shadow-2xs'
-                : statusCounts.verification > 0
-                  ? 'text-orange-700 hover:text-orange-900'
-                  : 'text-slate-600 hover:text-slate-900'
-            "
-            @click="statusFilter = 'verification'"
-          >
-            待验证 ({{ statusCounts.verification }})
-          </button>
-          <button
-            type="button"
-            class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-            :class="
-              statusFilter === 'expired'
-                ? 'bg-white text-rose-700 font-semibold shadow-2xs'
-                : 'text-slate-600 hover:text-slate-900'
-            "
-            @click="statusFilter = 'expired'"
-          >
-            失效 ({{ statusCounts.expired }})
-          </button>
-          <button
-            type="button"
-            class="px-2.5 py-1 rounded-md cursor-pointer"
-            :class="statusFilter === 'disabled' ? 'bg-white text-slate-800 shadow-2xs' : 'text-slate-500'"
-            @click="statusFilter = 'disabled'"
-          >
-            停用 ({{ statusCounts.disabled }})
-          </button>
-        </div>
+        <SegmentedControl
+          :model-value="statusFilter"
+          :options="statusOptions"
+          container-class="flex items-center bg-slate-200/60 p-0.5 rounded-lg text-xs font-medium tabular-nums"
+          idle-class="text-slate-600 hover:text-slate-900"
+          @update:model-value="setStatusFilter"
+        />
       </div>
 
       <!-- Right: Quota Reset Timer & View Toggles -->
@@ -642,7 +633,7 @@ async function handleClearModelCooldown(accountId: string, model: string) {
         >
           <span>该账号触发 Google 403 验证拦截，已自动禁用。请完成验证后重新启用该账号即可恢复调度。</span>
           <a
-            href="https://aistudio.google.com/verify-account"
+            :href="AI_STUDIO_VERIFY_URL"
             target="_blank"
             rel="noopener noreferrer"
             class="shrink-0 px-2.5 py-1 rounded-md bg-white border border-orange-300 text-orange-700 font-medium hover:bg-orange-100 transition-colors whitespace-nowrap"

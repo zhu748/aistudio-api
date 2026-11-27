@@ -2,14 +2,16 @@
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { RefreshCw, Trash2, Search, ArrowDownToLine, Radio, Pause } from 'lucide-vue-next'
 import HistoricalLogsPanel from '@/components/HistoricalLogsPanel.vue'
-import ThoughtSignatureBadges from '@/components/ThoughtSignatureBadges.vue'
 import { systemApi } from '@/api/system.ts'
 import { useAuthStore } from '@/stores/auth.ts'
 import { useToastStore } from '@/stores/toast.ts'
 import type { LogEntry } from '@/types'
 import { useRoute } from 'vue-router'
-import { stageLabels } from '@/utils/requests.ts'
 import { usePageRefresh } from '@/composables/usePageRefresh.ts'
+import { errorMessage } from '@/utils/errors.ts'
+import SegmentedControl from '@/components/ui/SegmentedControl.vue'
+import LogRow from '@/components/logs/LogRow.vue'
+import { useDebouncedWatch } from '@/composables/useDebouncedWatch.ts'
 
 const route = useRoute()
 const category = ref(typeof route.query.category === 'string' ? route.query.category : 'model')
@@ -37,8 +39,6 @@ const authStore = useAuthStore()
 const toast = useToastStore()
 let es: EventSource | null = null
 let retryTimer: ReturnType<typeof setTimeout> | null = null
-let debounceTimer: ReturnType<typeof setTimeout> | null = null
-let levelTimer: ReturnType<typeof setTimeout> | null = null
 let connectSeq = 0
 
 const levelOptions = [
@@ -47,20 +47,6 @@ const levelOptions = [
   { value: 'WARNING', label: 'WARN+' },
   { value: 'ERROR', label: 'ERROR' },
 ]
-
-const levelBadgeClass: Record<string, string> = {
-  ERROR: 'bg-rose-500/15 text-rose-400 border-rose-500/30',
-  CRITICAL: 'bg-rose-500/25 text-rose-300 border-rose-500/40',
-  WARNING: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
-  INFO: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
-  DEBUG: 'bg-slate-800 text-slate-400 border-slate-700',
-}
-
-const rowAccentClass: Record<string, string> = {
-  ERROR: 'border-l-2 border-l-rose-500 bg-rose-950/20',
-  CRITICAL: 'border-l-2 border-l-rose-500 bg-rose-950/30',
-  WARNING: 'border-l-2 border-l-amber-400 bg-amber-950/15',
-}
 
 const connDotClass: Record<string, string> = {
   idle: 'bg-slate-400',
@@ -94,6 +80,18 @@ function applyFingerprintFilter(fp: string) {
   search.value = fp
   if (category.value !== 'thought_signature') category.value = 'thought_signature'
 }
+
+const categoryOptions = [
+  { value: 'model', label: '模型请求' },
+  { value: 'thought_signature', label: 'ThoughtSignature' },
+  { value: 'system', label: '系统日志' },
+  { value: 'all', label: '全部日志' },
+]
+
+const orderOptions = [
+  { value: 'desc', label: '最新在前' },
+  { value: 'asc', label: '时间正序' },
+]
 
 const categoryDescriptions: Record<string, string> = {
   model: '仅展示模型调用及其签名、切号和网络异常',
@@ -319,7 +317,7 @@ async function handleClear() {
     total.value = res.total ?? 0
     toast.success('环形日志缓冲区已清空')
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : '清空日志失败'
+    const msg = errorMessage(err, '清空日志失败')
     toast.error(msg)
   }
 }
@@ -354,17 +352,12 @@ watch(historical, (value) => {
     connState.value = 'idle'
   } else void connectStream()
 })
-watch(level, () => {
-  closeStream()
-  if (levelTimer) clearTimeout(levelTimer)
-  levelTimer = setTimeout(() => void connectStream(), 300)
-})
-let filterTimer: ReturnType<typeof setTimeout> | null = null
-watch([category, requestFilter, modelFilter, accountFilter], () => {
-  closeStream()
-  entries.value = []
-  if (filterTimer) clearTimeout(filterTimer)
-  filterTimer = setTimeout(() => void connectStream(), 300)
+useDebouncedWatch(level, () => void connectStream(), { onChange: () => closeStream() })
+useDebouncedWatch([category, requestFilter, modelFilter, accountFilter], () => void connectStream(), {
+  onChange: () => {
+    closeStream()
+    entries.value = []
+  },
 })
 watch(
   () => [route.query.request_id, route.query.category, route.query.search],
@@ -388,11 +381,8 @@ watch(live, (enabled) => {
 watch(order, () => {
   if (autoScroll.value && order.value === 'asc') scrollToEnd()
 })
-watch(searchInput, (val) => {
-  if (debounceTimer) clearTimeout(debounceTimer)
-  debounceTimer = setTimeout(() => {
-    search.value = val
-  }, 300)
+useDebouncedWatch(searchInput, () => {
+  search.value = searchInput.value
 })
 
 onMounted(() => {
@@ -406,9 +396,6 @@ usePageRefresh(async () => {
 
 onUnmounted(() => {
   closeStream()
-  if (debounceTimer) clearTimeout(debounceTimer)
-  if (filterTimer) clearTimeout(filterTimer)
-  if (levelTimer) clearTimeout(levelTimer)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
 })
 </script>
@@ -417,24 +404,15 @@ onUnmounted(() => {
   <div class="flex flex-col gap-3.5">
     <div class="surface-card rounded-xl p-4 space-y-3">
       <div class="flex flex-wrap items-center justify-between gap-3">
-        <div class="flex flex-wrap gap-1 rounded-lg bg-slate-100 p-1">
-          <button
-            v-for="item in [
-              { id: 'model', label: '模型请求' },
-              { id: 'thought_signature', label: 'ThoughtSignature' },
-              { id: 'system', label: '系统日志' },
-              { id: 'all', label: '全部日志' },
-            ]"
-            :key="item.id"
-            class="rounded-md px-3 py-1.5 text-sm cursor-pointer"
-            :class="
-              category === item.id ? 'bg-white text-brand-700 shadow-2xs font-semibold' : 'text-slate-500'
-            "
-            @click="category = item.id"
-          >
-            {{ item.label }}
-          </button>
-        </div>
+        <SegmentedControl
+          :model-value="category"
+          :options="categoryOptions"
+          container-class="flex flex-wrap gap-1 rounded-lg bg-slate-100 p-1"
+          item-class="rounded-md px-3 py-1.5 text-sm cursor-pointer"
+          active-class="bg-white text-brand-700 shadow-2xs font-semibold"
+          idle-class="text-slate-500"
+          @update:model-value="category = $event"
+        />
         <p class="text-xs text-slate-500">
           {{ categoryDescriptions[category] || categoryDescriptions.all }}
         </p>
@@ -512,22 +490,14 @@ onUnmounted(() => {
           <!-- Level Segmented Selector & Stream Actions -->
           <div class="flex items-center gap-2 flex-wrap">
             <!-- Level Pills -->
-            <div class="flex items-center bg-slate-100 p-0.5 rounded-lg text-xs font-mono font-medium">
-              <button
-                v-for="opt in levelOptions"
-                :key="opt.value"
-                type="button"
-                class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-                :class="
-                  level === opt.value
-                    ? 'bg-white text-slate-900 font-bold shadow-2xs'
-                    : 'text-slate-500 hover:text-slate-900'
-                "
-                @click="level = opt.value"
-              >
-                {{ opt.label }}
-              </button>
-            </div>
+            <SegmentedControl
+              :model-value="level"
+              :options="levelOptions"
+              container-class="flex items-center bg-slate-100 p-0.5 rounded-lg text-xs font-mono font-medium"
+              active-class="bg-white text-slate-900 font-bold shadow-2xs"
+              idle-class="text-slate-500 hover:text-slate-900"
+              @update:model-value="level = $event"
+            />
 
             <!-- Live Toggle Button -->
             <button
@@ -591,32 +561,12 @@ onUnmounted(() => {
             >
           </div>
 
-          <div class="inline-flex rounded-lg bg-slate-100 p-0.5 text-xs font-medium">
-            <button
-              type="button"
-              class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-              :class="
-                order === 'desc'
-                  ? 'bg-white text-slate-900 font-semibold shadow-2xs'
-                  : 'text-slate-500 hover:text-slate-900'
-              "
-              @click="order = 'desc'"
-            >
-              最新在前
-            </button>
-            <button
-              type="button"
-              class="px-2.5 py-1 rounded-md transition-all cursor-pointer"
-              :class="
-                order === 'asc'
-                  ? 'bg-white text-slate-900 font-semibold shadow-2xs'
-                  : 'text-slate-500 hover:text-slate-900'
-              "
-              @click="order = 'asc'"
-            >
-              时间正序
-            </button>
-          </div>
+          <SegmentedControl
+            :model-value="order"
+            :options="orderOptions"
+            container-class="inline-flex rounded-lg bg-slate-100 p-0.5 text-xs font-medium"
+            @update:model-value="order = $event as 'desc' | 'asc'"
+          />
 
           <label
             v-if="order === 'asc'"
@@ -662,65 +612,12 @@ onUnmounted(() => {
           </span>
         </div>
 
-        <div
+        <LogRow
           v-for="entry in visibleLogs"
           :key="keyOf(entry)"
-          class="py-1.5 px-2.5 rounded hover:bg-white/[0.04] transition-colors"
-          :class="rowAccentClass[entry.level]"
-        >
-          <div class="flex items-baseline gap-2 flex-wrap">
-            <span class="text-slate-500 shrink-0 tabular-nums text-[11px]">{{ entry.ts }}</span>
-            <span
-              class="shrink-0 inline-flex items-center px-1.5 py-px rounded border text-[10px] font-semibold"
-              :class="levelBadgeClass[entry.level] || levelBadgeClass.DEBUG"
-            >
-              {{ entry.level }}
-            </span>
-            <span
-              v-if="entry.category !== 'model'"
-              class="text-brand-400/90 shrink-0 max-w-[240px] truncate text-[11px]"
-              :title="entry.name"
-            >{{ entry.name }}</span>
-            <span
-              v-if="entry.model"
-              class="text-brand-300 text-xs break-all"
-            >{{ entry.model }}</span>
-            <span
-              v-if="entry.account_id"
-              class="text-slate-400 text-xs"
-            >{{ entry.account_id }}</span>
-            <span
-              v-if="entry.stage"
-              class="text-slate-500 text-xs"
-            >{{ stageLabels[entry.stage] || entry.stage }}</span>
-            <router-link
-              v-if="entry.request_id && entry.category === 'model'"
-              :to="{
-                path: '/requests',
-                query: {
-                  request_id: entry.request_id,
-                  ...(entry.name === 'aistudio.thought_signature' ? { tab: 'signature' } : {}),
-                },
-              }"
-              class="text-sky-400 hover:underline text-xs font-mono"
-              :title="entry.request_id"
-            >
-              {{ entry.request_id.slice(0, 16) }}… ↗
-            </router-link>
-            <div
-              v-if="entry.sig_meta"
-              class="w-full"
-            >
-              <ThoughtSignatureBadges
-                :meta="entry.sig_meta"
-                @filter-fp="applyFingerprintFilter"
-              />
-            </div>
-            <span class="text-slate-200 whitespace-pre-wrap break-words w-full leading-6 text-[13px]">
-              {{ entry.message }}
-            </span>
-          </div>
-        </div>
+          :entry="entry"
+          @filter-fp="applyFingerprintFilter"
+        />
       </div>
     </template>
   </div>

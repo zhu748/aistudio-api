@@ -138,10 +138,11 @@ async def test_account_switch_with_echoed_thought_recovers_caching_and_isolates_
     gateway_app,
 ):
     """After switching accounts (scope miss), an unobserved turn with unsigned
-    echoed thoughts must preserve the exact-owner invariant (no fabricated SKIP
-    alongside echoed thoughts), yet keep the history prefix compatible so newly
-    generated turns on the new account are cached and replayed — while still
-    isolating distinct echoed thoughts."""
+    echoed thoughts must not go upstream with a bare lead functionCall (the SKIP
+    sentinel is backfilled on unsigned calls, exactly like an unidentified
+    batch), yet keep the history prefix compatible so newly generated turns on
+    the new account are cached and replayed — while still isolating distinct
+    echoed thoughts and never unlocking a real signature for them."""
     http, gw_client, replies, sent_bodies = gateway_app
 
     # Turn 1 on Account A: returns unsigned thought + signed functionCall
@@ -208,17 +209,20 @@ async def test_account_switch_with_echoed_thought_recovers_caching_and_isolates_
     )
     assert r2.status_code == 200
 
-    # Exact-owner invariant: unobserved turn with echoed thought is NOT fabricated with SKIP,
-    # and its replay reason is recorded as unobserved_thought while caching succeeds for Turn 2.
+    # Exact-owner invariant: unobserved turn with echoed thought only ever gets the
+    # SKIP sentinel (never a borrowed real signature), its replay reason is recorded as
+    # unobserved_thought, and caching succeeds for Turn 2.
     body2 = json.loads(sent_bodies[-1])
     model1_wire = [parse_response_part(w) for w in body2[TopLevelIndex.CONTENTS][1][0]]
     fc1 = [p for p in model1_wire if p.function_call is not None]
     assert len(fc1) == 1
-    assert fc1[0].thought_signature == ""
+    assert fc1[0].thought_signature == SKIP_THOUGHT_SIGNATURE
     rec2 = request_history().get(r2.headers["x-request-id"])
     assert rec2 is not None
     sig2 = cast(dict[str, Any], rec2["thought_signature"])
     assert "unobserved_thought" in sig2["replay"]["miss_reasons"]
+    assert sig2["replay"]["skip_fills"] >= 1
+    assert sig2["upstream_out"]["fc_unsigned"] == 0
     assert sig2["upstream_in"]["cached_warm"] is True
 
     # Turn 3 on Account B: Turn 2 should now HIT Account B's warm cache and replay SIG_B!
@@ -271,7 +275,8 @@ async def test_account_switch_with_echoed_thought_recovers_caching_and_isolates_
     ]
     fc2_tampered = [p for p in model2_tampered if p.function_call is not None]
     assert len(fc2_tampered) == 1
-    assert fc2_tampered[0].thought_signature == ""
+    # Warm miss isolates the prefix: SIG_B must not leak, only the SKIP sentinel is backfilled.
+    assert fc2_tampered[0].thought_signature == SKIP_THOUGHT_SIGNATURE
 
 
 def test_unobserved_unsigned_thought_does_not_block_later_turn_skip_or_collide():

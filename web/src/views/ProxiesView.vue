@@ -6,6 +6,7 @@ import { useToastStore } from '@/stores/toast.ts'
 import Button from '@/components/ui/Button.vue'
 import ProxyInputField from '@/components/ui/ProxyInputField.vue'
 import { usePageRefresh } from '@/composables/usePageRefresh.ts'
+import { errorMessage } from '@/utils/errors.ts'
 
 const toast = useToastStore()
 const status = ref<ProxyStatus>({ global_proxy: '', signer: '', accounts: [] })
@@ -72,7 +73,7 @@ async function load() {
     error.value = ''
     return true
   } catch (err) {
-    error.value = err instanceof Error ? err.message : '加载失败'
+    error.value = errorMessage(err, '加载失败')
     return false
   } finally {
     loading.value = false
@@ -87,7 +88,7 @@ async function save() {
     proxy.value = ''
     await load()
   } catch (err) {
-    toast.error(err instanceof Error ? err.message : '保存失败')
+    toast.error(errorMessage(err, '保存失败'))
   } finally {
     saving.value = false
   }
@@ -103,7 +104,7 @@ async function test(accountId = '', draft = false) {
     checks.value = result.checks
     checkedProxy.value = result.effective_proxy || result.proxy || '直连'
   } catch (err) {
-    toast.error(err instanceof Error ? err.message : '诊断失败')
+    toast.error(errorMessage(err, '诊断失败'))
   } finally {
     testing.value = ''
   }
@@ -124,7 +125,7 @@ async function testGroup(group: ExitGroup) {
       checks.value = result.checks
       checkedProxy.value = group.proxy || '直连'
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : '诊断失败')
+      toast.error(errorMessage(err, '诊断失败'))
     } finally {
       testing.value = ''
     }

@@ -28,9 +28,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from aistudio_api.infrastructure.request_context import log_context
 from aistudio_api.infrastructure.utils.common import atomic_write_json
-from aistudio_api.infrastructure.utils.redaction import redact_text
+from aistudio_api.infrastructure.utils.redaction import redact_record, redact_text
 
 # ---------------------------------------------------------------------------
 # 内存日志环形缓冲（供 Web 面板 /api/logs 查询运行日志与报错）
@@ -57,7 +56,10 @@ class RingBufferHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            message = redact_text(record.getMessage())
+            # 记录级脱敏只做一次（见 redaction.redact_record）：本条记录
+            # 无论先落到控制台、文件还是内存环，后到的落点都直接复用。
+            redact_record(record)
+            message = record.getMessage()
             if record.exc_info:
                 exc_text = self._format_exc_tail(record)
                 if exc_text:
@@ -75,9 +77,16 @@ class RingBufferHandler(logging.Handler):
                 "level": record.levelname,
                 "name": record.name,
                 "message": message,
+                # 上下文由 redact_record 一次性写入记录（见其文档），这里直接读。
                 **{
-                    key: getattr(record, key, value)
-                    for key, value in log_context().items()
+                    key: getattr(record, key, "system" if key == "category" else "")
+                    for key in (
+                        "request_id",
+                        "category",
+                        "model",
+                        "account_id",
+                        "stage",
+                    )
                 },
             }
             sig_meta = getattr(record, "sig_meta", None)
@@ -271,10 +280,7 @@ class UnifiedFormatter(logging.Formatter):
         self.use_color = use_color
 
     def format(self, record: logging.LogRecord) -> str:
-        record.msg = redact_text(record.getMessage())
-        record.args = ()
-        for key, value in log_context().items():
-            setattr(record, key, getattr(record, key, "") or value)
+        redact_record(record)
         orig_levelname = record.levelname
         if self.use_color and record.levelname in _COLORS:
             color = _COLORS[record.levelname]
@@ -283,13 +289,19 @@ class UnifiedFormatter(logging.Formatter):
             record.levelname = record.levelname
 
         try:
-            return redact_text(super().format(record))
+            return super().format(record)
         finally:
             record.levelname = orig_levelname
 
 
 _root_handler: logging.Handler | None = None
 _ring_handler: RingBufferHandler | None = None
+# 记录本函数在第三方 logger 上装过哪些 handler：setup_logging 可被重复调用
+# （测试/配置热更新），原先用 handlers.clear() 一把清空，会把 log_files 的
+# 队列 handler 一并清掉——只所以今天不出问题，纯粹因为 app.py 的
+# import 期 setup_logging 恰好早于 lifespan 的 start_file_logging。改成只
+# 摘自己装过的，顺序就无关了。
+_installed_on: dict[str, list[logging.Handler]] = {}
 _current_level: str = "INFO"
 _dump_requests_override: bool | None = None
 _dump_to_file_override: bool | None = None
@@ -537,13 +549,21 @@ def setup_logging(level: str | int = "INFO") -> None:
         "httpcore",
     ):
         lgr = logging.getLogger(logger_name)
-        lgr.handlers.clear()
-        if _root_handler not in lgr.handlers:
+        ours = _installed_on.setdefault(logger_name, [])
+        # 只移除本函数此前装上的 handler，保留 log_files 的队列 handler。
+        for handler in ours:
+            lgr.removeHandler(handler)
+        ours.clear()
+        installed: list[logging.Handler] = []
+        if _root_handler is not None:
             lgr.addHandler(_root_handler)
+            installed.append(_root_handler)
         # 同时也挂环形缓冲 handler，让上游/uvicorn 错误能进 /api/logs。
         # 这些 logger 的 propagate 关闭，仅靠 root 无法镜像到 ring。
-        if _ring_handler is not None and _ring_handler not in lgr.handlers:
+        if _ring_handler is not None:
             lgr.addHandler(_ring_handler)
+            installed.append(_ring_handler)
+        ours.extend(installed)
         lgr.propagate = False
 
     set_log_level(level)

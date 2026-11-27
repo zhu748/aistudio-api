@@ -768,11 +768,24 @@ def _convert_part(
             thought=bool(part.thought),
         )
         if result_owner is None:
-            parts.append(
-                AistudioPart(
-                    text=tool_history_text("tool_result", fr.name, fr.id, resp_payload)
-                )
+            transcript = tool_history_text("tool_result", fr.name, fr.id, resp_payload)
+            parts.append(AistudioPart(text=transcript))
+            # 没有对应 tool_use 的 tool_result：只能作为文本转写发给模型。
+            # 这是客户端历史不一致（例如压缩后保留了 tool_result 却丢了
+            # tool_use）的信号，之前全程静默；记一条 warning 便于排查
+            # "模型为何看到伪工具结果"，并计入 thoughtSignature 追踪。
+            logger.warning(
+                "孤儿 tool_result 转为文本：tool=%s id=%s payload=%d 字",
+                fr.name,
+                fr.id or "-",
+                len(transcript),
             )
+            if (trace := get_signature_trace()) is not None:
+                trace.record_client_orphan_result(
+                    call_id=fr.id or "",
+                    call_name=fr.name,
+                    payload_chars=len(transcript),
+                )
             if part.text is not None or inline is not None:
                 parts.append(result)
         else:

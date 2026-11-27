@@ -21,6 +21,7 @@ import {
   Key,
   SlidersHorizontal,
 } from 'lucide-vue-next'
+import { errorMessage } from '@/utils/errors.ts'
 
 const toast = useToastStore()
 
@@ -43,7 +44,7 @@ async function loadConfig() {
     config.value = await systemApi.getConfig()
     return true
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : '获取系统配置失败'
+    const msg = errorMessage(err, '获取系统配置失败')
     toast.error(msg)
     return false
   } finally {

@@ -779,3 +779,129 @@ async def test_b4_responses_parallel_tool_calls_false_accepted():
     gemini_req, resolved = await responses_to_gemini_request(req)
     assert gemini_req.contents
     assert resolved
+
+
+# ---------------------------------------------------------------------------
+# C5: 孤儿 tool_result（无对应 tool_use）转文本不再静默：warning + trace 计数
+# ---------------------------------------------------------------------------
+
+
+def test_c5_orphan_tool_result_is_logged_and_traced():
+    """无对应 functionCall 的 functionResponse 转为文本转写时，记 warning 并
+    计入 thoughtSignature 追踪（此前全程静默，模型"看到伪工具结果"无从排查）。"""
+    import logging
+
+    from aistudio_api.infrastructure.request_context import (
+        RequestContext,
+        current_request,
+    )
+    from aistudio_api.infrastructure.signature_trace import get_signature_trace
+
+    ctx_token = current_request.set(
+        RequestContext("req_orphan_result", category="model", protocol="claude")
+    )
+    chat_logger = logging.getLogger("aistudio.chat")
+    captured: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    handler = _Capture(level=logging.WARNING)
+    previous_level = chat_logger.level
+    chat_logger.addHandler(handler)
+    chat_logger.setLevel(logging.WARNING)
+    trace = get_signature_trace(create=True)
+    try:
+        normalized = _norm(
+            [
+                GeminiContent(role="user", parts=[GeminiPart(text="hi")]),
+                GeminiContent(
+                    role="user",
+                    parts=[
+                        GeminiPart(
+                            functionResponse=GeminiFunctionResponse(
+                                name="Read",
+                                response={"result": "x" * 50},
+                                id="toolu_orphan",
+                            )
+                        )
+                    ],
+                ),
+            ]
+        )
+    finally:
+        chat_logger.removeHandler(handler)
+        chat_logger.setLevel(previous_level)
+        current_request.reset(ctx_token)
+
+    # 用户轮里只剩文本转写：没有任何 functionResponse 部件直达 wire
+    assert all(
+        part.function_response is None
+        for content in normalized.contents
+        for part in content.parts
+    )
+    transcripts = [
+        part.text
+        for content in normalized.contents
+        for part in content.parts
+        if part.text and '"tool_result"' in part.text
+    ]
+    assert transcripts and "toolu_orphan" in transcripts[0] and "Read" in transcripts[0]
+
+    warnings = [r for r in captured if "孤儿 tool_result" in r.getMessage()]
+    assert len(warnings) == 1, [r.getMessage() for r in captured]
+    assert "toolu_orphan" in warnings[0].getMessage()
+
+    assert trace is not None
+    assert trace.client_orphan_results == 1
+    assert cast(dict[str, Any], trace.to_dict()["client_in"])["orphan_results"] == 1
+    assert any(item.get("kind") == "orphan" for item in trace.client_in_items)
+
+
+def test_c5_matched_tool_result_is_not_counted_as_orphan():
+    """配对成功的 tool_result 不计入孤儿。"""
+    from aistudio_api.infrastructure.request_context import (
+        RequestContext,
+        current_request,
+    )
+    from aistudio_api.infrastructure.signature_trace import get_signature_trace
+
+    ctx_token = current_request.set(
+        RequestContext("req_orphan_negative", category="model", protocol="claude")
+    )
+    try:
+        normalized = _norm(
+            [
+                GeminiContent(role="user", parts=[GeminiPart(text="hi")]),
+                GeminiContent(
+                    role="model",
+                    parts=[
+                        GeminiPart(
+                            functionCall=GeminiFunctionCall(
+                                name="Read", args={}, id="toolu_ok"
+                            )
+                        )
+                    ],
+                ),
+                GeminiContent(
+                    role="user",
+                    parts=[
+                        GeminiPart(
+                            functionResponse=GeminiFunctionResponse(
+                                name="Read", response={"result": "ok"}, id="toolu_ok"
+                            )
+                        )
+                    ],
+                ),
+            ]
+        )
+        assert any(
+            part.function_response is not None
+            for content in normalized.contents
+            for part in content.parts
+        )
+        trace = get_signature_trace()
+        assert trace is not None and trace.client_orphan_results == 0
+    finally:
+        current_request.reset(ctx_token)

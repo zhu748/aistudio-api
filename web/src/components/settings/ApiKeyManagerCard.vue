@@ -19,6 +19,7 @@ import {
   ShieldCheck,
   AlertTriangle,
 } from 'lucide-vue-next'
+import { errorMessage } from '@/utils/errors.ts'
 
 const toast = useToastStore()
 const { confirm } = useConfirm()
@@ -44,7 +45,7 @@ async function loadApiKeys() {
   try {
     apiKeys.value = await systemApi.listApiKeys()
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : '获取 API Key 列表失败'
+    const msg = errorMessage(err, '获取 API Key 列表失败')
     toast.error(msg)
   } finally {
     loading.value = false
@@ -89,7 +90,7 @@ async function handleCreateKey() {
     createModalOpen.value = false
     await loadApiKeys()
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : '创建 API Key 失败'
+    const msg = errorMessage(err, '创建 API Key 失败')
     toast.error(msg)
   } finally {
     creating.value = false
@@ -113,7 +114,7 @@ async function handleSaveEditName() {
     editModalOpen.value = false
     await loadApiKeys()
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : '更新备注失败'
+    const msg = errorMessage(err, '更新备注失败')
     toast.error(msg)
   }
 }
@@ -131,7 +132,7 @@ async function handleDeleteKey(item: ApiKeyItem) {
       toast.success('API Key 已删除')
       await loadApiKeys()
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '删除失败'
+      const msg = errorMessage(err, '删除失败')
       toast.error(msg)
     }
   }

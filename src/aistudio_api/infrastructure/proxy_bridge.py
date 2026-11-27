@@ -24,7 +24,6 @@ import ctypes
 import hashlib
 import json
 import os
-import re
 import shutil
 import socket
 import subprocess
@@ -40,6 +39,7 @@ from aistudio_api.infrastructure.account.cookie_parser import (
     normalize_proxy_url,
     parse_bridge_proxy_uri,
 )
+from aistudio_api.infrastructure.utils.common import mask_proxy_userinfo
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("proxy_bridge")
@@ -640,8 +640,25 @@ class ProxyBridgeManager:
 
 
 def _mask_bridge_uri(uri: str) -> str:
-    """脱敏桥接代理 URI 的凭据（日志 / 诊断展示用）。"""
-    return re.sub(r"//[^@/]+@", "//***@", uri)
+    """把 URI 里的 userinfo 掩码后再写日志/错误信息（与 transport 同一实现）。"""
+    return mask_proxy_userinfo(uri)
+
+
+# 直连哨兵：历史配置里 direct/none/off 与中文写法等价，空值也算直连。
+_DIRECT_SENTINELS = frozenset({"direct", "none", "off", "直连", "无代理"})
+# httpx 能直接消费的 scheme（bridge 的 turn/turns/sstp 不在其中）。
+_HTTP_PROXY_SCHEMES = frozenset({"http", "https", "socks5", "socks5h"})
+
+
+def _proxy_text(raw: str | None) -> str:
+    """去空白；空串或直连哨兵统一返回空串（调用方据此直连）。"""
+    text = (raw or "").strip()
+    return "" if text.lower() in _DIRECT_SENTINELS else text
+
+
+def _proxy_scheme(normalized: str) -> str:
+    """``scheme://…`` → 小写 scheme（normalize_proxy_url 已保证含 ``://``）。"""
+    return normalized.split("://", 1)[0].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -720,14 +737,14 @@ def resolve_proxy_url(raw: str | None) -> str | None:
 
     正常复用期间端口稳定，客户端池签名不会因重复 resolve 而抖动。
     """
-    text = (raw or "").strip()
-    if not text or text.lower() in {"direct", "none", "off", "直连", "无代理"}:
+    text = _proxy_text(raw)
+    if not text:
         return None
     normalized = normalize_proxy_url(text)
     if normalized is None:
         raise ProxyBridgeError(f"代理地址无法识别：{_mask_bridge_uri(text)}")
-    scheme = normalized.split("://", 1)[0].lower()
-    if scheme in ("http", "https", "socks5", "socks5h"):
+    scheme = _proxy_scheme(normalized)
+    if scheme in _HTTP_PROXY_SCHEMES:
         return normalized
     started = time.monotonic()
     url = bridge_manager.get_local_socks5(normalized)
@@ -742,14 +759,14 @@ async def resolve_proxy_url_async(raw: str | None) -> str | None:
     FastAPI 处理器等异步上下文应优先用这个入口；结果与同步版完全一致
     （同 URI 端口映射在进程内稳定）。
     """
-    text = (raw or "").strip()
-    if not text or text.lower() in {"direct", "none", "off", "直连", "无代理"}:
+    text = _proxy_text(raw)
+    if not text:
         return None
     normalized = normalize_proxy_url(text)
     if normalized is None:
         raise ProxyBridgeError(f"代理地址无法识别：{_mask_bridge_uri(text)}")
-    scheme = normalized.split("://", 1)[0].lower()
-    if scheme in ("http", "https", "socks5", "socks5h"):
+    scheme = _proxy_scheme(normalized)
+    if scheme in _HTTP_PROXY_SCHEMES:
         return normalized
     cached = bridge_manager.cached_local_socks5(normalized)
     if cached is not None:
@@ -791,14 +808,14 @@ def resolve_proxy_url_cached(raw: str | None) -> str | None:
     场景使用（transport.retire_stale_clients）：native 协议原样返回，
     bridge 协议仅在实例存活时映射为本地地址。
     """
-    text = (raw or "").strip()
+    text = _proxy_text(raw)
     if not text:
         return None
     normalized = normalize_proxy_url(text)
     if normalized is None:
         return None
-    scheme = normalized.split("://", 1)[0].lower()
-    if scheme in ("http", "https", "socks5", "socks5h"):
+    scheme = _proxy_scheme(normalized)
+    if scheme in _HTTP_PROXY_SCHEMES:
         return normalized
     cached = bridge_manager.cached_local_socks5(normalized)
     return cached if cached is not None else normalized

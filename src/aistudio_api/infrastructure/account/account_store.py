@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import ClassVar
 
 from aistudio_api.infrastructure.utils.common import atomic_write_json
+from aistudio_api.infrastructure.utils.logger import get_logger
+
+_logger = get_logger("account_store")
 
 
 def _assign_if_changed(acc: AccountMeta, field_name: str, value: object) -> bool:
@@ -41,8 +44,14 @@ _SEARCH_ROOTS: list[Path] = [
 ]
 
 
-def _safe_account_dir(accounts_dir: Path, account_id: str) -> Path:
-    """验证并返回安全的账号子目录路径，防止路径遍历攻击。"""
+def _validate_account_name(account_id: str) -> str:
+    """校验 account_id 并返回可安全拼接的子目录名（不触碰文件系统）。
+
+    判断条件与历史 ``_safe_account_dir`` 完全一致：只允许字母数字与
+    ``- _ . @``，且清洗后的名字必须与原始 id 逐字符相同（任何被清洗掉的
+    字符都视为非法，用于挡住 ``../etc/passwd``、``user/subdir`` 一类路径
+    遍历）。
+    """
     raw = str(account_id or "").strip()
     clean_id = "".join(c for c in raw if c.isalnum() or c in ("-", "_", ".", "@"))
     safe_name = basename(clean_id)
@@ -53,12 +62,76 @@ def _safe_account_dir(accounts_dir: Path, account_id: str) -> Path:
         or ".." in safe_name
     ):
         raise ValueError(f"Invalid or unsafe account_id: {account_id!r}")
-    base_str = realpath(str(accounts_dir))
-    target_str = realpath(join(base_str, safe_name))
-    prefix = base_str if base_str.endswith(os.sep) else base_str + os.sep
+    return safe_name
+
+
+def _join_verified_dir(base_real: str, safe_name: str, account_id: str) -> Path:
+    """在已 realpath 的基础目录下拼出子目录，并校验结果未逃逸出基础目录。"""
+    target_str = realpath(join(base_real, safe_name))
+    prefix = base_real if base_real.endswith(os.sep) else base_real + os.sep
     if not target_str.startswith(prefix):
         raise ValueError(f"Account path escapes base directory: {account_id!r}")
     return Path(target_str)
+
+
+def _safe_account_dir(accounts_dir: Path, account_id: str) -> Path:
+    """验证并返回安全的账号子目录路径，防止路径遍历攻击。
+
+    纯函数、不做缓存（签名与返回值类型保持不变）：模块级调用方与测试
+    直接使用。``AccountStore`` 内部走 ``_safe_account_dir_cached`` 的实例级
+    记忆化，避免每个请求都在事件循环线程上重付两次 realpath（Windows
+    实测约 260µs/次）。
+
+    判断逻辑与历史实现逐字等价：先校验 account_id，再解析基础目录与目标
+    路径，最后用「基础目录 + 分隔符」前缀判定是否逃逸。
+    """
+    safe_name = _validate_account_name(account_id)
+    return _join_verified_dir(realpath(str(accounts_dir)), safe_name, account_id)
+
+
+def _quarantine_corrupt_file(
+    path: Path,
+    error: Exception,
+    *,
+    logger: logging.Logger,
+    hidden: bool,
+) -> Path | None:
+    """把损坏的 JSON 文件改名隔离，返回备份路径；重试耗尽/失败时返回 None。
+
+    16 次带递增后缀的重试：微秒时间戳 + 递增后缀，避免同一微秒内二次隔离
+    撞名后 ``shutil.move`` 失败、坏文件留在原地继续挡住启动。搬移失败时
+    不抛错（不能掩盖原始错误，仍由调用方抛 RuntimeError），只返回 None。
+
+    备份命名（``stamp`` 为微秒时间戳，``attempt`` > 0 时追加 ``.attempt``）：
+    - ``hidden=False``：``<stem>.corrupt.<stamp>[.n].<suffix>``
+      （registry.json → registry.corrupt.<stamp>.json）
+    - ``hidden=True``：``.corrupt.<stamp>[.n].<name>``
+      （presets.json → .corrupt.<stamp>.presets.json，隐藏文件）
+    """
+    stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
+    for attempt in range(16):
+        tail = "" if attempt == 0 else f".{attempt}"
+        name = (
+            f".corrupt.{stamp}{tail}.{path.name}"
+            if hidden
+            else f"{path.stem}.corrupt.{stamp}{tail}{path.suffix}"
+        )
+        backup = path.parent / name
+        if backup.exists():
+            continue
+        try:
+            shutil.move(str(path), str(backup))
+        except Exception:
+            # 隔离失败也不能掩盖原始错误；仍由调用方抛出 RuntimeError
+            return None
+        logger.error(
+            "%s 解析失败(%s)，已隔离到 %s；请人工恢复",
+            path.name,
+            type(error).__name__,
+            backup,
+        )
+        return backup
+    return None
 
 
 def _resolve_accounts_dir() -> Path:
@@ -296,6 +369,12 @@ class AccountStore:
             self._accounts_dir = (accounts_dir or _resolve_accounts_dir()).absolute()
             self._registry_path = self._accounts_dir / "registry.json"
             self._presets_path = self._accounts_dir / "presets.json"
+            # _safe_account_dir 的记忆化（约 260µs/次，Windows 实测）：
+            # 基础目录的 realpath 只依赖 _accounts_dir，构造时算一次即可。
+            # _accounts_dir 在本类生命周期内不变（绝对路径，__init__ 只跑一次）。
+            self._accounts_dir_real: str = realpath(str(self._accounts_dir))
+            # account_id -> 已解析的账号目录。命中即返回，完全跳过两次 realpath。
+            self._safe_dir_cache: dict[str, Path] = {}
             self._registry: Registry | None = None
             self._presets: dict[str, AccountPreset] | None = None
             # RLock：update_account_cookies 等复合读改写序列需要全程持锁，
@@ -325,13 +404,48 @@ class AccountStore:
                 if acc_dir.is_dir():
                     removed += cleanup_stale_tmp_files(acc_dir, pattern="*.tmp.*")
             if removed:
-                logging.getLogger("account_store").info(
-                    "已清扫 %d 个残留临时凭据文件", removed
-                )
+                _logger.info("已清扫 %d 个残留临时凭据文件", removed)
 
     def _ensure_dirs(self) -> None:
         """确保目录存在。"""
         self._accounts_dir.mkdir(parents=True, exist_ok=True)
+
+    def _safe_account_dir_cached(self, account_id: str) -> Path:
+        """``_safe_account_dir`` 的实例级记忆化版本（判断逻辑完全一致）。
+
+        调用点大部分在 ``self._lock`` 内（_sync_sibling_cookies_locked /
+        _update_account_cookies_locked 由 save_account / update_account_cookies
+        持锁进入，_update_account_fields 及各 update_* 均自带 with self._lock），
+        但 ``get_auth_path_optional`` 只在 _load_registry 内部短暂持锁、取
+        路径那一步在锁外，因此本方法确实会被无锁调用。这里不做加锁：
+        CPython 下 dict 的读/写各自是原子的（GIL 保证不会看到半成品键值），
+        最坏情况是两个线程同时未命中、各算一遍再写入同一个值——结果相同，
+        不会崩溃也不会脏读，不值得为它引入额外锁竞争。
+
+        只缓存「解析结果恰好等于 base/安全名 的朴素拼接」的条目：这种情况下
+        目标路径没有任何符号链接/目录联接参与，后续无需再解析即可复用。若
+        realpath 结果与朴素拼接不同（说明账号目录本身是链接），则不缓存，
+        每次重新解析并重新校验，确保「逃逸出 accounts 目录即报错」的防护
+        不会被第一次的成功结果固化。
+        """
+        cached = self._safe_dir_cache.get(account_id)
+        if cached is not None:
+            return cached
+        safe_name = _validate_account_name(account_id)
+        path = _join_verified_dir(self._accounts_dir_real, safe_name, account_id)
+        if str(path) == join(self._accounts_dir_real, safe_name):
+            self._safe_dir_cache[account_id] = path
+        return path
+
+    def _forget_safe_dir(self, account_id: str) -> None:
+        """账号从注册表移除后清掉其目录缓存（delete_account 调用）。
+
+        只有「account_id 不再存在」才需要 pop：账号目录被外部删除后重建时
+        解析出的路径本身没变（基础目录与安全名都没变），缓存依旧正确。
+        需要 pop 的真正理由是：同名的后续账号可能复用该 id，而缓存的 Path
+        对象在语义上应随账号生命周期一起结束，同时避免缓存无界增长。
+        """
+        self._safe_dir_cache.pop(account_id, None)
 
     def _load_registry(self) -> Registry:
         """加载注册表（线程安全）。"""
@@ -402,9 +516,7 @@ class AccountStore:
                     _atomic_write_json(self._registry_path, self._registry.to_dict())
             except Exception as e:
                 # 补齐失败只记录，不影响本次加载结果（内存态已可用）
-                logging.getLogger("account_store").warning(
-                    "注册表一致化补齐失败(%s)", type(e).__name__
-                )
+                _logger.warning("注册表一致化补齐失败(%s)", type(e).__name__)
             return self._registry
 
     def _has_corrupt_marker(self) -> bool:
@@ -420,27 +532,9 @@ class AccountStore:
 
     def _quarantine_corrupt_registry(self, error: Exception) -> None:
         """把损坏的 registry.json 改名隔离，避免下次 _save_registry 覆盖它。"""
-        # 用微秒 + 递增后缀：秒级时间戳在同一秒内二次隔离会撞名，
-        # shutil.move 会失败并被忽略，坏文件留在原地继续挡住启动。
-        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
-        for suffix in range(16):
-            name = (
-                f".corrupt.{stamp}.json"
-                if suffix == 0
-                else f".corrupt.{stamp}.{suffix}.json"
-            )
-            backup = self._registry_path.with_suffix(name)
-            if backup.exists():
-                continue
-            try:
-                shutil.move(str(self._registry_path), str(backup))
-            except Exception:
-                # 隔离失败也不能掩盖原始错误；仍由调用方抛出 RuntimeError
-                return
-            logging.getLogger("account_store").error(
-                "registry.json 解析失败(%s)，已隔离到 %s", type(error).__name__, backup
-            )
-            return
+        _quarantine_corrupt_file(
+            self._registry_path, error, logger=_logger, hidden=False
+        )
 
     def _save_registry(self, registry: Registry) -> None:
         """保存注册表（线程安全+原子写入）。"""
@@ -622,7 +716,7 @@ class AccountStore:
         else:
             account_id = _generate_account_id()
 
-        account_dir = _safe_account_dir(self._accounts_dir, account_id)
+        account_dir = self._safe_account_dir_cached(account_id)
         safe_id = account_dir.name
         existing_meta = registry.accounts.get(safe_id)
         # 已探测到的邮箱不应被调用方传 None 抹掉：环境变量注入账号每次启动都会
@@ -679,13 +773,16 @@ class AccountStore:
                 return False
             safe_id = acc.id
             # 删除目录
-            account_dir = _safe_account_dir(self._accounts_dir, safe_id)
+            account_dir = self._safe_account_dir_cached(safe_id)
             if account_dir.is_dir():
                 shutil.rmtree(account_dir, ignore_errors=True)
             # 从注册表移除
             del registry.accounts[safe_id]
             if registry.active_account_id == safe_id:
                 registry.active_account_id = next(iter(registry.accounts), None)
+            # account_id 已彻底不存在：清掉目录缓存（外部删目录后重建路径不变，
+            # 只有账号记录消失时才需要失效，见 _forget_safe_dir 的说明）。
+            self._forget_safe_dir(safe_id)
             self._save_registry(registry)
             return True
 
@@ -709,7 +806,7 @@ class AccountStore:
             changed = mutate(acc)
             if changed:
                 # 同步更新 meta.json
-                account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+                account_dir = self._safe_account_dir_cached(acc.id)
                 meta_path = account_dir / "meta.json"
                 if meta_path.exists():
                     _atomic_write_json(meta_path, acc.to_dict())
@@ -725,7 +822,7 @@ class AccountStore:
                 return None
             acc.name = str(name or "").strip() or acc.name
             # 同步更新 meta.json
-            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+            account_dir = self._safe_account_dir_cached(acc.id)
             meta_path = account_dir / "meta.json"
             if meta_path.exists():
                 _atomic_write_json(meta_path, acc.to_dict())
@@ -786,7 +883,7 @@ class AccountStore:
         groups: dict[str, list[tuple[AccountMeta, Path, dict[str, str]]]] = {}
         for acc_id, acc in registry.accounts.items():
             try:
-                auth_path = _safe_account_dir(self._accounts_dir, acc_id) / "auth.json"
+                auth_path = self._safe_account_dir_cached(acc_id) / "auth.json"
             except ValueError:
                 continue
             if not auth_path.is_file():
@@ -952,7 +1049,7 @@ class AccountStore:
 
         for acc_id, acc in registry.accounts.items():
             try:
-                apath = _safe_account_dir(self._accounts_dir, acc_id) / "auth.json"
+                apath = self._safe_account_dir_cached(acc_id) / "auth.json"
             except ValueError:
                 continue
             if not apath.is_file():
@@ -1011,7 +1108,7 @@ class AccountStore:
         acc = self._find_registered_account(registry, account_id)
         if acc is None:
             return None
-        path = _safe_account_dir(self._accounts_dir, acc.id) / "auth.json"
+        path = self._safe_account_dir_cached(acc.id) / "auth.json"
         if require_exists and not path.exists():
             return None
         return path
@@ -1029,7 +1126,7 @@ class AccountStore:
             acc.enabled = not acc.enabled if enabled is None else bool(enabled)
             if acc.enabled:
                 acc.verification_required = False
-            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+            account_dir = self._safe_account_dir_cached(acc.id)
             meta_path = account_dir / "meta.json"
             if meta_path.exists():
                 _atomic_write_json(meta_path, acc.to_dict())
@@ -1050,7 +1147,7 @@ class AccountStore:
                 acc.enabled = False
                 if registry.active_account_id == acc.id:
                     registry.active_account_id = None
-            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+            account_dir = self._safe_account_dir_cached(acc.id)
             meta_path = account_dir / "meta.json"
             if meta_path.exists():
                 _atomic_write_json(meta_path, acc.to_dict())
@@ -1066,7 +1163,7 @@ class AccountStore:
             if acc is None:
                 return None
             acc.group = str(group or "default").strip() or "default"
-            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+            account_dir = self._safe_account_dir_cached(acc.id)
             meta_path = account_dir / "meta.json"
             if meta_path.exists():
                 _atomic_write_json(meta_path, acc.to_dict())
@@ -1082,7 +1179,7 @@ class AccountStore:
             if acc is None:
                 return None
             acc.notes = str(notes or "")
-            account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+            account_dir = self._safe_account_dir_cached(acc.id)
             meta_path = account_dir / "meta.json"
             if meta_path.exists():
                 _atomic_write_json(meta_path, acc.to_dict())
@@ -1109,7 +1206,7 @@ class AccountStore:
                     acc.enabled = enabled
                     if enabled:
                         acc.verification_required = False
-                    account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+                    account_dir = self._safe_account_dir_cached(acc.id)
                     meta_path = account_dir / "meta.json"
                     if meta_path.exists():
                         _atomic_write_json(meta_path, acc.to_dict())
@@ -1178,7 +1275,16 @@ class AccountStore:
             return self._presets
 
     def _has_corrupt_presets_marker(self) -> bool:
-        """目录里是否残留 presets 的隔离备份（跨重启的持久损坏标记）。"""
+        """目录里是否残留 presets 的隔离备份（跨重启的持久损坏标记）。
+
+        刻意保留 ``startswith``/``endswith`` 过滤，不简化成
+        ``next(parent.glob(".corrupt.*.presets.json"), None) is not None``：
+        ``glob`` 在 Windows 上（ntpath 的 normcase）是大小写不敏感的，模式会
+        连 ``.Corrupt.xxx.presets.json`` 一起命中；两个过滤器把命中范围精确
+        收敛到隔离逻辑实际写出的小写文件名，因此二者并不等价（Python
+        3.14.4 实测：glob 命中 ``.Corrupt.2024.presets.json``，过滤后为空）。
+        该标记决定「拒绝静默清空预设」，判定语义必须逐字保持，故只补注释。
+        """
         try:
             return any(
                 p.name.startswith(".corrupt.") and p.name.endswith(".presets.json")
@@ -1189,27 +1295,7 @@ class AccountStore:
 
     def _quarantine_corrupt_presets(self, error: Exception) -> None:
         """把损坏的 presets.json 改名隔离，避免下次 _save_presets 覆盖它。"""
-        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
-        for suffix in range(16):
-            name = (
-                f".corrupt.{stamp}.presets.json"
-                if suffix == 0
-                else f".corrupt.{stamp}.{suffix}.presets.json"
-            )
-            backup = self._presets_path.parent / name
-            if backup.exists():
-                continue
-            try:
-                shutil.move(str(self._presets_path), str(backup))
-            except Exception:
-                # 隔离失败也不能掩盖原始错误；仍由调用方抛出 RuntimeError
-                return
-            logging.getLogger("account_store").error(
-                "presets.json 解析失败(%s)，已隔离到 %s；请人工恢复",
-                type(error).__name__,
-                backup.name,
-            )
-            return
+        _quarantine_corrupt_file(self._presets_path, error, logger=_logger, hidden=True)
 
     def _save_presets(self, presets: dict[str, AccountPreset]) -> None:
         with self._lock:
@@ -1323,7 +1409,7 @@ class AccountStore:
                 acc.enabled = should_enable
                 if should_enable:
                     acc.verification_required = False
-                account_dir = _safe_account_dir(self._accounts_dir, acc.id)
+                account_dir = self._safe_account_dir_cached(acc.id)
                 meta_path = account_dir / "meta.json"
                 if meta_path.exists():
                     _atomic_write_json(meta_path, acc.to_dict())

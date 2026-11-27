@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -22,6 +23,7 @@ from aistudio_api.application.compat_service import (
 from aistudio_api.application.responses_service import responses_to_gemini_request
 from aistudio_api.domain import tool_signatures
 from aistudio_api.domain.errors import TransportError
+from aistudio_api.domain.tool_signatures import SKIP_THOUGHT_SIGNATURE
 from aistudio_api.infrastructure.gateway import model_turns as module
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.model_turns import ModelTurnHistory
@@ -29,6 +31,7 @@ from aistudio_api.infrastructure.gateway.session import SessionContext
 from aistudio_api.infrastructure.gateway.wire_spec import TopLevelIndex
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent, AistudioPart
 from aistudio_api.infrastructure.request_context import RequestContext, current_request
+from aistudio_api.infrastructure.signature_trace import get_signature_trace
 
 SIGNATURE = base64.b64encode(b"upstream-state-for-this-turn").decode()
 TOKEN = "v1_" + "a" * 24
@@ -624,3 +627,125 @@ def test_split_model_messages_restore_without_mutating_the_cached_turn():
     assert restored[1].to_wire()[0] == raw
     restored[1].parts.clear()
     assert history.prepare("scope", contents)[0][1].to_wire()[0] == raw
+
+
+def test_explicit_sig_unobserved_after_restart_keeps_session_cacheable(
+    monkeypatch, tmp_path
+):
+    """Claude Code after a restart (warm history gone, cold cache wiped): the
+    client echoes the lead FC signature via extra_content. That turn is forwarded
+    untouched (siblings stay bare), the rest of the session is cacheable again
+    (no chain_broken), and the exact echoed signature is bound into the prefix so
+    a different signature under the same visible text cannot unlock turn 2."""
+    monkeypatch.setattr(
+        tool_signatures,
+        "_cache_instance",
+        tool_signatures.ThoughtSignatureCache(tmp_path / "before.json"),
+    )
+    contents = remember(ModelTurnHistory())
+    # Restart: fresh in-memory history and fresh on-disk cache (ephemeral data dir).
+    restarted = ModelTurnHistory()
+    monkeypatch.setattr(
+        tool_signatures,
+        "_cache_instance",
+        tool_signatures.ThoughtSignatureCache(tmp_path / "after.json"),
+    )
+    second_sig = base64.b64encode(b"upstream-state-for-turn-two").decode()
+    request_token = current_request.set(
+        RequestContext("req_restart", category="model", protocol="claude")
+    )
+    try:
+        trace = get_signature_trace(create=True)
+        assert trace is not None
+        echoed = echo(contents)
+        echoed[1].parts[0].thought_signature = SIGNATURE
+        restored, token, context = restarted.prepare("scope", echoed)
+        assert token is None
+        assert context is not None
+        # Client signature untouched; the unsigned sibling keeps the bare shape.
+        assert restored[1].parts[0].thought_signature == SIGNATURE
+        assert restored[1].parts[1].thought_signature is None
+        replay = cast(dict[str, Any], trace.to_dict()["replay"])
+        assert "explicit_sig_unobserved" in replay["miss_reasons"]
+        assert "chain_broken" not in replay["miss_reasons"]
+        assert replay["skip_fills"] == 0
+
+        # Turn 2 is generated on the restarted process and stored under the bound prefix.
+        capture = context.capture()
+        capture.add(
+            [
+                AistudioPart(text="private reasoning 2", thought=True).to_wire(),
+                AistudioPart(
+                    function_call=("reply", {"message": "answer"}, "server-2"),
+                    thought_signature=second_sig,
+                ).to_wire(),
+            ],
+            TOKEN,
+        )
+        capture.finish(1)
+
+        # Next request: the client echoes turn 2 with the signature stripped; the
+        # warm cache restores the original roll (thought + real signature).
+        turn2_echo = AistudioContent(
+            "model",
+            [AistudioPart(function_call=("reply", {"message": "answer"}, "echo-2"))],
+        )
+        follow_up = AistudioContent("user", [AistudioPart(text="next")])
+        restored2, token2, _ = restarted.prepare(
+            "scope", [*echoed, turn2_echo, follow_up]
+        )
+        assert token2 == TOKEN
+        assert restored2[3].parts[0].thought
+        assert restored2[3].parts[1].thought_signature == second_sig
+
+        # A different echoed signature on turn 1 is another prefix: turn 2 stays locked.
+        other = echo(contents)
+        other[1].parts[0].thought_signature = base64.b64encode(
+            b"another upstream state"
+        ).decode()
+        restored3, token3, _ = restarted.prepare(
+            "scope", [*other, turn2_echo, follow_up]
+        )
+        assert token3 is None
+        assert restored3[3].parts[0].thought_signature == SKIP_THOUGHT_SIGNATURE
+    finally:
+        current_request.reset(request_token)
+
+
+def test_stripped_tool_signature_with_explicit_thought_signature_gets_lead_skip(
+    monkeypatch, tmp_path
+):
+    """A client that echoes a real thought signature but strips the tool
+    signature must not send a bare lead functionCall: only the lead call gets the
+    SKIP sentinel, the thought signature stays on the thought part."""
+    monkeypatch.setattr(
+        tool_signatures,
+        "_cache_instance",
+        tool_signatures.ThoughtSignatureCache(tmp_path / "signatures.json"),
+    )
+    history = ModelTurnHistory()
+    thought_sig = base64.b64encode(b"thought-state").decode()
+    contents = [
+        AistudioContent("user", [AistudioPart(text=PROMPT)]),
+        AistudioContent(
+            "model",
+            [
+                AistudioPart(
+                    text="private reasoning",
+                    thought=True,
+                    thought_signature=thought_sig,
+                ),
+                AistudioPart(function_call=("context", {"query": "sync"}, "call-0")),
+                AistudioPart(function_call=("reply", {"message": "answer"}, "call-1")),
+            ],
+        ),
+        AistudioContent("user", [AistudioPart(text="next")]),
+    ]
+    restored, token, context = history.prepare("scope", contents)
+    assert token is None
+    assert context is not None
+    parts = restored[1].parts
+    assert parts[0].thought and parts[0].thought_signature == thought_sig
+    assert parts[1].thought_signature == SKIP_THOUGHT_SIGNATURE
+    assert parts[2].thought_signature is None
+    assert contents[1].parts[1].thought_signature is None

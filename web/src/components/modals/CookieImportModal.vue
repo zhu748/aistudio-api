@@ -7,6 +7,8 @@ import Modal from '@/components/ui/Modal.vue'
 import Button from '@/components/ui/Button.vue'
 import ProxyInputField from '@/components/ui/ProxyInputField.vue'
 import { Sparkles, FileText, Upload, FolderOpen, CheckCircle2, PlugZap } from 'lucide-vue-next'
+import { errorMessage } from '@/utils/errors.ts'
+import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 
 defineProps<{
   modelValue: boolean
@@ -18,6 +20,11 @@ const emit = defineEmits<{
 
 const accountsStore = useAccountsStore()
 const toast = useToastStore()
+
+const importTabs = [
+  { value: 'text', label: '文本粘贴导入', icon: FileText },
+  { value: 'file', label: '文件批量导入', icon: Upload },
+]
 
 const activeTab = ref<'text' | 'file'>('text')
 
@@ -46,7 +53,7 @@ async function testProxy() {
       toast.success('代理连通性测试全部通过')
     }
   } catch (err) {
-    toast.error(err instanceof Error ? err.message : '诊断失败')
+    toast.error(errorMessage(err, '诊断失败'))
   } finally {
     testing.value = false
   }
@@ -168,27 +175,13 @@ async function handleSubmit() {
     @update:model-value="emit('update:modelValue', $event)"
   >
     <div class="space-y-4">
-      <!-- Tab Switcher -->
-      <div class="flex items-center p-1 bg-slate-100 rounded-lg">
-        <button
-          type="button"
-          class="flex-1 flex items-center justify-center gap-1.5 py-1.5 text-xs font-medium rounded-md transition-all cursor-pointer"
-          :class="activeTab === 'text' ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-500 hover:text-slate-900'"
-          @click="switchTab('text')"
-        >
-          <FileText class="w-3.5 h-3.5" />
-          <span>文本粘贴导入</span>
-        </button>
-        <button
-          type="button"
-          class="flex-1 flex items-center justify-center gap-1.5 py-1.5 text-xs font-medium rounded-md transition-all cursor-pointer"
-          :class="activeTab === 'file' ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'text-slate-500 hover:text-slate-900'"
-          @click="switchTab('file')"
-        >
-          <Upload class="w-3.5 h-3.5" />
-          <span>文件批量导入</span>
-        </button>
-      </div>
+      <SegmentedControl
+        :model-value="activeTab"
+        :options="importTabs"
+        container-class="flex items-center p-1 bg-slate-100 rounded-lg"
+        item-class="flex-1 flex items-center justify-center gap-1.5 py-1.5 text-xs font-medium rounded-md transition-all cursor-pointer"
+        @update:model-value="switchTab($event as 'text' | 'file')"
+      />
 
       <!-- Mode: File Import -->
       <div

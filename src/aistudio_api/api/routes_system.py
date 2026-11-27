@@ -142,6 +142,19 @@ async def stats():
     return await asyncio.to_thread(stats_response)
 
 
+@protected_router.get("/memory")
+async def memory() -> dict[str, object]:
+    """进程内存快照（RSS/峰值、cgroup 用量、子进程），小容器 OOM 排查用。
+
+    Render Free 512MB 档上长代理会话被 OOMKiller 杀掉前没有任何征兆：
+    本端点给出 Python 主进程与 waa-signer 子进程各自的 RSS 以及整个
+    cgroup 的用量，长会话中轮询即可看到水位曲线与是哪一个进程在涨。
+    """
+    from aistudio_api.config import memory_snapshot
+
+    return await asyncio.to_thread(memory_snapshot)
+
+
 # ========== 调度与配额管理 API ==========
 
 

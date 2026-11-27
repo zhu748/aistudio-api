@@ -9,6 +9,7 @@ import re
 import shutil
 import tempfile
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import yaml
@@ -139,15 +140,28 @@ def resolve_config_file(config_path: str | os.PathLike[str] | None = None) -> Pa
     return target
 
 
+@lru_cache(maxsize=8)
+def _resolved_data_dir(raw: str) -> Path:
+    """按路径文本缓存的数据目录解析结果（mkdir + resolve 各一次）。
+
+    ``raw`` 必须是绝对路径文本：传空串会被 ``Path("").resolve()`` 解释成
+    进程当前工作目录，从而把数据目录从 ``<repo>/data`` 悄悄挪到 CWD。
+    调用方负责把默认值展开成 ``str(_DEFAULT_DATA_DIR)``。
+    """
+    path = Path(raw).resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def resolve_data_dir() -> Path:
-    """解析数据存储根目录（优先使用 AISTUDIO_DATA_DIR 环境变量）。"""
+    """解析数据存储根目录（优先使用 AISTUDIO_DATA_DIR 环境变量，默认 data/）。
+
+    仍每次读环境变量（测试/多实例会动态改写），但 ``mkdir`` + ``resolve``
+    这两个系统调用按路径值缓存：实测单次约 115 µs，请求历史等热点在事件
+    循环上每请求要取一次路径。
+    """
     override = os.getenv("AISTUDIO_DATA_DIR")
-    if override:
-        path = Path(override).resolve()
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-    _DEFAULT_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    return _DEFAULT_DATA_DIR.resolve()
+    return _resolved_data_dir(override or str(_DEFAULT_DATA_DIR))
 
 
 def detect_memory_budget_mb() -> int | None:
@@ -190,6 +204,106 @@ def detect_memory_budget_mb() -> int | None:
     except (OSError, ValueError):
         pass
     return None
+
+
+def _read_proc_status(pid: int) -> dict[str, int | str]:
+    """读取 /proc/<pid>/status 的 Name/PPid/VmRSS/VmHWM；不可读返回空 dict。"""
+    info: dict[str, int | str] = {}
+    try:
+        with Path(f"/proc/{pid}/status").open(encoding="ascii") as handle:
+            for line in handle:
+                key, sep, value = line.partition(":")
+                if not sep:
+                    continue
+                if key in ("Name", "PPid", "VmRSS", "VmHWM"):
+                    fields = value.split()
+                    if fields:
+                        info[key] = fields[0] if key == "Name" else int(fields[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    return info
+
+
+def _read_cgroup_memory() -> tuple[int | None, int | None]:
+    """cgroup 内存 (当前用量, 限额) 字节数；v2 优先、v1 回退，非 Linux 为 (None, None)。"""
+    pairs = (
+        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+        (
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        ),
+    )
+    for current_path, limit_path in pairs:
+        try:
+            with Path(current_path).open(encoding="ascii") as handle:
+                raw = handle.read().strip()
+            if not raw:
+                continue
+            current = int(raw)
+            with Path(limit_path).open(encoding="ascii") as handle:
+                raw = handle.read().strip()
+            # v2 未设限为 "max"；v1 未设限是页计数器巨值（≫ 物理内存）
+            limit = int(raw) if raw and raw != "max" else 0
+            if not 0 < limit < (1 << 40):
+                limit = 0
+            return current, (limit or None)
+        except (OSError, ValueError):
+            continue
+    return None, None
+
+
+def memory_snapshot() -> dict[str, object]:
+    """进程内存快照：RSS/峰值、cgroup 用量、直接子进程（waa-signer 等同 cgroup 内共享 512MB）。
+
+    供 /memory 端点与排障日志使用。/proc 与 cgroup 文件在非 Linux 环境
+    不存在：对应字段为 None，不抛错。cgroup 用量是整个容器的口径——
+    Python 主进程 + Go 签名器 + 代理桥 + 页缓存，OOM 判定看的就是这个数。
+    """
+    status = _read_proc_status(os.getpid())
+    rss_kb = status.get("VmRSS")
+    hwm_kb = status.get("VmHWM")
+    children: list[dict[str, object]] = []
+    try:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit() or int(entry.name) == os.getpid():
+                continue
+            child = _read_proc_status(int(entry.name))
+            if child.get("PPid") == os.getpid():
+                child_rss = child.get("VmRSS")
+                children.append(
+                    {
+                        "pid": int(entry.name),
+                        "name": child.get("Name"),
+                        "rss_mb": (
+                            round(child_rss / 1024, 1)
+                            if isinstance(child_rss, int)
+                            else None
+                        ),
+                    }
+                )
+    except OSError:
+        pass
+
+    def _child_rss(item: dict[str, object]) -> float:
+        value = item["rss_mb"]
+        return float(value) if isinstance(value, (int, float)) else 0.0
+
+    children.sort(key=_child_rss, reverse=True)
+    cgroup_current, cgroup_limit = _read_cgroup_memory()
+    return {
+        "pid": os.getpid(),
+        "rss_mb": round(rss_kb / 1024, 1) if isinstance(rss_kb, int) else None,
+        "rss_peak_mb": round(hwm_kb / 1024, 1) if isinstance(hwm_kb, int) else None,
+        "children": children,
+        "cgroup_current_mb": (
+            round(cgroup_current / 1048576, 1) if cgroup_current is not None else None
+        ),
+        "cgroup_limit_mb": (
+            round(cgroup_limit / 1048576, 1) if cgroup_limit is not None else None
+        ),
+        "budget_mb": detect_memory_budget_mb(),
+        "malloc_arena_max": os.environ.get("MALLOC_ARENA_MAX") or None,
+    }
 
 
 def path_mount_info(path: Path | str) -> tuple[str, str]:

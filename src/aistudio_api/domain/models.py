@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
+from functools import cached_property
 
 
 @dataclass
 class GeneratedImage:
     mime: str
-    data: bytes
-    size: int
+    # 上游 inlineData 的原始 base64 即主数据源：出站重新编码（SSE / 响应
+    # 模型）直接复用，免去每张图一次 b64decode→b64encode 全量往返（流式
+    # 图片生成场景图片会随 chunk 反复过这一对编解码）。repr=False 避免
+    # 日志/异常信息里内联 MB 级 base64。
+    raw_b64: str = field(repr=False)
     thought_signature: str = ""
-    # 上游 inlineData 的原始 base64：出站重新编码（SSE / 响应模型）时直接
-    # 复用，免去每张图一次 b64decode→b64encode 全量往返（流式图片生成
-    # 场景图片会随 chunk 反复过这一对编解码）。data 变更时置 None 失效。
-    raw_b64: str | None = field(default=None, repr=False)
+
+    @cached_property
+    def data(self) -> bytes:
+        """惰性解码的原始字节：仅在调用方确实需要 bytes 时才付一次解码成本。"""
+        return base64.b64decode(self.raw_b64)
 
 
 @dataclass(slots=True)

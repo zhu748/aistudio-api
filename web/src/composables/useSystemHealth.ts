@@ -1,5 +1,6 @@
 import { ref } from 'vue'
 import { request } from '@/api/client.ts'
+import type { HealthCheckResponse } from '@/types'
 import { usePolling } from './usePolling.ts'
 
 export type SystemHealthState = 'checking' | 'online' | 'degraded' | 'offline'
@@ -16,7 +17,7 @@ export function useSystemHealth(intervalMs = 15000) {
     try {
       // 必须走统一 request：裸 fetch 没有超时，服务端接受连接却不响应时
       // Promise 永不 settle，usePolling 的 running 标志会永久卡住整条轮询链。
-      await request<{ status: string }>('/health', { timeoutMs: 8000 })
+      await request<HealthCheckResponse>('/health', { timeoutMs: 8000 })
       try {
         readiness.value = await request('/api/ready', { timeoutMs: 6000, acceptableStatuses: [503] })
         state.value = readiness.value?.ready ? 'online' : 'degraded'
@@ -29,7 +30,7 @@ export function useSystemHealth(intervalMs = 15000) {
     }
   }
 
-  usePolling(check, intervalMs, { key: 'system_health', immediate: true })
+  usePolling(check, intervalMs, { immediate: true })
 
   return { state, readiness }
 }

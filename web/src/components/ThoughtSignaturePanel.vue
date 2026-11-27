@@ -10,6 +10,7 @@ import {
   sigReasonLabels,
   sigSourceLabels,
 } from '@/utils/requests.ts'
+import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 
 const props = defineProps<{
   trace: ThoughtSignatureTrace | null | undefined
@@ -17,12 +18,20 @@ const props = defineProps<{
 }>()
 
 const router = useRouter()
+
 const activeList = ref<'client_in' | 'upstream_out' | 'upstream_in' | 'client_out'>('upstream_out')
+
+const bareLeadTurns = computed(() => {
+  const t = props.trace
+  if (!t) return 0
+  // 兼容旧记录：没有 lead 口径时退回 fc_unsigned。
+  return t.upstream_out.fc_unsigned_lead_turns ?? t.upstream_out.fc_unsigned
+})
 
 const hasRisk = computed(() => {
   const t = props.trace
   if (!t) return false
-  return t.upstream_out.fc_unsigned > 0 || t.replay.conflicts > 0 || t.client_in.dropped > 0
+  return bareLeadTurns.value > 0 || t.replay.conflicts > 0 || t.client_in.dropped > 0
 })
 
 const hasFallback = computed(() => {
@@ -40,8 +49,8 @@ const bannerClass = computed(() => {
 const bannerTitle = computed(() => {
   const t = props.trace
   if (!t) return ''
-  if (t.upstream_out.fc_unsigned > 0) {
-    return `存在 ${t.upstream_out.fc_unsigned} 个未签名函数调用直接发往上游（存在 400 风险）`
+  if (bareLeadTurns.value > 0) {
+    return `存在 ${bareLeadTurns.value} 轮首个函数调用未带签名直接发往上游（存在 400 风险）`
   }
   if (t.replay.conflicts > 0) {
     return `检测到 ${t.replay.conflicts} 轮历史签名冲突或越权，已按安全策略扣留真签名`
@@ -86,6 +95,10 @@ const currentItems = computed<ThoughtSignatureItem[]>(() => {
   if (!t) return []
   return t[activeList.value].items || []
 })
+
+function setActiveList(value: string) {
+  activeList.value = value as (typeof activeList)['value']
+}
 
 const listTabs = computed(() => {
   const t = props.trace
@@ -299,8 +312,9 @@ function jumpToRequestLogs() {
           <div class="flex items-center justify-between gap-2">
             <span class="text-xs font-semibold text-slate-800">3. 发往上游 (Slot 14)</span>
             <span
-              v-if="trace.upstream_out.fc_unsigned > 0"
+              v-if="bareLeadTurns > 0"
               class="px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 text-[10px] font-semibold"
+              title="每轮只有首个 functionCall 需要签名；此处只统计首 FC 裸发的轮次，兄弟 FC 不计"
             >
               400 风险
             </span>
@@ -321,11 +335,14 @@ function jumpToRequestLogs() {
             <dt class="text-slate-500">
               总 FC / 未签 FC
             </dt>
-            <dd class="font-mono font-medium text-right tabular-nums">
+            <dd
+              class="font-mono font-medium text-right tabular-nums"
+              title="兄弟 functionCall 本来就不带签名，未签 FC 计数本身不代表风险；风险看首 FC 裸发轮次"
+            >
               {{ trace.upstream_out.fc_total }} /
               <span
                 :class="
-                  trace.upstream_out.fc_unsigned > 0 ? 'text-rose-600 font-bold' : 'text-slate-600'
+                  bareLeadTurns > 0 ? 'text-rose-600 font-bold' : 'text-slate-600'
                 "
               >
                 {{ trace.upstream_out.fc_unsigned }}
@@ -542,23 +559,14 @@ function jumpToRequestLogs() {
         <h3 class="text-xs font-semibold text-slate-600">
           签名载体明细
         </h3>
-        <div class="inline-flex rounded-lg bg-slate-100 p-0.5 text-xs">
-          <button
-            v-for="t in listTabs"
-            :key="t.id"
-            type="button"
-            class="px-2.5 py-1 rounded-md cursor-pointer transition-colors"
-            :class="
-              activeList === t.id
-                ? 'bg-white text-slate-900 font-semibold shadow-2xs'
-                : 'text-slate-500 hover:text-slate-900'
-            "
-            @click="activeList = t.id"
-          >
-            {{ t.label }}
-            <span class="ml-1 font-mono text-[10px] opacity-70">{{ t.count }}</span>
-          </button>
-        </div>
+        <SegmentedControl
+          :model-value="activeList"
+          :options="listTabs.map((t) => ({ value: t.id, label: t.label, count: t.count }))"
+          count-style="muted"
+          container-class="inline-flex rounded-lg bg-slate-100 p-0.5 text-xs"
+          item-class="px-2.5 py-1 rounded-md cursor-pointer transition-colors"
+          @update:model-value="setActiveList"
+        />
       </div>
 
       <div

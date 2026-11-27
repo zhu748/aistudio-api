@@ -20,6 +20,7 @@ import {
   Camera,
   Trash2,
 } from 'lucide-vue-next'
+import { errorMessage } from '@/utils/errors.ts'
 
 const props = defineProps<{
   initialConfig: SystemConfig
@@ -98,7 +99,7 @@ async function handleSave() {
     emit('saved')
     void loadSnapshotStats()
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : '保存配置失败'
+    const msg = errorMessage(err, '保存配置失败')
     toast.error(msg)
   } finally {
     saving.value = false
@@ -114,7 +115,7 @@ async function handleClearSnapshots(scope: 'all' | 'success') {
     )
     void loadSnapshotStats()
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : '清理快照失败'
+    const msg = errorMessage(err, '清理快照失败')
     toast.error(msg)
   } finally {
     snapshotClearing.value = ''

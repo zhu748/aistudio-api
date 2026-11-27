@@ -14,6 +14,14 @@ from pathlib import Path
 
 from aistudio_api.config import resolve_data_dir, settings
 
+# 面板"空值"筛选项：与查询列名一一对应，每次 query 都会用到（原先在
+# 列循环内重建字典）。
+_EMPTY_FILTERS = {
+    "model": "__unknown__",
+    "account_id": "__unassigned__",
+    "key_id": "__anonymous__",
+}
+
 
 class RequestHistory:
     def __init__(self, path: Path) -> None:
@@ -29,7 +37,8 @@ class RequestHistory:
         # self._lock 串行执行，同一时刻只有一个线程在用这条连接；WAL
         # 模式下读写分离，长连接与原先的每调用 connect/close 语义一致
         # （每连接 PRAGMA 在获取时已设置）。线程池并发读（query/metrics/
-        # options/get）继续走各自的临时连接，不受写锁串行影响。
+        # options）继续走各自的临时连接，不受写锁串行影响；get 例外——
+        # 它要看到 fire-and-forget 起始记录的提交，故同样持锁。
         self._write_conn: sqlite3.Connection | None = None
 
     def _ensure_schema(self, connection: sqlite3.Connection) -> None:
@@ -90,15 +99,17 @@ class RequestHistory:
         线程，self._lock 已保证同一时刻只有一个线程在用这条连接。
         连接损坏（磁盘错误等）时丢弃重建，不影响正确性。
         """
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.touch(mode=0o600, exist_ok=True)
         conn = self._write_conn
         if conn is None:
+            # 目录/文件与 PRAGMA 只在建连时做一次：长连接复用时每个请求
+            # 重复 mkdir+touch+两条 PRAGMA 纯属系统调用浪费。
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.touch(mode=0o600, exist_ok=True)
             conn = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
             self._write_conn = conn
-        try:
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA secure_delete=ON")
+        try:
             self._ensure_schema(conn)
             with conn:
                 yield conn
@@ -163,12 +174,7 @@ class RequestHistory:
             ("result", result),
         ):
             if value:
-                empty_filters = {
-                    "model": "__unknown__",
-                    "account_id": "__unassigned__",
-                    "key_id": "__anonymous__",
-                }
-                if value == empty_filters.get(column):
+                if value == _EMPTY_FILTERS.get(column):
                     clauses.append(f"{column} = ''")
                 elif column == "result" and value == "failed":
                     clauses.append("result != 'success'")
@@ -227,9 +233,10 @@ class RequestHistory:
         }
 
     def get(self, request_id: str) -> dict[str, object] | None:
-        # 单行主键查询持锁开销可忽略，且锁原先提供了「请求起始记录
-        # insert → 面板查询」的时序保证（running 请求立即可查），
-        # 去锁会让并发读者看到 insert 提交前的空窗。
+        # 读也要持写锁：起始记录的 insert 是 fire-and-forget 丢给工作线程的，
+        # 面板按 request_id 轮询正在运行的请求时，靠这把锁与那次 insert 串行，
+        # 才能保证「刚出现的活动请求立刻可查到」。调用方已用 to_thread 包住，
+        # 阻塞只落在工作线程上，不会影响事件循环。
         with self._lock, self._connect() as connection:
             row = connection.execute(
                 "SELECT payload FROM requests WHERE request_id = ?", (request_id,)

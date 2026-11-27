@@ -377,8 +377,8 @@ async def _env_subaccount_probe(
 
 
 def _log_memory_posture() -> None:
-    """启动时输出内存预算与缓存档位（小容器排障的第一手信息）。"""
-    from aistudio_api.config import detect_memory_budget_mb
+    """启动时输出内存预算、缓存档位与分配器姿态（小容器排障的第一手信息）。"""
+    from aistudio_api.config import detect_memory_budget_mb, memory_snapshot
     from aistudio_api.infrastructure.gateway.model_turns import _turn_limits
 
     budget = detect_memory_budget_mb()
@@ -391,14 +391,35 @@ def _log_memory_posture() -> None:
             entries,
             turn_bytes / 1048576,
         )
-        return
+    else:
+        logger.info(
+            "内存预算：%dMB（cgroup/AISTUDIO_MEMORY_BUDGET_MB），缓存档位自适应："
+            "model_turns 回放缓存 %.0fMB/%d 条/单条 %.0fMB",
+            budget,
+            cache_bytes / 1048576,
+            entries,
+            turn_bytes / 1048576,
+        )
+    # 分配器姿态：MALLOC_ARENA_MAX 未生效（Render 面板覆盖/旧镜像）时
+    # glibc 每线程一个 arena，长会话线程池会把空闲页留在高水位不归还。
+    snapshot = memory_snapshot()
+    children = snapshot["children"]
+    child_text = (
+        [
+            f"{item.get('name', '?')}:{item.get('rss_mb')}MB"
+            for item in children
+            if isinstance(item, dict)
+        ]
+        if isinstance(children, list)
+        else []
+    )
     logger.info(
-        "内存预算：%dMB（cgroup/AISTUDIO_MEMORY_BUDGET_MB），缓存档位自适应："
-        "model_turns 回放缓存 %.0fMB/%d 条/单条 %.0fMB",
-        budget,
-        cache_bytes / 1048576,
-        entries,
-        turn_bytes / 1048576,
+        "分配器姿态：MALLOC_ARENA_MAX=%s，启动 RSS=%sMB，cgroup=%s/%sMB，子进程=%s",
+        snapshot["malloc_arena_max"] or "<unset: glibc 默认 8×CPU 核>",
+        snapshot["rss_mb"],
+        snapshot["cgroup_current_mb"],
+        snapshot["cgroup_limit_mb"],
+        child_text,
     )
 
 

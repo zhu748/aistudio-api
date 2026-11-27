@@ -477,6 +477,12 @@ def _schema_has_lossy_keys(node: object, *, response: bool = False) -> bool:
     propertyNames、$ref。结构化输出侧（response=True）对照
     jsonSchemaBeyondPlayground：另含 exclusiveMaximum / uniqueItems，且
     additionalProperties 仅真值触发（false 是 Gemini 对象的默认闭合语义）。
+
+    声明侧的 ``additionalProperties: false`` 同样按闭合语义处理、不触发：
+    Gemini functionDeclarations 本身只描述 properties/required，模型按属性集
+    生成参数；Claude Code 15 个工具里 12 个仅因 ``additionalProperties: false``
+    就把整份 schema 原文重复附加进 description（每请求 ~17KB、~4.5k token），
+    这些信息在 wire 的参数编码里已经完整存在。
     """
     if isinstance(node, dict):
         for key, value in node.items():
@@ -489,7 +495,13 @@ def _schema_has_lossy_keys(node: object, *, response: bool = False) -> bool:
                 ):
                     return True
             elif key in _DECLARATION_LOSSY_KEYS:
-                return True
+                if (
+                    key in ("additionalProperties", "additional_properties")
+                    and value is False
+                ):
+                    pass  # 闭合对象：Gemini 默认语义，wire 不需要额外表达
+                else:
+                    return True
             if _schema_has_lossy_keys(value, response=response):
                 return True
         return False
@@ -648,7 +660,12 @@ def _tool_schema_shape(value: object) -> dict[str, object]:
 
 
 def _compact_schema_json(schema: object) -> str:
-    """附加到 description 用的 schema 原文（紧凑 JSON，保序）。"""
+    """附加到 description 用的 schema 原文（紧凑 JSON，保序）。
+
+    顶层 ``$schema`` 方言元声明会被剔除：它不约束任何值，wire 编码也忽略。
+    """
+    if isinstance(schema, dict) and "$schema" in schema:
+        schema = {key: value for key, value in schema.items() if key != "$schema"}
     return json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
 
 

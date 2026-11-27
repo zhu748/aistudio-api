@@ -48,7 +48,12 @@ _DOWNSTREAM_DISCONNECT = "Downstream disconnected (client or reverse proxy)"
 # 拷贝反复分配释放后，glibc 堆把空闲页留在高水位不归还 OS；512MB 档容器
 # （Render 免费档等）上水位只升不降，最终被 OOMKiller SIGKILL（无优雅
 # 关停）。大请求收尾后调用 malloc_trim(0) 让内核回收空闲页。
-_MALLOC_TRIM_THRESHOLD_BYTES = 1024 * 1024
+# 门槛按「正文字节」而非「请求是否大」：Claude Code 第 10 轮起正文就稳定
+# 在数百 KB，1MB 门槛下这些请求永远不触发归还，碎片一路累积到 MB 级请求
+# 出现才释放——而那时往往已经贴近 OOM 阈值。超大请求（≥8MB）跳过限频：
+# 这种请求本身就把 RSS 顶到高水位，紧接着的并发请求没有 2s 可以等。
+_MALLOC_TRIM_THRESHOLD_BYTES = 256 * 1024
+_MALLOC_TRIM_FORCE_BYTES = 8 * 1024 * 1024
 _MALLOC_TRIM_MIN_INTERVAL = 2.0
 _malloc_trim_enabled: bool | None = None  # 延迟解析 env（AISTUDIO_MALLOC_TRIM=0 关闭）
 _malloc_trim_fn: Callable[[int], int] | None = None
@@ -57,7 +62,11 @@ _last_trim_monotonic = 0.0
 
 
 def _resolve_malloc_trim() -> Callable[[int], int] | None:
-    """glibc malloc_trim（解析一次并缓存）；musl/非 glibc 返回 None。"""
+    """glibc malloc_trim（解析一次并缓存）；musl/非 glibc/Windows 返回 None。
+
+    Windows 的 ``ctypes.CDLL(None)`` 直接抛 ``TypeError``（LoadLibrary 不接受
+    None 句柄），必须一并捕获：否则首个超阈值的请求会在收尾路径炸掉。
+    """
     global _malloc_trim_fn, _malloc_trim_unavailable
     if _malloc_trim_unavailable:
         return None
@@ -69,7 +78,7 @@ def _resolve_malloc_trim() -> Callable[[int], int] | None:
             libc.malloc_trim.argtypes = [ctypes.c_size_t]
             libc.malloc_trim.restype = ctypes.c_int
             _malloc_trim_fn = libc.malloc_trim
-        except (OSError, AttributeError, ValueError):
+        except (OSError, AttributeError, ValueError, TypeError):
             _malloc_trim_unavailable = True
             return None
     return _malloc_trim_fn
@@ -95,7 +104,10 @@ def _release_allocator_memory(received_bytes: int, sent_bytes: int) -> None:
     if trim is None:
         return
     now = time.monotonic()
-    if now - _last_trim_monotonic < _MALLOC_TRIM_MIN_INTERVAL:
+    if (
+        max(received_bytes, sent_bytes) < _MALLOC_TRIM_FORCE_BYTES
+        and now - _last_trim_monotonic < _MALLOC_TRIM_MIN_INTERVAL
+    ):
         return
     _last_trim_monotonic = now
     try:
@@ -213,9 +225,15 @@ class RequestMiddleware:
                 # 编码重建（raw_path 仅信息性字段，路由按 path 进行）。
                 raw_path = urllib.parse.quote(path, safe="/%").encode("ascii")
             scope = {**scope, "path": path, "raw_path": raw_path}
-        model_call = scope["method"] == "POST" and (
-            path.startswith(("/v1beta/", "/v1/messages"))
-            or path in ("/v1/chat/completions", "/v1/responses")
+        # /v1/messages/count_tokens 是纯本地 token 估算接口（routes_compat 的
+        # claude_count_tokens），不产生上游模型调用，不应占并发名额或进历史统计。
+        model_call = (
+            scope["method"] == "POST"
+            and (
+                path.startswith(("/v1beta/", "/v1/messages"))
+                or path in ("/v1/chat/completions", "/v1/responses")
+            )
+            and not path.endswith("/count_tokens")
         )
         responses_call = model_call and path == "/v1/responses"
         if responses_call:

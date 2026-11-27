@@ -11,6 +11,7 @@ import {
   ShieldAlert,
   ExternalLink,
 } from 'lucide-vue-next'
+import { errorMessage } from '@/utils/errors.ts'
 
 const toast = useToastStore()
 
@@ -71,7 +72,7 @@ async function loadConfig() {
   try {
     absorbResponse(await systemApi.getKeepaliveConfig())
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : '获取保活配置失败'
+    const msg = errorMessage(err, '获取保活配置失败')
     toast.error(msg)
   } finally {
     loading.value = false
@@ -96,7 +97,7 @@ async function handleSave() {
         : '保活配置已保存（URL 为空，保活任务已停止）',
     )
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : '保存保活配置失败'
+    const msg = errorMessage(err, '保存保活配置失败')
     toast.error(msg)
   } finally {
     saving.value = false

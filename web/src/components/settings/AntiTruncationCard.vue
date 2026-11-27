@@ -12,6 +12,7 @@ import {
   Check,
   Boxes,
 } from 'lucide-vue-next'
+import { errorMessage } from '@/utils/errors.ts'
 
 const toast = useToastStore()
 
@@ -62,7 +63,7 @@ async function loadConfig() {
     selectedModels.value = [...(res.variants?.models || [])]
     availableModels.value = res.available_models || []
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : '获取抗截断配置失败'
+    const msg = errorMessage(err, '获取抗截断配置失败')
     toast.error(msg)
   } finally {
     loading.value = false
@@ -82,7 +83,7 @@ async function handleSave() {
     selectedModels.value = [...(res.variants?.models || [])]
     toast.success('抗截断传输配置已保存')
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : '保存抗截断配置失败'
+    const msg = errorMessage(err, '保存抗截断配置失败')
     toast.error(msg)
   } finally {
     saving.value = false

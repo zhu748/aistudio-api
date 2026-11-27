@@ -147,6 +147,38 @@ def is_service_healthy(url: str) -> bool:
         return False
 
 
+def _signer_address(url: str) -> tuple[str, int]:
+    """把签名服务 URL 解析成 (host, port)，用于本地端口探活。
+
+    原先探活与端口占用检查硬编码 "127.0.0.1:8081" 五处：一旦 server_url
+    被注入（测试、或用户改了本地签名服务端口），探活就会打到错误的端口。
+    解析失败时退回默认的本地监听地址。
+    """
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower() or "127.0.0.1"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return "127.0.0.1", 8081
+    return host, port
+
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
+
+
+def _signer_listen_addr(url: str) -> str:
+    """本地签名器的 -listen/LISTEN_ADDR 取值。
+
+    仅当 URL 指向本机时才沿用其 host:port：若 server_url 被注入成远程地址
+    （测试或自定义部署），让本地 Go 二进制去 bind 那个地址毫无意义、还会
+    端口冲突失败，此时回落到默认的本机监听地址。
+    """
+    host, port = _signer_address(url)
+    if host not in _LOOPBACK_HOSTS:
+        return "127.0.0.1:8081"
+    return f"{host}:{port}"
+
+
 def ensure_signer_ready(*, server_url: str | None = None) -> str | None:
     """检查本地 WAA 签名服务状态，未运行时自动拉起。
 
@@ -163,22 +195,24 @@ def ensure_signer_ready(*, server_url: str | None = None) -> str | None:
             if server_url is not None
             else str(get_local_waa_server().get("url") or "")
         )
+        host, port = _signer_address(url)
+        listen_addr = _signer_listen_addr(url)
 
         root_dir = Path(__file__).resolve().parents[4]
         bin_name = "waa-signer.exe" if sys.platform == "win32" else "waa-signer"
         bin_path = root_dir / "waa-signer" / "bin" / bin_name
 
-        # 1. 检查本地 8081 是否已有健康实例在运行
+        # 1. 检查本地签名服务是否已有健康实例在运行
         if is_service_healthy(url):
-            logger.debug("本地 WAA 签名服务运行正常 (127.0.0.1:8081)")
+            logger.debug("本地 WAA 签名服务运行正常 (%s)", listen_addr)
             return None
 
         # 端口已被其它进程占用但 /health 不通过：不要贸然再拉起一个实例
         # （会立刻因端口冲突退出）。返回原因让调用方明确知晓本地引擎
         # 不可用；不去停止/杀死占用端口的进程（它不在我们的管理范围内）。
-        if is_port_open("127.0.0.1", 8081):
+        if is_port_open(host, port):
             return (
-                "端口 127.0.0.1:8081 已被占用，但 /health 探活失败；"
+                f"端口 {listen_addr} 已被占用，但 /health 探活失败；"
                 "请确认占用该端口的进程，或释放端口后重试"
             )
 
@@ -195,7 +229,7 @@ def ensure_signer_ready(*, server_url: str | None = None) -> str | None:
         if is_executable:
             # 全局代理传给 Go 签名器（仅 http/https/socks5；turn/sstp 先解析
             # 为本地回环 SOCKS5，解析失败按无代理启动并在日志里给出指引——
-            # 签名器拉起失败会整体回退远程节点，不应因代理单点问题阻断启动）。
+            # 签名器拉起失败不会有任何远程回退，不应因代理单点问题阻断启动）。
             raw_proxy = (
                 os.getenv("AISTUDIO_PROXY") or os.getenv("HTTPS_PROXY") or ""
             ).strip()
@@ -215,7 +249,7 @@ def ensure_signer_ready(*, server_url: str | None = None) -> str | None:
                     resolved_proxy = None
                 if resolved_proxy:
                     proxy = normalize_proxy_for_go_signer(resolved_proxy)
-            cmd = [str(bin_path), "-listen", "127.0.0.1:8081"]
+            cmd = [str(bin_path), "-listen", listen_addr]
             if proxy:
                 cmd.extend(["-proxy", proxy])
 
@@ -227,14 +261,14 @@ def ensure_signer_ready(*, server_url: str | None = None) -> str | None:
                     "cwd": str(bin_path.parent.parent),
                     # PORT 属于 PaaS 主服务；旧版签名器在解析 -listen 前就
                     # 检查它，显式覆盖默认监听地址也能兼容这些已有二进制。
-                    "env": {**os.environ, "LISTEN_ADDR": "127.0.0.1:8081"},
+                    "env": {**os.environ, "LISTEN_ADDR": listen_addr},
                 }
                 from aistudio_api.config import settings
 
                 if settings.signer_secret:
                     popen_kwargs["env"] = {
                         **os.environ,
-                        "LISTEN_ADDR": "127.0.0.1:8081",
+                        "LISTEN_ADDR": listen_addr,
                         "SIGNER_SHARED_SECRET": settings.signer_secret,
                     }
                 if sys.platform == "win32":

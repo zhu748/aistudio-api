@@ -21,6 +21,7 @@ import {
   ExternalLink,
 } from 'lucide-vue-next'
 import { useAccountsStore } from '@/stores/accounts.ts'
+import { AI_STUDIO_VERIFY_URL } from '@/utils/constants.ts'
 
 const props = defineProps<{
   account: AccountWithStats
@@ -370,7 +371,7 @@ async function handleDetectTier() {
         <div class="flex items-center gap-1 lg:border-l lg:border-slate-100 lg:pl-2">
           <a
             v-if="account.verification_required"
-            href="https://aistudio.google.com/verify-account"
+            :href="AI_STUDIO_VERIFY_URL"
             target="_blank"
             rel="noopener noreferrer"
             class="px-2 py-1 text-[11px] font-medium text-orange-700 bg-orange-50 hover:bg-orange-100 border border-orange-200 rounded-md transition-colors inline-flex items-center gap-1 whitespace-nowrap"

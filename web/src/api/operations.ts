@@ -89,7 +89,10 @@ export interface ThoughtSignatureTrace {
     real_sigs: number
     skip_sigs: number
     fc_total: number
+    /** 所有未带签名的 functionCall 数（兄弟 FC 本来就不签名，仅作计数） */
     fc_unsigned: number
+    /** 首 FC 裸发的轮次：这才是「400 missing thought_signature」的风险口径 */
+    fc_unsigned_lead_turns?: number
     continuation_sent: boolean
     fingerprints: string[]
     items: ThoughtSignatureItem[]

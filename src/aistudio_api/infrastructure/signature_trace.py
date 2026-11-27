@@ -151,8 +151,9 @@ class ThoughtSignatureTrace:
 
     protocol: str = "gemini"
     attempt: int = 0
-    # Client inbound protocol source hints keyed by id(GeminiPart)
-    _inbound_sources: dict[int, str] = field(default_factory=dict, repr=False)
+    # Client inbound protocol source hints: (部件对象, 来源)。
+    # 持强引用避免 id() 复用导致来源归因错乱；入站部件数量受请求体约束。
+    _inbound_sources: list[tuple[object, str]] = field(default_factory=list, repr=False)
     # Stage 1: client_in
     client_model_turns: int = 0
     client_fc_total: int = 0
@@ -164,6 +165,10 @@ class ThoughtSignatureTrace:
     client_tail_signed: int = 0
     client_other_signed: int = 0
     client_dropped: int = 0
+    # tool_result blocks whose tool_use is absent from the client history:
+    # they are forwarded as transcript text (no functionResponse), which is a
+    # client-side history mismatch worth surfacing, not a signature risk.
+    client_orphan_results: int = 0
     client_sources: list[str] = field(default_factory=list)
     client_in_items: list[dict[str, object]] = field(default_factory=list)
     _client_in_normalized: bool = field(default=False, repr=False)
@@ -183,6 +188,11 @@ class ThoughtSignatureTrace:
     upstream_out_skip: int = 0
     upstream_out_fc_total: int = 0
     upstream_out_fc_unsigned: int = 0
+    # Model turns whose FIRST functionCall goes upstream without any signature.
+    # Upstream validates the lead call only; unsigned sibling calls are the
+    # normal Gemini shape (only the first call of a turn is signed), so this —
+    # not fc_unsigned — is the "400 missing thought_signature" risk signal.
+    upstream_out_turns_unsigned_lead: int = 0
     upstream_out_continuation: bool = False
     upstream_out_fps: list[str] = field(default_factory=list)
     upstream_out_items: list[dict[str, object]] = field(default_factory=list)
@@ -233,6 +243,7 @@ class ThoughtSignatureTrace:
         self.upstream_out_skip = 0
         self.upstream_out_fc_total = 0
         self.upstream_out_fc_unsigned = 0
+        self.upstream_out_turns_unsigned_lead = 0
         self.upstream_out_continuation = False
         self.upstream_out_fps.clear()
         self.upstream_out_items.clear()
@@ -255,13 +266,22 @@ class ThoughtSignatureTrace:
         self._inbound_logged = False
 
     def tag_inbound_source(self, part_obj: object, source: str) -> None:
+        """记录某个入站部件的签名来源。
+
+        必须持强引用：旧实现只存 ``id(part_obj)``，标签对象在
+        ``record_client_part`` 之前被 GC 后，新分配的对象可能复用同一个
+        id，导致来源归因张冠李戴。改成 (对象, 来源) 列表后既保活又按
+        identity 精确匹配。
+        """
         if source:
-            self._inbound_sources[id(part_obj)] = source
+            self._inbound_sources.append((part_obj, source))
 
     def lookup_inbound_source(self, part_obj: object) -> str:
-        return self._inbound_sources.get(
-            id(part_obj),
-            "client_native" if self.protocol == "gemini" else f"client_{self.protocol}",
+        for tagged, source in reversed(self._inbound_sources):
+            if tagged is part_obj:
+                return source
+        return (
+            "client_native" if self.protocol == "gemini" else f"client_{self.protocol}"
         )
 
     def record_client_drop(
@@ -289,6 +309,22 @@ class ThoughtSignatureTrace:
                     call_name=call_name,
                     turn_index=turn_index,
                     note=note,
+                )
+            )
+
+    def record_client_orphan_result(
+        self, *, call_id: str = "", call_name: str = "", payload_chars: int = 0
+    ) -> None:
+        """A client tool_result had no matching tool_use in the history."""
+        self.client_orphan_results += 1
+        if len(self.client_in_items) < _MAX_TRACE_ITEMS:
+            self.client_in_items.append(
+                _make_item(
+                    carrier="tool_result",
+                    kind="orphan",
+                    call_id=call_id,
+                    call_name=call_name,
+                    note=f"无对应 tool_use，已转为文本 {payload_chars} 字",
                 )
             )
 
@@ -409,6 +445,7 @@ class ThoughtSignatureTrace:
             if content.role != "model":
                 continue
             model_turn += 1
+            lead_fc_seen = False
             for part in content.parts:
                 sig = part.thought_signature or ""
                 kind = classify_signature(sig)
@@ -434,6 +471,10 @@ class ThoughtSignatureTrace:
                     self.upstream_out_fc_total += 1
                     if kind == "missing":
                         self.upstream_out_fc_unsigned += 1
+                    if not lead_fc_seen:
+                        lead_fc_seen = True
+                        if kind == "missing":
+                            self.upstream_out_turns_unsigned_lead += 1
                 if kind == "real":
                     self.upstream_out_real += 1
                     _add_unique(
@@ -585,6 +626,7 @@ class ThoughtSignatureTrace:
                 "tail_signed": self.client_tail_signed,
                 "other_signed": self.client_other_signed,
                 "dropped": self.client_dropped,
+                "orphan_results": self.client_orphan_results,
                 "sources": list(self.client_sources),
                 "items": list(self.client_in_items),
             },
@@ -603,6 +645,7 @@ class ThoughtSignatureTrace:
                 "skip_sigs": self.upstream_out_skip,
                 "fc_total": self.upstream_out_fc_total,
                 "fc_unsigned": self.upstream_out_fc_unsigned,
+                "fc_unsigned_lead_turns": self.upstream_out_turns_unsigned_lead,
                 "continuation_sent": self.upstream_out_continuation,
                 "fingerprints": list(self.upstream_out_fps),
                 "items": list(self.upstream_out_items),
@@ -635,7 +678,7 @@ class ThoughtSignatureTrace:
     def emit_outbound_log(self) -> None:
         self.sync()
         has_warn = (
-            self.upstream_out_fc_unsigned > 0
+            self.upstream_out_turns_unsigned_lead > 0
             or self.conflicts > 0
             or self.client_dropped > 0
         )
@@ -656,6 +699,11 @@ class ThoughtSignatureTrace:
                     else ""
                 )
                 + (f" 丢弃={self.client_dropped}" if self.client_dropped else "")
+                + (
+                    f" 孤儿结果={self.client_orphan_results}"
+                    if self.client_orphan_results
+                    else ""
+                )
             )
         replay_part = (
             f"温命中={self.warm_hits} 冷命中={self.cold_hits} "
@@ -667,6 +715,11 @@ class ThoughtSignatureTrace:
         upstream_part = (
             f"真签={self.upstream_out_real}(fp:{fp_text}) "
             f"SKIP={self.upstream_out_skip} 未签FC={self.upstream_out_fc_unsigned}"
+            + (
+                f"(首FC裸发轮={self.upstream_out_turns_unsigned_lead})"
+                if self.upstream_out_turns_unsigned_lead
+                else ""
+            )
         )
         sig_meta: dict[str, object] = {
             "direction": "outbound",
@@ -680,6 +733,7 @@ class ThoughtSignatureTrace:
             "client_thought_signed": self.client_thought_signed,
             "client_tail_signed": self.client_tail_signed,
             "client_dropped": self.client_dropped,
+            "client_orphan_results": self.client_orphan_results,
             "client_sources": list(self.client_sources),
             "warm_hits": self.warm_hits,
             "cold_hits": self.cold_hits,
@@ -690,6 +744,7 @@ class ThoughtSignatureTrace:
             "upstream_real": self.upstream_out_real,
             "upstream_skip": self.upstream_out_skip,
             "upstream_fc_unsigned": self.upstream_out_fc_unsigned,
+            "upstream_fc_unsigned_lead": self.upstream_out_turns_unsigned_lead,
             "fingerprints": list(self.upstream_out_fps[:6]),
         }
         msg = (

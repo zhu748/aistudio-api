@@ -81,12 +81,28 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 FROM python:3.11-slim-bookworm
 
 # Set environment variables
+# 内存姿态（512MB 档容器 OOM 治理，子进程继承同一组环境变量）：
+#   MALLOC_ARENA_MAX=2 —— glibc 默认每线程一个 arena（上限 8×核数），
+#     线程池/httpx/日志线程各自持有空闲页不归还，长会话 RSS 只升不降；
+#     收敛到 2 个 arena 让空闲页集中在可被 malloc_trim 归还的堆上。
+#   GOGC=50 / GOMEMLIMIT —— waa-signer（Go + SpiderMonkey）与主进程共享
+#     同一 cgroup，每次 mint 解析完整 wireContents；Go 默认堆翻倍才 GC，
+#     压低触发点让签名器峰值紧贴真实活跃集，而不是 2 倍。
+#   MALLOC_MMAP_THRESHOLD_=128KB —— glibc 的 mmap 阈值是动态的：第一份大
+#     str 被释放后阈值就抬到那份块的大小（最高 32MB），此后每轮几 MB 的
+#     请求体拷贝全部改从主堆分配，释放后在堆里留下碎片——RSS 只升不降，
+#     表现为"每轮累积、约 40 轮撞 512MB"。固定阈值后 ≥128KB 的分配一律走
+#     mmap，free 即归还内核，RSS 紧贴活跃集（同时禁用动态阈值调整）。
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     AISTUDIO_DATA_DIR=/app/data \
-    AISTUDIO_CONFIG_FILE=/app/data/config.yaml
+    AISTUDIO_CONFIG_FILE=/app/data/config.yaml \
+    MALLOC_ARENA_MAX=2 \
+    MALLOC_MMAP_THRESHOLD_=131072 \
+    GOGC=50 \
+    GOMEMLIMIT=128MiB
 
 # Install minimal system dependencies for HTTPS and healthchecks
 RUN apt-get update && apt-get install -y --no-install-recommends \

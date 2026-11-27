@@ -300,6 +300,63 @@ def test_declaration_embeds_schema_for_lossy_keys():
     assert "additionalProperties" in wire[1]
 
 
+def test_declaration_closed_object_does_not_embed_schema():
+    """``additionalProperties: false`` 是 Gemini 对象默认闭合语义：声明侧不再
+    为它把整份 schema 原文重复附加进 description（Claude Code 15 个工具里
+    12 个仅因该键触发，每请求多 ~17KB）。"""
+    parameters = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "路径"},
+            "meta": {"type": "object", "additionalProperties": False},
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    }
+    wire = _encode_decl(
+        {"name": "Read", "description": "读文件", "parameters": parameters}
+    )
+    assert wire[1] == "读文件"
+    assert _NOTE not in wire[1]
+    # 参数编码本身完整保留（属性仍在 wire 槽位 6）
+    assert wire[2][6][0][0] == "path"
+
+
+def test_declaration_truthy_additional_properties_still_embeds():
+    """``additionalProperties`` 为 schema/true 时 wire 仍无法表达，继续附加原文。"""
+    parameters = {
+        "type": "object",
+        "properties": {
+            "meta": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+            }
+        },
+    }
+    wire = _encode_decl({"name": "t", "parameters": parameters})
+    assert _NOTE in wire[1]
+    assert "additionalProperties" in wire[1]
+
+
+def test_declaration_embed_strips_schema_dialect_keyword():
+    """仍需附加原文时（propertyNames 等真 lossy 键），附加的 JSON 剔除 ``$schema``。"""
+    parameters = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "env": {
+                "type": "object",
+                "propertyNames": {"pattern": "^[A-Z_]+$"},
+            }
+        },
+    }
+    wire = _encode_decl({"name": "Bash", "parameters": parameters})
+    assert _NOTE in wire[1]
+    assert "propertyNames" in wire[1]
+    assert "$schema" not in wire[1]
+
+
 def test_declaration_strict_embeds_full_schema():
     parameters = {"type": "object", "properties": {"q": {"type": "string"}}}
     plain = _encode_decl({"name": "t", "parameters": parameters})

@@ -3,8 +3,11 @@ import { ref, watch, onUnmounted } from 'vue'
 import { operationsApi } from '@/api/operations.ts'
 import type { LogEntry } from '@/types'
 import Button from '@/components/ui/Button.vue'
-import ThoughtSignatureBadges from '@/components/ThoughtSignatureBadges.vue'
+import LogRow from '@/components/logs/LogRow.vue'
 import { usePageRefresh } from '@/composables/usePageRefresh.ts'
+import { useLatest } from '@/composables/useLatest.ts'
+import { useDebouncedWatch } from '@/composables/useDebouncedWatch.ts'
+import { errorMessage } from '@/utils/errors.ts'
 
 const entries = ref<LogEntry[]>([])
 const props = defineProps<{
@@ -20,9 +23,9 @@ const search = ref(props.initialSearch || '')
 const level = ref('INFO')
 const loading = ref(false)
 const error = ref('')
-let loadSequence = 0
+const loadLatest = useLatest()
 async function load(reset = false) {
-  const current = ++loadSequence
+  const isLatest = loadLatest.begin()
   if (reset) page.value = 1
   loading.value = true
   try {
@@ -37,16 +40,16 @@ async function load(reset = false) {
         level: level.value,
       }),
     )
-    if (current !== loadSequence) return false
+    if (!isLatest()) return false
     entries.value = result.items
     total.value = result.total
     error.value = ''
     return true
   } catch (err) {
-    if (current === loadSequence) error.value = err instanceof Error ? err.message : '历史日志加载失败'
+    if (isLatest()) error.value = errorMessage(err, '历史日志加载失败')
     return false
   } finally {
-    if (current === loadSequence) loading.value = false
+    if (isLatest()) loading.value = false
   }
 }
 async function turn(delta: number) {
@@ -57,7 +60,6 @@ function filterByFp(fp: string) {
   search.value = fp
   void load(true)
 }
-let sequence = 0
 usePageRefresh(load)
 watch(
   () => props.initialSearch,
@@ -68,21 +70,19 @@ watch(
     }
   },
 )
-watch(
+useDebouncedWatch(
   () => [props.category, props.requestId, props.model, props.accountId],
-  () => {
-    const current = ++sequence
-    loadSequence++
-    entries.value = []
-    setTimeout(() => {
-      if (current === sequence) void load(true)
-    }, 300)
+  () => void load(true),
+  {
+    immediate: true,
+    onChange: () => {
+      loadLatest.invalidate()
+      entries.value = []
+    },
   },
-  { immediate: true },
 )
 onUnmounted(() => {
-  sequence++
-  loadSequence++
+  loadLatest.invalidate()
 })
 </script>
 
@@ -128,49 +128,13 @@ onUnmounted(() => {
     <div
       class="bg-slate-950 text-slate-200 rounded-xl p-4 max-h-[65vh] min-h-80 overflow-auto text-xs font-mono"
     >
-      <div
-        v-for="(entry, index) in entries"
-        :key="index"
-        class="py-2.5 border-b border-slate-800 break-words"
-      >
-        <div class="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-          <span class="text-slate-500">{{ entry.ts }}</span>
-          <span :class="entry.level === 'ERROR' ? 'text-rose-400' : entry.level === 'WARNING' ? 'text-amber-400' : 'text-sky-400'">[{{ entry.level }}]</span>
-          <span
-            v-if="entry.model"
-            class="text-brand-300"
-          >{{ entry.model }}</span>
-          <span
-            v-if="entry.account_id"
-            class="text-slate-500"
-          >{{ entry.account_id }}</span>
-        </div>
-        <ThoughtSignatureBadges
-          v-if="entry.sig_meta"
-          :meta="entry.sig_meta"
-          @filter-fp="filterByFp"
-        />
-        <p class="mt-1 leading-6 text-[13px] whitespace-pre-wrap break-words">
-          {{ entry.message }}
-        </p>
-        <p
-          v-if="entry.request_id"
-          class="text-slate-500 mt-1"
-        >
-          <router-link
-            :to="{
-              path: '/requests',
-              query: {
-                request_id: entry.request_id,
-                ...(entry.name === 'aistudio.thought_signature' ? { tab: 'signature' } : {}),
-              },
-            }"
-            class="text-sky-400 hover:underline"
-          >
-            {{ entry.request_id }} ↗
-          </router-link>
-        </p>
-      </div>
+      <LogRow
+        v-for="entry in entries"
+        :key="`${entry.ts_ms}-${entry.message}`"
+        :entry="entry"
+        variant="archive"
+        @filter-fp="filterByFp"
+      />
       <p
         v-if="!entries.length"
         class="text-slate-500 py-12 text-center"

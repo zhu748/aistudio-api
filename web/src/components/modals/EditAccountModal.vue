@@ -8,6 +8,7 @@ import Modal from '@/components/ui/Modal.vue'
 import Button from '@/components/ui/Button.vue'
 import ProxyInputField from '@/components/ui/ProxyInputField.vue'
 import { PlugZap } from 'lucide-vue-next'
+import { errorMessage } from '@/utils/errors.ts'
 
 const props = defineProps<{
   modelValue: boolean
@@ -43,7 +44,7 @@ async function testProxy() {
       toast.success('代理连通性测试全部通过')
     }
   } catch (err) {
-    toast.error(err instanceof Error ? err.message : '诊断失败')
+    toast.error(errorMessage(err, '诊断失败'))
   } finally {
     testing.value = false
   }

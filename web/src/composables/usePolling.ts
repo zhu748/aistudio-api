@@ -1,8 +1,6 @@
 import { onUnmounted } from 'vue'
 
 export interface PollingOptions {
-  /** 任务标识（可选，仅用于调试标注；去重由调用方自行保证） */
-  key?: string
   /** 是否在挂载或恢复可见时立即执行一次（默认 true） */
   immediate?: boolean
   /** 最大错误退避间隔（毫秒，默认 60000ms） */

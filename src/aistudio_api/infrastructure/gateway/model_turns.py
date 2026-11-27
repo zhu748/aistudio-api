@@ -747,37 +747,105 @@ class ModelTurnHistory:
                         for part in parts
                     )
                     thoughts = [part.text or "" for part in parts if part.thought]
-                    if seen_old or has_explicit_real_sig:
+                    if seen_old:
+                        # A legacy per-call record can neither authorize a replay
+                        # nor expand the SKIP fallback: forward untouched.
                         if trace is not None:
                             trace.record_replay_turn(
                                 turn_index=model_turn_index,
                                 action="miss",
-                                reason=(
-                                    "legacy_seen_old"
-                                    if seen_old
-                                    else "explicit_sig_unobserved"
-                                ),
+                                reason="legacy_seen_old",
                                 fc_count=len(calls),
                             )
                         restored.extend(contents[start:end])
                         compatible = False
+                    elif has_explicit_real_sig:
+                        # Unobserved turn that still carries a real signature:
+                        # forward it untouched — the client's signature is never
+                        # borrowed or replaced — and only patch the one shape the
+                        # validator rejects: a lead functionCall with no
+                        # signature at all (client echoed a thought signature but
+                        # stripped the tool signature). Sibling calls keep the
+                        # exact shape the client sent, as observed turns do. The
+                        # turn is bound into the prefix together with the exact
+                        # signatures the client echoed: later turns stay
+                        # lookup-able/cacheable (a restart no longer freezes the
+                        # session until compaction), while a different signature
+                        # under the same visible text still cannot unlock
+                        # anything.
+                        fc_parts = [
+                            part for part in parts if part.function_call is not None
+                        ]
+                        lead_unsigned = (
+                            bool(fc_parts) and not fc_parts[0].thought_signature
+                        )
+                        if lead_unsigned:
+                            restored.extend(
+                                _fill_missing_calls(
+                                    contents[start:end],
+                                    iter(
+                                        [SKIP_THOUGHT_SIGNATURE]
+                                        + [None] * (len(fc_parts) - 1)
+                                    ),
+                                )
+                            )
+                        else:
+                            restored.extend(contents[start:end])
+                        previous = _hash(
+                            [
+                                previous,
+                                "unobserved",
+                                calls,
+                                [
+                                    part.thought_signature
+                                    for part in parts
+                                    if part.thought_signature
+                                    and part.thought_signature != SKIP_THOUGHT_SIGNATURE
+                                ],
+                            ]
+                        )
+                        if trace is not None:
+                            trace.record_replay_turn(
+                                turn_index=model_turn_index,
+                                action="skip_fill" if lead_unsigned else "miss",
+                                reason="explicit_sig_unobserved",
+                                fc_count=len(calls),
+                                restored_sigs=1 if lead_unsigned else 0,
+                            )
                     elif thoughts:
                         # Unobserved turn with unsigned echoed thoughts (e.g.
                         # after an account switch or dynamic system prompt
-                        # update): never fabricate SKIP_THOUGHT_SIGNATURE onto
-                        # sibling calls, while binding the exact thought digest
-                        # into the unobserved prefix so subsequent turns on the
-                        # new scope can still be cached and replayed safely.
-                        restored.extend(contents[start:end])
+                        # update). No real signature exists anywhere in this
+                        # turn (has_explicit_real_sig is False), so a bare lead
+                        # functionCall would reach the validator and trip
+                        # "Function call is missing a thought_signature"; backfill
+                        # the SKIP sentinel on unsigned calls exactly like the
+                        # unidentified-batch arm below, while binding the exact
+                        # thought digest into the unobserved prefix so subsequent
+                        # turns on the new scope can still be cached and replayed
+                        # safely. Observed turns keep their unsigned siblings bare
+                        # (see _fill_missing_calls callers above).
+                        missing_fc = sum(
+                            1
+                            for part in parts
+                            if part.function_call is not None
+                            and not part.thought_signature
+                        )
+                        restored.extend(
+                            _fill_missing_calls(
+                                contents[start:end], repeat(SKIP_THOUGHT_SIGNATURE)
+                            )
+                        )
                         previous = _hash(
                             [previous, "unobserved", calls, _hash("".join(thoughts))]
                         )
                         if trace is not None:
                             trace.record_replay_turn(
                                 turn_index=model_turn_index,
-                                action="miss",
+                                action="skip_fill" if missing_fc > 0 else "miss",
                                 reason="unobserved_thought",
                                 fc_count=len(calls),
+                                restored_sigs=missing_fc,
                             )
                     else:
                         # Preserve the existing legacy behavior only for an

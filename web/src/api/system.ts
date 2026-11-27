@@ -9,7 +9,6 @@ import type {
   UpdateApiKeyRequest,
   UpdateLoggingConfigRequest,
   UpdateLoggingConfigResponse,
-  HealthCheckResponse,
   AntiTruncationConfig,
   UpdateAntiTruncationConfigRequest,
   KeepaliveConfig,
@@ -19,10 +18,6 @@ import type {
 
 
 export const systemApi = {
-  health(): Promise<HealthCheckResponse> {
-    return request<HealthCheckResponse>('/health')
-  },
-
   getStats(): Promise<StatsResponse> {
     return request<StatsResponse>('/stats')
   },

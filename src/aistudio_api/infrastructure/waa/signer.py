@@ -16,6 +16,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
@@ -67,32 +68,77 @@ def _retry_delay(attempt: int) -> float:
 _RETRYABLE_GATEWAY_STATUS = frozenset({502, 503, 504})
 
 
-def extract_content_digest(contents: list[AistudioContent]) -> tuple[str, str]:
-    """Strictly extract contents for SHA-256 digest calculation.
+def _iter_digest_parts(contents: list[AistudioContent]) -> Iterator[str]:
+    """按 digest 规则逐个产出部件文本（两条摘要函数的唯一真源）。
 
-    Follows Google AI Studio frontend logic (live_m=_b.js: _.gD / _.jn / _.VC):
-    1. Only extracts contents (field 2), never includes system_instruction
-    2. Parts: text -> getText(), inline_data -> data.Fe(), file -> getId()
-    3. Joined by single space " " and hashed with sha256.
-    Returns (prompt_string, sha256_hexdigest).
+    AI Studio 前端（live_m=_b.js: _.gD / _.jn / _.VC）只取 contents：
+    text → getText()、inline_data → data.Fe()、file → getId()，没有载荷
+    的部件贡献空串；各部件之间用单个空格连接。
     """
-    hash_parts: list[str] = []
     for content in contents:
         for part in content.parts:
             if part.text is not None:
-                hash_parts.append(str(part.text))
+                yield str(part.text)
             elif part.inline_data is not None:
-                hash_parts.append(str(part.inline_data[1]))
+                yield str(part.inline_data[1])
             elif part.file_id is not None:
-                hash_parts.append(str(part.file_id))
+                yield str(part.file_id)
             else:
-                hash_parts.append("")
-    prompt = " ".join(hash_parts)
+                yield ""
+
+
+def extract_content_digest(contents: list[AistudioContent]) -> tuple[str, str]:
+    """Strictly extract contents for SHA-256 digest calculation.
+
+    Returns (prompt_string, sha256_hexdigest)。仅测试与调试使用；生产签名
+    路径走 :func:`compute_content_digest`，避免拼出整段 prompt 字符串。
+    """
+    prompt = " ".join(_iter_digest_parts(contents))
     # errors="replace"：text 内的孤立 UTF-16 代理项会让严格编码抛
     # UnicodeEncodeError（签名前奏即崩，请求 500）。摘要仅需稳定字节串，
     # 替换为 U+FFFD 后 hash 仍确定（上游 DeconstructedCube 036e618 同款）。
     content_hash = hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest()
     return prompt, content_hash
+
+
+def compute_content_digest(contents: list[AistudioContent]) -> tuple[int, str]:
+    """Compute the same SHA-256 digest as :func:`extract_content_digest` without
+    materialising the joined prompt string.
+
+    与 extract_content_digest 字节级一致（同一组部件、同一单空格分隔、同一
+    ``errors="replace"``，均来自 :func:`_iter_digest_parts`），但按部件增量
+    喂给 sha256。签名链路只需要摘要，不再把整段对话文本拼成一个 str
+    （PEP 393：正文含一个 emoji 就会让整段 str 按 4 字节/字符驻留）再
+    encode 出一份 bytes。
+    Returns (prompt_chars, sha256_hexdigest)。
+    """
+    hasher = hashlib.sha256()
+    prompt_chars = 0
+    first = True
+    for text in _iter_digest_parts(contents):
+        if first:
+            first = False
+        else:
+            hasher.update(b" ")
+            prompt_chars += 1
+        hasher.update(text.encode("utf-8", errors="replace"))
+        prompt_chars += len(text)
+    return prompt_chars, hasher.hexdigest()
+
+
+def _encode_json_bytes(payload: dict[str, Any]) -> bytes:
+    """Encode a payload to the exact bytes httpx ``json=`` would send, chunk by chunk.
+
+    httpx 的 ``json=`` 先 ``json.dumps`` 出整份 str 再 ``.encode()``：含非 BMP
+    字符时该 str 按 4 字节/字符驻留，一份 mint 载荷会同时以 str 与 bytes 两份
+    形态存在。这里用同一组参数（ensure_ascii=False, allow_nan=False,
+    separators=(",", ":")）走 ``iterencode`` 分块编码，字节输出完全一致，
+    但不再物化整份 str。
+    """
+    encoder = json.JSONEncoder(
+        ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    )
+    return b"".join(chunk.encode("utf-8") for chunk in encoder.iterencode(payload))
 
 
 def _resolve_signer_timeout() -> float:
@@ -199,8 +245,15 @@ class LocalProofSigner:
         prompt: str = "",
         wire_contents: list[Any] | None = None,
         upstream_proxy: str | None = None,
+        digest: str | None = None,
     ) -> str:
-        """Request proof from remote proof server with automatic retry on transient failure."""
+        """Request proof from remote proof server with automatic retry on transient failure.
+
+        ``digest`` 非空时只发送摘要（签名器在 ``req.Digest`` 非空时跳过
+        ``sha256(req.Prompt)``），整段对话文本 ``prompt`` 不再进入载荷——
+        否则每次签名都要把全文 JSON 再序列化一遍。``prompt`` 仍保留给
+        直接调用的旧路径（未提供 digest 时行为与此前完全一致）。
+        """
         min_cookies = filter_minimal_cookies(cookies)
         cookie_header = "; ".join(f"{k}={v}" for k, v in min_cookies.items())
         if not cookie_header:
@@ -214,8 +267,11 @@ class LocalProofSigner:
             "authUser": int(auth_user) if auth_user.isdigit() else 0,
             "g1Tier": g1_tier,
             "model": normalized_model,
-            "prompt": prompt,
         }
+        if digest:
+            payload["digest"] = digest
+        else:
+            payload["prompt"] = prompt
         if wire_contents is not None:
             payload["wireContents"] = wire_contents
         if upstream_proxy:
@@ -233,6 +289,8 @@ class LocalProofSigner:
             "Content-Type": "application/json",
             **signer_authorization(self.server_url),
         }
+        # 重试循环外编码一次：重试时复用同一份 bytes，不再重复序列化。
+        payload_bytes = _encode_json_bytes(payload)
 
         max_attempts = 2
         last_error: Exception | None = None
@@ -243,15 +301,17 @@ class LocalProofSigner:
                 client = await self._get_client()
                 resp = await client.post(
                     f"{self.server_url}/v1/proof/mint",
-                    json=payload,
+                    content=payload_bytes,
                     headers=request_headers,
                 )
                 elapsed_ms = (time.perf_counter() - t0) * 1000
 
                 if resp.status_code != 200:
+                    # resp.text 只取一次：它是 MB 级响应体的完整解码副本。
+                    detail_text = resp.text[:300]
                     detail = (
                         f"Local proof signer returned HTTP {resp.status_code}: "
-                        f"{resp.text[:300]}"
+                        f"{detail_text}"
                     )
                     if (
                         resp.status_code in _RETRYABLE_GATEWAY_STATUS
@@ -267,7 +327,7 @@ class LocalProofSigner:
                             attempt,
                             max_attempts,
                             self.server_url,
-                            resp.text[:300],
+                            detail_text,
                         )
                         await asyncio.sleep(_retry_delay(attempt))
                         continue
@@ -440,11 +500,11 @@ class WaaSigner:
         """Compute content hash and generate WAA proof token (with reuse cache)."""
         if self._closed:
             raise TransportError("Proof signer is closed")
-        prompt, content_hash = extract_content_digest(contents)
+        prompt_chars, content_hash = compute_content_digest(contents)
         logger.debug(
             "计算请求摘要: hash=%s, prompt_len=%d, u/%s",
             content_hash[:8],
-            len(prompt),
+            prompt_chars,
             auth_user,
         )
 
@@ -475,13 +535,14 @@ class WaaSigner:
                 self._proof_cache.pop(key, None)
 
         # 2) 未命中：请求本地签名守护进程铸造 proof（mint_proof 内部已
-        # 含瞬时故障的退避重试）。
+        # 含瞬时故障的退避重试）。只传摘要：签名器侧 digest 非空即直接使用，
+        # wireContents 仍需携带（签名器从中取最后一轮文本作为 pagePrompt）。
         proof = await self._local_signer.mint_proof(
             cookies=cookies,
             auth_user=auth_user,
             tier=tier,
             model=model,
-            prompt=prompt,
+            digest=content_hash,
             wire_contents=[c.to_wire() for c in contents],
             upstream_proxy=upstream_proxy,
         )

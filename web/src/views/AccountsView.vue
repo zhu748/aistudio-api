@@ -21,6 +21,7 @@ import {
   Folder,
   Check,
 } from 'lucide-vue-next'
+import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 
 const accountsStore = useAccountsStore()
 const systemStore = useSystemStore()
@@ -53,6 +54,27 @@ const allGroups = computed(() => {
   })
   return Array.from(set).sort()
 })
+
+const groupOptions = computed(() => [
+  {
+    value: 'ALL',
+    label: '全部分组',
+    count: accountsStore.accounts.length,
+    activeClass: 'bg-slate-900 text-white shadow-2xs',
+    idleClass: 'text-slate-600 hover:bg-slate-100 bg-slate-50 border border-slate-200/70',
+    itemClass: 'px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer tabular-nums',
+  },
+  ...allGroups.value.map((grp) => ({
+    value: grp,
+    label: grp,
+    icon: Folder,
+    iconClass: 'w-3 h-3 opacity-75',
+    activeClass: 'bg-brand-600 text-white shadow-2xs',
+    idleClass: 'text-slate-600 hover:bg-slate-100 bg-slate-50 border border-slate-200/70',
+    itemClass:
+      'px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer flex items-center gap-1.5',
+  })),
+])
 
 const filteredAccounts = computed(() => {
   if (selectedGroup.value === 'ALL') {
@@ -119,37 +141,12 @@ async function handleDeletePreset(presetId: string, name: string) {
     <div class="bg-white border border-slate-200/90 rounded-xl p-4 shadow-2xs space-y-3">
       <!-- Row 1: Group Filter Tabs & Primary Action Buttons -->
       <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-        <!-- Group Tabs -->
-        <div class="flex items-center gap-1.5 flex-wrap">
-          <button
-            type="button"
-            class="px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer tabular-nums"
-            :class="[
-              selectedGroup === 'ALL'
-                ? 'bg-slate-900 text-white shadow-2xs'
-                : 'text-slate-600 hover:bg-slate-100 bg-slate-50 border border-slate-200/70',
-            ]"
-            @click="selectedGroup = 'ALL'"
-          >
-            全部分组 ({{ accountsStore.accounts.length }})
-          </button>
-
-          <button
-            v-for="grp in allGroups"
-            :key="grp"
-            type="button"
-            class="px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer flex items-center gap-1.5"
-            :class="[
-              selectedGroup === grp
-                ? 'bg-brand-600 text-white shadow-2xs'
-                : 'text-slate-600 hover:bg-slate-100 bg-slate-50 border border-slate-200/70',
-            ]"
-            @click="selectedGroup = grp"
-          >
-            <Folder class="w-3 h-3 opacity-75" />
-            <span>{{ grp }}</span>
-          </button>
-        </div>
+        <SegmentedControl
+          :model-value="selectedGroup"
+          :options="groupOptions"
+          variant="dark"
+          @update:model-value="selectedGroup = $event"
+        />
 
         <!-- Primary Action Cluster -->
         <div class="flex items-center gap-2 flex-wrap shrink-0">

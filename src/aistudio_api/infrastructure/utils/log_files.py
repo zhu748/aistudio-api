@@ -9,8 +9,7 @@ import queue
 from pathlib import Path
 
 from aistudio_api.config import resolve_data_dir
-from aistudio_api.infrastructure.request_context import log_context
-from aistudio_api.infrastructure.utils.redaction import redact_text
+from aistudio_api.infrastructure.utils.redaction import redact_record
 
 _listener: logging.handlers.QueueListener | None = None
 _queue_handler: logging.handlers.QueueHandler | None = None
@@ -19,20 +18,19 @@ _file_handler: logging.handlers.RotatingFileHandler | None = None
 
 class ContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        for key, value in log_context().items():
-            setattr(record, key, getattr(record, key, "") or value)
-        record.msg, record.args = redact_text(record.getMessage()), ()
+        redact_record(record)
         return True
 
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
+        redact_record(record)
         payload: dict[str, object] = {
             "ts": self.formatTime(record, "%Y-%m-%d %H:%M:%S"),
             "ts_ms": int(record.created * 1000),
             "level": record.levelname,
             "name": record.name,
-            "message": redact_text(record.getMessage())[:8192],
+            "message": record.getMessage()[:8192],
             "request_id": getattr(record, "request_id", ""),
             **{
                 key: getattr(record, key, "system" if key == "category" else "")
@@ -109,6 +107,13 @@ def stop_file_logging() -> None:
     _listener = _queue_handler = _file_handler = None
 
 
+def _backup_count() -> int:
+    """当前轮转文件保留的备份份数（未启动文件日志时退回 5）。"""
+    handler = _file_handler
+    count = getattr(handler, "backupCount", 5)
+    return count if isinstance(count, int) and count > 0 else 5
+
+
 def read_log_history(
     *,
     level: str = "INFO",
@@ -129,9 +134,10 @@ def read_log_history(
     # （当前文件最新，备份序号越大越旧），凑满 offset+page_size 后
     # 更旧文件不可能影响本页内容，可停止读取（最多 6×5MB 全量读盘
     # -> 通常只读当前文件的一小段）。
+    # 备份份数从 handler 推导：写死 6 会在 backupCount 调整后读不到旧档。
     paths = [
         folder / "runtime.jsonl",
-        *[folder / f"runtime.jsonl.{i}" for i in range(1, 6)],
+        *[folder / f"runtime.jsonl.{i}" for i in range(1, _backup_count() + 1)],
     ]
     # desc（默认）：当前文件 -> .1 -> .2 ...（每文件内部行本身时间递增，
     # 文件间当前文件整体最新）；凑满 offset+page_size 即可停止读更旧文件
@@ -139,26 +145,47 @@ def read_log_history(
     needed = page * page_size
     overflow_seen: int | None = None  # total 只能给出下界时用它提示截断
 
+    def _parse(line: str) -> dict[str, object] | None:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(item, dict):
+            return None
+        if not matches_log_entry(
+            item,
+            min_level=level,
+            search=search,
+            request_id=request_id,
+            category=category,
+            model=model,
+            account_id=account_id,
+        ):
+            return None
+        return item
+
     for path in paths:
         if not path.is_file():
             continue
         with path.open(encoding="utf-8") as stream:
-            for line in stream:
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(item, dict) or not matches_log_entry(
-                    item,
-                    min_level=level,
-                    search=search,
-                    request_id=request_id,
-                    category=category,
-                    model=model,
-                    account_id=account_id,
-                ):
+            if not early_stop:
+                for line in stream:
+                    item = _parse(line)
+                    if item is not None:
+                        matched.append(item)
+                continue
+            # desc：同一文件内越靠后越新，从尾部往前读并逐行判定；凑满即停，
+            # 不再为整份日志的每一行做 json.loads。
+            # readlines() 会把当前文件整体读入，但单文件被 RotatingFileHandler
+            # 限制在 5MB（maxBytes=5*1024*1024），属于有界开销；分块倒读需要
+            # 自行处理多字节字符跨块边界，收益不抵风险。
+            for line in reversed(stream.readlines()):
+                item = _parse(line)
+                if item is None:
                     continue
                 matched.append(item)
+                if len(matched) >= needed:
+                    break
         if early_stop and len(matched) >= needed:
             # 已凑满到请求页：更旧文件不可能影响本页内容，可安全停止。
             # total 退化为下界（实际值 >= 返回值），用 overflow 标记提示。

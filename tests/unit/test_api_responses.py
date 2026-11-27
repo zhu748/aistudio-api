@@ -84,7 +84,7 @@ def test_to_gemini_parts_can_emit_inline_image_data():
 
     parts = to_gemini_parts(
         "说明",
-        images=[GeneratedImage(mime="image/png", data=b"png-bytes", size=9)],
+        images=[GeneratedImage(mime="image/png", raw_b64="cG5nLWJ5dGVz")],
     )
 
     assert [part.model_dump(mode="json", exclude_none=True) for part in parts] == [

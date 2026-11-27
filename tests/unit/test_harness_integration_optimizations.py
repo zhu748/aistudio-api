@@ -368,7 +368,12 @@ async def test_claude_code_tool_turn_replay_keeps_only_known_owners(
     signed_thought,
     keep_tool_signature,
 ) -> None:
-    """An unsigned thought never takes a tool signature; an explicit one survives."""
+    """An unsigned thought never takes a tool signature; an explicit one survives.
+
+    Without the echoed tool signature the lead FC gets the SKIP sentinel
+    (upstream rejects a bare lead FC); a client-provided thought signature is
+    forwarded untouched and never borrowed onto the FC.
+    """
     expected_thought_signature = _SIG2 if signed_thought else None
     response = _gemini_response(
         [
@@ -434,7 +439,12 @@ async def test_claude_code_tool_turn_replay_keeps_only_known_owners(
     fc = fc_part.function_call
     assert fc is not None
     assert fc[0] == "Bash"
-    assert fc_part.thought_signature == (_SIG if keep_tool_signature else None)
+    if keep_tool_signature:
+        assert fc_part.thought_signature == _SIG
+    else:
+        # 客户端没回传 tool 签名：无论 thought 带不带真实签名，首个 FC 都补 SKIP
+        # 哨兵；显式 thought 签名留在 thought part 上（上面已断言），绝不借到 FC
+        assert fc_part.thought_signature == tool_signatures.SKIP_THOUGHT_SIGNATURE
     # tool_result 反查名字正确（id 匹配）
     fr_part = next(p for p in outbound[2].parts if p.function_response)
     fr = fr_part.function_response

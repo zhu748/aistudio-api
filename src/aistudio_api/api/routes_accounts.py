@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from typing import TYPE_CHECKING
 
@@ -229,13 +230,15 @@ async def detect_account_email(
         except Exception as e:
             logger.debug("探测账号 %s 邮箱/等级失败: %s", account_id, e)
     if email:
-        account_service.update_account_email(account_id, email)
+        await asyncio.to_thread(account_service.update_account_email, account_id, email)
         logger.info("更新账号邮箱: id=%s, email=%s", account_id, mask_email(email))
 
     if detected_tier:
         # 层级变化影响目录拉取的 tier 头与付费门控，目录缓存失效已收敛到
         # AccountService.update_account_tier。
-        account_service.update_account_tier(account_id, detected_tier)
+        await asyncio.to_thread(
+            account_service.update_account_tier, account_id, detected_tier
+        )
         logger.info("更新账号订阅等级: id=%s, tier=%s", account_id, detected_tier)
     acc = account_service.get_account(account_id)
     if not acc:
@@ -270,7 +273,9 @@ async def detect_account_tier(
 
     if detected_tier:
         # 目录缓存失效已收敛到 AccountService.update_account_tier。
-        account_service.update_account_tier(account_id, detected_tier)
+        await asyncio.to_thread(
+            account_service.update_account_tier, account_id, detected_tier
+        )
         logger.info("更新账号订阅等级: id=%s, tier=%s", account_id, detected_tier)
 
     acc = account_service.get_account(account_id)
@@ -312,7 +317,7 @@ async def update_account_tier_manual(
             detail="无效的订阅等级，允许值: Free / Plus / Pro / Ultra / Ultra_20X",
         )
     clean_tier = normalize_benefit_tier(req.tier)
-    account_service.update_account_tier(account_id, clean_tier)
+    await asyncio.to_thread(account_service.update_account_tier, account_id, clean_tier)
     # 活跃账号层级变化同步内存上下文，避免在途/后续请求仍带旧 tier 头
     gateway_session = runtime_state.client.session if runtime_state.client else None
     active = account_service.get_active_account()
@@ -366,7 +371,7 @@ async def delete_account(
     active_account = account_service.get_active_account()
     is_active = active_account is not None and active_account.id == account_id
 
-    success = account_service.delete_account(account_id)
+    success = await asyncio.to_thread(account_service.delete_account, account_id)
     if not success:
         raise HTTPException(status_code=404, detail="账号不存在")
 
@@ -377,7 +382,7 @@ async def delete_account(
         new_active = remaining_accounts[0] if remaining_accounts else None
         gateway_session = runtime_state.client.session if runtime_state.client else None
         if new_active is not None:
-            account_service.set_active_account(new_active.id)
+            await asyncio.to_thread(account_service.set_active_account, new_active.id)
             if gateway_session is not None:
                 new_auth_path = account_service.get_account_auth_path(new_active.id)
                 await gateway_session.switch_auth(
@@ -410,7 +415,7 @@ async def delete_cookie_group(
         if acc_cid == cookie_id:
             if a.id == active_id:
                 active_deleted = True
-            if account_service.delete_account(a.id):
+            if await asyncio.to_thread(account_service.delete_account, a.id):
                 deleted_count += 1
                 if rotator:
                     rotator.remove_account(a.id)
@@ -421,7 +426,7 @@ async def delete_cookie_group(
         new_active = remaining_accounts[0] if remaining_accounts else None
         gateway_session = runtime_state.client.session if runtime_state.client else None
         if new_active is not None:
-            account_service.set_active_account(new_active.id)
+            await asyncio.to_thread(account_service.set_active_account, new_active.id)
             if gateway_session is not None:
                 new_auth_path = account_service.get_account_auth_path(new_active.id)
                 await gateway_session.switch_auth(
@@ -442,7 +447,9 @@ async def update_account(
     account_service: AccountService = Depends(get_account_service),
 ) -> AccountResponse:
     """更新账号名称。"""
-    account = account_service.update_account(account_id, req.name)
+    account = await asyncio.to_thread(
+        account_service.update_account, account_id, req.name
+    )
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
     logger.info("账号名称已更新: id=%s, name=%s", account.id, req.name)
@@ -462,7 +469,9 @@ async def toggle_account(
     # active_acc.id == account_id 便永远命中不了（切换被跳过、会话停留在
     # 已禁用账号上继续发请求的分叉根因）。
     active_before = account_service.get_active_account()
-    account = account_service.toggle_account_enabled(account_id, req.enabled)
+    account = await asyncio.to_thread(
+        account_service.toggle_account_enabled, account_id, req.enabled
+    )
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
 
@@ -484,7 +493,9 @@ async def update_account_group(
     account_service: AccountService = Depends(get_account_service),
 ) -> AccountResponse:
     """更新账号所属业务分组。"""
-    account = account_service.update_account_group(account_id, req.group)
+    account = await asyncio.to_thread(
+        account_service.update_account_group, account_id, req.group
+    )
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
     logger.info("账号分组已更新: id=%s, group=%s", account.id, account.group)
@@ -499,7 +510,9 @@ async def update_account_notes(
     account_service: AccountService = Depends(get_account_service),
 ) -> AccountResponse:
     """更新账号备注。"""
-    account = account_service.update_account_notes(account_id, req.notes)
+    account = await asyncio.to_thread(
+        account_service.update_account_notes, account_id, req.notes
+    )
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
     return to_account_response(account, request=request)
@@ -528,7 +541,9 @@ async def update_account_proxy(
             status_code=400,
             detail="代理地址无效：需为 http(s):// / socks5:// 完整地址或 host:port 形式",
         )
-    account_service.update_account_proxy(account_id, raw_proxy or None)
+    await asyncio.to_thread(
+        account_service.update_account_proxy, account_id, raw_proxy or None
+    )
     account = account_service.get_account(account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
@@ -575,7 +590,9 @@ async def batch_toggle_group(
     account_service: AccountService = Depends(get_account_service),
 ) -> dict[str, object]:
     """按分组批量启用或停用账号。"""
-    updated = account_service.batch_toggle_group(group_name, enabled)
+    updated = await asyncio.to_thread(
+        account_service.batch_toggle_group, group_name, enabled
+    )
     active_acc = account_service.get_active_account()
     if active_acc and active_acc.group == group_name and not enabled:
         from aistudio_api.application.account_orchestrator import try_switch_account
@@ -615,7 +632,7 @@ async def create_preset(
         target_groups=req.target_groups,
         is_system=False,
     )
-    saved = account_service.save_preset(preset)
+    saved = await asyncio.to_thread(account_service.save_preset, preset)
     return PresetResponse.model_validate(saved.to_dict())
 
 
@@ -625,7 +642,9 @@ async def create_snapshot_preset(
     account_service: AccountService = Depends(get_account_service),
 ) -> PresetResponse:
     """将当前所有启用账号一键快照保存为新预设方案。"""
-    saved = account_service.create_snapshot_preset(req.name, req.description)
+    saved = await asyncio.to_thread(
+        account_service.create_snapshot_preset, req.name, req.description
+    )
     logger.info("已创建预设快照: name=%s, id=%s", saved.name, saved.id)
     return PresetResponse.model_validate(saved.to_dict())
 
@@ -637,7 +656,7 @@ async def delete_preset(
 ) -> dict[str, bool]:
     """删除自定义预设方案。"""
     try:
-        ok = account_service.delete_preset(preset_id)
+        ok = await asyncio.to_thread(account_service.delete_preset, preset_id)
         if not ok:
             raise HTTPException(status_code=404, detail="预设方案不存在")
         return {"ok": True}
@@ -652,7 +671,9 @@ async def apply_preset(
 ) -> ApplyPresetResponse:
     """一键应用预设方案，原子切换账号使能状态。"""
     try:
-        preset, en_ids, dis_ids = account_service.apply_preset(preset_id)
+        preset, en_ids, dis_ids = await asyncio.to_thread(
+            account_service.apply_preset, preset_id
+        )
         # 检查当前活跃账号是否有效，若失效则顺延切换
         active_acc = account_service.get_active_account()
         from aistudio_api.application.account_orchestrator import try_switch_account

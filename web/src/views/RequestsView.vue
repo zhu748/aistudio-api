@@ -17,6 +17,8 @@ import {
   stageLabels,
   downloadJson,
 } from '@/utils/requests.ts'
+import { errorMessage } from '@/utils/errors.ts'
+import { useLatest } from '@/composables/useLatest.ts'
 
 const route = useRoute()
 const router = useRouter()
@@ -50,7 +52,7 @@ const page = computed(() => Math.max(1, Math.floor(Number(route.query.page) || 1
 const pages = computed(() => Math.max(1, Math.ceil(total.value / 50)))
 const selectedId = computed(() => (typeof route.query.request_id === 'string' ? route.query.request_id : ''))
 const selectedTab = computed(() => (typeof route.query.tab === 'string' ? route.query.tab : ''))
-let sequence = 0
+const latestLoad = useLatest()
 
 function localDate(timestamp: string) {
   const date = new Date(Number(timestamp) * 1000)
@@ -65,13 +67,13 @@ function params() {
   return query
 }
 async function load() {
-  const current = ++sequence
+  const isLatest = latestLoad.begin()
   loading.value = true
   const outcomes = await Promise.allSettled([
     operationsApi
       .requests(params())
       .then((response) => {
-        if (current !== sequence) return
+        if (!isLatest()) return
         rows.value = response.items
         total.value = response.total
         error.value = ''
@@ -80,23 +82,23 @@ async function load() {
           void router.replace({ query: { ...route.query, page: String(pages.value) } })
       })
       .catch((err) => {
-        if (current === sequence) error.value = err instanceof Error ? err.message : '请求历史加载失败'
+        if (isLatest()) error.value = errorMessage(err, '请求历史加载失败')
         throw err
       }),
     operationsApi
       .active()
       .then((response) => {
-        if (current === sequence) {
+        if (isLatest()) {
           active.value = response.items
           activeError.value = ''
         }
       })
       .catch((err) => {
-        if (current === sequence) activeError.value = err instanceof Error ? err.message : '执行状态加载失败'
+        if (isLatest()) activeError.value = errorMessage(err, '执行状态加载失败')
         throw err
       }),
   ])
-  if (current === sequence) loading.value = false
+  if (isLatest()) loading.value = false
   return outcomes.every((item) => item.status === 'fulfilled')
 }
 async function apply() {
@@ -143,7 +145,7 @@ async function exportRows() {
     downloadJson(response.items, `requests-${new Date().toISOString().slice(0, 10)}.json`)
     toast.success(`已导出 ${response.items.length} / ${response.total} 条记录，单次上限 5000 条`)
   } catch (err) {
-    toast.error(err instanceof Error ? err.message : '导出失败')
+    toast.error(errorMessage(err, '导出失败'))
   } finally {
     exporting.value = false
   }
@@ -155,7 +157,7 @@ async function clear() {
     await load()
     toast.success('已清空已完成请求历史')
   } catch (err) {
-    toast.error(err instanceof Error ? err.message : '清空失败')
+    toast.error(errorMessage(err, '清空失败'))
   }
 }
 const visibleActive = computed(() =>

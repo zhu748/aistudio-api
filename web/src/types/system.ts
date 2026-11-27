@@ -74,6 +74,8 @@ export interface ThoughtSignatureLogMeta {
   upstream_real?: number
   upstream_skip?: number
   upstream_fc_unsigned?: number
+  /** Model turns whose first functionCall went upstream bare (the real 400 risk). */
+  upstream_fc_unsigned_lead?: number
   // Inbound fields
   upstream_total?: number
   by_carrier?: Record<string, number>

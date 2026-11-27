@@ -86,10 +86,11 @@ const emit = defineEmits<{
         续传命中
       </span>
       <span
-        v-if="(meta.upstream_fc_unsigned || 0) > 0"
+        v-if="(meta.upstream_fc_unsigned_lead || 0) > 0"
         class="inline-flex items-center px-1.5 py-px rounded border bg-rose-500/20 text-rose-300 border-rose-500/40 font-semibold"
+        title="每轮只有首个 functionCall 需要签名；此处只统计首 FC 裸发的轮次，兄弟 FC 不计"
       >
-        未签FC风险 ×{{ meta.upstream_fc_unsigned }}
+        未签FC风险 ×{{ meta.upstream_fc_unsigned_lead }}
       </span>
       <span
         v-if="(meta.conflicts || 0) > 0"

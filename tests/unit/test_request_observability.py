@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import time
 from dataclasses import asdict
@@ -339,7 +340,11 @@ async def test_buffered_thought_images_are_separate_from_answer_timing(
         candidates=[
             Candidate(
                 text="answer" if with_answer else "",
-                reasoning_images=[GeneratedImage("image/png", b"image", 5)],
+                reasoning_images=[
+                    GeneratedImage(
+                        mime="image/png", raw_b64=base64.b64encode(b"image").decode()
+                    )
+                ],
             )
         ]
     )

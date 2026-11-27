@@ -20,6 +20,14 @@
 #     收尾后归还 glibc 堆碎片，避免长会话把 RSS 顶过 OOM 阈值被 SIGKILL
 #     （OOM 崩溃重启同样会清空临时盘数据）。可用 AISTUDIO_MEMORY_BUDGET_MB /
 #     AISTUDIO_MODEL_TURN_CACHE_MB 显式调节；AISTUDIO_MALLOC_TRIM=0 关闭堆归还。
+#   - 面板里的「上游成功快照」开关不持久：Free 档无磁盘，重启后 /app/data 清空，
+#     entrypoint 发现 config.yaml 不在就用镜像内 defaults/config.yaml（该值
+#     为 10）重建——也就是说面板改成 0 后第一次 OOM 重启就悄悄回到 10，之后
+#     每次成功请求都在线程池里再复制 3～4 倍正文。要真正关掉必须用下面的
+#     环境变量。
+#   - 排障：GET /memory（面板密码鉴权，与 /stats 同为顶层路径）返回主进程/
+#     子进程 RSS 与 cgroup 用量；启动日志「分配器姿态」一行可见
+#     MALLOC_ARENA_MAX 是否生效。
 #   - 需要持久磁盘与服务常驻（不休眠）时：plan 改回 starter，并恢复下方
 #     注释中的 disk 段。
 
@@ -50,6 +58,17 @@ services:
         value: "300"
       - key: AISTUDIO_REQUEST_TIMEOUT
         value: "600"
+      # 关闭上游成功快照（面板改不持久：重启即被 defaults 覆盖回 10）。
+      # 长会话每轮请求体 MB 级，快照线程整体解析+序列化会放大 3～4 倍正文。
+      # 需要抓错误现场时不受影响：失败快照不受此开关限制。
+      - key: AISTUDIO_UPSTREAM_SNAPSHOT_KEEP
+        value: "0"
+      # 显式告知 512MB 预算：缓存分档（model_turns 64MB→12MB 等）依赖 cgroup
+      # 探测，Render 的容器运行时不保证暴露 memory.max；探测失败会静默回退
+      # 大内存默认档，长会话峰值直接多出 ~50MB。升级套餐时同步修改或删除
+      # （删除 = 按 cgroup 自动探测）。启动日志「内存预算」一行可核对。
+      - key: AISTUDIO_MEMORY_BUDGET_MB
+        value: "512"
       # 【必填】Web 管理面板登录密码 —— 公网部署务必设置，否则面板裸奔
       - key: AISTUDIO_WEB_PASSWORD
         sync: false

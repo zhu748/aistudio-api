@@ -6,6 +6,7 @@ import type { LogEntry } from '@/types'
 import Modal from '@/components/ui/Modal.vue'
 import Button from '@/components/ui/Button.vue'
 import ThoughtSignaturePanel from '@/components/ThoughtSignaturePanel.vue'
+import LogRow from '@/components/logs/LogRow.vue'
 import { useClipboard } from '@/composables/useClipboard.ts'
 import { usePolling } from '@/composables/usePolling.ts'
 import {
@@ -16,6 +17,8 @@ import {
   stageLabels,
   downloadJson,
 } from '@/utils/requests.ts'
+import { errorMessage } from '@/utils/errors.ts'
+import { useLatest } from '@/composables/useLatest.ts'
 
 const props = defineProps<{ requestId: string; initialTab?: string; keyNames?: Record<string, string> }>()
 const emit = defineEmits<{ close: [] }>()
@@ -67,12 +70,20 @@ const tabs = [
 ]
 const validTabIds = new Set(tabs.map((item) => item.id))
 const sigTrace = computed(() => record.value?.thought_signature ?? null)
+const bareLeadTurns = computed(() => {
+  const t = sigTrace.value
+  if (!t) return 0
+  // 兼容旧记录：没有 lead 口径时退回 fc_unsigned。
+  return t.upstream_out.fc_unsigned_lead_turns ?? t.upstream_out.fc_unsigned
+})
 const signatureHasRisk = computed(() => {
   const t = sigTrace.value
   if (!t) return false
-  return t.upstream_out.fc_unsigned > 0 || t.replay.conflicts > 0 || t.client_in.dropped > 0
+  // 风险口径是「首 FC 裸发的轮次」：每轮只有第一个 functionCall 需要签名，
+  // 兄弟 FC 不带签名是上游正常形态，用 fc_unsigned 会误报。
+  return bareLeadTurns.value > 0 || t.replay.conflicts > 0 || t.client_in.dropped > 0
 })
-let sequence = 0
+const latestLoad = useLatest()
 
 async function loadLogs() {
   const id = props.requestId
@@ -94,7 +105,7 @@ async function loadLogs() {
     logsTotal.value = response.total
     logsError.value = ''
   } catch (err) {
-    if (id === props.requestId) logsError.value = err instanceof Error ? err.message : '关联日志加载失败'
+    if (id === props.requestId) logsError.value = errorMessage(err, '关联日志加载失败')
   } finally {
     if (id === props.requestId) logsLoading.value = false
   }
@@ -103,45 +114,45 @@ async function loadLogs() {
 async function load() {
   const id = props.requestId
   if (!id) return
-  const current = ++sequence
+  const isLatest = latestLoad.begin()
   loading.value = true
   await Promise.allSettled([
     operationsApi
       .detail(id)
       .then((value) => {
-        if (current === sequence) {
+        if (isLatest()) {
           record.value = value
           error.value = ''
         }
       })
       .catch((err) => {
-        if (current === sequence) error.value = err instanceof Error ? err.message : '详情加载失败'
+        if (isLatest()) error.value = errorMessage(err, '详情加载失败')
       }),
     operationsApi
       .payload(id)
       .then((value) => {
-        if (current === sequence) {
+        if (isLatest()) {
           payload.value = value
           payloadError.value = ''
         }
       })
       .catch((err) => {
-        if (current === sequence) payloadError.value = err instanceof Error ? err.message : '正文加载失败'
+        if (isLatest()) payloadError.value = errorMessage(err, '正文加载失败')
       }),
     operationsApi
       .upstream(id)
       .then((value) => {
-        if (current === sequence) {
+        if (isLatest()) {
           upstream.value = value
           upstreamError.value = ''
         }
       })
       .catch((err) => {
-        if (current === sequence) upstreamError.value = err instanceof Error ? err.message : '上游快照加载失败'
+        if (isLatest()) upstreamError.value = errorMessage(err, '上游快照加载失败')
       }),
     loadLogs(),
   ])
-  if (current === sequence) loading.value = false
+  if (isLatest()) loading.value = false
 }
 
 watch(
@@ -149,7 +160,7 @@ watch(
   ([reqId, initTab], prev) => {
     const prevId = prev?.[0]
     if (reqId !== prevId) {
-      sequence++
+      latestLoad.invalidate()
       record.value = null
       payload.value = null
       upstream.value = null
@@ -203,7 +214,7 @@ async function downloadUpstream() {
     anchor.click()
     URL.revokeObjectURL(url)
   } catch (err) {
-    upstreamError.value = err instanceof Error ? err.message : '下载失败'
+    upstreamError.value = errorMessage(err, '下载失败')
   } finally {
     upstreamDownloading.value = false
   }
@@ -354,10 +365,11 @@ async function downloadUpstream() {
               收发 上行{{ sigTrace.upstream_out.real_sigs }} → 返回{{ sigTrace.upstream_in.total_sigs }} → 下发{{ sigTrace.client_out.total_sigs }}
             </span>
             <span
-              v-if="sigTrace.upstream_out.fc_unsigned > 0"
+              v-if="bareLeadTurns > 0"
               class="font-semibold text-rose-700"
+              title="首 FC 裸发的轮次数（兄弟 FC 不计）"
             >
-              未签FC ×{{ sigTrace.upstream_out.fc_unsigned }}
+              首FC裸发 ×{{ bareLeadTurns }}
             </span>
           </div>
           <button
@@ -726,15 +738,12 @@ async function downloadUpstream() {
         <div
           class="bg-slate-950 text-slate-200 p-4 rounded-lg max-h-96 overflow-auto font-mono text-xs whitespace-pre-wrap break-words"
         >
-          <p
-            v-for="(log, index) in logs"
-            :key="index"
-            class="py-2 border-b border-slate-800"
-          >
-            <span class="text-slate-500">{{ log.ts }}</span>
-            <span :class="log.level === 'ERROR' ? 'text-rose-400' : 'text-sky-400'">[{{ log.level }}]</span>
-            {{ log.message }}
-          </p>
+          <LogRow
+            v-for="(log, logIndex) in logs"
+            :key="logIndex"
+            :entry="log"
+            compact
+          />
           <p
             v-if="!logs.length"
             class="text-slate-400 py-8 text-center"

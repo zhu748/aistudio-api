@@ -94,12 +94,35 @@ def _sanitize_headers(
     return safe
 
 
+# 快照侧解析上限（字符数）：成功快照默认开启（upstream_snapshot_keep=10），
+# 长会话请求体随轮次涨到 MB 级后，json.loads 整树 + 后续 json.dumps 会在
+# 线程池里再放大 3～4 倍正文，与请求路径本身的拷贝叠加把 512MB 档容器
+# 的 RSS 顶过 OOM 阈值。超过上限只保留头部样本，不再整体解析。
+_MAX_BODY_PARSE_CHARS = 256 * 1024
+_BODY_HEAD_CHARS = 2000
+_BODY_COUNT_CHUNK = 64 * 1024
+
+
+def _utf8_len(text: str) -> int:
+    """按 UTF-8 计算字节数，分块编码避免整段 .encode() 再复制一份正文。"""
+    total = 0
+    for start in range(0, len(text), _BODY_COUNT_CHUNK):
+        total += len(text[start : start + _BODY_COUNT_CHUNK].encode("utf-8", "replace"))
+    return total
+
+
 def _sanitize_wire_body(body: str) -> Any:
     """解析 wire JSON 并截断各槽位中的 proof；非 JSON 原样截断返回。"""
+    if len(body) > _MAX_BODY_PARSE_CHARS:
+        return (
+            f"<wire body truncated len={len(body)} "
+            f"exceeds snapshot parse limit {_MAX_BODY_PARSE_CHARS}>"
+            f" head={body[:_BODY_HEAD_CHARS]!r}"
+        )
     try:
         arr = json.loads(body)
     except (ValueError, TypeError):
-        return body[:2000]
+        return body[:_BODY_HEAD_CHARS]
     if isinstance(arr, list):
         for i, slot in enumerate(arr):
             if isinstance(slot, str) and len(slot) > _PROOF_MIN_CHARS:
@@ -268,7 +291,7 @@ def save_upstream_exchange(
                 "method": "POST",
                 "headers": _sanitize_headers(wire_headers),
                 "wire_body": _sanitize_wire_body(body),
-                "body_bytes": len(body.encode("utf-8", "replace")),
+                "body_bytes": _utf8_len(body),
             },
             "proxy": (
                 proxy_url.split("@")[-1] if proxy_url and "@" in proxy_url else None

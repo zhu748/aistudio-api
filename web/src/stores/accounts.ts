@@ -12,6 +12,8 @@ import type {
   AccountPreset,
 } from '@/types'
 import { useToastStore } from './toast.ts'
+import { errorMessage } from '@/utils/errors.ts'
+import { useLatest } from '@/composables/useLatest.ts'
 
 export const useAccountsStore = defineStore('accounts', () => {
   const accounts = ref<Account[]>([])
@@ -93,12 +95,12 @@ export const useAccountsStore = defineStore('accounts', () => {
   })
 
   // 请求代次：轮询与操作后的 fetchAll 可能乱序返回，只让最新一次写状态。
-  let fetchSeq = 0
+  const fetchLatest = useLatest()
   // fetchAll 错误去重：同一错误文本只弹一次 toast，恢复后重新武装
   let lastFetchError = ''
 
   async function fetchAll() {
-    const seq = ++fetchSeq
+    const isLatest = fetchLatest.begin()
     loading.value = true
     try {
       const [accsRes, activeRes, rotationRes] = await Promise.allSettled([
@@ -106,7 +108,7 @@ export const useAccountsStore = defineStore('accounts', () => {
         accountsApi.getActive(),
         systemStore.fetchRotation(),
       ])
-      if (seq !== fetchSeq) return
+      if (!isLatest()) return
 
       if (accsRes.status === 'fulfilled') {
         accounts.value = accsRes.value
@@ -136,7 +138,7 @@ export const useAccountsStore = defineStore('accounts', () => {
         rotationRes.value
       )
     } finally {
-      if (seq === fetchSeq) loading.value = false
+      if (isLatest()) loading.value = false
     }
   }
 
@@ -156,242 +158,200 @@ export const useAccountsStore = defineStore('accounts', () => {
     }
   }
 
-  async function toggleAccountEnabled(id: string, enabled?: boolean) {
+  /**
+   * 账号操作的统一外壳（私有 helper，不导出给组件用）：成功/失败提示、
+   * 失败返回值（统一 null）与刷新都在这里收口；需要返回 boolean 的
+   * action 自己把 null 映射成 false，因此对外返回类型保持不变。
+   */
+  async function withAction<T>(
+    fn: () => Promise<T>,
+    opts: {
+      failure: string
+      /** 固定文案，或按结果动态生成（返回空串则不提示） */
+      success?: string | ((result: T) => string | void)
+      /** 成功后的刷新动作，默认只刷账号列表 */
+      refresh?: () => Promise<unknown>
+      /** activateAccount 失败时也要刷新，避免列表与激活态不一致 */
+      refreshOnError?: boolean
+    },
+  ): Promise<T | null> {
     const toast = useToastStore()
     try {
-      const updated = await accountsApi.toggle(id, enabled)
-      toast.success(`账号已${updated.enabled ? '启用' : '停用'}`)
-      await fetchAll()
-      return updated
+      const result = await fn()
+      if (typeof opts.success === 'function') {
+        const message = opts.success(result)
+        if (message) toast.success(message)
+      } else if (opts.success) {
+        toast.success(opts.success)
+      }
+      await (opts.refresh ?? fetchAll)()
+      return result
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '切换状态失败'
-      toast.error(msg)
+      toast.error(errorMessage(err, opts.failure))
+      if (opts.refreshOnError) await (opts.refresh ?? fetchAll)()
       return null
     }
+  }
+
+  async function toggleAccountEnabled(id: string, enabled?: boolean) {
+    return withAction(() => accountsApi.toggle(id, enabled), {
+      success: (updated) => `账号已${updated.enabled ? '启用' : '停用'}`,
+      failure: '切换状态失败',
+    })
   }
 
   async function updateAccountGroup(id: string, group: string) {
-    const toast = useToastStore()
-    try {
-      const updated = await accountsApi.updateGroup(id, group)
-      toast.success('分组已更新')
-      await fetchAll()
-      await fetchGroups()
-      return updated
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '更新分组失败'
-      toast.error(msg)
-      return null
-    }
+    return withAction(() => accountsApi.updateGroup(id, group), {
+      success: '分组已更新',
+      failure: '更新分组失败',
+      refresh: async () => {
+        await fetchAll()
+        await fetchGroups()
+      },
+    })
   }
 
   async function applyPreset(presetId: string) {
-    const toast = useToastStore()
     applyingPresetId.value = presetId
     try {
-      const res = await accountsApi.applyPreset(presetId)
-      toast.success(`已应用「${res.preset_name}」: 启用 ${res.enabled_count} 个`)
-      await fetchAll()
-      return true
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '应用方案失败'
-      toast.error(msg)
-      return false
+      const res = await withAction(() => accountsApi.applyPreset(presetId), {
+        success: (preset) => `已应用「${preset.preset_name}」: 启用 ${preset.enabled_count} 个`,
+        failure: '应用方案失败',
+      })
+      return res !== null
     } finally {
       applyingPresetId.value = null
     }
   }
 
   async function createSnapshotPreset(name: string, description = '') {
-    const toast = useToastStore()
-    try {
-      const created = await accountsApi.createSnapshotPreset({ name, description })
-      toast.success(`方案「${created.name}」已保存`)
-      await fetchPresets()
-      return created
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '保存方案失败'
-      toast.error(msg)
-      return null
-    }
+    return withAction(() => accountsApi.createSnapshotPreset({ name, description }), {
+      success: (created) => `方案「${created.name}」已保存`,
+      failure: '保存方案失败',
+      refresh: fetchPresets,
+    })
   }
 
   async function deletePreset(presetId: string) {
-    const toast = useToastStore()
-    try {
-      await accountsApi.deletePreset(presetId)
-      toast.success('方案已删除')
-      await fetchPresets()
-      return true
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '删除方案失败'
-      toast.error(msg)
-      return false
-    }
+    const res = await withAction(() => accountsApi.deletePreset(presetId), {
+      success: '方案已删除',
+      failure: '删除方案失败',
+      refresh: fetchPresets,
+    })
+    return res !== null
   }
 
   async function activateAccount(id: string) {
-    const toast = useToastStore()
     activatingId.value = id
     try {
-      const updated = await accountsApi.activate(id)
-      activeAccount.value = updated
-      toast.success(`已成功激活账号: ${updated.name || updated.email || updated.id}`)
-      await fetchAll()
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '激活失败'
-      toast.error(msg)
-      await fetchAll()
+      await withAction(() => accountsApi.activate(id), {
+        success: (updated) => {
+          // 激活成功后先就地更新激活账号，再交给 fetchAll 与后端对账
+          activeAccount.value = updated
+          return `已成功激活账号: ${updated.name || updated.email || updated.id}`
+        },
+        failure: '激活失败',
+        refreshOnError: true,
+      })
     } finally {
       activatingId.value = null
     }
   }
 
   async function deleteAccount(id: string) {
-    const toast = useToastStore()
-    try {
-      await accountsApi.delete(id)
-      toast.success('账号已删除')
-      await fetchAll()
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '删除失败'
-      toast.error(msg)
-    }
+    await withAction(() => accountsApi.delete(id), { success: '账号已删除', failure: '删除失败' })
   }
 
   async function deleteCookieGroup(cookieId: string) {
-    const toast = useToastStore()
-    try {
-      const res = await accountsApi.deleteCookieGroup(cookieId)
-      toast.success(`已成功删除该 Cookie 凭据下的全部 ${res.deleted} 个子账号`)
-      await fetchAll()
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '删除失败'
-      toast.error(msg)
-    }
+    await withAction(() => accountsApi.deleteCookieGroup(cookieId), {
+      success: (res) => `已成功删除该 Cookie 凭据下的全部 ${res.deleted} 个子账号`,
+      failure: '删除失败',
+    })
   }
 
   async function updateAccountName(id: string, name: string) {
-    const toast = useToastStore()
-    try {
-      await accountsApi.update(id, name)
-      toast.success('账号名称已更新')
-      await fetchAll()
-      return true
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '更新失败'
-      toast.error(msg)
-      return false
-    }
+    const res = await withAction(() => accountsApi.update(id, name), {
+      success: '账号名称已更新',
+      failure: '更新失败',
+    })
+    return res !== null
   }
 
   async function updateAccountProxy(id: string, proxyUrl: string | null) {
-    const toast = useToastStore()
-    try {
-      await accountsApi.updateProxy(id, proxyUrl)
-      toast.success(proxyUrl ? `账号代理已更新: ${proxyUrl}` : '已恢复使用全局代理')
-      await fetchAll()
-      return true
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '代理更新失败'
-      toast.error(msg)
-      return false
-    }
+    const res = await withAction(() => accountsApi.updateProxy(id, proxyUrl), {
+      success: proxyUrl ? `账号代理已更新: ${proxyUrl}` : '已恢复使用全局代理',
+      failure: '代理更新失败',
+    })
+    return res !== null
   }
 
   async function updateAccountNotes(id: string, notes: string) {
-    try {
-      await accountsApi.updateNotes(id, notes)
-      await fetchAll()
-      return true
-    } catch (err) {
-      useToastStore().error(err instanceof Error ? err.message : '备注更新失败')
-      return false
-    }
+    // 备注保存无成功提示（编辑框直接展示结果），与原实现一致
+    const res = await withAction(() => accountsApi.updateNotes(id, notes), {
+      failure: '备注更新失败',
+    })
+    return res !== null
   }
 
   async function importCookies(payload: ImportCookiesRequest) {
-    const toast = useToastStore()
     importing.value = true
     try {
-      const res = await accountsApi.importCookies(payload)
-      toast.success(`导入成功: 解析出 ${res.cookie_count} 个 Cookie (u/${res.auth_user})`)
-      await fetchAll()
-      return true
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '导入失败'
-      toast.error(msg)
-      return false
+      const res = await withAction(() => accountsApi.importCookies(payload), {
+        success: (result) => `导入成功: 解析出 ${result.cookie_count} 个 Cookie (u/${result.auth_user})`,
+        failure: '导入失败',
+      })
+      return res !== null
     } finally {
       importing.value = false
     }
   }
 
   async function probeAndImport(payload: ProbeAndImportRequest) {
-    const toast = useToastStore()
     importing.value = true
     try {
-      const res = await accountsApi.probeAndImport(payload)
-      toast.success(`已完成探测并导入 ${res.imported_count} 个账号`)
-      await fetchAll()
-      return true
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '自动探活导入失败'
-      toast.error(msg)
-      return false
+      const res = await withAction(() => accountsApi.probeAndImport(payload), {
+        success: (result) => `已完成探测并导入 ${result.imported_count} 个账号`,
+        failure: '自动探活导入失败',
+      })
+      return res !== null
     } finally {
       importing.value = false
     }
   }
 
   async function importBundle(payload: ImportBundleRequest) {
-    const toast = useToastStore()
     importing.value = true
     try {
-      const res = await accountsApi.importBundle(payload)
-      toast.success(`批量导入成功: 已入库 ${res.imported_count} 个账号`)
-      await fetchAll()
-      return true
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '批量导入失败'
-      toast.error(msg)
-      return false
+      const res = await withAction(() => accountsApi.importBundle(payload), {
+        success: (result) => `批量导入成功: 已入库 ${result.imported_count} 个账号`,
+        failure: '批量导入失败',
+      })
+      return res !== null
     } finally {
       importing.value = false
     }
   }
 
   async function detectAccountEmail(id: string) {
-    const toast = useToastStore()
-    try {
-      const res = await accountsApi.detectEmail(id)
-      const tierSuffix = res.tier ? ` · 等级: ${res.tier}` : ''
-      if (res.email) {
-        toast.success(`已成功识别账号邮箱: ${res.email}${tierSuffix}`)
-      } else {
-        toast.info(`未在当前页面识别到有效邮箱${tierSuffix}`)
-      }
-      await fetchAll()
-      return res
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '识别邮箱失败'
-      toast.error(msg)
-      return null
-    }
+    return withAction(() => accountsApi.detectEmail(id), {
+      // 未识别到邮箱时用 info 提示（不是 success），故在此自行分支
+      success: (res) => {
+        const tierSuffix = res.tier ? ` · 等级: ${res.tier}` : ''
+        if (res.email) {
+          useToastStore().success(`已成功识别账号邮箱: ${res.email}${tierSuffix}`)
+        } else {
+          useToastStore().info(`未在当前页面识别到有效邮箱${tierSuffix}`)
+        }
+      },
+      failure: '识别邮箱失败',
+    })
   }
 
   async function detectAccountTier(id: string) {
-    const toast = useToastStore()
-    try {
-      const res = await accountsApi.detectTier(id)
-      toast.success(`已更新账号订阅等级: ${res.tier || 'Free'}`)
-      await fetchAll()
-      return res
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '探测订阅等级失败'
-      toast.error(msg)
-      return null
-    }
+    return withAction(() => accountsApi.detectTier(id), {
+      success: (res) => `已更新账号订阅等级: ${res.tier || 'Free'}`,
+      failure: '探测订阅等级失败',
+    })
   }
 
   return {

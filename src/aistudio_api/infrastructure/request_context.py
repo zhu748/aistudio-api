@@ -7,7 +7,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 from aistudio_api.infrastructure.utils.redaction import redact_text
@@ -47,12 +47,10 @@ class RequestContext:
     thought_signature: dict[str, object] | None = None
 
 
-def record_requested_parameters(parameters: dict[str, object]) -> None:
-    """Keep generation settings only; never retain prompts, tools or credentials."""
-    context = current_request.get()
-    if context is None:
-        return
-    allowed = {
+# 每请求都会调 record_requested_parameters：两组白名单集合提到模块级，
+# 避免每次调用重建（原实现每次 new 两个 set）。
+_REQUESTED_PARAMETER_KEYS = frozenset(
+    {
         "temperature",
         "top_p",
         "topP",
@@ -71,7 +69,9 @@ def record_requested_parameters(parameters: dict[str, object]) -> None:
         # 顶层 output_config.effort，一并进请求详情便于排障。
         "output_config",
     }
-    thinking_keys = {
+)
+_THINKING_KEYS = frozenset(
+    {
         "type",
         "effort",
         "enabled",
@@ -88,6 +88,16 @@ def record_requested_parameters(parameters: dict[str, object]) -> None:
         "includeThoughts",
         "include_thoughts",
     }
+)
+
+
+def record_requested_parameters(parameters: dict[str, object]) -> None:
+    """Keep generation settings only; never retain prompts, tools or credentials."""
+    context = current_request.get()
+    if context is None:
+        return
+    allowed = _REQUESTED_PARAMETER_KEYS
+    thinking_keys = _THINKING_KEYS
 
     def scalar(value: object) -> object:
         return (
@@ -152,20 +162,43 @@ def active_requests() -> list[dict[str, object]]:
     return [request_snapshot(context, running=True) for context in contexts]
 
 
+def active_request_count() -> int:
+    """只取活跃请求数（面板统计用），避免为计数深拷贝每个上下文。"""
+    with _active_lock:
+        return len(_active)
+
+
+# 请求详情的快照字段：按字段名直接取，列表/字典做一层浅拷贝。
+# 原先用 dataclasses.asdict 递归深拷贝（100 事件/8 尝试/32 签名条目实测
+# 128.9 µs，逐字段复制 4.7 µs），每请求两次且都在事件循环上。
+_SNAPSHOT_FIELDS = tuple(
+    field_info.name
+    for field_info in fields(RequestContext)
+    if field_info.name != "started_monotonic"
+)
+_SNAPSHOT_SHALLOW = frozenset(
+    {"usage", "attempts", "events", "request_parameters", "effective_parameters"}
+)
+
+
 def request_snapshot(
     context: RequestContext, *, running: bool = False
 ) -> dict[str, object]:
-    return {
-        **{
-            key: value
-            for key, value in asdict(context).items()
-            if key != "started_monotonic"
-        },
-        "result": "running" if running else context.result,
-        "elapsed_ms": round(
-            (time.perf_counter() - context.started_monotonic) * 1000, 2
-        ),
-    }
+    snapshot: dict[str, object] = {}
+    for name in _SNAPSHOT_FIELDS:
+        value = getattr(context, name)
+        snapshot[name] = (
+            list(value)
+            if name in _SNAPSHOT_SHALLOW and isinstance(value, list)
+            else dict(value)
+            if isinstance(value, dict)
+            else value
+        )
+    snapshot["result"] = "running" if running else context.result
+    snapshot["elapsed_ms"] = round(
+        (time.perf_counter() - context.started_monotonic) * 1000, 2
+    )
+    return snapshot
 
 
 def request_event(stage: str, message: str) -> None:

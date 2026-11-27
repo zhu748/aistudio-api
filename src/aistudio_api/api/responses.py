@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-
 from aistudio_api.api.response_models import (
     GeminiFunctionCallPayload,
     GeminiFunctionResponsePayload,
@@ -69,11 +67,8 @@ def to_gemini_usage_metadata(
 
 
 def _image_inline_data(image: GeneratedImage) -> GeminiInlineDataResponse:
-    """图片 → inlineData 响应模型；优先复用上游原始 base64，免全量重编码。"""
-    data = image.raw_b64
-    if data is None:
-        data = base64.b64encode(image.data).decode("ascii")
-    return GeminiInlineDataResponse(mimeType=image.mime, data=data)
+    """图片 → inlineData 响应模型；直接复用上游原始 base64，免全量重编码。"""
+    return GeminiInlineDataResponse(mimeType=image.mime, data=image.raw_b64)
 
 
 def _tool_part_fields(value: dict[str, object], payload_key: str) -> dict[str, object]:

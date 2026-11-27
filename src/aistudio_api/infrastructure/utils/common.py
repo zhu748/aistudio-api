@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import contextlib
 import json
 import os
+import re
 import time
 from pathlib import Path
+
+# 代理 URI 里的 userinfo（``scheme://user:pass@host``）。日志与诊断展示
+# 一律走这里遮蔽；原先 proxy_bridge 与 gateway/transport 各写一份同样的
+# 正则，改一处漏一处就是凭据明文进日志。
+_PROXY_USERINFO = re.compile(r"//[^@/]+@")
+
+
+def mask_proxy_userinfo(uri: str) -> str:
+    """遮蔽代理 URI 中的账号密码（日志 / 诊断展示用）。"""
+    return _PROXY_USERINFO.sub("//***@", uri)
 
 
 def _atomic_write_text(target_path: Path, text: str, *, private: bool = False) -> None:
@@ -114,29 +123,6 @@ def extract_outer_json(raw: str) -> list[object]:
         except json.JSONDecodeError:
             continue
     return results
-
-
-def decode_base64_images(images: list[dict[str, object]]) -> list[dict[str, object]]:
-    decoded: list[dict[str, object]] = []
-    for img in images:
-        try:
-            raw = img["data"]
-            # str(bytes) produces "b'...'" which is NOT valid base64 payload;
-            # only encode genuine text to bytes, pass real bytes through unchanged.
-            data = base64.b64decode(
-                raw if isinstance(raw, bytes) else str(raw).encode("ascii"),
-                validate=False,
-            )
-        except (KeyError, TypeError, ValueError, binascii.Error):
-            continue
-        decoded.append(
-            {
-                "mime": str(img.get("mime", "image/jpeg")),
-                "bytes": data,
-                "size": len(data),
-            }
-        )
-    return decoded
 
 
 def mask_email(email: str | None) -> str:

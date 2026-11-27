@@ -257,7 +257,9 @@ def test_real_malloc_trim_safe_when_available() -> None:
     try:
         libc = ctypes.CDLL(None)
         libc.malloc_trim(0)
-    except (OSError, AttributeError):
+    except (OSError, AttributeError, TypeError):
+        # TypeError: 非 POSIX 平台（如 Windows）的 ctypes.CDLL(None) 直接抛
+        # TypeError，而不是 OSError/AttributeError。
         pytest.skip("本机 libc 无 malloc_trim（musl 等）")
 
 

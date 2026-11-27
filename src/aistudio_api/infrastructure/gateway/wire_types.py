@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
+import re
 from dataclasses import dataclass, field
 from enum import IntEnum
 
 from aistudio_api.domain.tool_signatures import SKIP_THOUGHT_SIGNATURE
 
 from .wire_spec import GenerationConfigIndex, JspbArray, PartIndex
+
+# 标准 Base64 字母表 + 至多两个尾部 padding；配合 len % 4 == 0 即等价于
+# b64decode(validate=True) 的合法性判定，但只做 O(n) 字符扫描、不产出字节。
+_STANDARD_B64_RE = re.compile(r"[A-Za-z0-9+/]*={0,2}")
 
 
 def _normalize_standard_base64(value: str, *, pad_standard: bool = False) -> str:
@@ -20,8 +24,15 @@ def _normalize_standard_base64(value: str, *, pad_standard: bool = False) -> str
     thought_signature 回放）会产出 URL-safe 或缺 padding 的 Base64；
     AI Studio JSPB wire 槽位只认标准字母表。归一化策略：< 16 字符的
     短值原样返回（文件名等非编码字段不误伤）；仅当确实含 URL-safe
-    字符时才换写回标准字母表并补齐 padding，再经 validate=True 全量
-    校验，非法值原样返回交由后续层拒绝。
+    字符时才换写回标准字母表并补齐 padding，再校验合法性，非法值原样
+    返回交由后续层拒绝。
+
+    改写后的校验用预编译正则做 O(n) 字符集匹配，不再对整串跑
+    ``b64decode(validate=True)``：签名可达数十 KB、inlineData 可达 MB
+    级，而这里只需要确认「标准字母表字符 + 至多两个尾部 padding + 长度
+    是 4 的倍数」，不需要真正解码。二者等价——validate=True 恰好只
+    拒绝这些形态（非字母表字符、padding 位置/数量非法、长度非 4 倍数），
+    故省掉一次全量解码不改变判定结果。
     """
     cleaned = "".join(value.split())
     if not cleaned or (not pad_standard and len(cleaned) < 16):
@@ -33,11 +44,9 @@ def _normalize_standard_base64(value: str, *, pad_standard: bool = False) -> str
     pad_len = (-len(standard)) % 4
     if pad_len:
         standard += "=" * pad_len
-    try:
-        base64.b64decode(standard, validate=True)
+    if len(standard) % 4 == 0 and _STANDARD_B64_RE.fullmatch(standard) is not None:
         return standard
-    except Exception:
-        return value
+    return value
 
 
 # Playground GenerateContent / CountTokens 接口接受的最长函数名字节数

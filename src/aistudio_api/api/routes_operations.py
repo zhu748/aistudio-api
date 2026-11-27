@@ -16,7 +16,10 @@ from pydantic import BaseModel
 from aistudio_api.api.state import runtime_state
 from aistudio_api.config import settings
 from aistudio_api.infrastructure.gateway.model_defaults import get_local_waa_server
-from aistudio_api.infrastructure.request_context import active_requests
+from aistudio_api.infrastructure.request_context import (
+    active_request_count,
+    active_requests,
+)
 from aistudio_api.infrastructure.request_history import request_history
 from aistudio_api.infrastructure.utils.log_files import read_log_history
 from aistudio_api.infrastructure.utils.logger import _mask_json_value, get_dump_dir
@@ -141,7 +144,7 @@ async def request_statistics(
     result.update(
         history_days=settings.history_days,
         history_enabled=settings.request_history,
-        active=len(active_requests()),
+        active=active_request_count(),
     )
     return result
 
