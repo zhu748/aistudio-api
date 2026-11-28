@@ -11,6 +11,11 @@ from aistudio_api.infrastructure.gateway.wire_parser import (
     parse_chunk_usage,
     parse_response_chunk,
 )
+from aistudio_api.infrastructure.gateway.wire_unicode import (
+    INCOMPLETE_SURROGATE_PAIR,
+    is_json_escape,
+    validate_json_surrogates,
+)
 
 XSSI_PREFIX = ")]}'"
 _MAX_JSON_CHUNK_BYTES = 64 * 1024 * 1024
@@ -22,12 +27,6 @@ _STRUCT_SCAN_RE = re.compile(r'["\[\]{}]')
 
 _TRAILING_JUNK = " \t\r\n,"
 _INCOMPLETE_UNICODE_RE = re.compile(r"\\u[0-9a-fA-F]{0,3}$")
-# A full high surrogate, then zero to five characters of a *possible* low
-# surrogate escape. A complete pair and a prefix outside DC00-DFFF don't match.
-_INCOMPLETE_PAIR_RE = re.compile(
-    r"\\u[dD][89aAbB][0-9a-fA-F]{2}"
-    r"(?:\\|\\u|\\u[dD]|\\u[dD][c-fC-F][0-9a-fA-F]?)?\Z"
-)
 
 _CONTROL_ESCAPES = {
     "\n": "\\n",
@@ -49,12 +48,7 @@ def _trim_unicode_suffix(text: str, suffix: re.Pattern[str]) -> str:
     match = suffix.search(text, max(0, len(text) - 11))
     if not match:
         return text
-    backslashes_before = 0
-    index = match.start() - 1
-    while index >= 0 and text[index] == "\\":
-        backslashes_before += 1
-        index -= 1
-    if backslashes_before % 2 == 1:
+    if not is_json_escape(text, match.start()):
         return text
     return text[: match.start()]
 
@@ -174,6 +168,7 @@ class IncrementalJSONStreamParser:
         # Scan each input fragment once; join only when a wire chunk closes.
         self._fragments: list[str] = []
         self._chunk_size = 0
+        self._chunk_has_escape = False
         self._preamble = ""
         self.depth: int = 0
         self._containers: list[str] = []
@@ -246,10 +241,12 @@ class IncrementalJSONStreamParser:
             if self.in_string:
                 if ch == '"':
                     self.in_string = False
-                elif pos < size:
-                    pos += 1
                 else:
-                    self.escape = True
+                    self._chunk_has_escape = True
+                    if pos < size:
+                        pos += 1
+                    else:
+                        self.escape = True
             elif ch == '"':
                 self.in_string = True
             elif ch == "[":
@@ -257,6 +254,7 @@ class IncrementalJSONStreamParser:
                 if self.depth == 3:
                     self.chunk_start = 0
                     start = index
+                    self._chunk_has_escape = False
             elif ch == "]":
                 self.depth -= 1
                 if self.depth < 0:
@@ -268,6 +266,10 @@ class IncrementalJSONStreamParser:
                     self._chunk_size = 0
                     self.chunk_start = None
                     start = None
+                    # The structural scanner already noticed any backslash.
+                    # Do not rescan common plain-text / base64 chunks.
+                    if self._chunk_has_escape:
+                        validate_json_surrogates(chunk)
                     # A structurally closed chunk is normally valid JSON, but
                     # a middlebox may inject bare control chars inside strings
                     # (still balanced). _close_json_fragment has the escaping
@@ -293,7 +295,7 @@ class IncrementalJSONStreamParser:
             if self.in_string:
                 # Check the physical EOF, before generic repair can trim another
                 # escape or close the string on a lone high surrogate.
-                fragment = _trim_unicode_suffix(fragment, _INCOMPLETE_PAIR_RE)
+                fragment = _trim_unicode_suffix(fragment, INCOMPLETE_SURROGATE_PAIR)
         self._fragments.clear()
         self._chunk_size = 0
         self._preamble = ""
@@ -305,6 +307,9 @@ class IncrementalJSONStreamParser:
 
         if not fragment.strip():
             return
+        # Generic repair can discard partial elements; check the actual wire
+        # after trimming only an ambiguous pair prefix at the physical EOF.
+        validate_json_surrogates(fragment)
         repaired = _repair_truncated_json(fragment)
         if not isinstance(repaired, list):
             return

@@ -409,9 +409,12 @@ class AIStudioClient:
             headers=effective_prep.headers,
             ctx=effective_prep.ctx,
         )
-        raw_text = raw.decode("utf-8", errors="replace")
         if status != 200:
-            raise classify_error(status, raw_text)
+            raise classify_error(status, raw.decode("utf-8", errors="replace"))
+        try:
+            raw_text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise TransportError("Invalid UTF-8 in upstream response") from exc
         if not raw_text.strip():
             raise TransportError("empty 200 body (connection truncated)")
         if is_login_redirect_payload(raw_text):

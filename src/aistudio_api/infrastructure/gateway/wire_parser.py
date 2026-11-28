@@ -19,6 +19,7 @@ from aistudio_api.infrastructure.gateway.wire_spec import (
     WIRE_FINISH_REASON_STOP,
     PartIndex,
 )
+from aistudio_api.infrastructure.gateway.wire_unicode import validate_json_surrogates
 from aistudio_api.infrastructure.utils.common import extract_outer_json
 
 _ROLE_NAMES = frozenset({"model", "user", "system", "assistant"})
@@ -611,6 +612,9 @@ def wire_size_estimate(value: object) -> int:
 
 
 def parse_text_output(raw: str) -> ModelOutput:
+    # Also cover a definitely unpaired escape in an otherwise truncated
+    # document, before the permissive multiline JSON fallback can discard it.
+    validate_json_surrogates(raw, allow_eof_pair=True)
     output = ModelOutput(raw_response=raw)
 
     parts = extract_outer_json(raw)

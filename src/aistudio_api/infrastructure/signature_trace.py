@@ -154,9 +154,10 @@ class ThoughtSignatureTrace:
 
     protocol: str = "gemini"
     attempt: int = 0
-    # Client inbound protocol source hints: (部件对象, 来源)。
-    # 持强引用避免 id() 复用导致来源归因错乱；入站部件数量受请求体约束。
-    _inbound_sources: list[tuple[object, str]] = field(default_factory=list, repr=False)
+    # Keep the owner alive for this request so its id cannot be reused.
+    _inbound_sources: dict[int, tuple[object, str]] = field(
+        default_factory=dict, repr=False
+    )
     # Stage 1: client_in
     client_model_turns: int = 0
     client_fc_total: int = 0
@@ -270,20 +271,14 @@ class ThoughtSignatureTrace:
         self._inbound_logged = False
 
     def tag_inbound_source(self, part_obj: object, source: str) -> None:
-        """记录某个入站部件的签名来源。
-
-        必须持强引用：旧实现只存 ``id(part_obj)``，标签对象在
-        ``record_client_part`` 之前被 GC 后，新分配的对象可能复用同一个
-        id，导致来源归因张冠李戴。改成 (对象, 来源) 列表后既保活又按
-        identity 精确匹配。
-        """
+        """Remember only the latest nonempty source for this exact part."""
         if source:
-            self._inbound_sources.append((part_obj, source))
+            self._inbound_sources[id(part_obj)] = (part_obj, source)
 
     def lookup_inbound_source(self, part_obj: object) -> str:
-        for tagged, source in reversed(self._inbound_sources):
-            if tagged is part_obj:
-                return source
+        tagged = self._inbound_sources.get(id(part_obj))
+        if tagged is not None and tagged[0] is part_obj:
+            return tagged[1]
         return (
             "client_native" if self.protocol == "gemini" else f"client_{self.protocol}"
         )

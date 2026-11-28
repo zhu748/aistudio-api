@@ -661,6 +661,7 @@ def _rewrite_model_tail_for_continuation(
 
 
 _ToolOwner = tuple[str | None, str]
+_UNSUPPORTED_FILE_DATA = "fileData is not supported yet"
 
 
 def _match_pending_calls(
@@ -748,6 +749,10 @@ def _convert_part(
     parts: list[AistudioPart] = []
     if part.functionResponse is not None:
         fr = part.functionResponse
+        # Result attachments are flattened below, even for orphaned results.
+        # A URI cannot be represented there; do not forward a partial result.
+        if fr.parts and any(child.fileData is not None for child in fr.parts):
+            raise ValueError(_UNSUPPORTED_FILE_DATA)
         resp_payload = fr.response if fr.response is not None else {}
         inline = part.inlineData
         result = AistudioPart(
@@ -818,7 +823,7 @@ def _convert_part(
                     )
         return parts
     if part.fileData is not None:
-        raise ValueError("fileData is not supported yet")
+        raise ValueError(_UNSUPPORTED_FILE_DATA)
 
     # Distinguish absent from empty text and keep the orthogonal wire fields
     # together. An opaque signature authenticates the whole Part, not the

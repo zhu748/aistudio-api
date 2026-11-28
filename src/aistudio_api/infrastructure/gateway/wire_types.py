@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import re
 from dataclasses import dataclass, field
@@ -47,6 +48,24 @@ def _normalize_standard_base64(value: str, *, pad_standard: bool = False) -> str
     if len(standard) % 4 == 0 and _STANDARD_B64_RE.fullmatch(standard) is not None:
         return standard
     return value
+
+
+def _normalize_inline_base64(value: str) -> str:
+    """The GenAI SDK serializes even a one-byte Blob with the URL-safe alphabet."""
+    if len(value) >= 16:
+        return _normalize_standard_base64(value)
+    if "-" not in value and "_" not in value:
+        return value
+    # Only extend the old short-value policy for actual byte encodings. A
+    # bounded round trip rejects mixed alphabets, bad padding and stray bits.
+    try:
+        data = base64.b64decode(value + "=" * (-len(value) % 4), b"-_", validate=True)
+    except ValueError:
+        return value
+    encoded = base64.urlsafe_b64encode(data).decode("ascii")
+    if value not in (encoded, encoded.rstrip("=")):
+        return value
+    return encoded.replace("-", "+").replace("_", "/")
 
 
 # Playground GenerateContent / CountTokens 接口接受的最长函数名字节数
@@ -400,7 +419,7 @@ class AistudioPart:
             mime, b64 = self.inline_data
             # 多模态载荷：OpenAI 兼容层可能透传 URL-safe / 无 padding 的
             # Base64（上游 wire 只认标准字母表），编码前统一归一。
-            inline_wire = JspbArray([mime, _normalize_standard_base64(b64)])
+            inline_wire = JspbArray([mime, _normalize_inline_base64(b64)])
             filename = _wire_inline_filename(self.inline_filename)
             if filename is not None:
                 # 槽位 5 = filename；2-4 由 JspbArray 自动补 null，
