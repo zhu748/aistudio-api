@@ -38,6 +38,7 @@ from aistudio_api.api.schemas import (
 from aistudio_api.api.schemas_compat import OpenAIResponsesRequest
 from aistudio_api.application.chat_service import _normalize_gemini_tool_config
 from aistudio_api.application.compat_openai import _openai_history_call
+from aistudio_api.application.compat_result_owners import index_call_name, result_part
 from aistudio_api.application.compat_service import (
     _as_dict,
     _as_int,
@@ -352,7 +353,7 @@ async def responses_to_gemini_request(
         logger.warning("parallel_tool_calls=false 无法在上游强制串行，已忽略该提示")
     contents: list[GeminiContent] = []
     system_texts: list[str] = [req.instructions] if req.instructions else []
-    tool_name_by_call_id: dict[str, str] = {}
+    tool_name_by_call_id: dict[str, str | None] = {}
 
     # Index call ownership first because a result may precede its call.
     replayable_call_ids: set[str] = set()
@@ -367,8 +368,7 @@ async def responses_to_gemini_request(
             unfinished_call_ids.add(call_id)
             continue
         replayable_call_ids.add(call_id)
-        if name := _as_str(item.get("name")):
-            tool_name_by_call_id[call_id] = name
+        index_call_name(tool_name_by_call_id, call_id, _as_str(item.get("name")))
     unfinished_call_ids.difference_update(replayable_call_ids)
 
     if req.input is None and not req.instructions:
@@ -409,7 +409,8 @@ async def responses_to_gemini_request(
                     continue
                 name = _as_str(item.get("name")) or "unknown"
                 call_id = _as_str(item.get("call_id"))
-                if call_id:
+                # Keep the legacy fallback for nameless calls, never clear a conflict.
+                if call_id and tool_name_by_call_id.get(call_id, name) is not None:
                     tool_name_by_call_id[call_id] = name
                 sig, sig_source = _read_signature_with_source(item)
                 fc_part = _openai_history_call(
@@ -430,19 +431,19 @@ async def responses_to_gemini_request(
                     or item.get("status") in _UNFINISHED_TOOL_ITEM_STATUSES
                 ):
                     continue
-                name = tool_name_by_call_id.get(call_id, "unknown")
                 payload, media = _tool_output_payload(item.get("output"))
                 contents.append(
                     GeminiContent(
                         role="user",
                         parts=[
-                            GeminiPart(
-                                functionResponse=GeminiFunctionResponse(
-                                    name=name,
+                            result_part(
+                                tool_name_by_call_id,
+                                GeminiFunctionResponse(
+                                    name="unknown",
                                     response=payload,
                                     id=call_id or None,
                                     parts=media or None,
-                                )
+                                ),
                             )
                         ],
                     )

@@ -86,6 +86,9 @@ class HeartbeatStreamingResponse(StreamingResponse):
                                         "more_body": True,
                                     }
                                 )
+                                # The next read can be idle indefinitely. Don't
+                                # retain either form of an already accepted frame.
+                                del chunk, body
                     finally:
                         group.cancel_scope.cancel()
             except BaseExceptionGroup as exc:
@@ -146,6 +149,9 @@ class _DeferredResponse(HeartbeatStreamingResponse):
                 if isinstance(response, StreamingResponse):
                     async for chunk in response.body_iterator:
                         yield chunk
+                        # The sender has resumed us; release our forwarding
+                        # reference before waiting for the next source item.
+                        del chunk
                 else:
                     yield response.body
             finally:

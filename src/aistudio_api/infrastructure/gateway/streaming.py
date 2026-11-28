@@ -114,7 +114,7 @@ class StreamingGateway:
             nonlocal latest_usage, latest_finish_reason
             nonlocal latest_response_id, emitted_any_chunk, tool_interrupted
             events: list[tuple[str, object | None]] = []
-            usage = parse_chunk_usage(parsed_chunk)
+            usage = parse_chunk_usage(parsed_chunk, previous=latest_usage)
             if usage:
                 latest_usage = usage
                 if on_usage is not None:

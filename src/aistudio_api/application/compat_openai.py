@@ -34,6 +34,7 @@ from aistudio_api.application.compat_errors import (
     _GEMINI_TO_OPENAI_FINISH,
     _OPENAI_ERROR_TYPE,
 )
+from aistudio_api.application.compat_result_owners import index_call_name, result_part
 from aistudio_api.application.compat_shared import (
     _as_dict,
     _as_int,
@@ -492,7 +493,7 @@ async def openai_to_gemini_request(
         logger.warning("parallel_tool_calls=false 无法在上游强制串行，已忽略该提示")
     contents: list[GeminiContent] = []
     system_texts: list[str] = []
-    tool_name_by_id: dict[str, str] = {}
+    tool_name_by_id: dict[str, str | None] = {}
 
     # 第一遍：先扫全部 assistant 消息建 tool_call_id → 函数名映射。
     # 与 Claude 侧一致的两遍扫描：容忍客户端把 tool 结果放在对应
@@ -505,8 +506,7 @@ async def openai_to_gemini_request(
             function = _as_dict(tool_call.get("function"))
             call_id = _as_str(tool_call.get("id"))
             name = _as_str(function.get("name"))
-            if call_id and name:
-                tool_name_by_id.setdefault(call_id, name)
+            index_call_name(tool_name_by_id, call_id, name)
 
     for message in req.messages:
         role = message.role.strip().lower()
@@ -618,7 +618,8 @@ async def openai_to_gemini_request(
                         trace,
                     )
                 )
-                if call_id:
+                # Keep the legacy fallback for nameless calls, never clear a conflict.
+                if call_id and tool_name_by_id.get(call_id, name) is not None:
                     tool_name_by_id[call_id] = name
             contents.append(
                 GeminiContent(role="model", parts=parts or [GeminiPart(text="")])
@@ -627,20 +628,18 @@ async def openai_to_gemini_request(
         if role in ("tool", "function"):
             # 旧版 "function" 角色（LangChain 等客户端）与 "tool" 同义：
             # 函数名优先取 tool_call_id 反查，其次 message.name 字段
-            name = tool_name_by_id.get(
-                message.tool_call_id or "", message.name or "unknown"
-            )
             payload = _openai_tool_content_to_response(message.content)
             contents.append(
                 GeminiContent(
                     role="user",
                     parts=[
-                        GeminiPart(
-                            functionResponse=GeminiFunctionResponse(
-                                name=name,
+                        result_part(
+                            tool_name_by_id,
+                            GeminiFunctionResponse(
+                                name=message.name or "unknown",
                                 response=payload,
                                 id=message.tool_call_id,
-                            )
+                            ),
                         )
                     ],
                 )

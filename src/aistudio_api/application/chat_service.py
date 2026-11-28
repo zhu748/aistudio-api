@@ -693,6 +693,10 @@ def _match_pending_calls(
             owner = call_by_id[fr.id]
             owners[index] = pending[owner]
             consumed.add(owner)
+        elif fr._compat_owner.exact_id_only:
+            # This ID denotes different names in the replayed history. Its
+            # display label cannot establish a name-based or positional owner.
+            continue
         elif fr.name:
             named[fr.name].append((index, fr))
         else:
@@ -960,7 +964,9 @@ def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioConte
             owners = {
                 i: (fr.id or None, fr.name)
                 for i, part in enumerate(incoming)
-                if (fr := part.functionResponse) is not None and fr.name
+                if (fr := part.functionResponse) is not None
+                and fr.name
+                and not fr._compat_owner.exact_id_only
             }
         else:
             owners = _match_pending_calls(incoming, pending) if has_results else {}

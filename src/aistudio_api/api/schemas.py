@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Annotated
 
 from pydantic import (
@@ -60,6 +61,13 @@ def _function_result_part_filename(part: object) -> object:
     return part
 
 
+@dataclass(slots=True)
+class _ResultOwnerHint:
+    # A replay policy, not result data. Pydantic includes private attributes in
+    # model equality; keep the policy out of payload comparisons as well as JSON.
+    exact_id_only: bool = field(default=False, compare=False)
+
+
 class GeminiFunctionResponse(BaseModel):
     name: str = ""
     response: dict[str, object] | list[object] | object | None = Field(
@@ -71,6 +79,7 @@ class GeminiFunctionResponse(BaseModel):
         list[Annotated[GeminiPart, BeforeValidator(_function_result_part_filename)]]
         | None
     ) = None
+    _compat_owner: _ResultOwnerHint = PrivateAttr(default_factory=_ResultOwnerHint)
 
 
 class GeminiExecutableCode(BaseModel):

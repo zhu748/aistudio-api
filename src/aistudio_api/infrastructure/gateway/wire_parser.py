@@ -394,7 +394,10 @@ def _decode_wire_value(value: object, depth: int = 0) -> object:
     return [_decode_wire_value(item, depth + 1) for item in value]
 
 
-def parse_usage_metadata(raw_usage: object) -> dict[str, object]:
+def parse_usage_metadata(
+    raw_usage: object, *, previous: dict[str, object] | None = None
+) -> dict[str, object]:
+    """Read one snapshot using the last parsed meter from this attempt, if any."""
     if not isinstance(raw_usage, list):
         return {}
     prompt_tokens = _coerce_int(
@@ -428,19 +431,26 @@ def parse_usage_metadata(raw_usage: object) -> dict[str, object]:
     elif completion_tokens is None:
         completion_tokens = reasoning_tokens
     if (
-        total_tokens is None
-        and isinstance(prompt_tokens, int)
-        and isinstance(completion_tokens, int)
-    ):
-        total_tokens = prompt_tokens + completion_tokens
-    if (
         prompt_tokens is None
-        and visible_completion_tokens is None
+        and completion_tokens is None
         and total_tokens is None
         and cached_tokens is None
-        and reasoning_tokens is None
     ):
         return {}
+    # Sparse rows may report only output. Reuse the latest prompt and its
+    # own optional cache count as a pair; a cache-only revision cannot be
+    # attributed to that prompt. An explicit prompt (even zero) stands alone.
+    if prompt_tokens is None and previous:
+        prior_prompt = previous.get("prompt_tokens")
+        if isinstance(prior_prompt, int) and prior_prompt >= 0:
+            prompt_tokens = prior_prompt
+            cached_tokens = _coerce_int(previous.get("cached_tokens"))
+    if (
+        total_tokens is None
+        and prompt_tokens is not None
+        and completion_tokens is not None
+    ):
+        total_tokens = prompt_tokens + completion_tokens
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -458,11 +468,14 @@ def parse_usage_metadata(raw_usage: object) -> dict[str, object]:
     }
 
 
-def parse_chunk_usage(chunk: object) -> dict[str, object]:
+def parse_chunk_usage(
+    chunk: object, *, previous: dict[str, object] | None = None
+) -> dict[str, object]:
     if not isinstance(chunk, list):
         return {}
     return parse_usage_metadata(
-        chunk[WIRE_CHUNK_USAGE_INDEX] if len(chunk) > WIRE_CHUNK_USAGE_INDEX else None
+        chunk[WIRE_CHUNK_USAGE_INDEX] if len(chunk) > WIRE_CHUNK_USAGE_INDEX else None,
+        previous=previous,
     )
 
 
@@ -606,8 +619,7 @@ def parse_text_output(raw: str) -> ModelOutput:
 
     # 多文档容错：extract_outer_json 在单体 JSON 解析失败时退化为逐行
     # 解析；若上游/中间层按换行分隔下发多个 JSON 文档，逐个提取 chunk
-    # 合并（usage/response_id 以后到者为准），不再只取首个文档而静默
-    # 丢弃其余内容。单文档路径行为不变。
+    # 合并，不再只取首个文档而静默丢弃其余内容。单文档路径行为不变。
     chunks: list[list[object]] = []
     for outer in parts:
         chunks.extend(_iter_response_chunks(outer))
@@ -622,7 +634,7 @@ def parse_text_output(raw: str) -> ModelOutput:
     retain_parts = True
     replay_bytes = 0
     for chunk_index, chunk in enumerate(chunks):
-        usage = parse_chunk_usage(chunk)
+        usage = parse_chunk_usage(chunk, previous=output.usage)
         if usage:
             output.usage = usage
         if len(chunk) > WIRE_RESPONSE_ID_INDEX:

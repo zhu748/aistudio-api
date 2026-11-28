@@ -33,6 +33,7 @@ from aistudio_api.application.compat_errors import (
     _claude_signature,
     _read_claude_signature,
 )
+from aistudio_api.application.compat_result_owners import index_call_name, result_part
 from aistudio_api.application.compat_shared import (
     _as_dict,
     _as_int,
@@ -88,7 +89,7 @@ def _claude_document_text(source: dict[str, object]) -> str | None:
 async def _claude_blocks_to_parts(
     content: object,
     *,
-    tool_name_by_id: dict[str, str],
+    tool_name_by_id: dict[str, str | None],
     allow_text_documents: bool = False,
 ) -> list[GeminiPart]:
     """Claude content（str 或块数组）→ Gemini parts。
@@ -209,7 +210,6 @@ async def _claude_blocks_to_parts(
             parts.append(fc_part)
         elif block_type == "tool_result":
             tool_use_id = _as_str(block.get("tool_use_id"))
-            name = tool_name_by_id.get(tool_use_id, "unknown")
             payload: dict[str, object] = {}
             extra_parts: list[GeminiPart] = []
             result_content = block.get("content")
@@ -239,10 +239,11 @@ async def _claude_blocks_to_parts(
             if block.get("is_error") is True:
                 payload["is_error"] = True
             parts.append(
-                GeminiPart(
-                    functionResponse=GeminiFunctionResponse(
-                        name=name, response=payload, id=tool_use_id or None
-                    )
+                result_part(
+                    tool_name_by_id,
+                    GeminiFunctionResponse(
+                        name="unknown", response=payload, id=tool_use_id or None
+                    ),
                 )
             )
             parts.extend(extra_parts)
@@ -415,7 +416,7 @@ async def claude_to_gemini_request(
     set_trace_protocol("claude")
     resolved_model = resolve_compat_model(req.model, channel="claude")
     contents: list[GeminiContent] = []
-    tool_name_by_id: dict[str, str] = {}
+    tool_name_by_id: dict[str, str | None] = {}
 
     # 第一遍：登记 assistant tool_use 的 id → name 映射（tool_result 反查用）
     for message in req.messages:
@@ -425,8 +426,7 @@ async def claude_to_gemini_request(
             if isinstance(block, dict) and block.get("type") == "tool_use":
                 call_id = _as_str(block.get("id"))
                 name = _as_str(block.get("name"))
-                if call_id and name:
-                    tool_name_by_id[call_id] = name
+                index_call_name(tool_name_by_id, call_id, name)
 
     for message in req.messages:
         message_role = message.role.strip().lower()
