@@ -407,14 +407,10 @@ async def responses_to_gemini_request(
             elif item_type == "function_call":
                 if item.get("status") in _UNFINISHED_TOOL_ITEM_STATUSES:
                     continue
-                name = _as_str(item.get("name")) or "unknown"
                 call_id = _as_str(item.get("call_id"))
-                # Keep the legacy fallback for nameless calls, never clear a conflict.
-                if call_id and tool_name_by_call_id.get(call_id, name) is not None:
-                    tool_name_by_call_id[call_id] = name
                 sig, sig_source = _read_signature_with_source(item)
                 fc_part = _openai_history_call(
-                    name,
+                    item.get("name"),
                     item.get("arguments"),
                     call_id,
                     sig,

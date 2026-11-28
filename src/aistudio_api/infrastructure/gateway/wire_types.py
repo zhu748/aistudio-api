@@ -386,6 +386,9 @@ class AistudioPart:
     _compat_args_rewritten: bool = field(
         default=False, repr=False, compare=False, kw_only=True
     )
+    _compat_name_rewritten: bool = field(
+        default=False, repr=False, compare=False, kw_only=True
+    )
 
     def to_wire(self) -> list[object]:
         if self.raw_wire is not None:

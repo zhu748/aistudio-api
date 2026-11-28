@@ -30,7 +30,7 @@ from typing import cast
 import httpx
 
 from aistudio_api.api.response_models import GeminiGenerateContentResponse
-from aistudio_api.api.schemas import GeminiInlineData, GeminiPart
+from aistudio_api.api.schemas import GeminiFunctionCall, GeminiInlineData, GeminiPart
 from aistudio_api.application.anti_truncation import _close_stream_quietly
 from aistudio_api.application.media_session import (
     current_media,
@@ -47,6 +47,7 @@ from aistudio_api.domain.tool_signatures import (
     valid_thought_signature,
 )
 from aistudio_api.infrastructure.gateway.model_defaults import get_compat_settings
+from aistudio_api.infrastructure.signature_trace import ThoughtSignatureTrace
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("compat.shared")
@@ -111,6 +112,46 @@ def _as_dict(value: object) -> dict[str, object]:
 
 def _as_str(value: object) -> str:
     return value if isinstance(value, str) else ""
+
+
+def _history_call_part(
+    raw_name: object,
+    args: object,
+    call_id: str,
+    signature: str | None,
+    source: str,
+    trace: ThoughtSignatureTrace | None,
+    *,
+    args_rewritten: bool,
+) -> GeminiPart:
+    """A compatibility display fallback is not the original call's state owner."""
+    name = _as_str(raw_name)
+    call = GeminiFunctionCall(name=name or "unknown", args=args, id=call_id or None)
+    if args_rewritten:
+        call._compat_args_rewritten = True
+    if not name:
+        call._compat_name_rewritten = True
+    if (
+        (args_rewritten or not name)
+        and signature
+        and signature != SKIP_THOUGHT_SIGNATURE
+    ):
+        if trace is not None:
+            trace.record_client_drop(
+                carrier="function_call",
+                raw_signature=signature,
+                source=source,
+                call_id=call_id,
+                call_name=call.name,
+                note="rewritten_call_arguments"
+                if args_rewritten
+                else "rewritten_call_name",
+            )
+        signature = None
+    part = GeminiPart(functionCall=call, thoughtSignature=signature)
+    if trace is not None and signature and source:
+        trace.tag_inbound_source(part, source)
+    return part
 
 
 # 远程媒体（http/https 下载）的分批并发上限：与媒体会话 semaphore 共同约束

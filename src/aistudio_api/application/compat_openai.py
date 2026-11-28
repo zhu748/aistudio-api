@@ -21,7 +21,6 @@ from collections.abc import AsyncGenerator, AsyncIterable, Callable
 from aistudio_api.api.response_models import GeminiGenerateContentResponse
 from aistudio_api.api.schemas import (
     GeminiContent,
-    GeminiFunctionCall,
     GeminiFunctionResponse,
     GeminiGenerateContentRequest,
     GeminiGenerationConfig,
@@ -46,6 +45,7 @@ from aistudio_api.application.compat_shared import (
     _file_block_to_part,
     _frame_candidate,
     _frame_parts,
+    _history_call_part,
     _is_signed_empty_thought,
     _iter_gemini_sse_frames,
     _iter_response_parts,
@@ -65,6 +65,7 @@ from aistudio_api.application.stream_utils import (
 from aistudio_api.domain.tool_signatures import (
     SKIP_THOUGHT_SIGNATURE,
     remember_function_signature as _remember_function_signature,
+    tool_history_text,
     valid_thought_signature,
 )
 from aistudio_api.infrastructure.request_context import record_result
@@ -98,7 +99,7 @@ def _openai_content_text(content: object) -> str:
 
 
 def _openai_history_call(
-    name: str,
+    raw_name: object,
     raw: object,
     call_id: str,
     signature: str | None,
@@ -120,23 +121,9 @@ def _openai_history_call(
     exact = isinstance(parsed, dict) or (not responses and isinstance(parsed, list))
     if not exact:
         parsed = {"raw_arguments": raw} if responses and malformed_json else {}
-        if signature and signature != SKIP_THOUGHT_SIGNATURE:
-            if trace is not None:
-                trace.record_client_drop(
-                    carrier="function_call",
-                    raw_signature=signature,
-                    source=source,
-                    call_id=call_id,
-                    call_name=name,
-                    note="rewritten_call_arguments",
-                )
-            signature = None
-    call = GeminiFunctionCall(name=name, args=parsed, id=call_id or None)
-    call._compat_args_rewritten = not exact
-    part = GeminiPart(functionCall=call, thoughtSignature=signature)
-    if trace is not None and signature and source:
-        trace.tag_inbound_source(part, source)
-    return part
+    return _history_call_part(
+        raw_name, parsed, call_id, signature, source, trace, args_rewritten=not exact
+    )
 
 
 async def _openai_parts_from_content(content: object) -> list[GeminiPart]:
@@ -600,9 +587,21 @@ async def openai_to_gemini_request(
                             logger.debug("assistant 历史图片块转换失败，已跳过: %s", e)
                             continue
                         parts.append(media_part)
+            # Old Chat calls have no call ID. Preserve their original argument
+            # string as prose, never as a native call or a carrier of metadata.
+            if not message.tool_calls and isinstance(message.function_call, dict):
+                legacy_name = _as_str(message.function_call.get("name"))
+                arguments = message.function_call.get("arguments")
+                if legacy_name.strip() and isinstance(arguments, str):
+                    parts.append(
+                        GeminiPart(
+                            text=tool_history_text(
+                                "tool_call", legacy_name, None, arguments
+                            )
+                        )
+                    )
             for tool_call in message.tool_calls or []:
                 function = _as_dict(tool_call.get("function"))
-                name = _as_str(function.get("name")) or "unknown"
                 call_id = _as_str(tool_call.get("id"))
                 tc_sig, tc_source = _read_signature_with_source(tool_call)
                 if not tc_sig and call_id and call_id in detail_tool_sigs:
@@ -610,7 +609,7 @@ async def openai_to_gemini_request(
                     tc_source = "client_reasoning_details"
                 parts.append(
                     _openai_history_call(
-                        name,
+                        function.get("name"),
                         function.get("arguments"),
                         call_id,
                         tc_sig,
@@ -618,9 +617,9 @@ async def openai_to_gemini_request(
                         trace,
                     )
                 )
-                # Keep the legacy fallback for nameless calls, never clear a conflict.
-                if call_id and tool_name_by_id.get(call_id, name) is not None:
-                    tool_name_by_id[call_id] = name
+                # A display fallback cannot replace an indexed name or conflict.
+                if call_id:
+                    tool_name_by_id.setdefault(call_id, "unknown")
             contents.append(
                 GeminiContent(role="model", parts=parts or [GeminiPart(text="")])
             )

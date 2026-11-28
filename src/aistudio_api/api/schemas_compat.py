@@ -19,6 +19,9 @@ class OpenAIChatMessage(BaseModel):
     content: str | list[dict[str, object]] | None = None
     name: str | None = None
     tool_calls: list[dict[str, object]] | None = None
+    # Inspect the deprecated assistant history field without rejecting malformed
+    # values that were previously ignored. This is not a generation option.
+    function_call: object | None = None
     tool_call_id: str | None = None
     # —— 思考历史回传（2026-11-25 thought_signature 全面优化）——
     # DeepSeek 风格 ``reasoning_content`` / OpenRouter ``reasoning``（字符串

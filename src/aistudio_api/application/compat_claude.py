@@ -18,7 +18,6 @@ from collections.abc import AsyncGenerator, AsyncIterable, Callable
 from aistudio_api.api.response_models import GeminiGenerateContentResponse
 from aistudio_api.api.schemas import (
     GeminiContent,
-    GeminiFunctionCall,
     GeminiFunctionResponse,
     GeminiGenerateContentRequest,
     GeminiGenerationConfig,
@@ -44,6 +43,7 @@ from aistudio_api.application.compat_shared import (
     _dropped_part_reason,
     _frame_candidate,
     _frame_parts,
+    _history_call_part,
     _is_signed_empty_thought,
     _iter_gemini_sse_frames,
     _iter_response_parts,
@@ -61,7 +61,6 @@ from aistudio_api.application.stream_utils import (
     part_payload_signature,
 )
 from aistudio_api.domain.tool_signatures import (
-    SKIP_THOUGHT_SIGNATURE,
     remember_function_signature as _remember_function_signature,
 )
 from aistudio_api.infrastructure.request_context import record_result
@@ -178,33 +177,20 @@ async def _claude_blocks_to_parts(
                     _as_str(source.get("file_id")) or "(空)",
                 )
         elif block_type == "tool_use":
-            name = _as_str(block.get("name")) or "unknown"
             call_id = _as_str(block.get("id"))
             tool_input = block.get("input")
             sig, sig_source = _read_signature_with_source(block)
-            call = GeminiFunctionCall(
-                name=name,
-                args=tool_input if tool_input is not None else {},
-                id=call_id or None,
+            parts.append(
+                _history_call_part(
+                    block.get("name"),
+                    tool_input if tool_input is not None else {},
+                    call_id,
+                    sig,
+                    sig_source,
+                    trace,
+                    args_rewritten=tool_input is None,
+                )
             )
-            if tool_input is None:
-                # The compatibility fallback is not an echo of a model-owned {}.
-                call._compat_args_rewritten = True
-                if sig and sig != SKIP_THOUGHT_SIGNATURE:
-                    if trace is not None:
-                        trace.record_client_drop(
-                            carrier="function_call",
-                            raw_signature=sig,
-                            source=sig_source,
-                            call_id=call_id,
-                            call_name=name,
-                            note="rewritten_call_arguments",
-                        )
-                    sig = None
-            fc_part = GeminiPart(functionCall=call, thoughtSignature=sig)
-            if trace is not None and sig and sig_source:
-                trace.tag_inbound_source(fc_part, sig_source)
-            parts.append(fc_part)
         elif block_type == "tool_result":
             tool_use_id = _as_str(block.get("tool_use_id"))
             payload: dict[str, object] = {}

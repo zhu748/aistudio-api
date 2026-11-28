@@ -653,16 +653,28 @@ class ModelTurnHistory:
             if model:
                 model_turn_index += 1
                 token = None
-                if any(part._compat_args_rewritten for part in parts):
-                    # A fallback {} (or raw_arguments wrapper) can equal a
-                    # genuine observed call. Neither a whole-turn capture nor
-                    # a cold cohort proves this occurrence or its descendants.
+                rewritten = next(
+                    (
+                        p
+                        for p in parts
+                        if p._compat_args_rewritten or p._compat_name_rewritten
+                    ),
+                    None,
+                )
+                if rewritten is not None:
+                    # Fallback names and arguments can equal genuine observed
+                    # values. Neither a whole-turn capture nor a cold cohort
+                    # proves this occurrence or its descendants.
                     # Keep this request's original sibling owners untouched.
                     if trace is not None:
                         trace.record_replay_turn(
                             turn_index=model_turn_index,
                             action="conflict",
-                            reason="rewritten_call_arguments",
+                            reason=(
+                                "rewritten_call_arguments"
+                                if rewritten._compat_args_rewritten
+                                else "rewritten_call_name"
+                            ),
                             fc_count=owners.count if owners is not None else 0,
                         )
                     restored.extend(contents[start:end])

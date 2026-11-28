@@ -240,6 +240,9 @@ class StreamingGateway:
                         for parsed_chunk in parser.feed(text_payload):
                             for event in emit_parsed_chunk(parsed_chunk):
                                 yield event
+                    # The parser and error collector own any text still needed.
+                    # Don't pin the decoded fragment during the next network read.
+                    del text_payload
         except ValueError as exc:
             raise TransportError(f"Invalid upstream stream: {exc}") from exc
         finally:
