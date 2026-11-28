@@ -386,8 +386,9 @@ Web 面板在「导入账号」「编辑账号」与「全局代理」处提供*
 | `AISTUDIO_TIMEZONE` | string | 自动探测 | Wire 协议交互时区（默认 `America/Los_Angeles`） |
 | `AISTUDIO_ANTI_TRUNCATION` | bool | `false` | 强制覆盖 `config.yaml` 中 `anti_truncation.enabled` 全局开关（1=开启，0=关闭，留空跟随配置文件） |
 | `AISTUDIO_DUMP_REQUESTS` | bool | `false` | 是否在终端转储每次 API 交互报文详情（支持 `DEBUG=1` 触发） |
-| `AISTUDIO_DUMP_FILE` | bool | `false` | 是否将请求与响应报文详情落盘保存 |
-| `AISTUDIO_DUMP_DIR` | string | `data/dumps/` | 报文转储保存目录 |
+| `AISTUDIO_DUMP_FILE` | bool | `false` | 是否将客户端请求与响应报文落盘；不控制上游快照 |
+| `AISTUDIO_DUMP_DIR` | string | `data/dumps/` | 客户端报文转储和上游快照的保存目录 |
+| `AISTUDIO_UPSTREAM_SNAPSHOT_KEEP` | int | `10` | 上游模型调用成功时的快照保留条数（0–1000）。设置此值会覆盖 `config.yaml` 中的 `logging.upstream_snapshot_keep`；留空沿用该配置 |
 | `AISTUDIO_REQUEST_HISTORY` | bool | `true` | 是否持久化请求元数据（不保存正文） |
 | `AISTUDIO_HISTORY_DAYS` / `AISTUDIO_HISTORY_MAX_ROWS` | int | `14` / `100000` | 请求历史保留天数和最大记录数 |
 | `AISTUDIO_MAX_REQUEST_BYTES` | int | `33554432` | 单个模型请求正文上限（字节） |
@@ -411,6 +412,10 @@ Web 面板在「导入账号」「编辑账号」与「全局代理」处提供*
 | `AISTUDIO_WAA_PROOF_CACHE_TTL` | float | `300` | WAA proof 复用缓存的 TTL（秒） |
 | `AISTUDIO_ACCEPT_LANGUAGE` | string | 浏览器指纹 | 上游请求的 Accept-Language 覆盖（默认按指纹配置） |
 | `AISTUDIO_SIGNER_TIMEOUT` | float | `95` | 签名器 mint 请求的 HTTP 总超时（秒）；默认对齐 Go 侧 90s 冷启动预算 |
+
+如不需要新的上游成功快照，请在接收请求前设置 `AISTUDIO_UPSTREAM_SNAPSHOT_KEEP=0`。上游错误仍可能留档。
+
+在线修改配置、清理快照或切换目录都不会取消已开始的写入。要清理已有快照，请先暂停接收请求并等待采集结束，再清理并通过 `GET /api/requests/upstream-snapshots` 核对当前目录的库存。切换目录不会清理原目录，需单独核对。
 
 #### 本地 WAA 签名器（waa-signer）环境变量
 

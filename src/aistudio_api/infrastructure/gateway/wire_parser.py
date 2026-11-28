@@ -88,33 +88,91 @@ WIRE_CANDIDATE_FINISH_MESSAGE = 3  # Field 4 finish message string
 WIRE_CANDIDATE_SAFETY_RATINGS = 4  # Field 5 safety ratings array
 
 
-def _looks_like_response_chunk(value: object) -> bool:
-    return isinstance(value, list) and len(value) > 0 and isinstance(value[0], list)
+def _chunk_response_id(row: list[object]) -> str:
+    if len(row) > WIRE_RESPONSE_ID_INDEX:
+        rid = row[WIRE_RESPONSE_ID_INDEX]
+        if isinstance(rid, str):
+            return rid
+    return ""
+
+
+def _has_candidate_envelope(row: list[object]) -> bool:
+    # A candidate-only row can itself look like a singleton batch. The
+    # canonical [parts, role] fixes the level without traversing any Parts.
+    if not row or not isinstance(container := row[0], list):
+        return False
+    if not container:
+        return True
+    if not isinstance(candidate := container[0], list) or not candidate:
+        return False
+    content = candidate[WIRE_CANDIDATE_CONTENT]
+    if isinstance(content, list) and content and isinstance(parts := content[0], list):
+        if len(content) > 1 and isinstance(content[1], str):
+            return True
+        if len(content) == 1:
+            return not parts or (
+                isinstance(part := parts[0], list)
+                and bool(part)
+                and not isinstance(part[0], list)
+            )
+    # A finish-only Candidate can pad its finish message / safety slots.
+    # Do not confuse a chunk's unrelated slot 1 with that finish when it has
+    # a usage array or a response ID of its own.
+    return (
+        content is None
+        and 2 <= len(candidate) <= WIRE_CANDIDATE_SAFETY_RATINGS + 1
+        and type(candidate[WIRE_CANDIDATE_FINISH_REASON]) is int
+        and (len(candidate) == 2 or candidate[WIRE_CHUNK_USAGE_INDEX] is None)
+    )
+
+
+def _usable_chunk(row: list[object]) -> bool:
+    return bool(
+        row
+        and (
+            isinstance(row[0], list)
+            or (row[0] is None and (_chunk_response_id(row) or parse_chunk_usage(row)))
+        )
+    )
 
 
 def _iter_response_chunks(outer: object) -> list[list[object]]:
-    if isinstance(outer, list) and outer:
-        if len(outer) == 1 and isinstance(outer[0], list):
-            inner = outer[0]
-            nested_chunks = [
-                item
-                for item in inner
-                if _looks_like_response_chunk(item) and isinstance(item, list)
-            ]
-            if nested_chunks:
-                return nested_chunks
-        top_level_chunks = [
-            item
-            for item in outer
-            if _looks_like_response_chunk(item) and isinstance(item, list)
-        ]
-        if len(top_level_chunks) > 1:
-            return top_level_chunks
+    if not isinstance(outer, list) or not outer:
+        return []
 
-    if _looks_like_response_chunk(outer) and isinstance(outer, list):
-        return [outer]
+    # Direct row, [row, ...], or [[row, ...]]. A null candidate slot fixes
+    # the row boundary even when its meter is unusable: never search a usage
+    # detail / other positional field for a better-looking nested row.
+    for _depth in range(2):
+        first = outer[0]
+        if first is None:
+            return [outer] if _usable_chunk(outer) else []
+        if _has_candidate_envelope(outer):
+            return [outer]
+        if len(outer) == 1 and isinstance(first, list):
+            outer = first
+            continue
+        break
+    else:
+        return [outer] if _usable_chunk(outer) else []
 
-    return []
+    if (
+        isinstance(first, list)
+        and first
+        and (first[0] is None or _has_candidate_envelope(first))
+        and all(isinstance(item, list) for item in outer)
+    ):
+        return [item for item in outer if _usable_chunk(item)]
+    # Positional fields (including usage) are not sibling metadata rows.
+    # Retain the old tolerance for multiple candidate rows mixed with junk.
+    candidates = [
+        item
+        for item in outer
+        if isinstance(item, list) and item and isinstance(item[0], list)
+    ]
+    if len(candidates) > 1 or (_depth == 1 and candidates):
+        return candidates
+    return [outer] if _usable_chunk(outer) else []
 
 
 def _coerce_int(value: object) -> int | None:
@@ -645,14 +703,16 @@ def parse_text_output(raw: str) -> ModelOutput:
     code_output_parts: list[str] = []
     retain_parts = True
     replay_bytes = 0
+    saw_candidate_row = False
     for chunk_index, chunk in enumerate(chunks):
         usage = parse_chunk_usage(chunk, previous=output.usage)
         if usage:
             output.usage = usage
-        if len(chunk) > WIRE_RESPONSE_ID_INDEX:
-            raw_rid = chunk[WIRE_RESPONSE_ID_INDEX]
-            if isinstance(raw_rid, str) and raw_rid:
-                output.response_id = raw_rid
+        if rid := _chunk_response_id(chunk):
+            output.response_id = rid
+        if chunk[WIRE_CHUNK_CANDIDATES_INDEX] is None:
+            continue
+        saw_candidate_row = True
         parsed = parse_response_chunk(chunk)
         if parsed.ordered_parts:
             for part in parsed.ordered_parts:
@@ -710,7 +770,8 @@ def parse_text_output(raw: str) -> ModelOutput:
     merged.text = "".join(text_parts)
     merged.thinking = "".join(thinking_parts)
     merged.code_output = "\n".join(code_output_parts)
-    output.candidates = [merged]
+    if saw_candidate_row:
+        output.candidates = [merged]
     return output
 
 

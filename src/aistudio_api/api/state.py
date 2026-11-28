@@ -9,7 +9,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, tzinfo
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -59,6 +59,15 @@ class ModelStatsItem:
     total_tokens: int = 0
     finish_reasons: dict[str, int] = field(default_factory=dict)
     last_used: str | None = None
+
+    def to_payload(self) -> dict[str, object]:
+        # 工作线程持有独立快照；计数和时间戳不可变，只需复制结束原因表。
+        payload = {name: getattr(self, name) for name in _MODEL_STAT_FIELDS}
+        payload["finish_reasons"] = self.finish_reasons.copy()
+        return payload
+
+
+_MODEL_STAT_FIELDS = tuple(item.name for item in fields(ModelStatsItem))
 
 
 @dataclass
@@ -140,8 +149,12 @@ class RuntimeState:
 
     def save_stats(self) -> None:
         """将模型调用与 Token 统计持久化到文件。"""
+        if not settings.persist_stats:
+            return
         with self._stats_lock:
-            payload = {model: asdict(item) for model, item in self.model_stats.items()}
+            payload = {
+                model: item.to_payload() for model, item in self.model_stats.items()
+            }
         self._persist_stats(payload)
 
     def _persist_stats(self, payload: Mapping[str, object]) -> None:
@@ -180,7 +193,8 @@ class RuntimeState:
                 with self._stats_lock:
                     version_at_write = self._stats_version
                     payload = {
-                        model: asdict(item) for model, item in self.model_stats.items()
+                        model: item.to_payload()
+                        for model, item in self.model_stats.items()
                     }
                 write = asyncio.create_task(
                     asyncio.to_thread(self._persist_stats, payload)

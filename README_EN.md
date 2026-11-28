@@ -321,8 +321,13 @@ Open `http://localhost:8080` in your browser to access the Web Console.
 | `AISTUDIO_DEFAULT_TEXT_MODEL` | string | `gemini-3.7-flash` | Default text model |
 | `AISTUDIO_TIMEZONE` | string | Auto | Wire protocol timezone (`America/Los_Angeles` by default) |
 | `AISTUDIO_DUMP_REQUESTS` | bool | `false` | Dump API request/response exchanges to console logs (enabled via `DEBUG=1`) |
-| `AISTUDIO_DUMP_FILE` | bool | `false` | Dump request/response exchanges to individual disk files |
-| `AISTUDIO_DUMP_DIR` | string | `dumps/` | Target directory for dumped exchange files |
+| `AISTUDIO_DUMP_FILE` | bool | `false` | Save client request/response dumps to disk; does not control upstream snapshots |
+| `AISTUDIO_DUMP_DIR` | string | `data/dumps/` | Directory for exchange dumps and upstream snapshots |
+| `AISTUDIO_UPSTREAM_SNAPSHOT_KEEP` | int | `10` | Number of successful upstream model-call snapshots to retain (0–1000). Overrides `logging.upstream_snapshot_keep` in `config.yaml`; leave blank to use the YAML setting |
+
+If you do not need new snapshots of successful upstream model calls, set `AISTUDIO_UPSTREAM_SNAPSHOT_KEEP=0` before accepting requests. Upstream errors may still be saved.
+
+Changing settings, clearing snapshots, or switching directories does not cancel writes already in progress. To remove existing snapshots, pause traffic and let captures finish, then clear snapshots and check the inventory with `GET /api/requests/upstream-snapshots`. The inventory covers only the current directory. Switching directories does not clear the previous one, so check it separately.
 
 ### OpenAI / Claude Compatibility Layer (compat)
 
