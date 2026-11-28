@@ -136,7 +136,9 @@ class _DeferredResponse(HeartbeatStreamingResponse):
             response = None
             try:
                 try:
-                    response = await task
+                    # Only stream_response's finalizer cancels and joins generation.
+                    # Body cancellation must not interrupt its HTTP cleanup first.
+                    response = await asyncio.shield(task)
                 except Exception as exc:
                     if stream:
                         for chunk in _preparation_stream_error(

@@ -8,18 +8,23 @@ SSE 流，因此这里直接调用端点函数并手动迭代 ``body_iterator``�
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
+import weakref
+from collections import deque
 from collections.abc import AsyncGenerator
 from typing import cast
 
 import pytest
 from starlette.requests import Request
+from starlette.types import Message
 
 # 导入 app 以触发 setup_logging()（挂载 RingBufferHandler 与订阅广播链路）
 from aistudio_api.api.app import (  # noqa: F401
     app,  # pyright: ignore[reportUnusedImport]
 )
 from aistudio_api.api.routes_logs import protected_router, stream_runtime_logs
+from aistudio_api.infrastructure.utils import logger as log_store
 from aistudio_api.infrastructure.utils.logger import (
     get_log_subscriber_count,
     get_logger,
@@ -296,3 +301,100 @@ async def test_stream_invalid_params_fall_back_to_defaults():
         assert payload["level"] == "INFO"
     finally:
         await agen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_releases_evicted_entries_after_delivery(monkeypatch):
+    class Entry(dict[str, object]):
+        pass  # Weak-referenceable log entry; observers never own its contents.
+
+    ring: deque[dict[str, object]] = deque(maxlen=4)
+    monkeypatch.setattr(log_store, "_log_ring", ring)
+    refs: dict[str, weakref.ReferenceType[Entry]] = {}
+
+    def record(message: str) -> dict[str, object]:
+        return {"category": "model", "level": "INFO", "message": message}
+
+    def add(key: str, message: str, *, publish: bool = True) -> None:
+        entry = Entry(record(message))
+        refs[key] = weakref.ref(entry)
+        ring.append(entry)
+        if publish:
+            log_store._publish_log_entry(entry)
+
+    def evict() -> None:
+        ring.extend({"category": "system"} for _ in range(4))
+
+    def retained() -> set[str]:
+        gc.collect()
+        return {key for key, ref in refs.items() if ref() is not None}
+
+    def frame(event: str, payload: object) -> bytes:
+        return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n".encode()
+
+    seen: list[str] = []
+    held: dict[str, set[str]] = {}
+    idle = asyncio.Event()
+
+    async def receive() -> Message:
+        if seen[-1:] == ["live"]:
+            idle.set()
+        return {"type": "http.disconnect" if seen[-1:] == ["fresh"] else "http.request"}
+
+    async def send(msg: Message) -> None:
+        if not (body := msg.get("body")):
+            return
+        event, data = _parse_sse_block(body.decode())
+        if event == "ready":
+            seen.append(event)
+            stats = log_store.get_log_buffer_stats()
+            assert body == frame(
+                event,
+                {
+                    "ok": True,
+                    "level": "INFO",
+                    "total": len(ring),
+                    "capacity": stats["capacity"],
+                },
+            )
+            add("overlap", "same")
+        elif event == "snapshot":
+            seen.append(event)
+            assert body == frame(
+                event, {"count": 2, "logs": [record("history"), record("same")]}
+            )
+            # The queued overlap is the *same object* as a snapshot item; the
+            # first backlog item has the same fields but must still be sent.
+            add("first", "same")
+            add("second", "second")
+            add("third", "third")
+            evict()
+            held["snapshot"] = retained()
+        else:
+            assert event == "log"
+            message = json.loads(data)["message"]
+            seen.append(message)
+            assert body == frame("log", record(message))
+            if message == "second":
+                held["second"] = retained()
+            elif message == "third":
+                add("live", "live")
+                evict()
+        # Complete call_soon_threadsafe publications before accepting the frame.
+        await asyncio.sleep(0)
+
+    baseline = get_log_subscriber_count()
+    add("history", "history", publish=False)
+    response = await stream_runtime_logs(Request(_make_stream_request().scope, receive))
+    async with asyncio.timeout(5), asyncio.TaskGroup() as group:
+        group.create_task(response.stream_response(send))
+        await idle.wait()
+        held["idle"] = retained()
+        assert get_log_subscriber_count() == baseline + 1
+        add("fresh", "fresh")
+
+    assert get_log_subscriber_count() == baseline
+    assert seen == ["ready", "snapshot", "same", "second", "third", "live", "fresh"]
+    assert held["snapshot"] == {"history", "overlap", "first", "second", "third"}
+    assert {"third"} <= held["second"] <= {"second", "third"}
+    assert held["idle"] == set()

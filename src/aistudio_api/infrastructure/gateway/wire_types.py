@@ -477,6 +477,9 @@ class AistudioPart:
             )
             wire[PartIndex.CODE_RESULT] = [outcome_code, output]
         if self.text is not None:
+            # All other fields have already had their chance to populate wire.
+            if not wire:
+                return [None, self.text]
             wire[PartIndex.TEXT] = self.text
         return wire.compact()
 

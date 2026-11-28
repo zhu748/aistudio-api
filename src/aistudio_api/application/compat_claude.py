@@ -85,24 +85,33 @@ def _claude_document_text(source: dict[str, object]) -> str | None:
     return None
 
 
-def _reject_user_file_source(
+def _reject_unsupported_user_block(
     block: object, message_index: int, block_index: int, item_index: int | None = None
 ) -> None:
-    if not isinstance(block, dict) or block.get("type") not in ("document", "image"):
+    if not isinstance(block, dict):
         return
-    source = _as_dict(block.get("source"))
-    if source.get("type") != "file":
-        return
-    file_id = _as_str(source.get("file_id"))
-    if not file_id or file_id.isspace():
+    kind = block.get("type")
+    if kind in ("document", "image"):
+        source = _as_dict(block.get("source"))
+        if source.get("type") != "file":
+            return
+        file_id = _as_str(source.get("file_id"))
+        if not file_id or file_id.isspace():
+            return
+    elif kind != "search_result":
         return
     path = f"messages[{message_index}].content[{block_index}]"
     if item_index is not None:
         path += f".content[{item_index}]"
+    if kind == "search_result":
+        raise ValueError(
+            f"{path}: search_result is not supported; use plain text only if "
+            "source and citation metadata are not needed"
+        )
     alternative = (
         "an inline image source with type='base64', data, and the image's "
         "media_type (for example 'image/png')"
-        if block["type"] == "image"
+        if kind == "image"
         else "an inline PDF (type='base64', media_type='application/pdf', data) "
         "or a plain-text document (type='text', media_type='text/plain', data)"
     )
@@ -112,20 +121,18 @@ def _reject_user_file_source(
     )
 
 
-def _check_user_file_sources(
-    content: list[dict[str, object]], message_index: int
-) -> None:
-    """Only immediate message and tool_result blocks are attachment positions."""
+def _check_user_blocks(content: list[dict[str, object]], message_index: int) -> None:
+    """Check unsupported inputs in block order without walking opaque data."""
     for block_index, block in enumerate(content):
         if isinstance(block, dict) and block.get("type") == "tool_result":
             items = block.get("content")
             if isinstance(items, list):
                 for item_index, item in enumerate(items):
-                    _reject_user_file_source(
+                    _reject_unsupported_user_block(
                         item, message_index, block_index, item_index
                     )
         else:
-            _reject_user_file_source(block, message_index, block_index)
+            _reject_unsupported_user_block(block, message_index, block_index)
 
 
 def _opaque_assistant_history_field(block: dict[str, object]) -> str | None:
@@ -469,14 +476,14 @@ async def claude_to_gemini_request(
     contents: list[GeminiContent] = []
     tool_name_by_id: dict[str, str | None] = {}
 
-    # Validate user file references and assistant history before *any* media
+    # Validate unsupported user blocks and assistant history before *any* media
     # fetch or charge. Also index tool_use owners for later tool_result blocks.
     for message_index, message in enumerate(req.messages):
         if not isinstance(message.content, list):
             continue
         message_role = message.role.strip().lower()
         if message_role == "user":
-            _check_user_file_sources(message.content, message_index)
+            _check_user_blocks(message.content, message_index)
             continue
         if message_role != "assistant":
             continue

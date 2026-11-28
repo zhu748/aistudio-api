@@ -141,6 +141,7 @@ async def stream_runtime_logs(
     ``ping``      心跳（附带缓冲统计）
     """
     import json as _json
+    from collections import deque
     from collections.abc import AsyncIterator
 
     from aistudio_api.infrastructure.utils.logger import (
@@ -222,7 +223,7 @@ async def stream_runtime_logs(
             yield _sse("snapshot", {"count": len(snapshot), "logs": snapshot})
             # 3) 先排空订阅瞬间积压的增量（跳过已包含在快照中的条目，按对象身份去重）
             snapshot_ids = {id(entry) for entry in snapshot}
-            backlog: list[dict[str, object]] = []
+            backlog: deque[dict[str, object]] = deque()
             while True:
                 try:
                     pending = queue.get_nowait()
@@ -230,9 +231,13 @@ async def stream_runtime_logs(
                     break
                 if id(pending) not in snapshot_ids:
                     backlog.append(pending)
-            for entry in backlog:
-                yield _sse("log", entry)
+                del pending
+            # 去重期间保留快照以免 id 被复用；完成后不再占用已投递日志。
+            del snapshot, snapshot_ids
+            while backlog:
+                yield _sse("log", backlog.popleft())
                 pushed += 1
+            del backlog
             # 4) 持续增量推送 + 空闲心跳
             while True:
                 if await request.is_disconnected():
@@ -251,6 +256,7 @@ async def stream_runtime_logs(
                     )
                     continue
                 yield _sse("log", entry)
+                del entry
                 pushed += 1
         finally:
             unsubscribe_log_entries(handle)

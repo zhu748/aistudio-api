@@ -134,6 +134,14 @@ def _coerce_int(value: object) -> int | None:
 
 
 def parse_response_part(raw_part: object) -> ResponsePart:
+    # Plain text has only its two canonical slots, including an explicit empty string.
+    if (
+        type(raw_part) is list
+        and len(raw_part) == 2
+        and raw_part[0] is None
+        and type(raw_part[1]) is str
+    ):
+        return ResponsePart(text=raw_part[1], text_present=True)
     if not isinstance(raw_part, list):
         return ResponsePart()
 
