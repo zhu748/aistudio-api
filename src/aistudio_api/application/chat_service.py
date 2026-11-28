@@ -45,7 +45,6 @@ from aistudio_api.infrastructure.gateway.wire_types import (
     AistudioPart,
     AistudioThinkingConfig,
     ThinkingLevel,
-    wire_function_name as _wire_function_name,
 )
 from aistudio_api.infrastructure.signature_trace import get_signature_trace
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -349,9 +348,9 @@ def _normalize_gemini_tool_config(
         mode_code = mode_map.get(str(raw_mode).strip().upper(), 1)
 
     raw_allowed = fcc.get("allowedFunctionNames") or fcc.get("allowed_function_names")
+    # The declaration filter appends the selected wire names after matching
+    # client names. These are different namespaces for long function names.
     fcc_wire: list[object] = [mode_code]
-    if isinstance(raw_allowed, list) and raw_allowed:
-        fcc_wire.append(list(raw_allowed))
     allowed_names: list[str] | None = None
     if isinstance(raw_allowed, list) and raw_allowed:
         allowed_names = [str(x) for x in raw_allowed]
@@ -1043,14 +1042,18 @@ def _normalize_tools(
       tool_config.include_server_side_tool_invocations" 400 报错。
     - mode 为 NONE：显式置空 tools 与 tool_config，确保模型仅输出纯文本
       且不调用任何工具。
-    - allowedFunctionNames（tool_choice 指定具体函数）：与旧 wire 层过滤
-      逻辑对齐，仅保留声明名在 allowed 集合内的 functionDeclarations 工具
-      容器；内置工具容器不受影响。allowedFunctionNames 携带客户端原名，
-      而 tools 内已编码为 wire 名（超长声明已截短）——集合同时收录两种
-      形态才能正确命中。
+    - allowedFunctionNames 按客户端原名筛选声明，不影响内置工具。
+      编码器的二次过滤使用实际选中声明的 wire 名，而非客户端原名。
     """
     tools: list[list[object]] | None = None
     seen_builtin: set[str] = set()
+    tool_config, is_mode_none, allowed_names = _normalize_gemini_tool_config(
+        getattr(req, "toolConfig", None)
+    )
+    allowed = (
+        set(allowed_names) if allowed_names is not None and not is_mode_none else None
+    )
+    selected: dict[str, str] = {}
     # wire 名 → 原名（仅超长截短过的声明）；生成链路据此在响应侧换回
     function_name_restore: dict[str, str] = {}
     if req.tools is not None:
@@ -1062,15 +1065,22 @@ def _normalize_tools(
                 builtin_tool_names.append("code_execution")
             if tool.functionDeclarations:
                 for decl in tool.functionDeclarations:
-                    if isinstance(decl, dict):
-                        decl_name = _function_declaration_name(decl)
-                        if decl_name:
-                            wire_name = _wire_function_name(decl_name)
-                            if wire_name != decl_name:
-                                function_name_restore[wire_name] = decl_name
-                    all_function_declarations.append(
-                        encode_function_declaration_to_wire(decl)
-                    )
+                    encoded = encode_function_declaration_to_wire(decl)
+                    decl_name = _function_declaration_name(decl)
+                    if allowed is not None and decl_name not in allowed:
+                        continue
+                    wire_name = encoded[0]
+                    if decl_name and isinstance(wire_name, str):
+                        if (
+                            allowed is not None
+                            and selected.setdefault(wire_name, decl_name) != decl_name
+                        ):
+                            raise ValueError(
+                                "Selected functions have the same wire name; rename one of them"
+                            )
+                        if wire_name != decl_name:
+                            function_name_restore[wire_name] = decl_name
+                    all_function_declarations.append(encoded)
             builtin_tool_names.extend(
                 _extract_google_search_tool_names(
                     tool, is_image_model=defaults.is_image_model
@@ -1113,28 +1123,16 @@ def _normalize_tools(
         )
         tools = injected if injected else None
 
-    # toolConfig 二次解析已合并进 _normalize_gemini_tool_config 的三元组返回。
-    tool_config, is_mode_none, allowed_names = _normalize_gemini_tool_config(
-        getattr(req, "toolConfig", None)
-    )
-
     if is_mode_none:
         return None, function_name_restore, None
-    if allowed_names is not None and tools:
-        allowed_set = set(allowed_names) | {
-            _wire_function_name(name) for name in allowed_names
-        }
-        filtered_tools: list[list[object]] = []
-        for t in tools:
-            if isinstance(t, list) and len(t) > 1 and isinstance(t[1], list):
-                filtered_decls = [
-                    d for d in t[1] if isinstance(d, list) and d and d[0] in allowed_set
-                ]
-                if filtered_decls:
-                    filtered_tools.append([t[0], filtered_decls])
-            else:
-                filtered_tools.append(t)
-        tools = filtered_tools or None
+    if allowed is not None and tool_config is not None:
+        # Only original names of actual declarations can grant their wire alias.
+        # Hashing arbitrary allowlist entries could authorize a different literal.
+        fcc = tool_config[1]
+        if isinstance(fcc, list):
+            fcc.append(list(selected))
+        if req.tools and not tools:
+            tools = None
     return tools, function_name_restore, tool_config
 
 

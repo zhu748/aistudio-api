@@ -143,6 +143,29 @@ _STRICT_COMPACT_JSON = json.JSONEncoder(
 )
 
 
+def _argument_snapshot(value: object) -> tuple[object, bool]:
+    """Decode complete objects; distinguish deltas that cannot be cumulative."""
+    if not isinstance(value, str):
+        return value, True
+    start = len(value) - len(value.lstrip(" \t\r\n"))
+    if not value.startswith("{", start):
+        return value, True
+    if _utf8_size(value) > _MAX_TOOL_ARGUMENT_BYTES:
+        raise ValueError("Tool arguments exceed configured size limit")
+    if value.rstrip(" \t\r\n").endswith("}"):
+        try:
+            snapshot, end = _JSON_DECODER.raw_decode(value, start)
+        except ValueError:
+            pass
+        else:
+            if end == len(value) or not value[end:].strip(" \t\r\n"):
+                return snapshot, True
+            # The root object has already closed. Extra tokens cannot extend
+            # a cumulative snapshot, even if the text begins like the prefix.
+            return value, False
+    return value, True
+
+
 def _matches_signed_prefix(fragments: list[str], snapshot: str) -> bool:
     """Compare to compact JSON without interpreting escapes outside strings."""
     prefix = "".join(fragments)
@@ -196,6 +219,7 @@ class _ToolCall:
     size: int = 0
     invalid: bool = False
     explicit_chain: bool = True
+    needs_signed_snapshot: bool = False
 
     def matches(self, name: str) -> bool:
         return self.name.startswith(name) or name.startswith(self.name)
@@ -228,25 +252,88 @@ class _ToolCall:
                     quoted = not quoted
         return offset > 0
 
-    def update(self, call_id: str, name: str, args: object, signature: object) -> None:
-        # Later promotion must not retroactively identify anonymous shards.
+    def _can_grow_name(self, args: object) -> bool:
+        if self.invalid or self.args is not None or isinstance(args, dict):
+            return False
+        if not self.fragments or (isinstance(args, str) and args.strip()):
+            # A nonempty suffix appended to a completed object could not form
+            # another valid object. Normal argument validation still applies.
+            return True
+        # A name-only update must not borrow an already complete argument
+        # object. On an ambiguous tail, fail closed rather than rescan history.
+        tail = self.fragments[-1].rstrip()
+        return bool(tail) and not tail.endswith("}")
+
+    def _update_identity(
+        self,
+        call_id: str,
+        name: str,
+        args: object,
+        signature: object,
+        same_envelope: bool,
+    ) -> object:
+        """Return only a new signature attributable to the resulting call."""
         self.explicit_chain &= bool(
             call_id and name and (not self.name or self.name == name)
         )
+        stable_id = bool(call_id and call_id == self.call_id)
+        had_args = self.args is not None or bool(self.fragments)
+        if (call_id and not self.call_id) or (name and not self.name and had_args):
+            # A newly supplied ID/name can identify an unfinished call, not
+            # a previous anonymous shard's proof.
+            self.envelope.pop("thoughtSignature", None)
+            self.needs_signed_snapshot = True
         if self.name and name and name != self.name:
             self.envelope.pop("thoughtSignature", None)
-        if not self.matches(name):
-            self.invalid = True
-        elif len(name) > len(self.name):
+            if not same_envelope or not self.matches(name):
+                self.invalid = True
+                return None
+            if not (stable_id and isinstance(args, dict)):
+                if (
+                    call_id != self.call_id
+                    or not name.startswith(self.name)
+                    or not self._can_grow_name(args)
+                ):
+                    self.invalid = True
+                    return None
+                self.needs_signed_snapshot = True
+        if name:
+            # A complete snapshot supplies its own exact name, not the longest
+            # name ever observed for the ID.
             self.name = name
+        if self.needs_signed_snapshot:
+            if not (call_id and name and isinstance(args, dict) and same_envelope):
+                return None
+            self.needs_signed_snapshot = False
+        if not same_envelope or not signature:
+            return None
+        if args is None or (isinstance(args, str) and not args.strip()):
+            return signature if name and not had_args else None
+        if not name and not (stable_id and self.fragments and isinstance(args, str)):
+            # Only a sparse suffix to an existing stable chain has an owner;
+            # a differently scoped proof cannot sign a borrowed name.
+            return None
+        return signature
 
+    def update(
+        self,
+        call_id: str,
+        name: str,
+        args: object,
+        signature: object,
+        *,
+        same_envelope: bool,
+        may_be_cumulative: bool,
+    ) -> None:
+        signature = self._update_identity(call_id, name, args, signature, same_envelope)
         if isinstance(args, dict):
             try:
                 snapshot = _STRICT_COMPACT_JSON.encode(args)
             except ValueError:
                 # NaN/Infinity aren't JSON. Keep the existing argument handling
-                # but never carry a previous proof to such a snapshot.
+                # but never attach a proof to such a snapshot.
                 self.envelope.pop("thoughtSignature", None)
+                signature = None
                 snapshot = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
             if "thoughtSignature" in self.envelope:
                 if self.args is not None:
@@ -272,7 +359,8 @@ class _ToolCall:
                 self.size = 0
             new_size = _utf8_size(args)
             if (
-                self.fragments
+                may_be_cumulative
+                and self.fragments
                 and new_size >= self.size
                 and args.startswith(self.fragments[0])
                 and args.startswith("".join(self.fragments))
@@ -445,21 +533,10 @@ class ToolResponseAssembler:
             raw_id, raw_name = raw.get("id"), raw.get("name")
             call_id = raw_id if isinstance(raw_id, str) else ""
             name = raw_name if isinstance(raw_name, str) else ""
-            args = raw.get("args")
+            args, may_be_cumulative = _argument_snapshot(raw.get("args"))
             signature = part.get("thoughtSignature")
             # Complete named objects are independent unless there is an
             # identifiable chain of incomplete argument shards to replace.
-            if isinstance(args, str) and args.lstrip().startswith("{"):
-                if _utf8_size(args) > _MAX_TOOL_ARGUMENT_BYTES:
-                    raise ValueError("Tool arguments exceed configured size limit")
-                if args.rstrip().endswith("}"):
-                    try:
-                        snapshot = json.loads(args)
-                    except ValueError:
-                        snapshot = None
-                    if isinstance(snapshot, dict):
-                        args = snapshot
-
             tool = self._by_id.get(call_id) if call_id else None
             if tool is None:
                 snapshot = (
@@ -494,14 +571,12 @@ class ToolResponseAssembler:
                 ]
                 if len(matches) == 1:
                     tool = matches[0]
-                    if call_id:
-                        tool.call_id = call_id
-                        self._retained_bytes += _utf8_size(call_id)
                 elif len(matches) > 1:
                     # No identity information makes this update unsafe to
                     # assign. Do not guess among parallel calls.
                     for pending in matches:
                         pending.invalid = True
+            same_envelope = True
             if tool is None:
                 if len(self._calls) >= 256:
                     raise ValueError("Too many tool calls in one response")
@@ -514,11 +589,7 @@ class ToolResponseAssembler:
                 caption = _without_call(part)
                 if has_response_content(caption) or "text" in caption:
                     self._retain(caption, _retained_size(caption))
-                if signature and caption != _without_call(tool.envelope):
-                    # The same call ID identifies call arguments, not a changed
-                    # enclosing Part. Preserve existing signature ownership
-                    # rather than coalescing a later differently scoped proof.
-                    signature = None
+                same_envelope = caption == _without_call(tool.envelope)
             seen.add(tool)
             if call_id:
                 self._by_id[call_id] = tool
@@ -526,7 +597,17 @@ class ToolResponseAssembler:
             old_fields_size = _retained_size(tool.name) + _retained_size(
                 tool.envelope.get("thoughtSignature")
             )
-            tool.update(call_id, name, args, signature)
+            tool.update(
+                call_id,
+                name,
+                args,
+                signature,
+                same_envelope=same_envelope,
+                may_be_cumulative=may_be_cumulative,
+            )
+            if call_id and not tool.call_id:
+                tool.call_id = call_id
+                self._retained_bytes += _utf8_size(call_id)
             self._retained_bytes += (
                 _retained_size(tool.name)
                 + _retained_size(tool.envelope.get("thoughtSignature"))

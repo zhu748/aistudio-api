@@ -1007,8 +1007,11 @@ async def claude_stream_adapter(
             return
 
         async def _peeked_frames() -> AsyncGenerator[dict[str, object], None]:
+            nonlocal first_frame
             if first_frame is not None:
                 yield first_frame
+                # The consumer has advanced; don't pin this payload until EOF.
+                first_frame = None
             async for frame in frames:
                 yield frame
 

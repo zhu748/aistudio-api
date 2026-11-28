@@ -235,6 +235,8 @@ def _openai_tools_to_gemini(
 
 def _openai_tool_choice_to_config(
     tool_choice: str | dict[str, object] | None,
+    *,
+    chat: bool = False,
 ) -> dict[str, object] | None:
     if tool_choice is None:
         return None
@@ -260,15 +262,32 @@ def _openai_tool_choice_to_config(
         elif choice_type == "none":
             return {"functionCallingConfig": {"mode": "NONE"}}
         elif choice_type == "allowed_tools":
-            # OpenAI 2025 新形态：限定可调用工具子集 → AUTO + allowedFunctionNames
-            # （Gemini AUTO 模式下同样生效）；原先落入 None 静默降级 AUTO，
-            # 限定集外的工具也会被模型调用。
+            # Chat nests this envelope; Responses and older Chat clients use
+            # the flat form. The wire can restrict declarations, not force a call.
             names: list[str] = []
             raw_tools = tool_choice.get("tools")
+            nested_chat = chat and "allowed_tools" in tool_choice
+            if nested_chat:
+                if "tools" in tool_choice:
+                    raise ValueError(
+                        "tool_choice cannot mix flat and nested allowed_tools"
+                    )
+                allowed = _as_dict(tool_choice.get("allowed_tools"))
+                if allowed.get("mode") not in ("auto", "required"):
+                    raise ValueError(
+                        "tool_choice.allowed_tools.mode must be auto or required"
+                    )
+                raw_tools = allowed.get("tools")
             if not isinstance(raw_tools, list):
+                if nested_chat:
+                    raise ValueError("tool_choice.allowed_tools.tools must be a list")
                 return None
             for entry in raw_tools:
-                if isinstance(entry, dict):
+                if nested_chat:
+                    if not isinstance(entry, dict) or entry.get("type") != "function":
+                        continue
+                    name = _as_str(_as_dict(entry.get("function")).get("name"))
+                elif isinstance(entry, dict):
                     fn = _as_dict(entry.get("function"))
                     name = _as_str(fn.get("name")) or _as_str(entry.get("name"))
                 else:
@@ -282,6 +301,10 @@ def _openai_tool_choice_to_config(
                         "allowedFunctionNames": names,
                     }
                 }
+            if nested_chat:
+                raise ValueError(
+                    "tool_choice.allowed_tools.tools must include a supported function"
+                )
             return None
         elif choice_type in ("auto", "any", "required"):
             mode_map = {"auto": "AUTO", "any": "ANY", "required": "ANY"}
@@ -590,7 +613,7 @@ async def openai_to_gemini_request(
             else None
         ),
         tools=_openai_tools_to_gemini(req.tools),
-        toolConfig=_openai_tool_choice_to_config(req.tool_choice),
+        toolConfig=_openai_tool_choice_to_config(req.tool_choice, chat=True),
         generationConfig=(
             GeminiGenerationConfig.model_validate(generation_config)
             if generation_config
