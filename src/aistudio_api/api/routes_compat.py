@@ -52,6 +52,7 @@ from aistudio_api.application.compat_service import (
 from aistudio_api.application.compat_shared import _DATA_URL_RE
 from aistudio_api.application.responses_delivery import ResponsesStreamDelivery
 from aistudio_api.application.responses_service import (
+    ResponsesToolMetadata,
     build_responses_object,
     build_responses_preparation_failure,
     responses_stream_adapter,
@@ -294,7 +295,25 @@ async def openai_responses(
         delivery = ResponsesStreamDelivery()
         http_request.state.responses_accept_event = delivery.accept
 
+    # The pre-conversion error callback needs only these fields, never input
+    # history or attachments. Release the raw tool fields once converted.
+    model = req.model
+    unprepared_tools = req.tools, req.tool_choice
+    tool_metadata: ResponsesToolMetadata | None = None
+
+    def preparation_error(code: int, message: str) -> list[str]:
+        return build_responses_preparation_failure(
+            model,
+            code,
+            message,
+            register_failure=register_failure,
+            delivery=delivery,
+            tool_metadata=tool_metadata
+            or ResponsesToolMetadata.before_conversion(*unprepared_tools),
+        )
+
     async def respond():
+        nonlocal tool_metadata, unprepared_tools
         try:
             gemini_req, resolved_model = await responses_to_gemini_request(req)
         except ValueError as exc:
@@ -302,6 +321,10 @@ async def openai_responses(
                 400, detail={"message": str(exc), "type": "bad_request"}
             ) from exc
 
+        tool_metadata = ResponsesToolMetadata.from_gemini(
+            gemini_req.tools, gemini_req.toolConfig
+        )
+        unprepared_tools = (None, None)
         input_desc = "string" if isinstance(req.input, str) else "items"
         logger.info(
             "Responses 兼容请求: model=%s → %s, stream=%s, input=%s",
@@ -332,6 +355,7 @@ async def openai_responses(
                         register_failure=register_failure,
                         delivery=delivery,
                         include_encrypted_reasoning=include_encrypted_reasoning,
+                        tool_metadata=tool_metadata,
                     ),
                     media_type="text/event-stream",
                     headers=_STREAM_HEADERS,
@@ -342,6 +366,7 @@ async def openai_responses(
                     response,
                     requested_model=req.model,
                     include_encrypted_reasoning=include_encrypted_reasoning,
+                    tool_metadata=tool_metadata,
                 )
             )
         raise HTTPException(
@@ -356,13 +381,7 @@ async def openai_responses(
         respond,
         http_request,
         stream=req.stream,
-        preparation_error=lambda code, message: build_responses_preparation_failure(
-            req.model,
-            code,
-            message,
-            register_failure=register_failure,
-            delivery=delivery,
-        ),
+        preparation_error=preparation_error,
     )
 
 

@@ -11,9 +11,11 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import secrets
 import time
+from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterable, Callable
 
 from aistudio_api.api.response_models import GeminiGenerateContentResponse
@@ -362,16 +364,49 @@ def _openai_response_format_to_config(
     return {}
 
 
+def _opaque_detail_bytes(value: object) -> bytes | None:
+    # Validate the original spelling, before normalizing padding or alphabet.
+    if (
+        not isinstance(value, str)
+        or value == SKIP_THOUGHT_SIGNATURE
+        or not valid_thought_signature(value)
+    ):
+        return None
+    return base64.b64decode(
+        value + "=" * (-len(value) % 4), altchars=b"-_", validate=True
+    )
+
+
+def _encrypted_detail_signature(data: str, *, is_google_fmt: bool) -> str | None:
+    """Read one opaque value, whether raw or in our self-identifying envelope."""
+    raw = _opaque_detail_bytes(data)
+    if raw is None:
+        return None
+    try:
+        envelope = json.loads(raw)
+    except (ValueError, RecursionError):
+        envelope = None
+    if isinstance(envelope, dict) and "aistudio_thought_signature" in envelope:
+        # Invalid envelope contents are not raw Google signature bytes. The
+        # normal envelope reader returns None for both absent and empty fields.
+        raw = _opaque_detail_bytes(envelope["aistudio_thought_signature"])
+    elif not is_google_fmt:
+        return None
+    return base64.b64encode(raw).decode("ascii") if raw else None
+
+
 def _parse_openai_reasoning_details(
     details: list[dict[str, object]],
     *,
-    tool_call_ids: set[str],
+    tool_call_counts: Counter[str],
     trace: ThoughtSignatureTrace | None,
     scalar_present: bool,
 ) -> tuple[list[tuple[str, str | None, str]], dict[str, str]]:
     """Extract Google-compatible thought parts and tool-call signatures from reasoning_details."""
     thoughts: list[tuple[str, str | None, str]] = []
-    tool_sigs: dict[str, str] = {}
+    # None marks a conflict for the rest of this message, even if one of the
+    # values is repeated later. Keep at most one value per candidate owner.
+    tool_sigs: dict[str, str | None] = {}
     for entry in details:
         if not isinstance(entry, dict):
             continue
@@ -416,13 +451,10 @@ def _parse_openai_reasoning_details(
             data = _as_str(entry.get("data"))
             if not data:
                 continue
-            decoded = decode_signature_envelope(data)
-            candidate_sig: str | None = None
-            if decoded:
-                candidate_sig = decoded
-            elif is_google_fmt and valid_thought_signature(data):
-                candidate_sig = data
-            else:
+            candidate_sig = _encrypted_detail_signature(
+                data, is_google_fmt=is_google_fmt
+            )
+            if candidate_sig is None:
                 if trace is not None:
                     trace.record_client_drop(
                         carrier="thought",
@@ -432,12 +464,16 @@ def _parse_openai_reasoning_details(
                         note="foreign_reasoning_details_ignored",
                     )
                 continue
-            entry_id = _as_str(entry.get("id"))
-            if entry_id and entry_id in tool_call_ids:
-                tool_sigs.setdefault(entry_id, candidate_sig)
-            elif not scalar_present and _is_signed_empty_thought("", candidate_sig):
-                thoughts.append(("", candidate_sig, "client_reasoning_details"))
-    return thoughts, tool_sigs
+            entry_id = entry.get("id")
+            if entry_id is None or entry_id == "":
+                if not scalar_present:
+                    thoughts.append(("", candidate_sig, "client_reasoning_details"))
+                continue
+            if not isinstance(entry_id, str) or tool_call_counts[entry_id] != 1:
+                continue
+            if tool_sigs.setdefault(entry_id, candidate_sig) != candidate_sig:
+                tool_sigs[entry_id] = None
+    return thoughts, {k: v for k, v in tool_sigs.items() if v is not None}
 
 
 @media_session()
@@ -500,17 +536,14 @@ async def openai_to_gemini_request(
             scalar_present = bool(reasoning_text) or _is_signed_empty_thought(
                 reasoning_text, reasoning_signature
             )
-            msg_tool_call_ids = {
-                _as_str(tc.get("id"))
-                for tc in (message.tool_calls or [])
-                if _as_str(tc.get("id"))
-            }
             detail_thoughts: list[tuple[str, str | None, str]] = []
             detail_tool_sigs: dict[str, str] = {}
             if message.reasoning_details:
                 detail_thoughts, detail_tool_sigs = _parse_openai_reasoning_details(
                     message.reasoning_details,
-                    tool_call_ids=msg_tool_call_ids,
+                    tool_call_counts=Counter(
+                        _as_str(tc.get("id")) for tc in message.tool_calls or []
+                    ),
                     trace=trace,
                     scalar_present=scalar_present,
                 )

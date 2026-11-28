@@ -21,6 +21,7 @@ import re
 import secrets
 import time
 from collections.abc import AsyncGenerator, AsyncIterable, Callable, Iterator
+from dataclasses import dataclass
 
 from aistudio_api.api.response_models import (
     GeminiGenerateContentResponse,
@@ -32,8 +33,10 @@ from aistudio_api.api.schemas import (
     GeminiGenerationConfig,
     GeminiInlineData,
     GeminiPart,
+    GeminiTool,
 )
 from aistudio_api.api.schemas_compat import OpenAIResponsesRequest
+from aistudio_api.application.chat_service import _normalize_gemini_tool_config
 from aistudio_api.application.compat_openai import _openai_history_call
 from aistudio_api.application.compat_service import (
     _as_dict,
@@ -265,6 +268,74 @@ def _is_explicit_empty_summary(item: dict[str, object]) -> bool:
     return entry.get("type") == "summary_text" and entry.get("text") == ""
 
 
+def _responses_gemini_tools(
+    tools: list[dict[str, object]] | None, choice: str | dict[str, object] | None
+) -> tuple[list[GeminiTool] | None, dict[str, object] | None]:
+    return _openai_tools_to_gemini(tools), _openai_tool_choice_to_config(choice)
+
+
+@dataclass(frozen=True, slots=True)
+class ResponsesToolMetadata:
+    """Public function catalog and effective choice, not a wire-name or execution policy."""
+
+    tools: list[dict[str, object]]
+    choice: str | dict[str, object]
+
+    @classmethod
+    def from_gemini(
+        cls, tools: list[GeminiTool] | None, config: dict[str, object] | None
+    ) -> ResponsesToolMetadata:
+        # Start from the declarations accepted by the request converter, before
+        # wire aliases, schema fallbacks, or model-specific builtins are added.
+        public_tools: list[dict[str, object]] = [
+            {
+                "type": "function",
+                "name": declaration["name"],
+                "description": declaration.get("description"),
+                "parameters": declaration.get("parameters"),
+                # Strict schemas can guide the model but are not enforced.
+                "strict": False if "strict" in declaration else None,
+            }
+            for tool in tools or []
+            for declaration in tool.functionDeclarations or []
+        ]
+        _, disabled, allowed_names = _normalize_gemini_tool_config(config)
+        choice: str | dict[str, object] = "auto"
+        if disabled:
+            choice = "none"
+        elif allowed_names:
+            declared = {tool["name"] for tool in public_tools}
+            selected = [
+                {"type": "function", "name": name}
+                for name in dict.fromkeys(allowed_names)
+                if name in declared
+            ]
+            if selected:
+                # A named/required choice narrows declarations too, but cannot
+                # require even one call on this transport.
+                choice = {"type": "allowed_tools", "mode": "auto", "tools": selected}
+            elif tools is not None:
+                # An explicit catalog had no matches. "auto" would instead
+                # advertise every declared function; an empty allowlist is not
+                # a usable choice. With tools omitted, provider defaults may apply.
+                choice = "none"
+        return cls(public_tools, choice)
+
+    @classmethod
+    def before_conversion(
+        cls,
+        tools: list[dict[str, object]] | None,
+        choice: str | dict[str, object] | None,
+    ) -> ResponsesToolMetadata:
+        """Preparation failed before the normal converter could return any fields."""
+        try:
+            return cls.from_gemini(*_responses_gemini_tools(tools, choice))
+        except (TypeError, ValueError):
+            # For example, a rejected choice must not replace the original
+            # preparation error with a second exception after headers are sent.
+            return cls([], "auto")
+
+
 @media_session()
 async def responses_to_gemini_request(
     req: OpenAIResponsesRequest,
@@ -277,8 +348,7 @@ async def responses_to_gemini_request(
             "previous_response_id is not supported; send the complete conversation in input"
         )
     if req.parallel_tool_calls is False:
-        # OpenAI 官方语义是提示而非硬约束；接受+忽略+告警（与 chat
-        # completions 侧同策略）。
+        # 该传输不支持强制串行；兼容层接受并告警（与 Chat Completions 一致）。
         logger.warning("parallel_tool_calls=false 无法在上游强制串行，已忽略该提示")
     contents: list[GeminiContent] = []
     system_texts: list[str] = [req.instructions] if req.instructions else []
@@ -443,6 +513,7 @@ async def responses_to_gemini_request(
             if schema:
                 generation_config["responseSchema"] = schema
 
+    tools, tool_config = _responses_gemini_tools(req.tools, req.tool_choice)
     gemini_req = GeminiGenerateContentRequest(
         contents=contents,
         systemInstruction=(
@@ -452,8 +523,8 @@ async def responses_to_gemini_request(
             if system_texts
             else None
         ),
-        tools=_openai_tools_to_gemini(req.tools),
-        toolConfig=_openai_tool_choice_to_config(req.tool_choice),
+        tools=tools,
+        toolConfig=tool_config,
         generationConfig=(
             GeminiGenerationConfig.model_validate(generation_config)
             if generation_config
@@ -607,6 +678,7 @@ def _base_response(
     usage: dict[str, int] | None,
     incomplete_reason: str | None = None,
     created_at: int | None = None,
+    tool_metadata: ResponsesToolMetadata | None = None,
 ) -> dict[str, object]:
     # tools / tool_choice / parallel_tool_calls 为 openai-python 类型模型
     # 必填字段：流式宽松构造不报错，但 model_validate 严格校验的客户端
@@ -619,8 +691,8 @@ def _base_response(
         "model": requested_model,
         "output": output,
         "parallel_tool_calls": True,
-        "tool_choice": "auto",
-        "tools": [],
+        "tool_choice": tool_metadata.choice if tool_metadata is not None else "auto",
+        "tools": tool_metadata.tools if tool_metadata is not None else [],
     }
     if incomplete_reason is not None:
         payload["incomplete_details"] = {"reason": incomplete_reason}
@@ -659,6 +731,7 @@ def build_responses_object(
     requested_model: str,
     *,
     include_encrypted_reasoning: bool = False,
+    tool_metadata: ResponsesToolMetadata | None = None,
 ) -> dict[str, object]:
     """Gemini 完整响应 → Responses ``response`` 对象（非流式）。"""
     finish_reason_raw: str | None = None
@@ -686,6 +759,7 @@ def build_responses_object(
         output=output,
         usage=usage,
         incomplete_reason=incomplete_reason,
+        tool_metadata=tool_metadata,
     )
 
 
@@ -704,10 +778,12 @@ class _ResponsesStreamEmitter:
         delivery: ResponsesStreamDelivery | None = None,
         *,
         include_encrypted_reasoning: bool = False,
+        tool_metadata: ResponsesToolMetadata | None = None,
     ) -> None:
         self.response_id = response_id
         self.requested_model = requested_model
         self.delivery = delivery
+        self.tool_metadata = tool_metadata
         self.include_encrypted_reasoning = include_encrypted_reasoning
         self.created_at = int(time.time())
         self.seq = -1  # 首事件自增后为 0，与 SDK 从 0 递增一致
@@ -758,6 +834,7 @@ class _ResponsesStreamEmitter:
             usage=self.usage,
             incomplete_reason=incomplete_reason,
             created_at=self.created_at,
+            tool_metadata=self.tool_metadata,
         )
 
     def created(self) -> str:
@@ -1153,7 +1230,9 @@ class _ResponsesStreamEmitter:
             return list(self.error(message, code=504))
         if not sent.begin_failure():
             return []
-        emitter = _ResponsesStreamEmitter(self.response_id, self.requested_model)
+        emitter = _ResponsesStreamEmitter(
+            self.response_id, self.requested_model, tool_metadata=self.tool_metadata
+        )
         emitter.created_at = self.created_at
         emitter.seq = sent.sequence
         chunks = [emitter.created()] if sent.sequence == -1 else []
@@ -1235,9 +1314,12 @@ def build_responses_preparation_failure(
     *,
     register_failure: Callable[[Callable[[str], list[str]]], None],
     delivery: ResponsesStreamDelivery | None,
+    tool_metadata: ResponsesToolMetadata | None = None,
 ) -> list[str]:
     """Open and fail a Responses stream whose HTTP headers are already sent."""
-    emitter = _ResponsesStreamEmitter(_response_id(), requested_model, delivery)
+    emitter = _ResponsesStreamEmitter(
+        _response_id(), requested_model, delivery, tool_metadata=tool_metadata
+    )
     register_failure(emitter.timeout_error)
     return [emitter.created(), *emitter.error(message, code)]
 
@@ -1249,6 +1331,7 @@ async def responses_stream_adapter(
     register_failure: Callable[[Callable[[str], list[str]]], None] | None = None,
     delivery: ResponsesStreamDelivery | None = None,
     include_encrypted_reasoning: bool = False,
+    tool_metadata: ResponsesToolMetadata | None = None,
 ) -> AsyncGenerator[str, None]:
     """Gemini SSE → OpenAI Responses 语义事件流。"""
     response_id = _response_id()
@@ -1257,6 +1340,7 @@ async def responses_stream_adapter(
         requested_model,
         delivery,
         include_encrypted_reasoning=include_encrypted_reasoning,
+        tool_metadata=tool_metadata,
     )
     async with _stream_adapter_lifecycle(
         source, emitter.timeout_error, register_failure
@@ -1402,6 +1486,7 @@ async def responses_stream_adapter(
 
 
 __all__ = [
+    "ResponsesToolMetadata",
     "build_responses_object",
     "build_responses_preparation_failure",
     "responses_stream_adapter",

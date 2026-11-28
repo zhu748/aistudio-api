@@ -251,9 +251,9 @@ MakerSuite 协议无独立顶层工具控制字段，Gemini API 的 `toolConfig`
 
 | 模式 (Mode) | 语义说明 | 网关处理策略 |
 |---|---|---|
-| **`AUTO`** | 模型自主决定文本或工具调用 | 保持 `tools` 原样下发 |
+| **`AUTO`** | 模型自主决定文本或工具调用 | 若配置 `allowedFunctionNames`，仅下发匹配的函数声明 |
 | **`NONE`** | 禁用工具调用，强制纯文本输出 | 置空 `tools` 为 `null` |
-| **`ANY`** | 强制执行工具调用 | 若配置 `allowedFunctionNames`，在网关层过滤候选工具列表 |
+| **`ANY`** | 请求模型必须调用工具 | 网关只能按 `allowedFunctionNames` 过滤函数声明，不能强制调用；模型仍可只返回文本 |
 | **`VALIDATED`** | 受限解码验证 | 保持 `tools` 原样下发 |
 
 ### 6.5 函数调用往返编码（2026-11-14 hybrid6 真机抓包）
