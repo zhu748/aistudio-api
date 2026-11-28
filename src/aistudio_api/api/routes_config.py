@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import os
 from collections.abc import Mapping, Sequence
 
@@ -371,10 +372,18 @@ async def update_anti_truncation_config(
 # ========== API Key 备注与密钥管理 ==========
 
 
+def _api_key_id(raw_key: str) -> str:
+    """稳定短标识（与 request_options key_names 同口径）：SHA-256 前 12 位。"""
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:12]
+
+
 class ApiKeyItemModel(BaseModel):
+    id: str = ""
     name: str = "API Key"
     key: str = ""
     created_at: str | None = None
+    source: str = "config"
+    masked: bool = False
 
 
 class CreateApiKeyRequest(BaseModel):
@@ -587,11 +596,14 @@ async def list_api_keys(request: Request) -> list[ApiKeyItemModel]:
     items = get_configured_api_key_items()
     result = [
         ApiKeyItemModel(
+            id=_api_key_id(str(item.get("key") or "")),
             name=item.get("name") or "API Key",
             key=(item.get("key") or "")
             if show_plaintext
             else mask_api_key(str(item.get("key") or "")),
             created_at=item.get("created_at") or None,
+            source="config",
+            masked=not show_plaintext,
         )
         for item in items
     ]
@@ -605,9 +617,12 @@ async def list_api_keys(request: Request) -> list[ApiKeyItemModel]:
             continue
         result.append(
             ApiKeyItemModel(
+                id=_api_key_id(key),
                 name="环境变量注入 (ENV)",
                 key=key if show_plaintext else mask_api_key(key),
                 created_at=None,
+                source="env",
+                masked=not show_plaintext,
             )
         )
     return result
@@ -638,18 +653,30 @@ async def create_api_key(req: CreateApiKeyRequest) -> ApiKeyItemModel:
     await asyncio.to_thread(update_config_yaml_document, _persist_new_key, None)
 
     logger.info("创建 API Key: 备注=%s, 前缀=%s", name, new_key[:8] + "...")
-    return ApiKeyItemModel(name=name, key=new_key, created_at=created_at)
+    return ApiKeyItemModel(
+        id=_api_key_id(new_key),
+        name=name,
+        key=new_key,
+        created_at=created_at,
+        source="config",
+        masked=False,
+    )
 
 
 @protected_router.delete("/api-keys/{key_value:path}")
 async def delete_api_key(key_value: str) -> dict[str, bool]:
-    """在 config.yaml 中删除指定 API Key。"""
+    """在 config.yaml 中删除指定 API Key。
+
+    ``key_value`` 既接受原始密钥（历史路径），也接受 ``GET /api-keys`` 返回
+    的 ``id``（SHA-256 前 12 位）：后者避免把明文密钥放进 URL，从而不落进
+    反向代理访问日志。
+    """
 
     def _persist_delete_key(parsed: dict[str, object]) -> None:
         new_list: list[dict[str, str]] = []
         found = False
         for item in _normalize_key_entries(parsed.get("api_keys")):
-            if item["key"] == key_value:
+            if item["key"] == key_value or _api_key_id(item["key"]) == key_value:
                 found = True
                 continue
             new_list.append(item)
@@ -662,7 +689,7 @@ async def delete_api_key(key_value: str) -> dict[str, bool]:
     # 同 create_api_key：读-解析-落盘全套同步 I/O 下放线程池。
     await asyncio.to_thread(update_config_yaml_document, _persist_delete_key, None)
 
-    logger.info("删除 API Key: 前缀=%s", key_value[:8] + "...")
+    logger.info("删除 API Key: 选择器=%s", key_value[:12] + "...")
     return {"ok": True}
 
 
@@ -670,7 +697,10 @@ async def delete_api_key(key_value: str) -> dict[str, bool]:
 async def update_api_key_name(
     key_value: str, req: UpdateApiKeyRequest
 ) -> ApiKeyItemModel:
-    """在 config.yaml 中更新指定 API Key 的备注名。"""
+    """在 config.yaml 中更新指定 API Key 的备注名。
+
+    ``key_value`` 同 ``delete_api_key``：原始密钥或 ``id`` 短标识均可。
+    """
 
     def _persist_rename_key(parsed: dict[str, object]) -> None:
         new_list: list[dict[str, str]] = []
@@ -678,11 +708,14 @@ async def update_api_key_name(
         new_name_val = req.name.strip() if req.name.strip() else "API Key"
 
         for item in _normalize_key_entries(parsed.get("api_keys")):
-            if item["key"] == key_value:
+            if item["key"] == key_value or _api_key_id(item["key"]) == key_value:
                 updated_item = ApiKeyItemModel(
+                    id=_api_key_id(item["key"]),
                     name=new_name_val,
                     key=item["key"],
                     created_at=item["created_at"] or None,
+                    source="config",
+                    masked=False,
                 )
                 new_list.append(
                     {
@@ -707,7 +740,7 @@ async def update_api_key_name(
 
     updated = _rename_result[0]
     logger.info(
-        "更新 API Key 备注: 前缀=%s, 备注=%s", key_value[:8] + "...", updated.name
+        "更新 API Key 备注: 选择器=%s, 备注=%s", key_value[:12] + "...", updated.name
     )
 
     return updated
@@ -739,9 +772,20 @@ async def update_global_proxy(req: GlobalProxyRequest) -> dict[str, object]:
 
     # 代理 URL 可能内嵌用户名/密码：与迁移前一致按私密文件（0600）落盘。
     await asyncio.to_thread(update_config_yaml_document, save, None, private=True)
+    prev_proxy = settings.proxy_url
     settings.proxy_url = proxy
     if runtime_state.client:
         await runtime_state.client.session.set_default_proxy(proxy)
+        if prev_proxy != proxy:
+            runtime_state.client.session.invalidate_proof_cache()
+    if prev_proxy != proxy:
+        from aistudio_api.infrastructure.waa.daemon import (
+            restart_signer_daemon_if_managed,
+        )
+
+        await asyncio.to_thread(
+            restart_signer_daemon_if_managed, default_proxy=proxy or ""
+        )
     return {
         "ok": True,
         "global_proxy": redact_text(proxy or ""),

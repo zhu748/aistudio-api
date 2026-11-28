@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import json
 import sqlite3
 import threading
 import time
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import lru_cache
@@ -40,6 +42,23 @@ class RequestHistory:
         # options）继续走各自的临时连接，不受写锁串行影响；get 例外——
         # 它要看到 fire-and-forget 起始记录的提交，故同样持锁。
         self._write_conn: sqlite3.Connection | None = None
+        _ACTIVE_HISTORIES.add(self)
+
+    def close(self) -> None:
+        """显式关闭写路径长连接，防止 LRU 驱逐或进程退出时泄漏 sqlite 句柄。"""
+        with self._lock:
+            conn = self._write_conn
+            self._write_conn = None
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+
+    def __del__(self) -> None:
+        conn = getattr(self, "_write_conn", None)
+        if conn is not None:
+            self._write_conn = None
+            with contextlib.suppress(Exception):
+                conn.close()
 
     def _ensure_schema(self, connection: sqlite3.Connection) -> None:
         if self._schema_ready:
@@ -335,6 +354,19 @@ class RequestHistory:
                 "history_days": settings.history_days,
                 "enabled": settings.request_history,
             }
+
+
+_ACTIVE_HISTORIES: weakref.WeakSet[RequestHistory] = weakref.WeakSet()
+
+
+def close_all_histories() -> None:
+    """进程退出前关闭所有仍存活的 RequestHistory 长连接。"""
+    for history in list(_ACTIVE_HISTORIES):
+        with contextlib.suppress(Exception):
+            history.close()
+
+
+atexit.register(close_all_histories)
 
 
 @lru_cache(maxsize=8)

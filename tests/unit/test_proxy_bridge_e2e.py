@@ -85,13 +85,22 @@ def _go(_build_dir: Path) -> str:
         pytest.skip("TURN fixture 源码缺失：proxybridge/testdata/turnfixture.go")
     # testdata 目录不参与 go build .，须显式编译为独立 fixture 二进制
     out = _build_dir / "turnfixture"
-    subprocess.run(
-        [go, "build", "-o", str(out), "testdata/turnfixture.go"],
-        cwd=_PROXYBRIDGE_DIR,
-        check=True,
-        capture_output=True,
-        timeout=300,
-    )
+    try:
+        subprocess.run(
+            [go, "build", "-o", str(out), "testdata/turnfixture.go"],
+            cwd=_PROXYBRIDGE_DIR,
+            check=True,
+            capture_output=True,
+            timeout=300,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        # 工具链存在但版本不足（go.mod 要求 go 1.27，本地 GOTOOLCHAIN=local 时
+        # 无法自动下载）或网络不可达：属前置条件不满足，应 skip 而非 error。
+        detail = ""
+        if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+            detail = exc.stderr.decode("utf-8", "replace").strip().splitlines()
+            detail = f"：{detail[0]}" if detail else ""
+        pytest.skip(f"无法编译 TURN fixture（需要 go >= 1.27）{detail}")
     return go
 
 

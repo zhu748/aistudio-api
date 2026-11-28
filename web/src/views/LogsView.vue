@@ -66,11 +66,7 @@ const visibleLogs = computed(() => {
   const needle = search.value.trim().toLowerCase()
   let list = entries.value
   if (needle) {
-    list = list.filter((e) =>
-      `${e.message} ${e.name} ${e.level} ${e.request_id || ''} ${e.model || ''} ${e.account_id || ''} ${e.sig_meta ? JSON.stringify(e.sig_meta) : ''}`
-        .toLowerCase()
-        .includes(needle),
-    )
+    list = list.filter((e) => searchTextOf(e).includes(needle))
   }
   return order.value === 'desc' ? [...list].reverse() : list
 })
@@ -110,6 +106,19 @@ function keyOf(entry: LogEntry): number {
     keyMap.set(entry, key)
   }
   return key
+}
+
+// 检索串缓存：关键词过滤每 100ms 随批量追加重算一次，原实现逐条
+// JSON.stringify(sig_meta) + 整串 toLowerCase，1000 条时是每批数千次
+// 字符串分配。条目对象在生命周期内不变，按对象身份缓存一次即可。
+const searchIndexMap = new WeakMap<LogEntry, string>()
+function searchTextOf(entry: LogEntry): string {
+  let text = searchIndexMap.get(entry)
+  if (text === undefined) {
+    text = `${entry.message} ${entry.name} ${entry.level} ${entry.request_id || ''} ${entry.model || ''} ${entry.account_id || ''}${entry.sig_meta ? ` ${JSON.stringify(entry.sig_meta)}` : ''}`.toLowerCase()
+    searchIndexMap.set(entry, text)
+  }
+  return text
 }
 
 function parseEventData<T>(ev: Event): T | null {

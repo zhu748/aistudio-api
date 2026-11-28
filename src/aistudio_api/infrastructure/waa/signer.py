@@ -278,13 +278,15 @@ class LocalProofSigner:
             # Go 签名器的 scheme 白名单只认 http/https/socks5（详见
             # normalize_proxy_for_go_signer），turn/turns/sstp 也必须先解析为
             # 本地回环 SOCKS5。签名与模型请求必须同出口 IP，故始终随请求传
-            # 当前代理。
+            # 当前代理；显式 direct 哨兵需透传，覆盖签名器启动期默认代理。
             try:
                 resolved_proxy = await resolve_proxy_url_async(upstream_proxy)
             except ProxyBridgeError as exc:
                 raise TransportError(f"出站代理解析失败: {exc}") from exc
             if resolved_proxy:
                 payload["proxy"] = normalize_proxy_for_go_signer(resolved_proxy)
+            else:
+                payload["proxy"] = "direct"
         request_headers = {
             "Content-Type": "application/json",
             **signer_authorization(self.server_url),

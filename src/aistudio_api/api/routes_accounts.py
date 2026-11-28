@@ -57,13 +57,17 @@ class AccountResponse(BaseModel):
 
 
 def to_account_response(
-    account: AccountMeta, *, request: Request | None = None
+    account: AccountMeta,
+    *,
+    request: Request | None = None,
+    is_admin: bool | None = None,
 ) -> AccountResponse:
     """AccountMeta → 响应模型。
 
-    传入 ``request`` 时按会话级别掩码代理内嵌凭据：API Key 回退会话
-    只应看到脱敏地址（与 GET /config、/api/proxies 同一信任边界），
-    管理密码会话保持明文便于面板复制。不传（测试/内部调用）保持原样。
+    传入 ``request``（或预计算好的 ``is_admin``）时按会话级别掩码代理内嵌
+    凭据：API Key 回退会话只应看到脱敏地址（与 GET /config、/api/proxies
+    同一信任边界），管理密码会话保持明文便于面板复制。不传（测试/内部调用）
+    保持原样。
     """
     cid = getattr(account, "cookie_id", None) or (
         f"cookie_{account.created_at[:16]}"
@@ -71,10 +75,13 @@ def to_account_response(
         else f"cookie_{account.id}"
     )
     proxy_url = getattr(account, "proxy_url", None)
-    if proxy_url and request is not None:
-        from aistudio_api.api.dependencies import is_admin_password_session
+    if proxy_url and (is_admin is not None or request is not None):
+        if is_admin is None:
+            from aistudio_api.api.dependencies import is_admin_password_session
 
-        if not is_admin_password_session(request):
+            assert request is not None
+            is_admin = is_admin_password_session(request)
+        if not is_admin:
             proxy_url = redact_text(proxy_url)
     return AccountResponse(
         id=account.id,
@@ -153,8 +160,13 @@ async def list_accounts(
     account_service: AccountService = Depends(get_account_service),
 ) -> list[AccountResponse]:
     """列出所有账号。"""
-    accounts = account_service.list_accounts()
-    return [to_account_response(a, request=request) for a in accounts]
+    from aistudio_api.api.dependencies import is_admin_password_session
+
+    accounts = await asyncio.to_thread(account_service.list_accounts)
+    if not accounts:
+        return []
+    is_admin = is_admin_password_session(request)
+    return [to_account_response(a, is_admin=is_admin) for a in accounts]
 
 
 @router.get("/active", response_model=AccountResponse)
@@ -211,20 +223,36 @@ async def detect_account_email(
 
     if target_auth:
         try:
-            cookie_dict = load_cookies_from_auth_file(target_auth)
+            cookie_dict = await asyncio.to_thread(
+                load_cookies_from_auth_file, target_auth
+            )
             if cookie_dict:
-                # 账号绑定独立代理时，探活请求走同一出口
+                import httpx
+
+                from aistudio_api.infrastructure.proxy_bridge import (
+                    resolve_effective_proxy_async,
+                )
+
+                # 账号绑定独立代理时，探活请求走同一出口并复用同一个连接池
                 acc_proxy = getattr(acc, "proxy_url", None)
-                email = await probe_account_email(
-                    cookie_dict,
-                    auth_user=acc.auth_user or "0",
-                    proxy_url=acc_proxy,
-                )
-                http_tier = await probe_account_benefit_tier(
-                    cookie_dict,
-                    auth_user=acc.auth_user or "0",
-                    proxy_url=acc_proxy,
-                )
+                resolved_proxy = await resolve_effective_proxy_async(acc_proxy)
+                async with httpx.AsyncClient(
+                    timeout=8.0,
+                    proxy=resolved_proxy,
+                    follow_redirects=True,
+                ) as probe_client:
+                    email = await probe_account_email(
+                        cookie_dict,
+                        auth_user=acc.auth_user or "0",
+                        client=probe_client,
+                        proxy_url=acc_proxy,
+                    )
+                    http_tier = await probe_account_benefit_tier(
+                        cookie_dict,
+                        auth_user=acc.auth_user or "0",
+                        client=probe_client,
+                        proxy_url=acc_proxy,
+                    )
                 if http_tier:
                     detected_tier = http_tier
         except Exception as e:
@@ -261,7 +289,9 @@ async def detect_account_tier(
     target_auth = account_service.get_account_auth_path(account_id)
     if target_auth:
         try:
-            cookie_dict = load_cookies_from_auth_file(target_auth)
+            cookie_dict = await asyncio.to_thread(
+                load_cookies_from_auth_file, target_auth
+            )
             if cookie_dict:
                 detected_tier = await probe_account_benefit_tier(
                     cookie_dict,
@@ -361,6 +391,36 @@ async def rotate_account_cookies(
     }
 
 
+async def _switch_after_active_deletion(
+    account_service: AccountService,
+    runtime_state: RuntimeState,
+) -> None:
+    """删除当前活跃账号后切换至首个启用（优先可用）的剩余账号；无启用账号时置空会话。"""
+    remaining_accounts = await asyncio.to_thread(account_service.list_accounts)
+    enabled_accounts = [a for a in remaining_accounts if getattr(a, "enabled", True)]
+    rotator = runtime_state.rotator
+    new_active = None
+    if enabled_accounts:
+        if rotator is not None:
+            new_active = next(
+                (a for a in enabled_accounts if rotator.is_account_available(a.id)),
+                None,
+            )
+        if new_active is None:
+            new_active = enabled_accounts[0]
+
+    gateway_session = runtime_state.client.session if runtime_state.client else None
+    if new_active is not None:
+        await asyncio.to_thread(account_service.set_active_account, new_active.id)
+        if gateway_session is not None:
+            new_auth_path = account_service.get_account_auth_path(new_active.id)
+            await gateway_session.switch_auth(
+                str(new_auth_path) if new_auth_path else None
+            )
+    elif gateway_session is not None:
+        await gateway_session.switch_auth(None)
+
+
 @router.delete("/{account_id}")
 async def delete_account(
     account_id: str = FastApiPath(..., pattern=r"^[a-zA-Z0-9_\-\.@]+$"),
@@ -376,21 +436,9 @@ async def delete_account(
         raise HTTPException(status_code=404, detail="账号不存在")
 
     if runtime_state.rotator:
-        runtime_state.rotator.remove_account(account_id)
+        await asyncio.to_thread(runtime_state.rotator.remove_account, account_id)
     if is_active:
-        remaining_accounts = account_service.list_accounts()
-        new_active = remaining_accounts[0] if remaining_accounts else None
-        gateway_session = runtime_state.client.session if runtime_state.client else None
-        if new_active is not None:
-            await asyncio.to_thread(account_service.set_active_account, new_active.id)
-            if gateway_session is not None:
-                new_auth_path = account_service.get_account_auth_path(new_active.id)
-                await gateway_session.switch_auth(
-                    str(new_auth_path) if new_auth_path else None
-                )
-        else:
-            if gateway_session is not None:
-                await gateway_session.switch_auth(None)
+        await _switch_after_active_deletion(account_service, runtime_state)
 
     logger.info("已删除账号: id=%s", account_id)
     return {"ok": True}
@@ -407,7 +455,7 @@ async def delete_cookie_group(
     active_id = active_account.id if active_account is not None else None
     active_deleted = False
 
-    accounts = account_service.list_accounts()
+    accounts = await asyncio.to_thread(account_service.list_accounts)
     deleted_count = 0
     rotator = runtime_state.rotator
     for a in accounts:
@@ -418,23 +466,11 @@ async def delete_cookie_group(
             if await asyncio.to_thread(account_service.delete_account, a.id):
                 deleted_count += 1
                 if rotator:
-                    rotator.remove_account(a.id)
+                    await asyncio.to_thread(rotator.remove_account, a.id)
                 logger.info("已删除子账号: cookie_id=%s, id=%s", cookie_id, a.id)
 
     if active_deleted:
-        remaining_accounts = account_service.list_accounts()
-        new_active = remaining_accounts[0] if remaining_accounts else None
-        gateway_session = runtime_state.client.session if runtime_state.client else None
-        if new_active is not None:
-            await asyncio.to_thread(account_service.set_active_account, new_active.id)
-            if gateway_session is not None:
-                new_auth_path = account_service.get_account_auth_path(new_active.id)
-                await gateway_session.switch_auth(
-                    str(new_auth_path) if new_auth_path else None
-                )
-        else:
-            if gateway_session is not None:
-                await gateway_session.switch_auth(None)
+        await _switch_after_active_deletion(account_service, runtime_state)
 
     return {"deleted": deleted_count}
 
@@ -544,7 +580,7 @@ async def update_account_proxy(
     await asyncio.to_thread(
         account_service.update_account_proxy, account_id, raw_proxy or None
     )
-    account = account_service.get_account(account_id)
+    account = await asyncio.to_thread(account_service.get_account, account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
     from aistudio_api.api.state import runtime_state
@@ -563,7 +599,7 @@ async def update_account_proxy(
         from aistudio_api.config import settings
 
         keep_proxies: set[str | None] = {settings.proxy_url}
-        for acc in account_service.list_accounts():
+        for acc in await asyncio.to_thread(account_service.list_accounts):
             keep_proxies.add(getattr(acc, "proxy_url", None))
         with contextlib.suppress(Exception):
             await client.session.retire_unused_clients(keep_proxies)

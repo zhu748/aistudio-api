@@ -34,6 +34,10 @@ dev = [
   "google-auth<2.48.0",
   "pyright>=1.1.300",
   "ruff>=0.8.0; sys_platform != 'android'",
+  # 配额窗口/统计时区测试直接构造 ZoneInfo("America/Los_Angeles")：Linux 与
+  # Termux 由系统 tzdata 提供，Windows 与精简镜像没有 IANA 数据库，缺包时
+  # 这些测试会以 ZoneInfoNotFoundError 失败。仅开发/测试环境需要。
+  "tzdata>=2024.1; sys_platform == 'win32'",
 ]
 test = [
   "pytest>=8.0.0",
@@ -43,6 +47,7 @@ test = [
   "anthropic>=2.8.0",
   "httpx2>=2.16.0",
   "google-auth<2.48.0",
+  "tzdata>=2024.1; sys_platform == 'win32'",
 ]
 
 [project.scripts]

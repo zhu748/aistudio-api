@@ -184,6 +184,20 @@ def _shared_test_env(tmp_path_factory):
     return config_file, data_dir
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _close_request_history_on_exit():
+    """测试会话结束时关闭 RequestHistory 写路径长连接。
+
+    ``request_history()`` 是进程级单例并复用一条 sqlite 写连接；不显式关闭时，
+    解释器退出阶段由 GC 终结会抛 ``ResourceWarning: unclosed database``，
+    在 ``filterwarnings = error`` 下会把整个测试会话标成失败。
+    """
+    yield
+    from aistudio_api.infrastructure.request_history import close_all_histories
+
+    close_all_histories()
+
+
 @pytest.fixture(autouse=True)
 def isolate_test_config(monkeypatch, _shared_test_env):
     """Isolate all test runs from repository-level config.yaml modifications and runtime state files."""

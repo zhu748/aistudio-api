@@ -155,23 +155,26 @@ async def request_options() -> dict[str, object]:
         get_configured_api_key_items,
     )
 
-    result = await asyncio.to_thread(request_history().options)
-    service = runtime_state.account_service
-    result["accounts"] = (
-        [
-            {"id": account.id, "name": account.email or account.name or account.id}
-            for account in service.list_accounts()
-        ]
-        if service
-        else []
-    )
-    result["key_names"] = {
-        hashlib.sha256(str(item.get("key") or "").encode()).hexdigest()[:12]: str(
-            item.get("name") or "API Key"
+    def _collect_options() -> dict[str, object]:
+        result = request_history().options()
+        service = runtime_state.account_service
+        result["accounts"] = (
+            [
+                {"id": account.id, "name": account.email or account.name or account.id}
+                for account in service.list_accounts()
+            ]
+            if service
+            else []
         )
-        for item in get_configured_api_key_items()
-    } | {"admin": "管理员"}
-    return result
+        result["key_names"] = {
+            hashlib.sha256(str(item.get("key") or "").encode()).hexdigest()[:12]: str(
+                item.get("name") or "API Key"
+            )
+            for item in get_configured_api_key_items()
+        } | {"admin": "管理员"}
+        return result
+
+    return await asyncio.to_thread(_collect_options)
 
 
 @router.get("/requests/{request_id}/payload")

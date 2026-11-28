@@ -204,12 +204,20 @@ watch(
   },
   { immediate: true },
 )
-onMounted(async () => {
+async function loadOptions() {
   try {
     options.value = await operationsApi.options()
   } catch {
     toast.error('筛选选项加载失败，可继续输入 ID 查询')
   }
+}
+
+async function refresh() {
+  await Promise.all([load(), loadOptions()])
+}
+
+onMounted(() => {
+  void loadOptions()
 })
 usePolling(
   async () => {
@@ -218,7 +226,7 @@ usePolling(
   10000,
   { immediate: false },
 )
-usePageRefresh(load)
+usePageRefresh(refresh)
 </script>
 
 <template>
@@ -236,7 +244,7 @@ usePageRefresh(load)
       <div class="flex flex-wrap items-center gap-2">
         <Button
           :loading="loading"
-          @click="load"
+          @click="refresh"
         >
           <RefreshCw class="w-3.5 h-3.5" />刷新
         </Button><Button

@@ -32,9 +32,15 @@ export interface HealthCheckResponse {
   status: string
 }
 export interface ApiKeyItem {
+  /** 稳定短标识（SHA-256 前 12 位）：编辑/删除用它而非明文密钥。 */
+  id?: string
   name: string
   key: string
   created_at?: string | null
+  /** config = 面板创建（可改可删）；env = 环境变量注入（只读）。 */
+  source?: 'config' | 'env'
+  /** true 表示 key 字段是脱敏串（未配置管理密码的回退会话）。 */
+  masked?: boolean
 }
 
 export interface CreateApiKeyRequest {

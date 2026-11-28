@@ -276,7 +276,9 @@ func (p *WorkerPool) AcquireWorker(
 
         key := accountKeyFromState(state, authUser)
         effectiveProxy := strings.TrimSpace(proxyOverride)
-        if effectiveProxy == "" {
+        if strings.EqualFold(effectiveProxy, "direct") || strings.EqualFold(effectiveProxy, "none") {
+                effectiveProxy = ""
+        } else if effectiveProxy == "" {
                 effectiveProxy = p.proxy
         }
 

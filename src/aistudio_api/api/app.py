@@ -596,6 +596,9 @@ async def _graceful_shutdown(
             await asyncio.to_thread(pending_rotator.save_state)
     except Exception as e:
         logger.debug("关闭时刷新统计/调度状态失败: %s", e)
+    from aistudio_api.infrastructure.request_history import close_all_histories
+
+    await asyncio.to_thread(close_all_histories)
     from aistudio_api.infrastructure.utils.log_files import stop_file_logging
 
     await asyncio.to_thread(stop_file_logging)

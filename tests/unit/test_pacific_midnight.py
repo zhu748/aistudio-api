@@ -10,6 +10,24 @@ import pytest
 from aistudio_api.application import account_rotator as module
 
 
+def _load_la_zone() -> ZoneInfo | None:
+    """北美太平洋时区对象；宿主缺 IANA 数据库（Windows/精简镜像无 tzdata）时返回 None。
+
+    项目运行时对此是健壮的（``_pacific_zone`` 失败即走纯算术 DST 回退），
+    但本文件的断言需要与 ZoneInfo 逐秒对齐，故缺库时跳过 zoneinfo 分支。
+    """
+    try:
+        return ZoneInfo("America/Los_Angeles")
+    except Exception:
+        return None
+
+
+_LA_ZONE = _load_la_zone()
+_requires_tzdata = pytest.mark.skipif(
+    _LA_ZONE is None, reason="宿主缺少 IANA 时区数据库（需安装 tzdata）"
+)
+
+
 @pytest.mark.parametrize("fallback", [False, True])
 @pytest.mark.parametrize(
     "start,end",
@@ -21,6 +39,8 @@ from aistudio_api.application import account_rotator as module
     ],
 )
 def test_midnight_countdown_matches_utc_elapsed_time(monkeypatch, fallback, start, end):
+    if not fallback and _LA_ZONE is None:
+        pytest.skip("宿主缺少 IANA 时区数据库（需安装 tzdata）")
     now = datetime.fromisoformat(start).replace(tzinfo=UTC).timestamp()
     midnight = datetime.fromisoformat(end).replace(tzinfo=UTC).timestamp()
     monkeypatch.setattr(module.time, "time", lambda: now)
@@ -36,6 +56,8 @@ def test_midnight_countdown_matches_utc_elapsed_time(monkeypatch, fallback, star
 
 
 def _pin_la_zone(monkeypatch) -> None:
+    if _LA_ZONE is None:
+        pytest.skip("宿主缺少 IANA 时区数据库（需安装 tzdata）")
     monkeypatch.setattr(module, "_pacific_date_key_cache", None)
     monkeypatch.setattr(
         module, "_pacific_zone", lambda: ZoneInfo("America/Los_Angeles")

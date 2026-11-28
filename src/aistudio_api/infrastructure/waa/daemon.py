@@ -179,7 +179,141 @@ def _signer_listen_addr(url: str) -> str:
     return f"{host}:{port}"
 
 
-def ensure_signer_ready(*, server_url: str | None = None) -> str | None:
+def _ensure_signer_ready_locked(
+    *, server_url: str | None = None, default_proxy: str | None = None
+) -> str | None:
+    """内部实现：在已持有 _daemon_lock 下检查/拉起本地签名服务。"""
+    global _daemon_proc
+    url = (
+        server_url
+        if server_url is not None
+        else str(get_local_waa_server().get("url") or "")
+    )
+    host, port = _signer_address(url)
+    listen_addr = _signer_listen_addr(url)
+
+    root_dir = Path(__file__).resolve().parents[4]
+    bin_name = "waa-signer.exe" if sys.platform == "win32" else "waa-signer"
+    bin_path = root_dir / "waa-signer" / "bin" / bin_name
+
+    # 1. 检查本地签名服务是否已有健康实例在运行
+    if is_service_healthy(url):
+        logger.debug("本地 WAA 签名服务运行正常 (%s)", listen_addr)
+        return None
+
+    # 端口已被其它进程占用但 /health 不通过：不要贸然再拉起一个实例
+    # （会立刻因端口冲突退出）。返回原因让调用方明确知晓本地引擎
+    # 不可用；不去停止/杀死占用端口的进程（它不在我们的管理范围内）。
+    if is_port_open(host, port):
+        return (
+            f"端口 {listen_addr} 已被占用，但 /health 探活失败；"
+            "请确认占用该端口的进程，或释放端口后重试"
+        )
+
+    # 2. 检查本地编译产物是否存在
+    is_executable = bin_path.is_file() and (
+        sys.platform == "win32" or os.access(bin_path, os.X_OK)
+    )
+    reason = (
+        f"本地签名器没有执行权限: {bin_path}，请为该文件添加执行权限"
+        if bin_path.is_file()
+        else f"未检测到本地 WAA 签名服务二进制产物: {bin_path}，"
+        "请运行 waa-signer 构建脚本，或重新构建包含本地签名器的 Docker 镜像"
+    )
+    if is_executable:
+        from aistudio_api.config import settings
+
+        # 全局代理传给 Go 签名器（仅 http/https/socks5；turn/sstp 先解析
+        # 为本地回环 SOCKS5，解析失败按无代理启动并在日志里给出指引——
+        # 签名器拉起失败不会有任何远程回退，不应因代理单点问题阻断启动）。
+        if default_proxy is not None:
+            raw_proxy = default_proxy.strip()
+        else:
+            raw_proxy = (
+                settings.proxy_url
+                or os.getenv("AISTUDIO_PROXY")
+                or os.getenv("HTTPS_PROXY")
+                or ""
+            ).strip()
+        proxy = ""
+        if raw_proxy:
+            from aistudio_api.infrastructure.proxy_bridge import (
+                normalize_proxy_for_go_signer,
+                resolve_proxy_url,
+            )
+
+            try:
+                resolved_proxy = resolve_proxy_url(raw_proxy)
+            except Exception as e:
+                logger.warning(
+                    "全局代理 %s 解析失败，本地签名器本次直连启动: %s", raw_proxy, e
+                )
+                resolved_proxy = None
+            if resolved_proxy:
+                proxy = normalize_proxy_for_go_signer(resolved_proxy)
+        cmd = [str(bin_path), "-listen", listen_addr]
+        if proxy:
+            cmd.extend(["-proxy", proxy])
+
+        logger.info("启动本地 WAA 签名服务: %s", bin_path)
+        try:
+            popen_kwargs: dict[str, object] = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "cwd": str(bin_path.parent.parent),
+                # PORT 属于 PaaS 主服务；旧版签名器在解析 -listen 前就
+                # 检查它，显式覆盖默认监听地址也能兼容这些已有二进制。
+                "env": {**os.environ, "LISTEN_ADDR": listen_addr},
+            }
+            if settings.signer_secret:
+                popen_kwargs["env"] = {
+                    **os.environ,
+                    "LISTEN_ADDR": listen_addr,
+                    "SIGNER_SHARED_SECRET": settings.signer_secret,
+                }
+            if sys.platform == "win32":
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                popen_kwargs["preexec_fn"] = functools.partial(
+                    _set_parent_death_signal, os.getpid()
+                )
+
+            proc = subprocess.Popen(cmd, **popen_kwargs)  # type: ignore[call-overload]
+            threading.Thread(
+                target=_relay_signer_logs,
+                args=(proc,),
+                daemon=True,
+                name="signer-logs",
+            ).start()
+            _daemon_proc = proc
+            # 冷启动给 10 秒宽限；提前退出时立即报告退出码。
+            deadline = time.monotonic() + 10.0
+            reason = "本地 WAA 签名服务启动后 10 秒内未通过 /health 探活，请查看 waa.process 日志"
+            while time.monotonic() < deadline:
+                returncode = proc.poll()
+                if returncode is not None:
+                    reason = f"本地 WAA 签名服务提前退出（退出码 {returncode}），请查看 waa.process 日志"
+                    break
+                if is_service_healthy(url):
+                    logger.info("本地 WAA 签名服务已就绪 (PID %d)", proc.pid)
+                    return None
+                time.sleep(0.1)
+            logger.warning("%s", reason)
+        except Exception as e:
+            reason = f"启动本地 WAA 签名服务失败: {e}"
+            logger.warning("%s", reason)
+
+    # 3. 若无本地二进制或拉起失败：回收子进程（不回收会留下僵尸进程
+    #    并长期占用 8081，导致后续重启无法绑定端口），返回失败原因。
+    if _daemon_proc is not None:
+        _stop_signer_daemon_locked()
+
+    return reason
+
+
+def ensure_signer_ready(
+    *, server_url: str | None = None, default_proxy: str | None = None
+) -> str | None:
     """检查本地 WAA 签名服务状态，未运行时自动拉起。
 
     本地引擎是唯一签名方式（远程签名与多节点切换支持已移除）：拉起
@@ -188,127 +322,27 @@ def ensure_signer_ready(*, server_url: str | None = None) -> str | None:
     请使用 ``await asyncio.to_thread(ensure_signer_ready)``。
     返回本地启动失败原因；指定 server_url 时仅准备该节点（测试注入用）。
     """
-    global _daemon_proc
     with _daemon_lock:
-        url = (
-            server_url
-            if server_url is not None
-            else str(get_local_waa_server().get("url") or "")
+        return _ensure_signer_ready_locked(
+            server_url=server_url, default_proxy=default_proxy
         )
-        host, port = _signer_address(url)
-        listen_addr = _signer_listen_addr(url)
 
-        root_dir = Path(__file__).resolve().parents[4]
-        bin_name = "waa-signer.exe" if sys.platform == "win32" else "waa-signer"
-        bin_path = root_dir / "waa-signer" / "bin" / bin_name
 
-        # 1. 检查本地签名服务是否已有健康实例在运行
-        if is_service_healthy(url):
-            logger.debug("本地 WAA 签名服务运行正常 (%s)", listen_addr)
+def restart_signer_daemon_if_managed(
+    *, server_url: str | None = None, default_proxy: str | None = None
+) -> str | None:
+    """若本地签名器由本进程托管运行中，停止并以最新默认代理重启之。
+
+    用于面板动态调整全局代理（尤其切回直连）后同步刷新签名器启动期默认
+    代理，避免签名继续沿用旧代理；外部自启动的签名器实例不受影响。
+    """
+    with _daemon_lock:
+        if _daemon_proc is None or _daemon_proc.poll() is not None:
             return None
-
-        # 端口已被其它进程占用但 /health 不通过：不要贸然再拉起一个实例
-        # （会立刻因端口冲突退出）。返回原因让调用方明确知晓本地引擎
-        # 不可用；不去停止/杀死占用端口的进程（它不在我们的管理范围内）。
-        if is_port_open(host, port):
-            return (
-                f"端口 {listen_addr} 已被占用，但 /health 探活失败；"
-                "请确认占用该端口的进程，或释放端口后重试"
-            )
-
-        # 2. 检查本地编译产物是否存在
-        is_executable = bin_path.is_file() and (
-            sys.platform == "win32" or os.access(bin_path, os.X_OK)
+        _stop_signer_daemon_locked()
+        return _ensure_signer_ready_locked(
+            server_url=server_url, default_proxy=default_proxy
         )
-        reason = (
-            f"本地签名器没有执行权限: {bin_path}，请为该文件添加执行权限"
-            if bin_path.is_file()
-            else f"未检测到本地 WAA 签名服务二进制产物: {bin_path}，"
-            "请运行 waa-signer 构建脚本，或重新构建包含本地签名器的 Docker 镜像"
-        )
-        if is_executable:
-            # 全局代理传给 Go 签名器（仅 http/https/socks5；turn/sstp 先解析
-            # 为本地回环 SOCKS5，解析失败按无代理启动并在日志里给出指引——
-            # 签名器拉起失败不会有任何远程回退，不应因代理单点问题阻断启动）。
-            raw_proxy = (
-                os.getenv("AISTUDIO_PROXY") or os.getenv("HTTPS_PROXY") or ""
-            ).strip()
-            proxy = ""
-            if raw_proxy:
-                from aistudio_api.infrastructure.proxy_bridge import (
-                    normalize_proxy_for_go_signer,
-                    resolve_proxy_url,
-                )
-
-                try:
-                    resolved_proxy = resolve_proxy_url(raw_proxy)
-                except Exception as e:
-                    logger.warning(
-                        "全局代理 %s 解析失败，本地签名器本次直连启动: %s", raw_proxy, e
-                    )
-                    resolved_proxy = None
-                if resolved_proxy:
-                    proxy = normalize_proxy_for_go_signer(resolved_proxy)
-            cmd = [str(bin_path), "-listen", listen_addr]
-            if proxy:
-                cmd.extend(["-proxy", proxy])
-
-            logger.info("启动本地 WAA 签名服务: %s", bin_path)
-            try:
-                popen_kwargs: dict[str, object] = {
-                    "stdout": subprocess.PIPE,
-                    "stderr": subprocess.STDOUT,
-                    "cwd": str(bin_path.parent.parent),
-                    # PORT 属于 PaaS 主服务；旧版签名器在解析 -listen 前就
-                    # 检查它，显式覆盖默认监听地址也能兼容这些已有二进制。
-                    "env": {**os.environ, "LISTEN_ADDR": listen_addr},
-                }
-                from aistudio_api.config import settings
-
-                if settings.signer_secret:
-                    popen_kwargs["env"] = {
-                        **os.environ,
-                        "LISTEN_ADDR": listen_addr,
-                        "SIGNER_SHARED_SECRET": settings.signer_secret,
-                    }
-                if sys.platform == "win32":
-                    popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-                else:
-                    popen_kwargs["preexec_fn"] = functools.partial(
-                        _set_parent_death_signal, os.getpid()
-                    )
-
-                proc = subprocess.Popen(cmd, **popen_kwargs)  # type: ignore[call-overload]
-                threading.Thread(
-                    target=_relay_signer_logs,
-                    args=(proc,),
-                    daemon=True,
-                    name="signer-logs",
-                ).start()
-                _daemon_proc = proc
-                # 冷启动给 10 秒宽限；提前退出时立即报告退出码。
-                deadline = time.monotonic() + 10.0
-                reason = "本地 WAA 签名服务启动后 10 秒内未通过 /health 探活，请查看 waa.process 日志"
-                while time.monotonic() < deadline:
-                    returncode = proc.poll()
-                    if returncode is not None:
-                        reason = f"本地 WAA 签名服务提前退出（退出码 {returncode}），请查看 waa.process 日志"
-                        break
-                    if is_service_healthy(url):
-                        logger.info("本地 WAA 签名服务已就绪 (PID %d)", proc.pid)
-                        return None
-                    time.sleep(0.1)
-                logger.warning("%s", reason)
-            except Exception as e:
-                reason = f"启动本地 WAA 签名服务失败: {e}"
-                logger.warning("%s", reason)
-
-        # 3. 若无本地二进制或拉起失败：回收子进程（不回收会留下僵尸进程
-        #    并长期占用 8081，导致后续重启无法绑定端口），返回失败原因。
-        if _daemon_proc is not None:
-            _stop_signer_daemon_locked()
-
-        return reason
 
 
 def _stop_signer_daemon_locked() -> None:

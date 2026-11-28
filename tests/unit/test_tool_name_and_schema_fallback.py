@@ -21,10 +21,10 @@ from typing import Any, cast
 from aistudio_api.application.anti_truncation import prepare_anti_truncation
 from aistudio_api.application.chat_service import (
     NormalizedGeminiRequest,
-    _tool_schema_shape,
     encode_function_declaration_to_wire,
     encode_response_schema_to_wire,
 )
+from aistudio_api.application.schema_wire_codec import _tool_schema_shape
 from aistudio_api.infrastructure.gateway.client import AIStudioClient, PreparedRequest
 from aistudio_api.infrastructure.gateway.wire_types import (
     AistudioContent,

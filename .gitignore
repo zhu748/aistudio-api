@@ -44,3 +44,7 @@ waa-signer/.deps/
 # TURN/SSTP 桥接器构建产物
 proxybridge/bin/
 proxybridge/.deps/
+
+# 本地临时目录（pytest basetemp / 审查脚本落盘等）
+/.tmp/
+/tmp*/

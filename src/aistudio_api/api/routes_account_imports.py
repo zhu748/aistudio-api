@@ -339,8 +339,11 @@ async def probe_and_import(
             rotator.add_account(meta.id)
             rotator.clear_cooldown(meta.id)
 
+    from aistudio_api.api.dependencies import is_admin_password_session
+
+    is_admin = is_admin_password_session(request)
     imported_accounts = [
-        to_account_response(account, request=request) for account in metas
+        to_account_response(account, is_admin=is_admin) for account in metas
     ]
 
     client_obj = getattr(runtime_state, "client", None)
@@ -464,7 +467,10 @@ async def import_bundle(
             status_code=400, detail="未解析到任何包含有效 cookies 的账号条目"
         )
 
+    from aistudio_api.api.dependencies import is_admin_password_session
+
     had_active_account = account_service.get_active_account() is not None
+    is_admin = is_admin_password_session(request)
     imported_accounts: list[AccountResponse] = []
     for idx, item in enumerate(items_to_import):
         raw_cookie_str = str(item.get("cookies") or "")
@@ -532,7 +538,7 @@ async def import_bundle(
         if rotator:
             rotator.add_account(account.id)
             rotator.clear_cooldown(account.id)
-        imported_accounts.append(to_account_response(account, request=request))
+        imported_accounts.append(to_account_response(account, is_admin=is_admin))
     if not had_active_account and imported_accounts:
         # set_active_account 亦触发目录缓存失效（收敛在 AccountService）。
         account_service.set_active_account(imported_accounts[0].id)

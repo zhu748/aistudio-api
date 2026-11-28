@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import time
 import urllib.parse
 from collections.abc import Callable
@@ -41,6 +42,9 @@ from aistudio_api.infrastructure.utils.redaction import redact_text
 
 logger = get_logger("requests")
 _DOWNSTREAM_DISCONNECT = "Downstream disconnected (client or reverse proxy)"
+# 大请求体（>64KB）首个 64KB 前缀内轻量嗅探顶层 "model": "..."，
+# 让提前返回 400/413 的调用仍能在请求历史里看到模型名。
+_MODEL_SNIFF_RE = re.compile(rb'"model"\s*:\s*"([^"\\]{1,256})"')
 
 
 # ── 小内存容器的 RSS 高水位治理 ──────────────────────────────────────────────
@@ -358,24 +362,36 @@ class RequestMiddleware:
                 body = message.get("body", b"")
                 observer.received_bytes += len(body)
                 observer.request_body_complete = not message.get("more_body", False)
-                if (
-                    model_call
-                    and not context.requested_model
-                    and observer.received_bytes <= 65536
-                ):
-                    observer.metadata_body.extend(body)
-                    if not message.get("more_body", False):
-                        try:
-                            metadata = json.loads(observer.metadata_body)
-                            if isinstance(metadata, dict) and isinstance(
-                                metadata.get("model"), str
-                            ):
-                                context.requested_model = redact_text(
-                                    metadata["model"]
-                                )[:256]
+                if model_call and not context.requested_model:
+                    if observer.received_bytes <= 65536:
+                        observer.metadata_body.extend(body)
+                        if not message.get("more_body", False):
+                            try:
+                                metadata = json.loads(observer.metadata_body)
+                                if isinstance(metadata, dict) and isinstance(
+                                    metadata.get("model"), str
+                                ):
+                                    context.requested_model = redact_text(
+                                        metadata["model"]
+                                    )[:256]
+                                    context.model = context.requested_model
+                            except (ValueError, UnicodeDecodeError):
+                                pass
+                    elif observer.metadata_body:
+                        # 超过 64KB 阈值：对已收到的前缀（补当前块前 4KB，
+                        # 避免 "model" 键名跨块截断）做一次轻量正则嗅探，
+                        # 之后丢弃缓冲（大请求体不再累积观测副本）。
+                        sample = bytes(observer.metadata_body) + body[:4096]
+                        observer.metadata_body.clear()
+                        match = _MODEL_SNIFF_RE.search(sample)
+                        if match is not None:
+                            try:
+                                sniffed = match.group(1).decode("utf-8")
+                            except UnicodeDecodeError:
+                                sniffed = ""
+                            if sniffed:
+                                context.requested_model = redact_text(sniffed)[:256]
                                 context.model = context.requested_model
-                        except (ValueError, UnicodeDecodeError):
-                            pass
                 # 管理路径同样施加请求体上限（1MB）：写端点无界接收可把
                 # 磁盘与 yaml 解析 CPU 打爆（实测 50MB config 被完整落盘）
                 body_limit = settings.max_request_bytes if model_call else 1_048_576

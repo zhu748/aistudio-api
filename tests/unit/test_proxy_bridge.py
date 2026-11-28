@@ -164,7 +164,12 @@ _URI = "sstp://private-user:private-password@vpn.example.com:443?sni=cert.exampl
 
 
 def _fake_launch(state_dir: Path):
-    """构造 Popen 侧效果：读取私有配置、断言权限、写 ready 标记、返回假进程。"""
+    """构造 Popen 侧效果：读取私有配置、断言权限、写 ready 标记、返回假进程。
+
+    POSIX 权限位断言仅在 POSIX 生效：Windows 无 POSIX mode 位（chmod 只映射
+    只读标志），``stat.S_IMODE`` 恒为 0o666，无法表达 0600。生产部署目标
+    （Docker / Termux）均为 POSIX，该契约在那里仍被完整校验。
+    """
 
     def launch(args, **kwargs):
         assert args[1:2] == ["-config"], args  # 命令行只有 -config 路径
@@ -172,8 +177,9 @@ def _fake_launch(state_dir: Path):
         config = json.loads(config_path.read_text(encoding="utf-8"))
         # 凭据绝不出现在命令行或进程参数里（ps 泄漏面）
         assert "private-password" not in " ".join(args)
-        assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
-        assert stat.S_IMODE(config_path.parent.stat().st_mode) == 0o700
+        if sys.platform != "win32":
+            assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+            assert stat.S_IMODE(config_path.parent.stat().st_mode) == 0o700
         Path(config["ready_file"]).write_text("ready\n", encoding="ascii")
         process = MagicMock()
         process.poll.return_value = None

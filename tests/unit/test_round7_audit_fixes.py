@@ -241,8 +241,15 @@ def test_request_history_schema_once(tmp_path: Path) -> None:
             "status_code": 200,
         }
     )
-    assert not [s for s in stmts if "CREATE" in s.upper()]
-    assert conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 4
+    try:
+        assert not [s for s in stmts if "CREATE" in s.upper()]
+        assert conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 4
+    finally:
+        # 显式关闭：不关闭时 sqlite3.Connection.__del__ 在 GC 期抛
+        # ResourceWarning: unclosed database，在 filterwarnings=error 下变成失败。
+        conn.close()
+        h.close()
+        h2.close()
 
 
 # ─── P3-8: 日志查询 desc 提前终止 ───

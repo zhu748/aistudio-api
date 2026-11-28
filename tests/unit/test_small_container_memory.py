@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -37,6 +38,12 @@ from aistudio_api.infrastructure.gateway.model_turns import (
     ModelTurnHistory,
     _hash_media_b64,
     _turn_limits,
+)
+
+# cgroup 限额与 /proc/mounts 只存在于 Linux（部署目标是 Docker/Termux）；
+# Windows 上没有这些伪文件系统，相关探测函数按设计恒返回 None/("","")。
+_linux_only = pytest.mark.skipif(
+    sys.platform != "linux", reason="cgroup / /proc/mounts 仅存在于 Linux"
 )
 
 # ---------------------------------------------------------------------------
@@ -66,12 +73,14 @@ def test_memory_budget_env_override_wins(monkeypatch: pytest.MonkeyPatch) -> Non
     assert detect_memory_budget_mb() == 512
 
 
+@_linux_only
 def test_memory_budget_cgroup_v2(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AISTUDIO_MEMORY_BUDGET_MB", raising=False)
     _fake_cgroup_files(monkeypatch, {"/sys/fs/cgroup/memory.max": "536870912\n"})
     assert detect_memory_budget_mb() == 512
 
 
+@_linux_only
 def test_memory_budget_cgroup_v2_unlimited(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AISTUDIO_MEMORY_BUDGET_MB", raising=False)
     # v2 "max" → 回退 v1；v1 未设限（页计数器巨值）→ 无预算
@@ -85,6 +94,7 @@ def test_memory_budget_cgroup_v2_unlimited(monkeypatch: pytest.MonkeyPatch) -> N
     assert detect_memory_budget_mb() is None
 
 
+@_linux_only
 def test_memory_budget_cgroup_v1_huge_limit_means_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -97,6 +107,7 @@ def test_memory_budget_cgroup_v1_huge_limit_means_none(
     assert detect_memory_budget_mb() is None
 
 
+@_linux_only
 def test_memory_budget_invalid_env_falls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -279,6 +290,7 @@ def _fake_mounts(monkeypatch: pytest.MonkeyPatch, content: str) -> None:
     monkeypatch.setattr(Path, "open", fake_open)
 
 
+@_linux_only
 def test_ephemeral_data_dir_on_overlay(monkeypatch: pytest.MonkeyPatch) -> None:
     import aistudio_api.config as config
 
@@ -290,6 +302,7 @@ def test_ephemeral_data_dir_on_overlay(monkeypatch: pytest.MonkeyPatch) -> None:
     assert is_ephemeral_data_dir() is True
 
 
+@_linux_only
 def test_persistent_data_dir_on_ext4(monkeypatch: pytest.MonkeyPatch) -> None:
     import aistudio_api.config as config
 
@@ -301,6 +314,7 @@ def test_persistent_data_dir_on_ext4(monkeypatch: pytest.MonkeyPatch) -> None:
     assert is_ephemeral_data_dir() is False
 
 
+@_linux_only
 def test_mount_info_longest_prefix_wins(monkeypatch: pytest.MonkeyPatch) -> None:
     _fake_mounts(
         monkeypatch,
@@ -311,6 +325,7 @@ def test_mount_info_longest_prefix_wins(monkeypatch: pytest.MonkeyPatch) -> None
     assert fs == "ext4"
 
 
+@_linux_only
 def test_mount_info_escapes_spaces(monkeypatch: pytest.MonkeyPatch) -> None:
     _fake_mounts(
         monkeypatch,

@@ -56,6 +56,18 @@ onMounted(() => {
   void loadApiKeys()
 })
 
+function keyOf(item: ApiKeyItem): string {
+  return item.id || item.key
+}
+
+function isReadonly(item: ApiKeyItem): boolean {
+  return item.source === 'env'
+}
+
+function isMasked(item: ApiKeyItem): boolean {
+  return item.masked === true
+}
+
 function toggleVisibility(key: string) {
   if (visibleKeys.value.has(key)) {
     visibleKeys.value.delete(key)
@@ -98,6 +110,10 @@ async function handleCreateKey() {
 }
 
 function openEditModal(item: ApiKeyItem) {
+  if (isReadonly(item)) {
+    toast.error('环境变量注入的 Key 为只读，请在部署平台修改 AISTUDIO_API_KEYS')
+    return
+  }
   editingKey.value = item
   editKeyNameInput.value = item.name
   editModalOpen.value = true
@@ -109,7 +125,7 @@ async function handleSaveEditName() {
   if (!name) return
 
   try {
-    await systemApi.updateApiKeyName(editingKey.value.key, { name })
+    await systemApi.updateApiKeyName(keyOf(editingKey.value), { name })
     toast.success('API Key 备注名已更新')
     editModalOpen.value = false
     await loadApiKeys()
@@ -120,6 +136,10 @@ async function handleSaveEditName() {
 }
 
 async function handleDeleteKey(item: ApiKeyItem) {
+  if (isReadonly(item)) {
+    toast.error('环境变量注入的 Key 为只读，无法在面板删除')
+    return
+  }
   const ok = await confirm({
     title: '吊销客户端 API Key',
     message: `确定要删除密钥「${item.name}」吗？删除后使用该 Key 的客户端将无法继续调用接口。`,
@@ -128,7 +148,7 @@ async function handleDeleteKey(item: ApiKeyItem) {
   })
   if (ok) {
     try {
-      await systemApi.deleteApiKey(item.key)
+      await systemApi.deleteApiKey(keyOf(item))
       toast.success('API Key 已删除')
       await loadApiKeys()
     } catch (err: unknown) {
@@ -210,14 +230,19 @@ async function handleDeleteKey(item: ApiKeyItem) {
         <tbody class="divide-y divide-slate-100">
           <tr
             v-for="item in apiKeys"
-            :key="item.key"
+            :key="keyOf(item)"
             class="hover:bg-slate-50/60 transition-colors"
           >
             <!-- Name / Memo -->
             <td class="py-3 px-4">
               <div class="flex items-center gap-1.5 font-semibold text-slate-900">
                 <span>{{ item.name }}</span>
+                <span
+                  v-if="isReadonly(item)"
+                  class="px-1.5 py-0.5 text-[10px] font-normal bg-slate-100 text-slate-500 rounded"
+                >只读</span>
                 <button
+                  v-if="!isReadonly(item)"
                   type="button"
                   class="text-slate-300 hover:text-slate-600 p-0.5 rounded cursor-pointer"
                   title="修改备注名"
@@ -232,17 +257,18 @@ async function handleDeleteKey(item: ApiKeyItem) {
             <td class="py-3 px-4 font-mono">
               <div class="flex items-center gap-1.5">
                 <span class="text-slate-800 bg-slate-50 px-2 py-0.5 rounded border border-slate-200/80">
-                  {{ visibleKeys.has(item.key) ? item.key : maskKey(item.key) }}
+                  {{ visibleKeys.has(keyOf(item)) ? item.key : maskKey(item.key) }}
                 </span>
 
                 <button
+                  v-if="!isMasked(item)"
                   type="button"
                   class="text-slate-400 hover:text-slate-700 p-1 rounded hover:bg-slate-100 cursor-pointer"
-                  :title="visibleKeys.has(item.key) ? '隐藏密钥' : '显示完整密钥'"
-                  @click="toggleVisibility(item.key)"
+                  :title="visibleKeys.has(keyOf(item)) ? '隐藏密钥' : '显示完整密钥'"
+                  @click="toggleVisibility(keyOf(item))"
                 >
                   <EyeOff
-                    v-if="visibleKeys.has(item.key)"
+                    v-if="visibleKeys.has(keyOf(item))"
                     class="w-3.5 h-3.5"
                   />
                   <Eye
@@ -252,6 +278,7 @@ async function handleDeleteKey(item: ApiKeyItem) {
                 </button>
 
                 <button
+                  v-if="!isMasked(item)"
                   type="button"
                   class="text-slate-400 hover:text-brand-600 p-1 rounded hover:bg-brand-50 cursor-pointer"
                   title="复制密钥"
@@ -266,6 +293,11 @@ async function handleDeleteKey(item: ApiKeyItem) {
                     class="w-3.5 h-3.5"
                   />
                 </button>
+                <span
+                  v-else
+                  class="text-[10px] text-slate-400 font-sans"
+                  title="未配置管理密码时密钥按脱敏展示，设置 AISTUDIO_WEB_PASSWORD 后可查看明文"
+                >已脱敏</span>
               </div>
             </td>
 
@@ -277,6 +309,7 @@ async function handleDeleteKey(item: ApiKeyItem) {
             <!-- Actions -->
             <td class="py-3 px-4 text-right">
               <button
+                v-if="!isReadonly(item)"
                 type="button"
                 class="text-slate-400 hover:text-rose-600 p-1 rounded-md hover:bg-rose-50 transition-colors cursor-pointer"
                 title="删除 API Key"
@@ -284,6 +317,10 @@ async function handleDeleteKey(item: ApiKeyItem) {
               >
                 <Trash2 class="w-3.5 h-3.5" />
               </button>
+              <span
+                v-else
+                class="text-[10px] text-slate-300"
+              >—</span>
             </td>
           </tr>
         </tbody>

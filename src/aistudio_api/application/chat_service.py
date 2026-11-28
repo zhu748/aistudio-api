@@ -18,26 +18,12 @@ if TYPE_CHECKING:
 
 from dataclasses import dataclass
 
-# 编码器区整体迁移至 schema_wire_codec（重导出保持 anti_truncation.py 与
-# 既有测试的 import 路径不变；F401 经下方 __all__ 声明豁免）
-from aistudio_api.application.schema_wire_codec import (  # noqa: F401
-    _DECLARATION_LOSSY_KEYS,
-    _RESPONSE_LOSSY_KEYS,
-    _RESPONSE_SCHEMA_NOTE,
-    _SHAPE_KEY_ALIASES,
-    _TOOL_ARGUMENTS_SCHEMA_NOTE,
+# 编码器区整体迁移至 schema_wire_codec（仅保留 __all__ 中的公开重导出，
+# 保持 anti_truncation.py 与既有测试的 import 路径不变）；本模块内部仍需
+# 复用声明名归一化辅助。
+from aistudio_api.application.schema_wire_codec import (
     SCHEMA_TYPE_CODES,
-    _compact_schema_json,
-    _declaration_cache,
-    _define_required_properties,
-    _encode_schema_combiners,
-    _encode_schema_to_wire,
-    _encode_tool_parameters,
     _function_declaration_name,
-    _resolve_schema_type_code,
-    _schema_has_empty_enum,
-    _schema_has_lossy_keys,
-    _tool_schema_shape,
     encode_function_declaration_to_wire,
     encode_response_schema_to_wire,
     encode_schema_to_wire,

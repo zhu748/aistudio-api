@@ -359,17 +359,21 @@ def test_record_rotator_event_uses_explicit_account_id(monkeypatch):
 
 
 def test_atomic_write_private_mode_permissions(tmp_path):
-    """private=True 写入的文件权限应为 0600。"""
+    """private=True 写入的文件权限应为 0600（POSIX 专属契约）。"""
     import stat
+    import sys
 
     from aistudio_api.infrastructure.utils.common import atomic_write_json
 
     target = tmp_path / "auth.json"
     atomic_write_json(target, {"cookies": []}, private=True)
 
-    mode = stat.S_IMODE(target.stat().st_mode)
-    assert mode == 0o600, f"凭据文件权限为 {oct(mode)}，应为 0600（3.13 回归）"
-    # 临时文件不残留
+    # Windows 无 POSIX mode 位（chmod 仅映射只读标志），0600 不可表达；
+    # 生产部署目标（Docker / Termux）均为 POSIX，契约在那里仍被校验。
+    if sys.platform != "win32":
+        mode = stat.S_IMODE(target.stat().st_mode)
+        assert mode == 0o600, f"凭据文件权限为 {oct(mode)}，应为 0600（3.13 回归）"
+    # 临时文件不残留（跨平台断言）
     leftovers = list(tmp_path.glob("*.tmp.*"))
     assert not leftovers, f"原子写残留临时文件: {leftovers}"
 

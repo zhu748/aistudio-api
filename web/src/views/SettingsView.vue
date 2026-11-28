@@ -30,6 +30,15 @@ const loading = ref(false)
 
 type SettingsTab = 'general' | 'transport' | 'apikeys' | 'models'
 const activeTab = ref<SettingsTab>('general')
+// 懒挂载 + 保活：切回已访问过的 Tab 不再销毁重建组件（原先每个 Tab 用
+// v-if，切走即卸载，未保存的表单草稿丢失且每次回来都重新拉取配置）。
+// 只记录访问过的 Tab，首次访问前不挂载，避免首屏并发拉四份配置。
+const mountedTabs = ref<Set<SettingsTab>>(new Set<SettingsTab>(['general']))
+
+function switchTab(tab: SettingsTab) {
+  activeTab.value = tab
+  mountedTabs.value.add(tab)
+}
 
 const tabs: { key: SettingsTab; label: string; desc: string; icon: typeof Activity }[] = [
   { key: 'general', label: '日志与调试', desc: '日志级别与请求报文转储', icon: Activity },
@@ -166,7 +175,7 @@ usePageRefresh(loadConfig)
             ? 'bg-slate-900 text-white shadow-2xs'
             : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
         "
-        @click="activeTab = tab.key"
+        @click="switchTab(tab.key)"
       >
         <component
           :is="tab.icon"
@@ -189,7 +198,8 @@ usePageRefresh(loadConfig)
 
     <!-- Tab 1: General & Logging -->
     <div
-      v-if="activeTab === 'general'"
+      v-if="mountedTabs.has('general')"
+      v-show="activeTab === 'general'"
       class="space-y-4"
     >
       <div
@@ -213,7 +223,8 @@ usePageRefresh(loadConfig)
 
     <!-- Tab 2: Anti-Truncation Transport & Keepalive -->
     <div
-      v-else-if="activeTab === 'transport'"
+      v-if="mountedTabs.has('transport')"
+      v-show="activeTab === 'transport'"
       class="space-y-5"
     >
       <KeepaliveCard />
@@ -221,12 +232,18 @@ usePageRefresh(loadConfig)
     </div>
 
     <!-- Tab 3: Client API Keys -->
-    <div v-else-if="activeTab === 'apikeys'">
+    <div
+      v-if="mountedTabs.has('apikeys')"
+      v-show="activeTab === 'apikeys'"
+    >
       <ApiKeyManagerCard />
     </div>
 
     <!-- Tab 4: Model Rules, Protocol Compat & YAML -->
-    <div v-else-if="activeTab === 'models'">
+    <div
+      v-if="mountedTabs.has('models')"
+      v-show="activeTab === 'models'"
+    >
       <VisualConfigEditor
         v-if="config"
         :initial-yaml="config.yaml_content"

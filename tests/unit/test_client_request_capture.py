@@ -134,7 +134,9 @@ async def test_original_body_survives_real_protocol_routes(
     assert "transport-secret" not in json.dumps(captured)
     assert len(converted) == 1
     assert "extension" not in converted[0].model_dump()
-    saved = json.loads((log_module.get_dump_dir() / f"{request_id}.json").read_text())
+    saved = json.loads(
+        (log_module.get_dump_dir() / f"{request_id}.json").read_text(encoding="utf-8")
+    )
     assert saved["client_request"]["body"].encode() == raw
     assert (
         saved["response_body"] is None if stream else saved["response_body"] is not None

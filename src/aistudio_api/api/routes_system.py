@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -43,7 +43,7 @@ def stats_response() -> StatsResponse:
     from aistudio_api.api.state import runtime_state
     from aistudio_api.infrastructure.gateway.model_defaults import resolve_tier_quota
 
-    stats = dict(runtime_state.model_stats)
+    stats = runtime_state.snapshot_model_stats()
     rotator = runtime_state.rotator
     account_svc = runtime_state.account_service
     accounts_list = account_svc.list_accounts() if account_svc else []
@@ -60,50 +60,69 @@ def stats_response() -> StatsResponse:
         total_tokens=sum(s.total_tokens for s in stats.values()),
     )
 
+    daily_snapshots: dict[str, tuple[bool, dict[str, Any]]] | None = None
+    if rotator is not None:
+        from aistudio_api.application.account_rotator import (
+            get_pacific_date_key,
+        )
+
+        current_la = get_pacific_date_key()
+        snapshot_fn = rotator.snapshot_daily_models
+        if callable(snapshot_fn):
+            snapshots = snapshot_fn([acc.id for acc in accounts_list], current_la)
+            if isinstance(snapshots, dict):
+                daily_snapshots = snapshots
+    now = time.time()
+
     models = {}
     for name, s in stats.items():
         clean_m = name.removeprefix("models/").lower()
         breakdown: list[AccountBreakdownItem] = []
 
-        if rotator:
-            from aistudio_api.application.account_rotator import get_pacific_date_key
-
-            current_la = get_pacific_date_key()
+        if rotator is not None:
             for acc in accounts_list:
-                st = rotator.get_account_stats(acc.id)
-                if st:
-                    st._check_date_reset(current_la)
-                    if clean_m in st.daily_models:
-                        m_daily = st.daily_models[clean_m]
-                        quota = resolve_tier_quota(acc.tier, clean_m)
-                        used_pct = round((m_daily.requests / max(1, quota)) * 100, 1)
-                        cd_rem = (
-                            max(0, int(m_daily.cooldown_until - time.time()))
-                            if m_daily.cooldown_until > time.time()
-                            else 0
+                if daily_snapshots is not None:
+                    snap = daily_snapshots.get(acc.id)
+                    if snap is None:
+                        continue
+                    session_expired, daily_models = snap
+                    m_daily = daily_models.get(clean_m)
+                else:
+                    st = rotator.get_account_stats(acc.id)
+                    if st is None:
+                        continue
+                    session_expired = st.session_expired
+                    m_daily = st.daily_models.get(clean_m)
+                if m_daily is not None:
+                    quota = resolve_tier_quota(acc.tier, clean_m)
+                    used_pct = round((m_daily.requests / max(1, quota)) * 100, 1)
+                    cd_rem = (
+                        max(0, int(m_daily.cooldown_until - now))
+                        if m_daily.cooldown_until > now
+                        else 0
+                    )
+                    breakdown.append(
+                        AccountBreakdownItem(
+                            account_id=acc.id,
+                            name=acc.name,
+                            auth_user=acc.auth_user,
+                            email=acc.email,
+                            tier=acc.tier,
+                            group=acc.group,
+                            enabled=acc.enabled,
+                            today_requests=m_daily.requests,
+                            today_success=m_daily.success,
+                            today_rate_limited=m_daily.rate_limited_total,
+                            today_tokens=m_daily.total_tokens,
+                            today_reasoning_tokens=m_daily.reasoning_tokens,
+                            configured_quota=quota,
+                            quota_used_percent=used_pct,
+                            is_available=acc.enabled
+                            and cd_rem == 0
+                            and not session_expired,
+                            cooldown_remaining=cd_rem,
                         )
-                        breakdown.append(
-                            AccountBreakdownItem(
-                                account_id=acc.id,
-                                name=acc.name,
-                                auth_user=acc.auth_user,
-                                email=acc.email,
-                                tier=acc.tier,
-                                group=acc.group,
-                                enabled=acc.enabled,
-                                today_requests=m_daily.requests,
-                                today_success=m_daily.success,
-                                today_rate_limited=m_daily.rate_limited_total,
-                                today_tokens=m_daily.total_tokens,
-                                today_reasoning_tokens=m_daily.reasoning_tokens,
-                                configured_quota=quota,
-                                quota_used_percent=used_pct,
-                                is_available=acc.enabled
-                                and cd_rem == 0
-                                and not st.session_expired,
-                                cooldown_remaining=cd_rem,
-                            )
-                        )
+                    )
 
         models[name] = ModelStatsResponse(
             requests=s.requests,
@@ -181,7 +200,7 @@ async def get_rotation_status(
     return {
         "enabled": True,
         "mode": "sticky",
-        "accounts": rotator.get_all_stats(),
+        "accounts": await asyncio.to_thread(rotator.get_all_stats),
         "upstream_keepalive": get_upstream_keepalive_status(),
     }
 
@@ -196,17 +215,21 @@ async def clear_cooldown(
     if rotator is None:
         raise HTTPException(503, detail="调度器未初始化")
 
-    if req.account_id:
-        rotator.clear_cooldown(req.account_id, model=req.model)
-    else:
-        rotator.clear_all_cooldowns()
+    def _clear_and_read() -> dict[str, dict[str, object]]:
+        if req.account_id:
+            rotator.clear_cooldown(req.account_id, model=req.model)
+        else:
+            rotator.clear_all_cooldowns()
+        return rotator.get_all_stats()
+
+    accounts = await asyncio.to_thread(_clear_and_read)
     logger.info(
         "已清除冷却状态: 账号=%s, 模型=%s",
         req.account_id or "全部",
         req.model or "全部",
     )
 
-    return {"ok": True, "accounts": rotator.get_all_stats()}
+    return {"ok": True, "accounts": accounts}
 
 
 @protected_router.post("/rotation/cleanup-ghosts")
@@ -218,12 +241,16 @@ async def cleanup_ghosts(
     if rotator is None:
         raise HTTPException(503, detail="调度器未初始化")
 
-    cleaned_ids = rotator.cleanup_ghost_accounts()
+    def _cleanup_and_read() -> tuple[list[str], dict[str, dict[str, object]]]:
+        cleaned = rotator.cleanup_ghost_accounts()
+        return cleaned, rotator.get_all_stats()
+
+    cleaned_ids, accounts = await asyncio.to_thread(_cleanup_and_read)
     return {
         "ok": True,
         "cleaned_count": len(cleaned_ids),
         "cleaned_ids": cleaned_ids,
-        "accounts": rotator.get_all_stats(),
+        "accounts": accounts,
     }
 
 
@@ -236,7 +263,7 @@ async def get_rotation_accounts(
     if rotator is None:
         raise HTTPException(503, detail="调度器未初始化")
 
-    return rotator.get_all_stats()
+    return await asyncio.to_thread(rotator.get_all_stats)
 
 
 @protected_router.post("/rotation/next")
