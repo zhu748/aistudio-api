@@ -1726,7 +1726,7 @@ def _build_gemini_streaming_response(
                 try:
                     if force_buffer:
                         # 非流式抗截断变体：上游改走缓冲（非流式）传输，整体
-                        # 还原后打包为单条完整 SSE 事件下发。
+                        # 还原后再组装 SSE 事件下发。
                         output = await client.generate_content(
                             **_stream_request_kwargs(normalized),
                             prepared=auth_manager.current_prepared,
@@ -1742,7 +1742,19 @@ def _build_gemini_streaming_response(
                         ) = _finalize_buffered_output(output, at_ctx, normalized.model)
                         state.has_yielded_data = buffered_has_output
                         has_yielded_any = True
-                        yield buffered_resp.model_dump(mode="json", exclude_none=True)
+                        buffered_frame = buffered_resp.model_dump(
+                            mode="json", exclude_none=True
+                        )
+                        if sdk_terminal and (
+                            not buffered_has_output
+                            or state.final_finish_reason != "STOP"
+                        ):
+                            # SDK chats use a nonempty terminal to curate history.
+                            # Partial answers and local diagnostics are display-only.
+                            content = buffered_frame["candidates"][0]["content"]
+                            yield _content_frame(content["parts"])
+                            content["parts"] = []
+                        yield buffered_frame
                         stream_completed = True
                         break
                     upstream_events = client.stream_generate_content(

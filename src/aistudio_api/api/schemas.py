@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from collections.abc import Mapping
+from typing import Annotated
+
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+)
 
 
 class GeminiInlineData(BaseModel):
     mimeType: str = Field(validation_alias=AliasChoices("mimeType", "mime_type"))
     data: str
     # 2026-11 AI Studio 真机抓包：inlineData wire 槽位 5 携带上传文件名
-    # （[mime, b64, null, null, null, filename]）。Gemini 原生 inlineData 无此
-    # 字段，仅 OpenAI file.filename / Responses input_file.filename 透传时出现。
+    # （[mime, b64, null, null, null, filename]）。普通 inlineData 不映射
+    # displayName；仅 functionResponse 的子附件复用这个上传文件名槽位。
     filename: str | None = Field(
         default=None, validation_alias=AliasChoices("filename", "file_name")
     )
@@ -31,6 +41,21 @@ class GeminiFunctionCall(BaseModel):
     id: str | None = None
 
 
+def _function_result_part_filename(part: object) -> object:
+    """Map FunctionResponseBlob.displayName without changing the general Blob."""
+    if not isinstance(part, Mapping):
+        return part
+    # Match GeminiPart's alias order, even for an explicitly null inlineData.
+    key = "inlineData" if "inlineData" in part else "inline_data"
+    blob = part.get(key)
+    if not isinstance(blob, Mapping) or "filename" in blob or "file_name" in blob:
+        return part
+    for alias in ("displayName", "display_name"):
+        if alias in blob:
+            return {**part, key: {**blob, "filename": blob[alias]}}
+    return part
+
+
 class GeminiFunctionResponse(BaseModel):
     name: str = ""
     response: dict[str, object] | list[object] | object | None = Field(
@@ -38,7 +63,10 @@ class GeminiFunctionResponse(BaseModel):
         validation_alias=AliasChoices("response", "content", "output"),
     )
     id: str | None = None
-    parts: list[GeminiPart] | None = None
+    parts: (
+        list[Annotated[GeminiPart, BeforeValidator(_function_result_part_filename)]]
+        | None
+    ) = None
 
 
 class GeminiExecutableCode(BaseModel):
