@@ -19,6 +19,7 @@ from aistudio_api.domain.errors import (
 from aistudio_api.domain.models import ModelOutput, ResponsePart
 from aistudio_api.infrastructure.account.cookie_parser import get_visit_id
 from aistudio_api.infrastructure.gateway.model_turns import (
+    HistorySignatureMigration,
     ModelTurnContext,
     ModelTurnHistory,
 )
@@ -147,6 +148,7 @@ class AIStudioClient:
         top_k: int | None = None,
         max_tokens: int | None = None,
         generation_config_overrides: dict | None = None,
+        signature_migration: HistorySignatureMigration | None = None,
     ) -> PreparedRequest:
         ctx = await self._session.ensure_ready()
         effective_contents = contents or [
@@ -175,7 +177,7 @@ class AIStudioClient:
         if trace is not None:
             trace.reset_attempt()
         effective_contents, turn_token, model_turn = self._model_turns.prepare(
-            scope, effective_contents
+            scope, effective_contents, migration=signature_migration
         )
         if trace is not None:
             trace.record_upstream_out(
@@ -316,6 +318,7 @@ class AIStudioClient:
         generation_config_overrides: dict | None = None,
         prepared: PreparedRequest | None = None,
         function_name_restore: dict[str, str] | None = None,
+        signature_migration: HistorySignatureMigration | None = None,
     ):
         effective_prep = prepared or await self.prepare_request(
             model=model,
@@ -329,6 +332,7 @@ class AIStudioClient:
             top_k=top_k,
             max_tokens=max_tokens,
             generation_config_overrides=generation_config_overrides,
+            signature_migration=signature_migration,
         )
         # aclosing：上层重试丢弃本生成器时确定性关闭流式网关生成器，
         # 逐层触发 aclose 链（session → transport → resp.aclose）。
@@ -374,6 +378,7 @@ class AIStudioClient:
         generation_config_overrides: dict | None = None,
         prepared: PreparedRequest | None = None,
         function_name_restore: dict[str, str] | None = None,
+        signature_migration: HistorySignatureMigration | None = None,
     ) -> ModelOutput:
         if prepared is not None:
             effective_prep = prepared
@@ -392,6 +397,7 @@ class AIStudioClient:
                 top_k=top_k,
                 max_tokens=max_tokens,
                 generation_config_overrides=generation_config_overrides,
+                signature_migration=signature_migration,
             )
 
         status, raw = await self._session.send_request(

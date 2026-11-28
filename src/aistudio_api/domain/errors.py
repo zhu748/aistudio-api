@@ -32,6 +32,7 @@ class UsageLimitExceeded(AistudioError):
 class RequestError(AistudioError):
     def __init__(self, status: int, message: str = ""):
         self.status = status
+        self.message = message
         super().__init__(f"HTTP {status}: {message}" if message else f"HTTP {status}")
 
 
@@ -171,6 +172,13 @@ def is_transient_rpc_error(exc: Exception) -> bool:
         err = str(exc).lower()
         return "ambiguous request for service" in err and "generatecontent" in err
     return False
+
+
+def is_corrupted_thought_signature(exc: Exception) -> bool:
+    if not isinstance(exc, RequestError) or exc.status != 400:
+        return False
+    _, message = parse_upstream_grpc_error(exc.message)
+    return message.strip().rstrip(".").casefold() == "corrupted thought signature"
 
 
 def is_transport_error(exc: Exception) -> bool:

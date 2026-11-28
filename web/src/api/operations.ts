@@ -46,6 +46,7 @@ export interface ThoughtSignatureItem {
   call_id?: string
   call_name?: string
   turn_index?: number
+  lead_call?: boolean
   note?: string
 }
 
@@ -67,6 +68,7 @@ export interface ThoughtSignatureTrace {
     fc_signed: number
     fc_skip: number
     fc_missing: number
+    fc_unsigned_lead_turns?: number
     thought_total: number
     thought_signed: number
     tail_signed: number

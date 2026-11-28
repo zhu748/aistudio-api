@@ -65,6 +65,7 @@ from aistudio_api.domain.errors import (
     TransportError,
     UsageLimitExceeded,
     is_account_verification_required,
+    is_corrupted_thought_signature,
     is_retryable_upstream_error,
     is_transient_rpc_error,
     parse_upstream_grpc_error,
@@ -77,6 +78,7 @@ from aistudio_api.infrastructure.gateway.client import (
     AIStudioClient,
     PreparedRequest,
 )
+from aistudio_api.infrastructure.gateway.model_turns import HistorySignatureMigration
 from aistudio_api.infrastructure.gateway.wire_spec import (
     WIRE_FINISH_REASON_CONTINUING,
 )
@@ -749,6 +751,24 @@ def _build_gemini_response_from_output(
     )
 
 
+def _retry_external_signatures(
+    exc: Exception, migration: HistorySignatureMigration | None
+) -> bool:
+    if (
+        migration is None
+        or migration.retrying
+        or not migration.candidates
+        or not is_corrupted_thought_signature(exc)
+    ):
+        return False
+    migration.retrying = True
+    record_attempt_error(400, str(exc))
+    logger.info(
+        "上游拒绝历史思维签名，迁移 %d 轮未观测签名后重试", len(migration.candidates)
+    )
+    return True
+
+
 async def handle_gemini_generate_content(
     model_path: str,
     req: GeminiGenerateContentRequest,
@@ -757,6 +777,7 @@ async def handle_gemini_generate_content(
     stream: bool,
     anti_truncation: bool | None = None,
     sdk_terminal: bool = False,
+    migrate_history: bool = False,
 ):
     observation = current_request.get()
     if observation is not None:
@@ -801,6 +822,7 @@ async def handle_gemini_generate_content(
             anti_truncation=anti_truncation,
             force_buffer=force_buffer,
             sdk_terminal=sdk_terminal,
+            migrate_history=migrate_history,
         )
 
     last_error: Exception | None = None
@@ -812,6 +834,7 @@ async def handle_gemini_generate_content(
     serving_account_id: str | None = None
     normalized = None
     at_ctx = None
+    signature_migration = HistorySignatureMigration() if migrate_history else None
     for attempt in range(total_attempts):
         await ensure_active_account(attempt, model=model_path)
         _svc = runtime_state.account_service
@@ -852,6 +875,7 @@ async def handle_gemini_generate_content(
                 generation_config_overrides=normalized.generation_config_overrides,
                 prepared=auth_manager.current_prepared,
                 function_name_restore=normalized.function_name_restore,
+                signature_migration=signature_migration,
             )
             auth_manager.current_prepared = None
             restore_anti_truncation_output(output, at_ctx)
@@ -936,6 +960,11 @@ async def handle_gemini_generate_content(
             if observation and observation.account_id:
                 serving_account_id = observation.account_id
                 auth_manager.serving_account_id = serving_account_id
+            if attempt + 1 < total_attempts and _retry_external_signatures(
+                exc, signature_migration
+            ):
+                auth_manager.current_prepared = None
+                continue
             if is_account_verification_required(exc):
                 auth_manager.current_prepared = None
             elif isinstance(exc, AuthError) and not isinstance(
@@ -1648,6 +1677,7 @@ def _build_gemini_streaming_response(
     anti_truncation: bool | None = None,
     force_buffer: bool = False,
     sdk_terminal: bool = False,
+    migrate_history: bool = False,
 ) -> GeminiStreamResponse:
     """构建 Gemini 流式响应（暴露结构化 frames 供适配层消费）。"""
 
@@ -1666,6 +1696,7 @@ def _build_gemini_streaming_response(
         serving_account_id: str | None = None
         state = _StreamAttemptState()
         pending_sdk_frame: dict[str, object] | None = None
+        signature_migration = HistorySignatureMigration() if migrate_history else None
         try:
             logger.info(
                 "流式请求: model=%s, 轮数=%d",
@@ -1699,6 +1730,7 @@ def _build_gemini_streaming_response(
                         output = await client.generate_content(
                             **_stream_request_kwargs(normalized),
                             prepared=auth_manager.current_prepared,
+                            signature_migration=signature_migration,
                         )
                         auth_manager.current_prepared = None
                         (
@@ -1716,6 +1748,7 @@ def _build_gemini_streaming_response(
                     upstream_events = client.stream_generate_content(
                         **_stream_request_kwargs(normalized),
                         prepared=auth_manager.current_prepared,
+                        signature_migration=signature_migration,
                     )
                     # 重试 continue / 客户端断连时，async for 不会自动关闭被
                     # 迭代的异步生成器；这里持引用并用 try/finally 确定性
@@ -1763,6 +1796,13 @@ def _build_gemini_streaming_response(
                     last_stream_error = exc
                     serving_account_id = _observed_serving_account(serving_account_id)
                     auth_manager.serving_account_id = serving_account_id
+                    if (
+                        not has_yielded_any
+                        and stream_attempt + 1 < total_attempts
+                        and _retry_external_signatures(exc, signature_migration)
+                    ):
+                        auth_manager.current_prepared = None
+                        continue
                     # 重试决策（403 阶梯分流 + 瞬态判定）见
                     # _retry_stream_attempt；已 yield 过数据后不可重试的守卫
                     # 语义全部保持。

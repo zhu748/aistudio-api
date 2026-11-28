@@ -779,11 +779,16 @@ def _convert_part(
             result.function_response = (
                 (name, resp_payload, result_id) if result_id else (name, resp_payload)
             )
-            if not (
-                part.fileData
-                or part.functionCall
-                or part.executableCode
-                or part.codeExecutionResult
+            if (
+                name == fr.name
+                and result_id == (fr.id or None)
+                and not (
+                    fr.parts
+                    or part.fileData
+                    or part.functionCall
+                    or part.executableCode
+                    or part.codeExecutionResult
+                )
             ):
                 result.thought_signature = _valid_thought_signature_or_none(
                     part.thoughtSignature
@@ -852,7 +857,8 @@ def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioConte
     pending: list[_ToolOwner] = []
 
     def result_run(content: GeminiContent) -> tuple[str, bool]:
-        return content.role or "user", any(p.functionResponse for p in content.parts)
+        role = content.role or "user"
+        return role, role != "model" and any(p.functionResponse for p in content.parts)
 
     def is_blank_user_content(content: GeminiContent) -> bool:
         # An empty user placeholder is not a new turn. Drop it before
@@ -885,10 +891,11 @@ def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioConte
             for part in incoming:
                 stripped_note = ""
                 if (
-                    part.functionResponse is not None
+                    (fr := part.functionResponse) is not None
                     and part.thoughtSignature
                     and (
-                        part.fileData
+                        fr.parts
+                        or part.fileData
                         or part.functionCall
                         or part.executableCode
                         or part.codeExecutionResult
@@ -947,7 +954,16 @@ def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioConte
                     turn_index=model_turn_index,
                     stripped_note=stripped_note,
                 )
-        owners = _match_pending_calls(incoming, pending) if has_results else {}
+        if role == "model":
+            # These results were emitted by the model alongside its response.
+            # Client results are matched against pending calls on user turns.
+            owners = {
+                i: (fr.id or None, fr.name)
+                for i, part in enumerate(incoming)
+                if (fr := part.functionResponse) is not None and fr.name
+            }
+        else:
+            owners = _match_pending_calls(incoming, pending) if has_results else {}
         parts = [
             p
             for i, part in enumerate(incoming)

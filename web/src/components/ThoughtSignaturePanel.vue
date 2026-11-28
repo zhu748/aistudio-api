@@ -15,6 +15,7 @@ import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 const props = defineProps<{
   trace: ThoughtSignatureTrace | null | undefined
   requestId: string
+  rejected: boolean
 }>()
 
 const router = useRouter()
@@ -24,20 +25,22 @@ const activeList = ref<'client_in' | 'upstream_out' | 'upstream_in' | 'client_ou
 const bareLeadTurns = computed(() => {
   const t = props.trace
   if (!t) return 0
-  // 兼容旧记录：没有 lead 口径时退回 fc_unsigned。
-  return t.upstream_out.fc_unsigned_lead_turns ?? t.upstream_out.fc_unsigned
+  return t.upstream_out.fc_unsigned_lead_turns ?? 0
 })
 
 const hasRisk = computed(() => {
   const t = props.trace
   if (!t) return false
-  return bareLeadTurns.value > 0 || t.replay.conflicts > 0 || t.client_in.dropped > 0
+  return props.rejected || bareLeadTurns.value > 0 || t.replay.conflicts > 0 || t.client_in.dropped > 0
 })
+
+const migrated = computed(() => props.trace?.replay.miss_reasons.includes('external_signature_migrated'))
+const unobserved = computed(() => props.trace?.replay.miss_reasons.includes('explicit_sig_unobserved'))
 
 const hasFallback = computed(() => {
   const t = props.trace
   if (!t) return false
-  return t.replay.skip_fills > 0 || t.client_out.dropped > 0
+  return migrated.value || unobserved.value || t.replay.skip_fills > 0 || t.client_out.dropped > 0
 })
 
 const bannerClass = computed(() => {
@@ -49,6 +52,7 @@ const bannerClass = computed(() => {
 const bannerTitle = computed(() => {
   const t = props.trace
   if (!t) return ''
+  if (props.rejected) return 'Google 上游拒绝了历史思维签名（Corrupted thought signature）'
   if (bareLeadTurns.value > 0) {
     return `存在 ${bareLeadTurns.value} 轮首个函数调用未带签名直接发往上游（存在 400 风险）`
   }
@@ -58,13 +62,15 @@ const bannerTitle = computed(() => {
   if (t.client_in.dropped > 0) {
     return `客户端回传中有 ${t.client_in.dropped} 条非法或跨协议签名已过滤丢弃`
   }
+  if (migrated.value) return '已按迁移模式发送历史，保留工具调用和结果'
+  if (unobserved.value) return '已原样转发未在当前作用域观测到的历史签名'
   if (t.replay.skip_fills > 0) {
     return `已通过 SKIP_THOUGHT_SIGNATURE 兜底补填 ${t.replay.skip_fills} 个缺失签名的函数调用`
   }
   if (t.client_out.dropped > 0) {
     return `上游返回 ${t.upstream_in.total_sigs} 条签名，其中 ${t.client_out.dropped} 条因兼容协议限制未下发（已由网关缓存托管）`
   }
-  return '签名收发与回放状态正常'
+  return '签名收发与回放未发现异常'
 })
 
 const allFingerprints = computed(() => {
@@ -115,6 +121,15 @@ function kindBadgeClass(kind: string): string {
   if (kind === 'skip_sentinel') return 'bg-amber-50 text-amber-800 border-amber-200'
   if (kind === 'invalid') return 'bg-rose-50 text-rose-700 border-rose-200'
   return 'bg-slate-100 text-slate-600 border-slate-200'
+}
+
+function signatureStatus(item: ThoughtSignatureItem): string {
+  if (item.kind === 'missing') {
+    if (item.lead_call === false) return '同批后续调用未签'
+    if (item.lead_call === true) return '首个调用未签'
+    if (item.carrier === 'thought') return '摘要未带签名'
+  }
+  return sigKindLabels[item.kind] || item.kind
 }
 
 function actionBadgeClass(action: string): string {
@@ -203,18 +218,31 @@ function jumpToRequestLogs() {
             </span>
           </div>
           <dl class="grid grid-cols-2 gap-y-1.5 gap-x-2 text-xs">
-            <dt class="text-slate-500">
-              FC 签名
+            <dt
+              class="text-slate-500"
+              title="同一并行批次通常只有首个工具调用携带签名。"
+            >
+              工具调用带签名
             </dt>
             <dd class="font-mono font-medium text-right tabular-nums">
               {{ trace.client_in.fc_signed }} / {{ trace.client_in.fc_total }}
-              <span
-                v-if="trace.client_in.fc_missing"
-                class="text-amber-600"
-              >(缺 {{ trace.client_in.fc_missing }})</span>
             </dd>
-            <dt class="text-slate-500">
-              思考签名
+            <template v-if="trace.client_in.fc_unsigned_lead_turns != null">
+              <dt class="text-slate-500">
+                首调用缺签
+              </dt>
+              <dd
+                class="font-mono font-medium text-right tabular-nums"
+                :class="trace.client_in.fc_unsigned_lead_turns > 0 ? 'text-amber-700' : ''"
+              >
+                {{ trace.client_in.fc_unsigned_lead_turns }} 轮
+              </dd>
+            </template>
+            <dt
+              class="text-slate-500"
+              title="思考摘要可以只含文本，工具调用的签名单独统计。"
+            >
+              思考摘要带签名
             </dt>
             <dd class="font-mono font-medium text-right tabular-nums">
               {{ trace.client_in.thought_signed }} / {{ trace.client_in.thought_total }}
@@ -254,16 +282,19 @@ function jumpToRequestLogs() {
             <span
               class="px-1.5 py-0.5 rounded text-[10px] font-medium"
               :class="
-                trace.replay.continuation_reused
+                trace.upstream_out.continuation_sent
                   ? 'bg-cyan-50 text-cyan-700'
                   : 'bg-slate-100 text-slate-500'
               "
             >
-              {{ trace.replay.continuation_reused ? '续传令牌已复用' : '无续传令牌' }}
+              {{ trace.upstream_out.continuation_sent ? '续传令牌已发送' : '本次未发送令牌' }}
             </span>
           </div>
           <dl class="grid grid-cols-2 gap-y-1.5 gap-x-2 text-xs">
-            <dt class="text-slate-500">
+            <dt
+              class="text-slate-500"
+              title="命中时回放上游返回的完整模型轮，可包含客户端已回传的签名及续传令牌。"
+            >
               温缓存命中
             </dt>
             <dd class="font-mono font-medium text-right tabular-nums text-sky-700">
@@ -321,7 +352,7 @@ function jumpToRequestLogs() {
           </div>
           <dl class="grid grid-cols-2 gap-y-1.5 gap-x-2 text-xs">
             <dt class="text-slate-500">
-              真实签名
+              携带签名
             </dt>
             <dd class="font-mono font-medium text-right tabular-nums text-emerald-700">
               {{ trace.upstream_out.real_sigs }}
@@ -333,20 +364,13 @@ function jumpToRequestLogs() {
               {{ trace.upstream_out.skip_sigs }}
             </dd>
             <dt class="text-slate-500">
-              总 FC / 未签 FC
+              工具调用 / 未签
             </dt>
             <dd
               class="font-mono font-medium text-right tabular-nums"
               title="兄弟 functionCall 本来就不带签名，未签 FC 计数本身不代表风险；风险看首 FC 裸发轮次"
             >
-              {{ trace.upstream_out.fc_total }} /
-              <span
-                :class="
-                  bareLeadTurns > 0 ? 'text-rose-600 font-bold' : 'text-slate-600'
-                "
-              >
-                {{ trace.upstream_out.fc_unsigned }}
-              </span>
+              {{ trace.upstream_out.fc_total }} / {{ trace.upstream_out.fc_unsigned }}
             </dd>
             <dt class="text-slate-500">
               槽 11 续传
@@ -511,7 +535,7 @@ function jumpToRequestLogs() {
                 FC 数
               </th>
               <th class="px-3 py-2 font-medium text-right">
-                恢复/补填签名
+                回放/补填签名
               </th>
               <th class="px-3 py-2 font-medium">
                 诊断说明
@@ -543,7 +567,7 @@ function jumpToRequestLogs() {
                   item.reason
                     ? sigReasonLabels[item.reason] || item.reason
                     : item.continuation_reused
-                      ? '精确匹配并复用续传令牌'
+                      ? '精确匹配，历史轮含续传令牌'
                       : '精确匹配'
                 }}
               </td>
@@ -615,7 +639,7 @@ function jumpToRequestLogs() {
                 <span
                   class="inline-flex items-center px-1.5 py-0.5 rounded border text-[11px]"
                   :class="kindBadgeClass(item.kind)"
-                >{{ sigKindLabels[item.kind] || item.kind }}</span>
+                >{{ signatureStatus(item) }}</span>
               </td>
               <td class="px-3 py-2 whitespace-nowrap font-mono">
                 <button
@@ -646,8 +670,8 @@ function jumpToRequestLogs() {
                 >{{ item.call_name }}</span>
                 <span
                   v-if="item.call_id"
-                  class="ml-1 font-mono text-[10px] text-slate-400"
-                >({{ item.call_id.slice(0, 16) }})</span>
+                  class="ml-1 font-mono text-[10px] text-slate-400 break-all"
+                >({{ item.call_id }})</span>
                 <span
                   v-if="item.note"
                   class="block text-[11px] text-amber-700 mt-0.5"

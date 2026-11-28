@@ -398,7 +398,7 @@ Web 面板在「导入账号」「编辑账号」与「全局代理」处提供*
 | `AISTUDIO_NONSTREAM_KEEPALIVE` | bool | `true` | 默认开启非流式保活；开始保活后 HTTP 200 已发送，迟到的失败以 JSON 错误体返回 |
 | `AISTUDIO_KEEPALIVE_URL` | string | `""` | 出站保活目标 URL：定期 GET（默认 60s 一次，间隔用 `AISTUDIO_KEEPALIVE_INTERVAL` 调整，下限 5s），防 Render / HuggingFace Space 等免费平台冻结闲置实例，填自己的 `https://域名/healthz` 即可自我唤醒；留空不启动。直连出站不走代理、失败仅记日志 |
 | `AISTUDIO_KEEPALIVE_ALLOW_PRIVATE` | bool | `false` | 允许私网/环回保活目标（默认拒绝，防内网探测）；仅内网监控等场景显式开启 |
-| `AISTUDIO_DUMP_MAX_BYTES` | int | `1048576` | 详细转储时单个请求体或响应体的采集上限（字节） |
+| `AISTUDIO_DUMP_MAX_BYTES` | int | `1048576` | 脱敏报文采集上限（字节），客户端原文按服务接收上限采集 |
 | `AISTUDIO_DUMP_MAX_FILES` | int | `1000` | 详细转储文件最多保留数量 |
 | `AISTUDIO_DUMP_MAX_AGE_DAYS` | int | `7` | 详细转储文件最多保留天数 |
 | `AISTUDIO_DUMP_MAX_TOTAL_BYTES` | int | `268435456` | 详细转储目录最大总容量（默认 256 MiB） |

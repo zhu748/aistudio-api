@@ -155,9 +155,9 @@ class _ToolCall:
             return True
         return self.complete_args() is None
 
-    def matches_snapshot(self, name: str, snapshot: str) -> bool:
-        """Only a compatible prefix links a named ID-less full snapshot."""
-        if self.call_id or self.name != name or not self.fragments or not snapshot:
+    def matches_argument_prefix(self, snapshot: str) -> bool:
+        """Check whether an object snapshot can complete the existing fragments."""
+        if not self.fragments or not snapshot:
             return False
         quoted = escaped = False
         offset = 0
@@ -185,11 +185,20 @@ class _ToolCall:
             self.name = name
 
         if isinstance(args, dict):
-            if self.args is not None and args != self.args:
-                self.envelope.pop("thoughtSignature", None)
-            self.size = _utf8_size(
-                json.dumps(args, ensure_ascii=False, separators=(",", ":"))
-            )
+            snapshot = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+            if "thoughtSignature" in self.envelope:
+                if self.args is not None:
+                    # Python equality merges JSON types such as true and 1.
+                    changed = args != self.args or json.dumps(
+                        args, sort_keys=True
+                    ) != json.dumps(self.args, sort_keys=True)
+                else:
+                    changed = bool(self.fragments) and not self.matches_argument_prefix(
+                        snapshot
+                    )
+                if changed:
+                    self.envelope.pop("thoughtSignature")
+            self.size = _utf8_size(snapshot)
             self.args = args
             self.fragments.clear()
         elif isinstance(args, str) and args and (self.fragments or args.strip()):
@@ -406,7 +415,11 @@ class ToolResponseAssembler:
                         call_id
                         or not name
                         or not isinstance(args, dict)
-                        or pending.matches_snapshot(name, snapshot)
+                        or (
+                            not pending.call_id
+                            and pending.name == name
+                            and pending.matches_argument_prefix(snapshot)
+                        )
                     )
                     and pending.matches(name)
                     and (

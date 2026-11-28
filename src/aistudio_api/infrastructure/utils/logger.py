@@ -14,6 +14,8 @@ subscribers so the web panel can stream them live via
 
 from __future__ import annotations
 
+import base64
+import codecs
 import contextlib
 import json
 import logging
@@ -24,11 +26,15 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import BinaryIO
 
-from aistudio_api.infrastructure.utils.common import atomic_write_json
+from aistudio_api.infrastructure.utils.common import (
+    atomic_write_json,
+    atomic_write_text,
+)
 from aistudio_api.infrastructure.utils.redaction import redact_record, redact_text
 
 # ---------------------------------------------------------------------------
@@ -703,6 +709,27 @@ def _mask_json_value(value: object) -> object:
     return value
 
 
+def _client_dump_chunks(
+    record: dict[str, object], source: BinaryIO, encoding: str
+) -> Iterator[str]:
+    """Write the client body as a JSON string without copying the whole request."""
+    # The caller appends client_request last and leaves its body out of record.
+    header = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+    yield header[:-2] + ',"body":"'
+    source.seek(0)
+    # Multiples of three avoid Base64 padding between chunks.
+    chunks = iter(lambda: source.read(48 * 1024), b"")
+    if encoding == "base64":
+        for chunk in chunks:
+            yield base64.b64encode(chunk).decode("ascii")
+    else:
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        for chunk in chunks:
+            yield json.dumps(decoder.decode(chunk), ensure_ascii=False)[1:-1]
+        yield json.dumps(decoder.decode(b"", final=True), ensure_ascii=False)[1:-1]
+    yield '"}}'
+
+
 def dump_request_exchange(
     *,
     req_id: str,
@@ -728,6 +755,7 @@ def dump_request_exchange(
     request_body_truncated: bool = False,
     response_body_truncated: bool = False,
     client_request: dict[str, object] | None = None,
+    client_body_file: BinaryIO | None = None,
 ) -> None:
     """转储单次完整请求与响应详细信息。"""
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -834,12 +862,34 @@ def dump_request_exchange(
                 "finish_reason": finish_reason,
                 "error_detail": redact_text(error_detail or ""),
             }
+            latest_file = dump_folder / "latest_request.json"
             if client_request is not None:
                 record_data["client_request"] = client_request
-            atomic_write_json(dump_file_path, record_data, private=True)
-
-            latest_file = dump_folder / "latest_request.json"
-            atomic_write_json(latest_file, record_data, private=True)
+            if client_body_file is not None and client_request is not None:
+                client_request.pop("body", None)
+                encoding = "utf-8"
+                try:
+                    atomic_write_text(
+                        dump_file_path,
+                        _client_dump_chunks(record_data, client_body_file, encoding),
+                        private=True,
+                    )
+                except UnicodeDecodeError:
+                    encoding = "base64"
+                    client_request["body_encoding"] = encoding
+                    atomic_write_text(
+                        dump_file_path,
+                        _client_dump_chunks(record_data, client_body_file, encoding),
+                        private=True,
+                    )
+                atomic_write_text(
+                    latest_file,
+                    _client_dump_chunks(record_data, client_body_file, encoding),
+                    private=True,
+                )
+            else:
+                atomic_write_json(dump_file_path, record_data, private=True)
+                atomic_write_json(latest_file, record_data, private=True)
             _prune_dumps(dump_folder)
         except Exception as e:
             dump_logger.warning("请求文件转储失败: %s", e)

@@ -72,9 +72,8 @@ def wire_function_name(name: str) -> str:
     digest = hashlib.sha256(encoded).digest()
     suffix = "_" + digest[:6].hex()
     budget = MAX_WIRE_FUNCTION_NAME_LENGTH - len(suffix)
-    prefix = name
-    while len(prefix.encode("utf-8")) > budget:
-        prefix = prefix[:-1]
+    # Input is valid UTF-8, so the bounded slice can only end mid-character.
+    prefix = encoded[:budget].decode("utf-8", errors="ignore")
     return prefix + suffix
 
 

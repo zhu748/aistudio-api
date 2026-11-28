@@ -7,6 +7,7 @@ import json
 import os
 import re
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 # 代理 URI 里的 userinfo（``scheme://user:pass@host``）。日志与诊断展示
@@ -20,7 +21,9 @@ def mask_proxy_userinfo(uri: str) -> str:
     return _PROXY_USERINFO.sub("//***@", uri)
 
 
-def _atomic_write_text(target_path: Path, text: str, *, private: bool = False) -> None:
+def _atomic_write_text(
+    target_path: Path, text: str | Iterable[str], *, private: bool = False
+) -> None:
     """把 text 写入 target_path：先写同目录唯一临时文件，再原子替换。
 
     持久化保证（3.13）：写后 fsync 文件内容再 rename，rename 后 fsync
@@ -31,9 +34,14 @@ def _atomic_write_text(target_path: Path, text: str, *, private: bool = False) -
     """
     target_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = target_path.with_suffix(f".tmp.{os.getpid()}_{time.time_ns()}")
+    if private:
+        tmp_path.touch(mode=0o600, exist_ok=False)
     try:
         with tmp_path.open("w", encoding="utf-8") as f:
-            f.write(text)
+            if isinstance(text, str):
+                f.write(text)
+            else:
+                f.writelines(text)
             f.flush()
             os.fsync(f.fileno())
         if private:
@@ -95,7 +103,9 @@ def atomic_write_json(
     _atomic_write_text(Path(path).absolute(), serialized, private=private)
 
 
-def atomic_write_text(path: Path | str, text: str, *, private: bool = False) -> None:
+def atomic_write_text(
+    path: Path | str, text: str | Iterable[str], *, private: bool = False
+) -> None:
     """原子写入文本文件（写唯一临时文件后原子替换，防止写穿或残留半截配置）。"""
     _atomic_write_text(Path(path).absolute(), text, private=private)
 

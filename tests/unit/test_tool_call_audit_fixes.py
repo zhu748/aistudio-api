@@ -144,7 +144,8 @@ def test_b1_function_response_subpart_signature_validated():
                                     thoughtSignature="@@@invalid@@@",
                                 )
                             ],
-                        )
+                        ),
+                        thoughtSignature=VALID_SIG,
                     )
                 ],
             ),
@@ -152,6 +153,8 @@ def test_b1_function_response_subpart_signature_validated():
     )
     sigs = _wire_signatures(normalized)
     assert not any(isinstance(s, str) and "@@@" in s for s in sigs)
+    # Flattening the nested image changes the signed parent result.
+    assert sigs == [VALID_SIG]
     # 附图载荷保留
     inlines = [
         part.inline_data
@@ -160,6 +163,35 @@ def test_b1_function_response_subpart_signature_validated():
         if part.inline_data is not None
     ]
     assert inlines == [("image/png", "aGk=")]
+
+
+@pytest.mark.parametrize("name", ["lookup", ""])
+def test_function_response_signature_requires_unchanged_owner_fields(name):
+    normalized = _norm(
+        [
+            GeminiContent(role="user", parts=[GeminiPart(text="Look up Paris.")]),
+            GeminiContent(
+                role="model",
+                parts=[
+                    GeminiPart(functionCall=GeminiFunctionCall(name="lookup", id="A"))
+                ],
+            ),
+            GeminiContent(
+                role="user",
+                parts=[
+                    GeminiPart(
+                        functionResponse=GeminiFunctionResponse(
+                            name=name, id="A", response={"city": "Paris"}
+                        ),
+                        thoughtSignature=VALID_SIG,
+                    )
+                ],
+            ),
+        ]
+    )
+    result = normalized.contents[-1].parts[0]
+    assert result.function_response == ("lookup", {"city": "Paris"}, "A")
+    assert result.thought_signature == (VALID_SIG if name else None)
 
 
 def test_b1_executable_code_signatures_validated():

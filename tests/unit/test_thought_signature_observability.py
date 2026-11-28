@@ -385,6 +385,7 @@ async def test_full_signature_lifecycle_persisted_and_logged_across_protocols(
     assert sig2["client_in"]["fc_total"] == 1
     assert sig2["client_in"]["fc_signed"] == 0
     assert sig2["client_in"]["fc_missing"] == 1
+    assert sig2["client_in"]["fc_unsigned_lead_turns"] == 1
     assert sig2["replay"]["warm_hits"] == 1
     assert sig2["replay"]["continuation_reused"] is True
     assert sig2["upstream_out"]["real_sigs"] == 1
@@ -410,6 +411,80 @@ async def test_full_signature_lifecycle_persisted_and_logged_across_protocols(
     assert all(e["name"] == "aistudio.thought_signature" for e in entries)
     directions = {e["sig_meta"]["direction"] for e in entries if "sig_meta" in e}
     assert directions == {"inbound", "outbound"}
+
+
+async def test_native_signed_parallel_history_replays_without_missing_lead(
+    observed_app,
+):
+    http, _, replies = observed_app
+    ids = ("call_1234567890123001", "call_1234567890123002", "call_1234567890123003")
+    replies.append(
+        _wire_response(
+            [
+                AistudioPart(text="Checking three cities.", thought=True),
+                *[
+                    AistudioPart(
+                        function_call=("lookup", {"n": index}, call_id),
+                        thought_signature=SIG_A if index == 0 else None,
+                    )
+                    for index, call_id in enumerate(ids)
+                ],
+            ]
+        )
+    )
+    path = f"/v1beta/models/{MODEL}:generateContent"
+    user = {"role": "user", "parts": [{"text": "Check three cities."}]}
+    first = await http.post(path, json={"contents": [user]})
+    assert first.status_code == 200
+    echoed = first.json()["candidates"][0]["content"]
+    replies.append(_wire_response([AistudioPart(text="Done.")]))
+    second = await http.post(
+        path,
+        json={
+            "contents": [
+                user,
+                echoed,
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "name": "lookup",
+                                "id": call_id,
+                                "response": {"ok": True},
+                            }
+                        }
+                        for call_id in ids
+                    ],
+                },
+            ]
+        },
+    )
+    assert second.status_code == 200
+    request = request_history().get(second.headers["x-request-id"])
+    assert request is not None
+    trace = cast(dict[str, Any], request["thought_signature"])
+    client_in, upstream_out = trace["client_in"], trace["upstream_out"]
+    assert (client_in["fc_signed"], client_in["fc_total"]) == (1, 3)
+    assert (client_in["thought_signed"], client_in["thought_total"]) == (0, 1)
+    assert client_in["fc_missing"] == upstream_out["fc_unsigned"] == 2
+    assert (
+        client_in["fc_unsigned_lead_turns"]
+        == upstream_out["fc_unsigned_lead_turns"]
+        == 0
+    )
+    inbound_calls, outbound_calls = [
+        [item for item in stage["items"] if item["carrier"] == "function_call"]
+        for stage in (client_in, upstream_out)
+    ]
+    for entries in (inbound_calls, outbound_calls):
+        assert [entry["lead_call"] for entry in entries] == [True, False, False]
+        assert [entry["call_id"] for entry in entries] == list(ids)
+    assert inbound_calls[0]["fp"] == outbound_calls[0]["fp"]
+    assert all(entry["source"] == "warm_cache" for entry in outbound_calls)
+    assert trace["replay"]["warm_hits"] == 1
+    assert trace["replay"]["skip_fills"] == 0
+    assert upstream_out["continuation_sent"] is True
 
 
 async def test_logs_stream_and_history_filter_thought_signature_category(

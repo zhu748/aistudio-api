@@ -13,8 +13,11 @@ import pytest
 from aistudio_api.api.app import app
 from aistudio_api.api.dependencies import get_client
 from aistudio_api.application import api_service_gemini
+from aistudio_api.domain.tool_signatures import SKIP_THOUGHT_SIGNATURE
 from aistudio_api.infrastructure.gateway.client import AIStudioClient, PreparedRequest
+from aistudio_api.infrastructure.gateway.session import SessionContext
 from aistudio_api.infrastructure.gateway.streaming import StreamingGateway
+from aistudio_api.infrastructure.gateway.wire_spec import PartIndex, TopLevelIndex
 
 PROTOCOLS = ("native", "chat", "claude", "responses")
 MODEL = "gemini-3.8-flash"
@@ -115,6 +118,160 @@ async def request(protocol, stream, *, stop=None):
         )
     assert response.status_code == 200, response.text
     return sse_events(response.text) if stream else [response.json()]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("statuses", [(200,), (400, 200), (400, 400), (400,)])
+async def test_native_resumes_history_after_corrupted_external_signature(
+    monkeypatch, stream, statuses
+):
+    gateway = AIStudioClient()
+    snapshot = AsyncMock(side_effect=["!first", "!retry", "!continued"])
+    monkeypatch.setitem(app.dependency_overrides, get_client, lambda: gateway)
+    monkeypatch.setattr(api_service_gemini, "ensure_active_account", AsyncMock())
+    monkeypatch.setattr(
+        gateway.session, "ensure_ready", AsyncMock(return_value=SessionContext())
+    )
+    monkeypatch.setattr(gateway.session, "generate_snapshot", snapshot)
+    monkeypatch.setattr(
+        gateway.session, "schedule_browser_counttokens_followup", lambda *_: None
+    )
+    sent = []
+    new_signature = "bmV3LWdhdGV3YXktc2lnbmF0dXJl"
+    accepted = wire(chunk([text("History retained.", signature=new_signature)], 1))
+
+    async def send_request(*, body, **_kwargs):
+        index = len(sent)
+        sent.append(json.loads(body))
+        status = statuses[index] if index < len(statuses) else 200
+        if status == 200:
+            return status, accepted
+        if statuses == (400,):
+            return status, b'[,[3,"Invalid request."]]'
+        return status, b'[,[3,"Corrupted thought signature."]]'
+
+    async def send_streaming_request(**kwargs):
+        status, raw = await send_request(**kwargs)
+        yield "status", status
+        yield "chunk", raw
+
+    monkeypatch.setattr(gateway.session, "send_request", send_request)
+    monkeypatch.setattr(
+        gateway.session, "send_streaming_request", send_streaming_request
+    )
+    path, params = input_request("native", stream)
+    signature = "ZXh0ZXJuYWwtZml4dHVyZS1zaWduYXR1cmU="
+    params["contents"].extend(
+        [
+            {
+                "role": "model",
+                "parts": [
+                    {
+                        "text": "Check both cities.",
+                        "thought": True,
+                        "thoughtSignature": signature,
+                    },
+                    {
+                        "functionCall": {"name": "weather", "id": "call-a", "args": {}},
+                        "thoughtSignature": signature,
+                    },
+                    {"functionCall": {"name": "weather", "id": "call-b", "args": {}}},
+                ],
+            },
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "name": "weather",
+                            "id": call_id,
+                            "response": {"city": city},
+                        },
+                    }
+                    for call_id, city in (("call-a", "Paris"), ("call-b", "London"))
+                ],
+            },
+            # A fallback model continued the conversation and produced its own
+            # tool batch. The client echoes it together with the older signatures.
+            {
+                "role": "model",
+                "parts": [
+                    {
+                        "functionCall": {
+                            "name": "weather",
+                            "id": "call-fallback",
+                            "args": {"city": "Rome"},
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "name": "weather",
+                            "id": "call-fallback",
+                            "response": {"city": "Rome"},
+                        }
+                    }
+                ],
+            },
+        ]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            path, json=params, headers={"X-Anti-Truncation": "0"}
+        )
+        events = sse_events(response.text) if stream else [response.json()]
+        assert len(sent) == len(statuses)
+        original = sent[0][TopLevelIndex.CONTENTS]
+        assert original[1][0][1][PartIndex.THOUGHT_SIGNATURE] == signature
+        assert original[3][0][0][PartIndex.THOUGHT_SIGNATURE] == SKIP_THOUGHT_SIGNATURE
+        if statuses[-1] == 200:
+            assert native_parts(events) == [
+                {"text": "History retained.", "thoughtSignature": new_signature}
+            ]
+        else:
+            assert events[-1]["error"]["code"] == 400
+        if len(statuses) == 2:
+            retried = sent[1][TopLevelIndex.CONTENTS]
+            assert retried[0] == original[0]
+            assert retried[2:] == original[2:]
+            migrated_thought = retried[1][0][0]
+            assert len(migrated_thought) <= PartIndex.THOUGHT_SIGNATURE
+            assert migrated_thought == original[1][0][0][: len(migrated_thought)]
+            assert (
+                retried[1][0][1][: PartIndex.THOUGHT_SIGNATURE]
+                == original[1][0][1][: PartIndex.THOUGHT_SIGNATURE]
+            )
+            assert (
+                retried[1][0][1][PartIndex.THOUGHT_SIGNATURE] == SKIP_THOUGHT_SIGNATURE
+            )
+            assert retried[1][0][2] == original[1][0][2]
+            assert (
+                snapshot.await_args_list[0].args[0]
+                != snapshot.await_args_list[1].args[0]
+            )
+
+        if statuses == (400, 200):
+            # DSH keeps echoing its original local history. Reuse the accepted
+            # migration instead of incurring another failed upstream attempt.
+            params["contents"].extend(
+                [
+                    {"role": "model", "parts": [{"text": "History retained."}]},
+                    {"role": "user", "parts": [{"text": "Continue."}]},
+                ]
+            )
+            await client.post(path, json=params, headers={"X-Anti-Truncation": "0"})
+            assert len(sent) == 3
+            continued = sent[2][TopLevelIndex.CONTENTS]
+            migrated_history = sent[1][TopLevelIndex.CONTENTS]
+            assert continued[: len(migrated_history)] == migrated_history
+            next_turn = continued[len(migrated_history)]
+            assert next_turn[0][0][PartIndex.THOUGHT_SIGNATURE] == new_signature
 
 
 def native_parts(events):

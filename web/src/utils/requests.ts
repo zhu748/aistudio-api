@@ -34,10 +34,10 @@ export const sigSourceLabels: Record<string, string> = {
   client_provider_fields: 'provider_specific_fields',
   client_top_level: '顶层字段',
   client_tool_function: 'tool.function',
-  warm_cache: '温缓存恢复',
+  warm_cache: '温缓存回放',
   cold_cache: '冷缓存恢复',
   skip_fallback: 'SKIP 兜底',
-  outbound_wire: '原样发往上游',
+  outbound_wire: '发往上游',
   upstream_wire: '上游线缆',
   thoughtSignature: 'thoughtSignature',
   'thinking.signature': 'thinking.signature',
@@ -63,6 +63,7 @@ export const sigReasonLabels: Record<string, string> = {
   cold_cohort_mismatch: '冷缓存调用批次校验未通过',
   legacy_seen_old: '旧版缓存观测保留',
   explicit_sig_unobserved: '携带未观测到的外部显式签名',
+  external_signature_migrated: '已迁移未观测的历史签名，保留原始载荷',
   chain_broken: '前置轮次断链',
   tail_empty_unrepresentable: '纯文本空尾签名无法映射到当前兼容协议（已交温缓存托管）',
   text_part_unrepresentable: '正文文本载体无法在当前兼容协议携带签名',
@@ -86,10 +87,10 @@ export const sigReasonLabels: Record<string, string> = {
   conflict_withheld: '同历史多次不同生成已扣留',
 }
 export const sigKindLabels: Record<string, string> = {
-  real: '真签名',
+  real: '携带签名',
   skip_sentinel: 'SKIP 哨兵',
   invalid: '非法签名',
-  missing: '缺失',
+  missing: '未携带签名',
 }
 export const stageLabels: Record<string, string> = {
   attempt_error: '上游异常',

@@ -4,6 +4,7 @@
 ``<dump_dir>/<request_id>.upstream*.json``，供请求详情页查看与下载
 （排除「客户端侧原始请求 vs 网关转换后 wire 请求」的歧义——
 2026-11-14 排查 403/400 时两次都需要人工 dump 才能定位线缆形态）。
+大请求体分块写入同一份 JSON 快照，控制台只读取元数据和正文开头。
 
 采集策略（2026-11-14 起扩展，原「仅失败采集」→「成功也采集」）：
 
@@ -30,11 +31,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from aistudio_api.infrastructure.utils.common import atomic_write_text
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -97,10 +99,14 @@ def _sanitize_headers(
 # 快照侧解析上限（字符数）：成功快照默认开启（upstream_snapshot_keep=10），
 # 长会话请求体随轮次涨到 MB 级后，json.loads 整树 + 后续 json.dumps 会在
 # 线程池里再放大 3～4 倍正文，与请求路径本身的拷贝叠加把 512MB 档容器
-# 的 RSS 顶过 OOM 阈值。超过上限只保留头部样本，不再整体解析。
+# 的 RSS 顶过 OOM 阈值。大数组按原始 JSON 分块落盘，不构建完整对象树。
 _MAX_BODY_PARSE_CHARS = 256 * 1024
 _BODY_HEAD_CHARS = 2000
 _BODY_COUNT_CHUNK = 64 * 1024
+_MAX_PREVIEW_HEADER_BYTES = 1024 * 1024
+_WIRE_BODY_FIELD = '"wire_body":\n'
+_JSON_STRUCTURE = re.compile(r'["\[\]{}]')
+_JSON_STRING_CONTROL = re.compile(r'["\\]')
 
 
 def _utf8_len(text: str) -> int:
@@ -126,10 +132,87 @@ def _sanitize_wire_body(body: str) -> Any:
     if isinstance(arr, list):
         for i, slot in enumerate(arr):
             if isinstance(slot, str) and len(slot) > _PROOF_MIN_CHARS:
-                arr[i] = (
-                    f"<proof truncated len={len(slot)} head={slot[:_PROOF_HEAD_CHARS]}>"
-                )
+                arr[i] = _proof_preview(len(slot), slot[:_PROOF_HEAD_CHARS])
     return arr
+
+
+def _proof_preview(length: int, head: str) -> str:
+    return f"<proof truncated len={length} head={head}>"
+
+
+def _wire_body_chunks(body: str) -> Iterator[str]:
+    """Redact long top-level strings in a serialized JSPB array in bounded chunks."""
+    depth = offset = written = 0
+    while token := _JSON_STRUCTURE.search(body, offset):
+        start, offset = token.span()
+        char = token[0]
+        if char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+        else:
+            # Skip escaped quotes and brackets in strings, including nested tool
+            # output and media. The input is already serialized by the codec.
+            while end := _JSON_STRING_CONTROL.search(body, offset):
+                offset = end.end()
+                if end[0] == '"':
+                    break
+                offset += 1
+            else:
+                raise ValueError("unterminated string in upstream wire body")
+            length = offset - start - 2
+            if depth == 1 and length > _PROOF_MIN_CHARS:
+                for pos in range(written, start, _BODY_COUNT_CHUNK):
+                    yield body[pos : min(pos + _BODY_COUNT_CHUNK, start)]
+                head = body[start + 1 : start + 1 + _PROOF_HEAD_CHARS]
+                yield json.dumps(_proof_preview(length, head), ensure_ascii=False)
+                written = offset
+    for pos in range(written, len(body), _BODY_COUNT_CHUNK):
+        yield body[pos : pos + _BODY_COUNT_CHUNK]
+
+
+def _large_snapshot_chunks(snapshot: dict[str, Any], body: str) -> Iterator[str]:
+    # "upstream" is written last so the first line contains all the metadata.
+    # Only the large wire array comes after it, still within the upstream object.
+    header = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+    yield header[:-2] + ",\n" + _WIRE_BODY_FIELD
+    yield from _wire_body_chunks(body)
+    yield "\n}}\n"
+
+
+def read_upstream_snapshot_preview(
+    source: BinaryIO, *, legacy_max_bytes: int
+) -> dict[str, object]:
+    """Read only metadata and a bounded wire preview for large snapshot files."""
+    header = source.readline(_MAX_PREVIEW_HEADER_BYTES).rstrip(b"\r\n")
+    field = _WIRE_BODY_FIELD.rstrip("\n").encode()
+    if (
+        header.endswith(b",")
+        and source.readline(len(field) + 2).rstrip(b"\r\n") == field
+    ):
+        preview = json.loads(header[:-1] + b"}}")
+        if not isinstance(preview, dict) or not isinstance(
+            upstream := preview.get("upstream"), dict
+        ):
+            raise ValueError("invalid upstream snapshot metadata")
+        upstream["wire_body"] = source.read(_BODY_HEAD_CHARS).decode("utf-8", "replace")
+        preview["note"] = "页面仅显示 wire 请求体开头，下载快照可查看完整的脱敏请求体。"
+        return preview
+    if os.fstat(source.fileno()).st_size > legacy_max_bytes:
+        return {
+            "available": False,
+            "note": "快照超过页面读取上限，请在服务器端查看。",
+        }
+    source.seek(0)
+    preview = json.load(source)
+    if not isinstance(preview, dict):
+        raise ValueError("invalid upstream snapshot")
+    upstream = preview.get("upstream")
+    if isinstance(upstream, dict):
+        wire_body = upstream.get("wire_body")
+        if isinstance(wire_body, str) and wire_body.startswith("<wire body truncated "):
+            preview["note"] = "旧版采集仅保留了请求体开头，下载包含已保存的部分。"
+    return preview
 
 
 def _rpc_name_from_url(url: str) -> str:
@@ -278,6 +361,12 @@ def save_upstream_exchange(
         else:
             response_text = response_sample[:_MAX_RESPONSE_SAMPLE]
 
+        upstream = {
+            "url": url,
+            "method": "POST",
+            "headers": _sanitize_headers(wire_headers),
+            "body_bytes": _utf8_len(body),
+        }
         snapshot: dict[str, Any] = {
             "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "request_id": request_id,
@@ -286,13 +375,6 @@ def save_upstream_exchange(
             "success": success,
             "model": model,
             "account_id": account_id,
-            "upstream": {
-                "url": url,
-                "method": "POST",
-                "headers": _sanitize_headers(wire_headers),
-                "wire_body": _sanitize_wire_body(body),
-                "body_bytes": _utf8_len(body),
-            },
             "proxy": (
                 proxy_url.split("@")[-1] if proxy_url and "@" in proxy_url else None
             ),
@@ -307,6 +389,7 @@ def save_upstream_exchange(
                 ),
                 "body": response_text,
             },
+            "upstream": upstream,
         }
 
         dump_dir = get_dump_dir()
@@ -321,11 +404,12 @@ def save_upstream_exchange(
         # 请求详情页的 json.loads 静默报“无上游交换快照”，恰好丢掉本模块
         # 要保留的错误现场。与同目录的请求 dump 落盘（logger.dump_request_
         # exchange → atomic_write_json private=True）同一契约。
-        atomic_write_text(
-            target,
-            json.dumps(snapshot, ensure_ascii=False, indent=1),
-            private=True,
-        )
+        if len(body) > _MAX_BODY_PARSE_CHARS and re.match(r"\s*\[", body):
+            serialized: str | Iterator[str] = _large_snapshot_chunks(snapshot, body)
+        else:
+            upstream["wire_body"] = _sanitize_wire_body(body)
+            serialized = json.dumps(snapshot, ensure_ascii=False, indent=1)
+        atomic_write_text(target, serialized, private=True)
         if success:
             _prune_success_snapshots(dump_dir, upstream_snapshot_keep())
         return target

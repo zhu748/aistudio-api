@@ -40,12 +40,16 @@ const emit = defineEmits<{
           v-if="(meta.client_fc_total || 0) > 0"
           class="inline-flex items-center px-1.5 py-px rounded border"
           :class="
-            (meta.client_fc_signed || 0) >= (meta.client_fc_total || 0)
-              ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-              : 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+            (meta.client_fc_unsigned_lead || 0) > 0
+              ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+              : 'bg-slate-800/80 text-slate-300 border-slate-700'
           "
+          title="所有带签名的工具调用占比。同批后续调用通常不带签名。"
         >
-          回传 FC {{ meta.client_fc_signed || 0 }}/{{ meta.client_fc_total }}
+          回传签名 {{ meta.client_fc_signed || 0 }}/{{ meta.client_fc_total }}
+          <template v-if="(meta.client_fc_unsigned_lead || 0) > 0">
+            · 首调用缺签 {{ meta.client_fc_unsigned_lead }} 轮
+          </template>
         </span>
         <span
           v-if="(meta.client_thought_signed || 0) > 0"
@@ -80,10 +84,10 @@ const emit = defineEmits<{
         SKIP兜底 ×{{ meta.skip_fills }}
       </span>
       <span
-        v-if="meta.continuation_reused"
+        v-if="meta.continuation_sent ?? meta.continuation_reused"
         class="inline-flex items-center px-1.5 py-px rounded border bg-cyan-500/15 text-cyan-300 border-cyan-500/30"
       >
-        续传命中
+        {{ meta.continuation_sent ? '已发送续传令牌' : '历史令牌命中' }}
       </span>
       <span
         v-if="(meta.upstream_fc_unsigned_lead || 0) > 0"

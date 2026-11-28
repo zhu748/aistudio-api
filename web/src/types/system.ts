@@ -67,6 +67,7 @@ export interface ThoughtSignatureLogMeta {
   client_fc_total?: number
   client_fc_signed?: number
   client_fc_missing?: number
+  client_fc_unsigned_lead?: number
   client_thought_signed?: number
   client_tail_signed?: number
   client_dropped?: number
@@ -77,6 +78,7 @@ export interface ThoughtSignatureLogMeta {
   conflicts?: number
   misses?: number
   continuation_reused?: boolean
+  continuation_sent?: boolean
   upstream_real?: number
   upstream_skip?: number
   upstream_fc_unsigned?: number

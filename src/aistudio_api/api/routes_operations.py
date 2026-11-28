@@ -5,13 +5,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import time
+from collections.abc import AsyncIterator
+from typing import BinaryIO
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from aistudio_api.api.state import runtime_state
 from aistudio_api.config import settings
@@ -26,6 +30,7 @@ from aistudio_api.infrastructure.utils.logger import _mask_json_value, get_dump_
 from aistudio_api.infrastructure.utils.redaction import redact_text
 from aistudio_api.infrastructure.utils.upstream_dump import (
     clear_upstream_snapshots,
+    read_upstream_snapshot_preview,
     upstream_snapshot_stats,
 )
 
@@ -195,9 +200,12 @@ async def request_payload(request_id: str) -> dict[str, object]:
                     "available": False,
                     "note": "此请求未采集正文，或转储已过保留期。可在日志与调试中为后续请求开启文件转储。",
                 }
-            # JSON escaping can expand body bytes sixfold, and legacy views
-            # coexist with the verbatim client capture in the same file.
-            if target.stat().st_size > settings.dump_max_bytes * 32 + 65536:
+            # The capture can contain the entire admitted request. JSON escaping
+            # can expand it sixfold, alongside the bounded legacy views.
+            max_bytes = (
+                settings.max_request_bytes * 6 + settings.dump_max_bytes * 32 + 65536
+            )
+            if target.stat().st_size > max_bytes:
                 return {
                     "available": False,
                     "note": "转储超过当前读取上限，请在服务器端查看。",
@@ -245,7 +253,7 @@ async def request_upstream_exchange(
     （``<id>.upstream.ok.json``）：按请求记录自身的成败选择优先级，
     展示「最后一次尝试」的形态。download=1 时以 attachment 形式
     返回 JSON 文件（文件名 ``<request_id>.upstream.json``），用于
-    离线排查与共享。
+    离线排查与共享。大请求的页面预览只读取请求体开头。
     """
     if not re.fullmatch(r"req_[A-Za-z0-9_-]{1,100}", request_id):
         raise HTTPException(400, "请求 ID 格式无效")
@@ -262,19 +270,18 @@ async def request_upstream_exchange(
         else (".upstream.json", ".upstream.ok.json")
     )
 
-    def read() -> dict[str, object]:
+    def read() -> dict[str, object] | BinaryIO:
         dump_dir = get_dump_dir()
         for suffix in order:
             target = dump_dir / f"{request_id}{suffix}"
             try:
-                if not target.is_file():
-                    continue
-                if target.stat().st_size > settings.dump_max_bytes * 4 + 65536:
-                    return {
-                        "available": False,
-                        "note": "快照超过当前读取上限，请在服务器端查看。",
-                    }
-                return json.loads(target.read_text(encoding="utf-8"))
+                source = target.open("rb")
+                if download:
+                    return source
+                with source:
+                    return read_upstream_snapshot_preview(
+                        source, legacy_max_bytes=settings.dump_max_bytes * 4 + 65536
+                    )
             except (OSError, ValueError):
                 continue
         return {
@@ -283,18 +290,30 @@ async def request_upstream_exchange(
         }
 
     snapshot = await asyncio.to_thread(read)
-    content = json.dumps(snapshot, ensure_ascii=False, indent=1)
-    if download:
+    if isinstance(snapshot, dict):
+        if download:
+            raise HTTPException(404, "此请求无上游交换快照")
         return Response(
-            content=content,
+            content=json.dumps(snapshot, ensure_ascii=False, indent=1),
             media_type="application/json",
-            headers={
-                "Content-Disposition": (
-                    f'attachment; filename="{request_id}.upstream.json"'
-                )
-            },
         )
-    return Response(content=content, media_type="application/json")
+
+    async def chunks() -> AsyncIterator[bytes]:
+        # Opening the file before streaming keeps the selected attempt stable
+        # if retention cleanup or a retry replaces the path mid-download.
+        with snapshot:
+            while chunk := await asyncio.to_thread(snapshot.read, 65536):
+                yield chunk
+
+    return StreamingResponse(
+        chunks(),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{request_id}.upstream.json"',
+            "Content-Length": str(os.fstat(snapshot.fileno()).st_size),
+        },
+        background=BackgroundTask(snapshot.close),
+    )
 
 
 @router.get("/requests/{request_id}")

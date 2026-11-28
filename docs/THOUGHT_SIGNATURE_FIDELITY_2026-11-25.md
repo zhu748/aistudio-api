@@ -5,8 +5,8 @@
 上游 MakerSuite 对回传历史的签名强制校验(见 `TOOL_HISTORY_LOSS_2026-11-14.md` /
 `WIRE_SPECIFICATION.md` §6.5):
 
-- **functionCall part**:一切回传强制 `thoughtSignature`,缺失 → 400
-  `missing thought_signature`,伪造 → 400 `Corrupted thought signature`;
+- **functionCall part**:并行批次首个调用承载 `thoughtSignature`，后续调用
+  通常不带签名。缺少必需签名或回传上游无法校验的签名均可能返回 400；
 - **纯文本轮**:思考摘要 + 文本 + **尾部空文本签名 part**(签名不在
   thought part 本体);
 - **模型 FC 轮**:思考摘要无签名,签名只挂在 FC part 上。
@@ -79,6 +79,13 @@ Claude 协议 thinking 块自带 `signature` 字段,而 OpenAI 生态
 
 ## 边界与后续
 
+- 原生 Gemini 接口首次按原样回放缓存未观测到的显式签名。上游明确返回
+  `400 Corrupted thought signature` 且尚未发布流式响应内容时，网关最多
+  重试一次。重试按 Google 的历史迁移约定，移除候选轮次不可用的思维签名，
+  给并行批次首个调用使用 `skip_thought_signature_validator`，保留文本、
+  思考摘要、工具调用及工具结果。已校验归属的历史轮次保持原有回放路径。
+  完整生成后，网关在当前进程和作用域内缓存已接受的迁移，后续回传同一
+  段历史时可直接续聊。 [Google Gemini 思维签名文档](https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures#faqs)
 - OpenAI 生态客户端是否原样回传 `extra_content` 取决于客户端实现;
   三层兜底(消息级载体 / thinking 缓存 / model_turns 回放)保证任一
   层命中即恢复,最坏退化为无签名思考历史(上游容忍,与 Claude 侧

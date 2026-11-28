@@ -85,6 +85,7 @@ async def generate_content(
             client,
             stream=False,
             anti_truncation=_parse_anti_truncation_header(http_request),
+            migrate_history=True,
         )
         assert isinstance(response, GeminiGenerateContentResponse)
         if response.candidates and response.candidates[0].content:
@@ -131,4 +132,5 @@ async def stream_generate_content(
         stream=True,
         anti_truncation=_parse_anti_truncation_header(http_request),
         sdk_terminal=_uses_python_genai_sdk(http_request),
+        migrate_history=True,
     )

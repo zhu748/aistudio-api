@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
 import re
+import tempfile
 import time
 import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import cast
+from typing import BinaryIO, cast
 from uuid import uuid4
 
 import anyio
@@ -195,12 +197,32 @@ class _ResponseObserver:
     response_body_truncated: bool = False
     metadata_body: bytearray = field(default_factory=bytearray)
     request_body: bytearray = field(default_factory=bytearray)
+    request_body_file: BinaryIO | None = None
     response_body: bytearray = field(default_factory=bytearray)
     response_headers: dict[str, str] = field(default_factory=dict)
 
     @property
     def response_delivered(self) -> bool:
         return self.completed or self.json_payload_sent or self.stream_terminal_sent
+
+    def spool_request_body(self, chunk: bytes) -> None:
+        try:
+            if self.request_body_file is None:
+                # The middleware closes the spool after final persistence.
+                self.request_body_file = tempfile.TemporaryFile(mode="w+b")  # noqa: SIM115
+                self.request_body_file.write(self.request_body)
+            self.request_body_file.write(chunk)
+        except OSError:
+            self.close_request_body_file()
+            logger.warning("无法暂存超出采集上限的客户端正文", exc_info=True)
+        finally:
+            self.request_body.clear()
+
+    def close_request_body_file(self) -> None:
+        if self.request_body_file is not None:
+            with contextlib.suppress(OSError):
+                self.request_body_file.close()
+            self.request_body_file = None
 
 
 class RequestMiddleware:
@@ -243,9 +265,8 @@ class RequestMiddleware:
         if responses_call:
             scope["state"]["responses_accept_event"] = None
         # Management payloads can contain cookies, complete config and credentials.
-        dump_enabled = model_call and (
-            is_dump_requests_enabled() or is_dump_to_file_enabled()
-        )
+        capture_client = model_call and is_dump_to_file_enabled()
+        dump_enabled = capture_client or (model_call and is_dump_requests_enabled())
         context = RequestContext(
             request_id="req_" + uuid4().hex,
             category="model" if model_call else "system",
@@ -395,17 +416,37 @@ class RequestMiddleware:
                 # 管理路径同样施加请求体上限（1MB）：写端点无界接收可把
                 # 磁盘与 yaml 解析 CPU 打爆（实测 50MB config 被完整落盘）
                 body_limit = settings.max_request_bytes if model_call else 1_048_576
-                if dump_enabled and not observer.request_body_truncated:
+                if observer.received_bytes > body_limit:
+                    observer.request_body_complete = False
+                    observer.request_body_truncated = True
+                    observer.request_body.clear()
+                    observer.close_request_body_file()
+                    raise HTTPException(413, "Request body exceeds configured limit")
+                if dump_enabled and (
+                    not observer.request_body_truncated
+                    or observer.request_body_file is not None
+                ):
                     if (
-                        len(observer.request_body) + len(body)
-                        <= settings.dump_max_bytes
+                        not observer.request_body_truncated
+                        and observer.received_bytes <= settings.dump_max_bytes
                     ):
                         observer.request_body.extend(body)
                     else:
-                        observer.request_body.clear()
                         observer.request_body_truncated = True
-                if observer.received_bytes > body_limit:
-                    raise HTTPException(413, "Request body exceeds configured limit")
+                        if capture_client:
+                            # Keep the original capture complete without holding
+                            # a second large copy of the request in memory.
+                            write = asyncio.create_task(
+                                asyncio.to_thread(observer.spool_request_body, body)
+                            )
+                            try:
+                                await asyncio.shield(write)
+                            except asyncio.CancelledError:
+                                with anyio.CancelScope(shield=True):
+                                    await write
+                                raise
+                        else:
+                            observer.request_body.clear()
                 if observer.request_body_complete and disconnect_scope is not None:
                     disconnect_watch = asyncio.create_task(
                         watch_disconnect(disconnect_scope)
@@ -723,6 +764,7 @@ class RequestMiddleware:
                         await task
                         raise
             finally:
+                observer.close_request_body_file()
                 if model_call and admitted:
                     unregister_request(context.request_id)
                 if responses_call:
@@ -775,6 +817,7 @@ class RequestMiddleware:
         if dump_enabled:
             try:
                 client_request: dict[str, object] | None = None
+                client_body_file = None
                 if is_dump_to_file_enabled():
                     # Keep the ASGI body verbatim, before validation, defaults,
                     # model mapping or protocol conversion. Only transport
@@ -794,6 +837,10 @@ class RequestMiddleware:
                         else original_scope["path"]
                     )
                     query = original_scope.get("query_string", b"").decode("latin1")
+                    client_body_file = observer.request_body_file
+                    client_body_truncated = (
+                        observer.request_body_truncated and client_body_file is None
+                    )
                     client_request = {
                         "source": "client",
                         "method": original_scope["method"],
@@ -814,8 +861,8 @@ class RequestMiddleware:
                         "body_encoding": encoding,
                         "body_bytes": observer.received_bytes,
                         "complete": observer.request_body_complete
-                        and not observer.request_body_truncated,
-                        "truncated": observer.request_body_truncated,
+                        and not client_body_truncated,
+                        "truncated": client_body_truncated,
                     }
                 await asyncio.to_thread(
                     dump_request_exchange,
@@ -844,6 +891,7 @@ class RequestMiddleware:
                     error_detail=context.error,
                     console=is_dump_requests_enabled(),
                     client_request=client_request,
+                    client_body_file=client_body_file,
                 )
             except Exception:
                 logger.exception("Failed to persist request dump")

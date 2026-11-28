@@ -426,11 +426,57 @@ def _fill_missing_calls(
     return result
 
 
+def _migrate_external_signatures(
+    contents: list[AistudioContent],
+) -> tuple[list[AistudioContent], int]:
+    """Keep the imported payload and replace its unusable thought state."""
+    result: list[AistudioContent] = []
+    lead = True
+    skip_fills = 0
+    for content in contents:
+        parts: list[AistudioPart] = []
+        for part in content.parts:
+            signature = part.thought_signature
+            if part.function_call is not None:
+                signature = SKIP_THOUGHT_SIGNATURE if lead else None
+                skip_fills += int(lead)
+                lead = False
+            elif signature:
+                if not (
+                    part.text
+                    or part.inline_data
+                    or part.file_id
+                    or part.function_response
+                    or part.executable_code
+                    or part.code_execution_result
+                ):
+                    continue  # Standalone signature carrier.
+                signature = None
+            parts.append(
+                part
+                if signature == part.thought_signature
+                else replace(part, thought_signature=signature)
+            )
+        if parts:
+            result.append(replace(content, parts=parts))
+    return result, skip_fills
+
+
+@dataclass
+class HistorySignatureMigration:
+    """Track eligible unobserved turns for a single native Gemini request."""
+
+    scope: str = ""
+    candidates: set[int] = field(default_factory=set)
+    retrying: bool = False
+
+
 @dataclass(frozen=True)
 class ModelTurnContext:
     history: ModelTurnHistory
     scope: str
     prefix: str
+    migrated_turns: tuple[str, ...] = ()
 
     def capture(self) -> ModelTurnCapture:
         return ModelTurnCapture(self)
@@ -532,6 +578,7 @@ class ModelTurnHistory:
         self._entries: OrderedDict[
             tuple[str, str], tuple[str | None, str | None, int, str]
         ] = OrderedDict()
+        self._accepted_migrations: OrderedDict[tuple[str, str], None] = OrderedDict()
         self._bytes = 0
         self._max_bytes = cache_bytes
         self._max_entries = max_entries
@@ -540,7 +587,11 @@ class ModelTurnHistory:
         self._codec = AistudioWireCodec()
 
     def prepare(
-        self, scope: str, contents: list[AistudioContent]
+        self,
+        scope: str,
+        contents: list[AistudioContent],
+        *,
+        migration: HistorySignatureMigration | None = None,
     ) -> tuple[list[AistudioContent], str | None, ModelTurnContext | None]:
         restored: list[AistudioContent] = []
         previous = ""
@@ -550,6 +601,10 @@ class ModelTurnHistory:
         owners = None
         trace = get_signature_trace()
         model_turn_index = 0
+        migrated_turns: list[str] = []
+        if migration is not None and not migration.retrying:
+            migration.scope = scope
+            migration.candidates.clear()
         cache = (
             get_signature_cache() if any(c.role == "model" for c in contents) else None
         )
@@ -603,6 +658,9 @@ class ModelTurnHistory:
                         self._entries.move_to_end((scope, previous))
                 token = None
             if entry is not None:
+                if migration is not None and not migration.retrying:
+                    # Changing a preceding turn would invalidate this proof's prefix.
+                    migration.candidates.clear()
                 assert owners is not None
                 raw, saved_token, _, state = entry
                 fc_count = sum(1 for part in parts if part.function_call is not None)
@@ -691,6 +749,8 @@ class ModelTurnHistory:
                 fc_count = sum(1 for part in parts if part.function_call is not None)
                 found, proof = cache.lookup_turn(scope, previous)
                 if found:
+                    if migration is not None and not migration.retrying:
+                        migration.candidates.clear()
                     if proof is not None and _verified_cohort(parts, owners, proof):
                         restored.extend(
                             _fill_missing_calls(
@@ -748,6 +808,8 @@ class ModelTurnHistory:
                     )
                     thoughts = [part.text or "" for part in parts if part.thought]
                     if seen_old:
+                        if migration is not None and not migration.retrying:
+                            migration.candidates.clear()
                         # A legacy per-call record can neither authorize a replay
                         # nor expand the SKIP fallback: forward untouched.
                         if trace is not None:
@@ -760,6 +822,52 @@ class ModelTurnHistory:
                         restored.extend(contents[start:end])
                         compatible = False
                     elif has_explicit_real_sig:
+                        if migration is not None and all(
+                            part.raw_wire is None for part in parts
+                        ):
+                            migration_key = _hash(
+                                [
+                                    previous,
+                                    "signature_migration",
+                                    calls,
+                                    thoughts,
+                                    [
+                                        (index, part.to_wire())
+                                        for index, part in enumerate(parts)
+                                        if part.thought_signature
+                                    ],
+                                ]
+                            )
+                            key = (scope, migration_key)
+                            with self._lock:
+                                accepted = key in self._accepted_migrations
+                                if accepted:
+                                    self._accepted_migrations.move_to_end(key)
+                            if accepted or (
+                                migration.retrying
+                                and migration.scope == scope
+                                and model_turn_index in migration.candidates
+                            ):
+                                if accepted and not migration.retrying:
+                                    migration.candidates.clear()
+                                migrated, skip_fills = _migrate_external_signatures(
+                                    contents[start:end]
+                                )
+                                restored.extend(migrated)
+                                previous = migration_key
+                                migrated_turns.append(migration_key)
+                                if trace is not None:
+                                    trace.record_replay_turn(
+                                        turn_index=model_turn_index,
+                                        action="skip_fill" if skip_fills else "miss",
+                                        reason="external_signature_migrated",
+                                        fc_count=len(calls),
+                                        restored_sigs=skip_fills,
+                                    )
+                                start = end
+                                continue
+                            if not migration.retrying:
+                                migration.candidates.add(model_turn_index)
                         # Unobserved turn that still carries a real signature:
                         # forward it untouched — the client's signature is never
                         # borrowed or replaced — and only patch the one shape the
@@ -875,7 +983,7 @@ class ModelTurnHistory:
                 restored.extend(contents[start:end])
             start = end
         context = (
-            ModelTurnContext(self, scope, previous)
+            ModelTurnContext(self, scope, previous, tuple(migrated_turns))
             if compatible and contents and contents[-1].role != "model"
             else None
         )
@@ -885,6 +993,14 @@ class ModelTurnHistory:
         self, context: ModelTurnContext, parts: list[list[object]], token: str | None
     ) -> None:
         trace = get_signature_trace()
+        if context.migrated_turns:
+            with self._lock:
+                for turn in context.migrated_turns:
+                    key = (context.scope, turn)
+                    self._accepted_migrations[key] = None
+                    self._accepted_migrations.move_to_end(key)
+                while len(self._accepted_migrations) > self._max_entries:
+                    self._accepted_migrations.popitem(last=False)
         parsed = [parse_response_part(wire) for wire in parts]
         if token is None and not any(
             part.function_call is not None or part.thought or part.thought_signature
@@ -967,4 +1083,5 @@ class ModelTurnHistory:
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
+            self._accepted_migrations.clear()
             self._bytes = 0

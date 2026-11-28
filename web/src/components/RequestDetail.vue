@@ -70,18 +70,20 @@ const tabs = [
 ]
 const validTabIds = new Set(tabs.map((item) => item.id))
 const sigTrace = computed(() => record.value?.thought_signature ?? null)
+const signatureRejected = computed(() =>
+  /corrupted thought signature/i.test(record.value?.error ?? ''),
+)
 const bareLeadTurns = computed(() => {
   const t = sigTrace.value
   if (!t) return 0
-  // 兼容旧记录：没有 lead 口径时退回 fc_unsigned。
-  return t.upstream_out.fc_unsigned_lead_turns ?? t.upstream_out.fc_unsigned
+  return t.upstream_out.fc_unsigned_lead_turns ?? 0
 })
 const signatureHasRisk = computed(() => {
   const t = sigTrace.value
   if (!t) return false
   // 风险口径是「首 FC 裸发的轮次」：每轮只有第一个 functionCall 需要签名，
   // 兄弟 FC 不带签名是上游正常形态，用 fc_unsigned 会误报。
-  return bareLeadTurns.value > 0 || t.replay.conflicts > 0 || t.client_in.dropped > 0
+  return signatureRejected.value || bareLeadTurns.value > 0 || t.replay.conflicts > 0 || t.client_in.dropped > 0
 })
 const latestLoad = useLatest()
 
@@ -355,11 +357,11 @@ async function downloadUpstream() {
           <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
             <span class="font-semibold">思维签名</span>
             <span class="font-mono">
-              回传 FC {{ sigTrace.client_in.fc_signed }}/{{ sigTrace.client_in.fc_total }}
-              · 思考 {{ sigTrace.client_in.thought_signed }}/{{ sigTrace.client_in.thought_total }}
+              工具调用带签名 {{ sigTrace.client_in.fc_signed }}/{{ sigTrace.client_in.fc_total }}
+              · 摘要带签名 {{ sigTrace.client_in.thought_signed }}/{{ sigTrace.client_in.thought_total }}
             </span>
             <span class="font-mono">
-              恢复 温{{ sigTrace.replay.warm_hits }}/冷{{ sigTrace.replay.cold_hits }}/SKIP{{ sigTrace.replay.skip_fills }}
+              回放 温{{ sigTrace.replay.warm_hits }}/冷{{ sigTrace.replay.cold_hits }}/SKIP{{ sigTrace.replay.skip_fills }}
             </span>
             <span class="font-mono">
               收发 上行{{ sigTrace.upstream_out.real_sigs }} → 返回{{ sigTrace.upstream_in.total_sigs }} → 下发{{ sigTrace.client_out.total_sigs }}
@@ -472,6 +474,7 @@ async function downloadUpstream() {
         v-else-if="tab === 'signature'"
         :trace="sigTrace"
         :request-id="requestId"
+        :rejected="signatureRejected"
       />
       <div
         v-else-if="tab === 'timeline'"
@@ -587,7 +590,7 @@ async function downloadUpstream() {
               v-if="!clientRequest.complete"
               class="text-amber-700 text-xs"
             >
-              {{ clientRequest.truncated ? '正文超过采集上限，已省略；请提高 AISTUDIO_DUMP_MAX_BYTES 后重新采集。' : '请求正文未接收完整，以下仅为已收到的内容。' }}
+              {{ clientRequest.truncated ? '此记录未保存完整原文，页面和下载仅包含已采集的内容。' : '请求正文未接收完整，以下仅为已收到的内容。' }}
             </p>
             <p
               v-if="clientRequest.body_encoding === 'base64'"

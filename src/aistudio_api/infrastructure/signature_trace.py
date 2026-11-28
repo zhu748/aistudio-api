@@ -123,6 +123,7 @@ def _make_item(
     call_id: str = "",
     call_name: str = "",
     turn_index: int | None = None,
+    lead_call: bool | None = None,
     note: str = "",
 ) -> dict[str, object]:
     item: dict[str, object] = {
@@ -140,6 +141,8 @@ def _make_item(
         item["call_name"] = call_name[:64]
     if turn_index is not None:
         item["turn_index"] = turn_index
+    if lead_call is not None:
+        item["lead_call"] = lead_call
     if note:
         item["note"] = note[:120]
     return item
@@ -160,6 +163,8 @@ class ThoughtSignatureTrace:
     client_fc_signed: int = 0
     client_fc_skip: int = 0
     client_fc_missing: int = 0
+    client_fc_unsigned_lead_turns: int = 0
+    _client_last_fc_turn: int | None = field(default=None, repr=False)
     client_thought_total: int = 0
     client_thought_signed: int = 0
     client_tail_signed: int = 0
@@ -189,9 +194,8 @@ class ThoughtSignatureTrace:
     upstream_out_fc_total: int = 0
     upstream_out_fc_unsigned: int = 0
     # Model turns whose FIRST functionCall goes upstream without any signature.
-    # Upstream validates the lead call only; unsigned sibling calls are the
-    # normal Gemini shape (only the first call of a turn is signed), so this —
-    # not fc_unsigned — is the "400 missing thought_signature" risk signal.
+    # A parallel batch normally carries its signature on the first call.
+    # Use the lead count for the "400 missing thought_signature" warning.
     upstream_out_turns_unsigned_lead: int = 0
     upstream_out_continuation: bool = False
     upstream_out_fps: list[str] = field(default_factory=list)
@@ -341,8 +345,14 @@ class ThoughtSignatureTrace:
     ) -> None:
         kind = classify_signature(raw_signature)
         sig_str = raw_signature if isinstance(raw_signature, str) else ""
+        lead_call = None
 
         if carrier == "function_call":
+            if turn_index is not None:
+                lead_call = turn_index != self._client_last_fc_turn
+                self._client_last_fc_turn = turn_index
+            if lead_call and (kind in ("missing", "invalid") or stripped_note):
+                self.client_fc_unsigned_lead_turns += 1
             self.client_fc_total += 1
             if kind == "real" and not stripped_note:
                 self.client_fc_signed += 1
@@ -392,6 +402,7 @@ class ThoughtSignatureTrace:
                     call_id=call_id,
                     call_name=call_name,
                     turn_index=turn_index,
+                    lead_call=lead_call,
                     note=note,
                 )
             )
@@ -441,15 +452,21 @@ class ThoughtSignatureTrace:
     ) -> None:
         self.upstream_out_continuation = continuation_sent
         model_turn = 0
+        in_model_turn = False
+        lead_fc_seen = False
         for content in contents:
             if content.role != "model":
+                in_model_turn = False
                 continue
-            model_turn += 1
-            lead_fc_seen = False
+            if not in_model_turn:
+                model_turn += 1
+                lead_fc_seen = False
+                in_model_turn = True
             for part in content.parts:
                 sig = part.thought_signature or ""
                 kind = classify_signature(sig)
                 has_fc = part.function_call is not None
+                lead_call = not lead_fc_seen if has_fc else None
                 carrier = _part_carrier(
                     has_fc=has_fc,
                     has_fr=part.function_response is not None,
@@ -471,7 +488,7 @@ class ThoughtSignatureTrace:
                     self.upstream_out_fc_total += 1
                     if kind == "missing":
                         self.upstream_out_fc_unsigned += 1
-                    if not lead_fc_seen:
+                    if lead_call:
                         lead_fc_seen = True
                         if kind == "missing":
                             self.upstream_out_turns_unsigned_lead += 1
@@ -494,7 +511,7 @@ class ThoughtSignatureTrace:
                             signature=sig,
                             source=(
                                 "warm_cache"
-                                if part.raw_wire is not None and kind == "real"
+                                if part.raw_wire is not None
                                 else "skip_fallback"
                                 if kind == "skip_sentinel"
                                 else "outbound_wire"
@@ -502,6 +519,7 @@ class ThoughtSignatureTrace:
                             call_id=call_id,
                             call_name=call_name,
                             turn_index=model_turn,
+                            lead_call=lead_call,
                         )
                     )
 
@@ -621,6 +639,7 @@ class ThoughtSignatureTrace:
                 "fc_signed": self.client_fc_signed,
                 "fc_skip": self.client_fc_skip,
                 "fc_missing": self.client_fc_missing,
+                "fc_unsigned_lead_turns": self.client_fc_unsigned_lead_turns,
                 "thought_total": self.client_thought_total,
                 "thought_signed": self.client_thought_signed,
                 "tail_signed": self.client_tail_signed,
@@ -691,7 +710,7 @@ class ThoughtSignatureTrace:
                 f"历史轮={self.client_model_turns} "
                 f"FC={self.client_fc_signed}/{self.client_fc_total}"
                 + (f"(SKIP:{self.client_fc_skip})" if self.client_fc_skip else "")
-                + (f"(缺:{self.client_fc_missing})" if self.client_fc_missing else "")
+                + f" 首FC无可用签名轮={self.client_fc_unsigned_lead_turns}"
                 + f" thought={self.client_thought_signed}/{self.client_thought_total}"
                 + (
                     f" 尾载体={self.client_tail_signed}"
@@ -709,12 +728,12 @@ class ThoughtSignatureTrace:
             f"温命中={self.warm_hits} 冷命中={self.cold_hits} "
             f"SKIP补填={self.skip_fills}"
             + (f" 冲突={self.conflicts}" if self.conflicts else "")
-            + (f" 续传={'是' if self.continuation_reused else '否'}")
             + (f" 原因={','.join(self.miss_reasons[:3])}" if self.miss_reasons else "")
         )
         upstream_part = (
-            f"真签={self.upstream_out_real}(fp:{fp_text}) "
-            f"SKIP={self.upstream_out_skip} 未签FC={self.upstream_out_fc_unsigned}"
+            f"签名={self.upstream_out_real}(fp:{fp_text}) "
+            f"SKIP={self.upstream_out_skip} 未签FC={self.upstream_out_fc_unsigned} "
+            f"发送续传={'是' if self.upstream_out_continuation else '否'}"
             + (
                 f"(首FC裸发轮={self.upstream_out_turns_unsigned_lead})"
                 if self.upstream_out_turns_unsigned_lead
@@ -730,6 +749,7 @@ class ThoughtSignatureTrace:
             "client_fc_total": self.client_fc_total,
             "client_fc_signed": self.client_fc_signed,
             "client_fc_missing": self.client_fc_missing,
+            "client_fc_unsigned_lead": self.client_fc_unsigned_lead_turns,
             "client_thought_signed": self.client_thought_signed,
             "client_tail_signed": self.client_tail_signed,
             "client_dropped": self.client_dropped,
@@ -741,6 +761,7 @@ class ThoughtSignatureTrace:
             "conflicts": self.conflicts,
             "misses": self.misses,
             "continuation_reused": self.continuation_reused,
+            "continuation_sent": self.upstream_out_continuation,
             "upstream_real": self.upstream_out_real,
             "upstream_skip": self.upstream_out_skip,
             "upstream_fc_unsigned": self.upstream_out_fc_unsigned,

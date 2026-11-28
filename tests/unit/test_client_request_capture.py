@@ -9,7 +9,7 @@ from typing import cast
 import httpx
 import pytest
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from aistudio_api.api import routes_compat, routes_gemini
 from aistudio_api.api.dependencies import get_client
@@ -21,6 +21,7 @@ from aistudio_api.api.routes_operations import (
 )
 from aistudio_api.api.schemas import GeminiGenerateContentRequest
 from aistudio_api.config import settings
+from aistudio_api.infrastructure.request_context import record_result
 from aistudio_api.infrastructure.utils import logger as log_module
 
 
@@ -202,6 +203,76 @@ async def test_capture_limits_and_scope(monkeypatch, mode):
     result = await request_payload(response.headers["x-request-id"])
     payload = cast(dict[str, object], result["payload"])
     captured = cast(dict[str, object], payload["client_request"])
-    assert captured["complete"] is False
-    assert captured["truncated"] is (mode == "over_limit")
-    assert captured["body"] is None if mode == "over_limit" else captured["body"] == ""
+    assert captured["complete"] is (mode == "over_limit")
+    assert captured["truncated"] is False
+    assert captured["body"] == (
+        '{"messages": "original payload"}' if mode == "over_limit" else ""
+    )
+
+
+@pytest.mark.parametrize(
+    "mode", ["success", "sse_success", "http_error", "sse_error", "binary_error"]
+)
+async def test_large_capture_preserves_bytes_for_any_outcome(monkeypatch, mode):
+    monkeypatch.setattr(settings, "dump_max_bytes", 1024)
+    monkeypatch.setattr(settings, "max_request_bytes", 2 * 1024 * 1024)
+    raw = b'{"contents":"' + b"x" * (48 * 1024 - len(b'{"contents":"') - 1)
+    raw += ("中文" * 280_000).encode() + b'\\r\\nTAIL"}\r\n'
+    if mode == "binary_error":
+        raw += b"\xff"
+    app = FastAPI()
+    app.add_middleware(RequestMiddleware)
+    app.include_router(operations_router)
+    path = "/v1beta/models/gemini-4-hydrogen:streamGenerateContent"
+
+    @app.post(path)
+    async def accept(request: Request):
+        assert await request.body() == raw
+        if mode in {"sse_success", "sse_error"}:
+
+            async def frames():
+                if mode == "sse_error":
+                    record_result("error", error="Corrupted thought signature.")
+                    yield b'data: {"error":{"code":400}}\n\n'
+                else:
+                    record_result("success")
+                    yield b'data: {"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}]}\n\n'
+
+            return StreamingResponse(frames(), media_type="text/event-stream")
+        code = 200 if mode == "success" else 400
+        return JSONResponse({"ok": code == 200}, status_code=code)
+
+    async def chunks():
+        yield raw[:768]
+        for offset in range(768, len(raw), 32768):
+            yield raw[offset : offset + 32768]
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"{path}?alt=sse&key=transport-secret",
+            content=chunks(),
+            headers={"authorization": "Bearer transport-secret"},
+        )
+        request_id = response.headers["x-request-id"]
+        result = await client.get(f"/api/requests/{request_id}/payload")
+
+    assert response.status_code == (
+        400 if mode in {"http_error", "binary_error"} else 200
+    )
+    payload = result.json()["payload"]
+    captured = payload["client_request"]
+    assert captured["body_bytes"] == len(raw)
+    assert "transport-secret" not in json.dumps(captured)
+    assert payload["body"] is None
+    encoding = "base64" if mode == "binary_error" else "utf-8"
+    assert captured["body_encoding"] == encoding
+    assert captured["complete"] is True and captured["truncated"] is False
+    assert (
+        base64.b64decode(captured["body"], validate=True)
+        if encoding == "base64"
+        else captured["body"].encode()
+    ) == raw
+    latest = log_module.get_dump_dir() / "latest_request.json"
+    assert json.loads(latest.read_bytes())["client_request"]["body"] == captured["body"]
