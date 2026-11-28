@@ -962,18 +962,25 @@ async def restore_anti_truncation_stream(
 
 
 def _without_plain_text(part: ResponsePart) -> ResponsePart:
-    signature = (
-        part.thought_signature
-        if (
-            part.function_call
-            or part.function_response
-            or part.image
-            or part.executable_code is not None
-            or part.code_execution_result is not None
-        )
-        else ""
+    if not part.text_present and not part.text:
+        return part
+    # The proof belongs to the entire original Part, not the payload left
+    # after removing its text. Drop the parser's mirrors on the copy too.
+    call = part.function_call
+    if call is not None and "thought_signature" in call:
+        call = call.copy()
+        del call["thought_signature"]
+    image = part.image
+    if image is not None and image.thought_signature:
+        image = replace(image, thought_signature="")
+    return replace(
+        part,
+        text="",
+        text_present=False,
+        thought_signature="",
+        function_call=call,
+        image=image,
     )
-    return replace(part, text="", text_present=False, thought_signature=signature)
 
 
 async def _ordered_transport_events(

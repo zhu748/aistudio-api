@@ -77,7 +77,7 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("compat.responses")
 _STANDARD_BASE64 = re.compile(r"[A-Za-z0-9+/]++={0,2}")
-_UNFINISHED_CALL_STATUSES = ("incomplete", "in_progress")
+_UNFINISHED_TOOL_ITEM_STATUSES = ("incomplete", "in_progress")
 
 # Responses reasoning.effort → Gemini reasoningEffort：统一走
 # normalize_reasoning_effort_word（与 chat completions 侧同一套词表，
@@ -293,7 +293,7 @@ async def responses_to_gemini_request(
         call_id = _as_str(item.get("call_id"))
         if not call_id:
             continue
-        if item.get("status") in _UNFINISHED_CALL_STATUSES:
+        if item.get("status") in _UNFINISHED_TOOL_ITEM_STATUSES:
             unfinished_call_ids.add(call_id)
             continue
         replayable_call_ids.add(call_id)
@@ -335,7 +335,7 @@ async def responses_to_gemini_request(
                         GeminiContent(role="user", parts=parts or [GeminiPart(text="")])
                     )
             elif item_type == "function_call":
-                if item.get("status") in _UNFINISHED_CALL_STATUSES:
+                if item.get("status") in _UNFINISHED_TOOL_ITEM_STATUSES:
                     continue
                 name = _as_str(item.get("name")) or "unknown"
                 call_id = _as_str(item.get("call_id"))
@@ -364,7 +364,11 @@ async def responses_to_gemini_request(
                 contents.append(GeminiContent(role="model", parts=[fc_part]))
             elif item_type == "function_call_output":
                 call_id = _as_str(item.get("call_id"))
-                if call_id in unfinished_call_ids:
+                # Even a completed call may have a draft before its final output.
+                if (
+                    call_id in unfinished_call_ids
+                    or item.get("status") in _UNFINISHED_TOOL_ITEM_STATUSES
+                ):
                     continue
                 name = tool_name_by_call_id.get(call_id, "unknown")
                 payload, media = _tool_output_payload(item.get("output"))

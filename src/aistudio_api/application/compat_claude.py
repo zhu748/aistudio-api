@@ -72,10 +72,23 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 logger = get_logger("compat.claude")
 
 
+def _claude_document_text(source: dict[str, object]) -> str | None:
+    """Anthropic PlainTextSourceParam contains literal text, not media to fetch."""
+    data = source.get("data")
+    if (
+        source.get("type") == "text"
+        and source.get("media_type") == "text/plain"
+        and isinstance(data, str)
+    ):
+        return data
+    return None
+
+
 async def _claude_blocks_to_parts(
     content: object,
     *,
     tool_name_by_id: dict[str, str],
+    allow_text_documents: bool = False,
 ) -> list[GeminiPart]:
     """Claude content（str 或块数组）→ Gemini parts。
 
@@ -91,7 +104,9 @@ async def _claude_blocks_to_parts(
         return await _convert_items_concurrently(
             content,
             lambda blocks: _claude_blocks_to_parts(
-                blocks, tool_name_by_id=tool_name_by_id
+                blocks,
+                tool_name_by_id=tool_name_by_id,
+                allow_text_documents=allow_text_documents,
             ),
         )
     trace = get_signature_trace()
@@ -140,7 +155,12 @@ async def _claude_blocks_to_parts(
                     parts.append(await _media_part_from_url(url))
         elif block_type == "document":
             source = _as_dict(block.get("source"))
-            if source.get("type") == "base64":
+            if (
+                allow_text_documents
+                and (text := _claude_document_text(source)) is not None
+            ):
+                parts.append(GeminiPart(text=text))
+            elif source.get("type") == "base64":
                 part = _claude_base64_part(
                     source, "application/pdf", kind="document media"
                 )
@@ -188,6 +208,10 @@ async def _claude_blocks_to_parts(
                         continue
                     if item.get("type") == "text":
                         texts.append(_as_str(item.get("text")))
+                    elif item.get("type") == "document" and allow_text_documents:
+                        text = _claude_document_text(_as_dict(item.get("source")))
+                        if text is not None:
+                            texts.append(text)
                     elif item.get("type") == "image":
                         source = _as_dict(item.get("source"))
                         if source.get("type") == "base64":
@@ -391,10 +415,12 @@ async def claude_to_gemini_request(
                     tool_name_by_id[call_id] = name
 
     for message in req.messages:
-        role = "model" if message.role.strip().lower() == "assistant" else "user"
+        message_role = message.role.strip().lower()
+        role = "model" if message_role == "assistant" else "user"
         parts = await _claude_blocks_to_parts(
             message.content,
             tool_name_by_id=tool_name_by_id,
+            allow_text_documents=message_role == "user",
         )
         contents.append(GeminiContent(role=role, parts=parts or [GeminiPart(text="")]))
 

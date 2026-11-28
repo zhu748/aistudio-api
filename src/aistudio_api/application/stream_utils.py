@@ -135,6 +135,57 @@ class StopSequenceBuffer:
         return text[:-hold] if hold else text
 
 
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
+_JSON_DELIMITERS = '{}[],:"'
+_JSON_DECODER = json.JSONDecoder()
+_STRICT_COMPACT_JSON = json.JSONEncoder(
+    ensure_ascii=False, separators=(",", ":"), allow_nan=False
+)
+
+
+def _matches_signed_prefix(fragments: list[str], snapshot: str) -> bool:
+    """Compare to compact JSON without interpreting escapes outside strings."""
+    prefix = "".join(fragments)
+    if snapshot.startswith(prefix) and "\\" not in prefix:
+        return bool(prefix)
+
+    # A synthetic closing quote lets the JSON decoder read a trailing partial
+    # string, but cannot repair a dangling backslash or truncated Unicode escape.
+    limit = len(prefix)
+    prefix += '"'
+    i = offset = 0
+    while i < limit:
+        char = prefix[i]
+        if char in " \t\r\n":
+            # Whitespace is optional between tokens, never inside e.g. 1 2.
+            if (
+                0 < offset < len(snapshot)
+                and snapshot[offset - 1] not in _JSON_DELIMITERS
+                and snapshot[offset] not in _JSON_DELIMITERS
+            ):
+                return False
+            i += 1
+        elif char == '"':
+            try:
+                decoded, i = _JSON_DECODER.raw_decode(prefix, i)
+            except ValueError:
+                return False
+            if _SURROGATE.search(decoded):
+                return False
+            token = _STRICT_COMPACT_JSON.encode(decoded)
+            if i > limit:
+                return snapshot.startswith(token[:-1], offset)
+            if not snapshot.startswith(token, offset):
+                return False
+            offset += len(token)
+        elif offset < len(snapshot) and char == snapshot[offset]:
+            i += 1
+            offset += 1
+        else:
+            return False
+    return offset > 0
+
+
 @dataclass(slots=True, eq=False)
 class _ToolCall:
     call_id: str
@@ -144,6 +195,7 @@ class _ToolCall:
     fragments: list[str] = field(default_factory=list)
     size: int = 0
     invalid: bool = False
+    explicit_chain: bool = True
 
     def matches(self, name: str) -> bool:
         return self.name.startswith(name) or name.startswith(self.name)
@@ -176,22 +228,34 @@ class _ToolCall:
                     quoted = not quoted
         return offset > 0
 
-    def update(self, name: str, args: object, signature: object) -> None:
+    def update(self, call_id: str, name: str, args: object, signature: object) -> None:
+        # Later promotion must not retroactively identify anonymous shards.
+        self.explicit_chain &= bool(
+            call_id and name and (not self.name or self.name == name)
+        )
+        if self.name and name and name != self.name:
+            self.envelope.pop("thoughtSignature", None)
         if not self.matches(name):
             self.invalid = True
         elif len(name) > len(self.name):
-            if self.name and self.args is not None:
-                self.envelope.pop("thoughtSignature", None)
             self.name = name
 
         if isinstance(args, dict):
-            snapshot = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+            try:
+                snapshot = _STRICT_COMPACT_JSON.encode(args)
+            except ValueError:
+                # NaN/Infinity aren't JSON. Keep the existing argument handling
+                # but never carry a previous proof to such a snapshot.
+                self.envelope.pop("thoughtSignature", None)
+                snapshot = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
             if "thoughtSignature" in self.envelope:
                 if self.args is not None:
                     # Python equality merges JSON types such as true and 1.
                     changed = args != self.args or json.dumps(
                         args, sort_keys=True
                     ) != json.dumps(self.args, sort_keys=True)
+                elif self.fragments and self.explicit_chain:
+                    changed = not _matches_signed_prefix(self.fragments, snapshot)
                 else:
                     changed = bool(self.fragments) and not self.matches_argument_prefix(
                         snapshot
@@ -462,7 +526,7 @@ class ToolResponseAssembler:
             old_fields_size = _retained_size(tool.name) + _retained_size(
                 tool.envelope.get("thoughtSignature")
             )
-            tool.update(name, args, signature)
+            tool.update(call_id, name, args, signature)
             self._retained_bytes += (
                 _retained_size(tool.name)
                 + _retained_size(tool.envelope.get("thoughtSignature"))
