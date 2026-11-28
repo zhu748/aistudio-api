@@ -144,14 +144,24 @@ def _has_image_url_source(value: object) -> bool:
     return _DATA_URL_RE.match(url) is not None
 
 
-def _check_user_media_references(content: object, input_index: int) -> None:
-    """Reject an unresolvable reference before any message can start media I/O."""
+def _check_user_media(content: object, input_index: int) -> None:
+    """Reject unsupported user media before any message can start media I/O."""
     if not isinstance(content, list):
         return
     for index, part in enumerate(content):
         if not isinstance(part, dict):
             continue
         kind = part.get("type")
+        if kind == "input_audio":
+            # The SDK can send this block outside its typed message union.
+            # Reject supplied data without decoding it or validating a format.
+            data = _as_str(_as_dict(part.get("input_audio")).get("data"))
+            if data and not data.isspace():
+                raise ValueError(
+                    f"input[{input_index}].content[{index}].input_audio is not supported; "
+                    "use input_file.file_data with an inline base64 data URL"
+                )
+            continue
         if kind not in ("input_image", "input_file"):
             continue
         field = "file_id"
@@ -181,8 +191,8 @@ async def _parts_from_input_content(content: object) -> list[GeminiPart]:
     """Responses input content（str 或 content part 数组）→ Gemini parts。
 
     支持 ``input_text`` / ``input_image``（image_url: HTTP(S) 或 data URL）
-    / ``input_file``（file_data: data URL）；用户消息中无法解析的文件引用已预检；
-    其余类型（audio 等）忽略并打日志。
+    / ``input_file``（file_data: data URL）；用户消息中无法解析的文件引用及带数据的
+    ``input_audio`` 已预检；其余不支持的类型忽略并打日志。
     """
     if isinstance(content, str):
         return [GeminiPart(text=content)]
@@ -402,7 +412,7 @@ async def responses_to_gemini_request(
     system_texts: list[str] = [req.instructions] if req.instructions else []
     tool_name_by_call_id: dict[str, str | None] = {}
 
-    # Check user references before any conversion can fetch an earlier image.
+    # Check user media before any conversion can fetch an earlier image.
     # Index call ownership in the same pass because a result may precede its call.
     replayable_call_ids: set[str] = set()
     unfinished_call_ids: set[str] = set()
@@ -413,7 +423,7 @@ async def responses_to_gemini_request(
             item.get("type") in (None, "message")
             and _as_str(item.get("role")).strip().lower() == "user"
         ):
-            _check_user_media_references(item.get("content"), index)
+            _check_user_media(item.get("content"), index)
         if item.get("type") != "function_call":
             continue
         call_id = _as_str(item.get("call_id"))

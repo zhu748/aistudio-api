@@ -44,6 +44,7 @@ from aistudio_api.infrastructure.utils.redaction import redact_text
 
 logger = get_logger("requests")
 _DOWNSTREAM_DISCONNECT = "Downstream disconnected (client or reverse proxy)"
+_CHAT_DONE = b"data: [DONE]\n\n"
 # 大请求体（>64KB）首个 64KB 前缀内轻量嗅探顶层 "model": "..."，
 # 让提前返回 400/413 的调用仍能在请求历史里看到模型名。
 _MODEL_SNIFF_RE = re.compile(rb'"model"\s*:\s*"([^"\\]{1,256})"')
@@ -122,6 +123,30 @@ def _release_allocator_memory(received_bytes: int, sent_bytes: int) -> None:
         logger.debug("malloc_trim 调用失败，跳过内存归还", exc_info=True)
 
 
+def _is_chat_choice_finish(body: bytes) -> bool:
+    # Our encoder puts finish_reason after delta, then optional usage:null.
+    # Test a fixed-size suffix before decoding: ordinary text/tool chunks end
+    # in a null finish regardless of any lookalike fields inside the delta.
+    if not body.endswith(
+        (b'"}]}\n\n', b'"}],"usage":null}\n\n')
+    ) or not body.startswith(b'data: {"id":'):
+        return False
+    try:
+        frame = json.loads(body[6:])
+    except ValueError:
+        return False
+    choices = frame.get("choices")
+    return (
+        frame.get("object") == "chat.completion.chunk"
+        and isinstance(choices, list)
+        and len(choices) == 1
+        and isinstance(choices[0], dict)
+        and choices[0].get("index") == 0
+        and choices[0].get("finish_reason")
+        in ("stop", "tool_calls", "length", "content_filter")
+    )
+
+
 def _is_terminal_event(path: str, body: bytes) -> bool:
     """Recognize complete terminal frames emitted by our model routes.
 
@@ -132,7 +157,7 @@ def _is_terminal_event(path: str, body: bytes) -> bool:
         # Official Chat clients raise and close on a top-level error without
         # consuming [DONE]. Our encoder places that object first; a nested
         # tool argument or text containing "error" cannot match this prefix.
-        return body == b"data: [DONE]\n\n" or body.startswith(b'data: {"error":{')
+        return body == _CHAT_DONE or body.startswith(b'data: {"error":{')
     if path == "/v1/messages":
         return body.startswith((b"event: message_stop\n", b"event: error\n"))
     if path == "/v1/responses":
@@ -184,6 +209,7 @@ class _ResponseObserver:
     sending: bool = False
     json_payload_sent: bool = False
     stream_terminal_sent: bool = False
+    chat_choice_finished: bool = False
     delivered_outcome: tuple[str, str, str] | None = None
     client_disconnected: bool = False
     is_stream: bool = False
@@ -525,6 +551,10 @@ class RequestMiddleware:
                     body = message.get("body", b"")
                     if _is_terminal_event(path, body):
                         observer.stream_terminal_sent = True
+                    elif path == "/v1/chat/completions" and _is_chat_choice_finish(
+                        body
+                    ):
+                        observer.chat_choice_finished = True
                     if responses_call and body.startswith(b"event: response."):
                         # Internal ASGI channels may run ahead. Commit protocol
                         # progress only after the outer transport accepted it.
@@ -634,6 +664,19 @@ class RequestMiddleware:
                 context.result = "cancelled"
                 context.error = "Request timeout interrupted downstream send"
                 raise OSError(context.error) from None
+            if observer.chat_choice_finished:
+                # The SDK already finalized the choice. Only its sentinel
+                # remains mandatory; do not manufacture usage or revoke the
+                # delivered finish with a new error/choice.
+                try:
+                    await observed_send(
+                        {"type": "http.response.body", "body": _CHAT_DONE}
+                    )
+                except (OSError, ClientDisconnect):
+                    context.result = "cancelled"
+                    context.error = context.error or _DOWNSTREAM_DISCONNECT
+                    raise
+                return
             context.result, context.error = "timeout", "Request exceeded total timeout"
             if not observer.response_started:
                 await reply(504, context.error)

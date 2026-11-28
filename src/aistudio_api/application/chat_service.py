@@ -674,6 +674,11 @@ def _match_pending_calls(
     """
     if not pending:
         return {}
+    # One exact pair cannot have a duplicate ID; skip the batch indexes.
+    if len(pending) == len(parts) == 1:
+        fr = parts[0].functionResponse
+        if fr is not None and fr.id and fr.id == pending[0][0]:
+            return {0: pending[0]}
     results = {
         i: part.functionResponse
         for i, part in enumerate(parts)
