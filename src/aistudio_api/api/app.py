@@ -12,10 +12,14 @@ from typing import TYPE_CHECKING
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exception_handlers import (
+    http_exception_handler as default_http_exception_handler,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from aistudio_api.application.api_service_gemini import classify_gemini_error_payload
 from aistudio_api.application.compat_service import build_compat_error_response
@@ -664,6 +668,18 @@ async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONR
         },
         headers=getattr(exc, "headers", None),
     )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def framework_http_exception_handler(
+    request: Request, exc: StarletteHTTPException
+) -> Response:
+    # FastAPI can turn the wrapped receive exception into a body-parse 400.
+    # Only the local count route's byte-limit rejection sets this request state.
+    detail = getattr(request.state, "count_tokens_body_limit_detail", None)
+    if exc.status_code == 400 and isinstance(detail, str):
+        return await http_exception_handler(request, HTTPException(413, detail))
+    return await default_http_exception_handler(request, exc)
 
 
 @app.exception_handler(RequestValidationError)

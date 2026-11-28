@@ -31,6 +31,8 @@ _TRUTHY = frozenset({"1", "true", "yes", "on", "y", "t"})
 _FALSY = frozenset({"0", "false", "no", "off", "n", "f"})
 # 日志注入防护（L6）：model_path 来自 URL，未过滤时控制字符可注入伪造日志行
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
+# @google/genai uses Node's process.version here, but sends gl-node/web in browsers.
+_NODE_RUNTIME_RE = re.compile(r"gl-node/v[0-9]+\.[0-9]+\.[0-9]+(?:[-+].+)?")
 
 
 def _sanitize_model_path(model_path: str) -> str:
@@ -52,13 +54,14 @@ def _parse_anti_truncation_header(request: Request) -> bool | None:
     return None
 
 
-def _uses_python_genai_sdk(request: Request) -> bool:
-    # google-genai's chat accumulator requires real candidate Parts in every
-    # chunk. Use its standard telemetry labels, only for the HTTP response.
+def _needs_sdk_terminal_part(request: Request) -> bool:
+    # The Python and Node GenAI chat SDKs drop a turn with an empty final
+    # candidate. Require both SDK and runtime labels in the same header.
     for name in ("x-goog-api-client", "user-agent"):
         labels = request.headers.get(name, "").lower().split()
         if any(label.startswith("google-genai-sdk/") for label in labels) and any(
-            label.startswith("gl-python/") for label in labels
+            label.startswith("gl-python/") or _NODE_RUNTIME_RE.fullmatch(label)
+            for label in labels
         ):
             return True
     return False
@@ -131,6 +134,6 @@ async def stream_generate_content(
         client,
         stream=True,
         anti_truncation=_parse_anti_truncation_header(http_request),
-        sdk_terminal=_uses_python_genai_sdk(http_request),
+        sdk_terminal=_needs_sdk_terminal_part(http_request),
         migrate_history=True,
     )

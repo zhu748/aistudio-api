@@ -1,4 +1,4 @@
-"""The official Gemini chat SDK can replay a completed native SSE turn."""
+"""The official Gemini chat SDKs can replay a completed native SSE turn."""
 
 from __future__ import annotations
 
@@ -21,7 +21,8 @@ from aistudio_api.infrastructure.gateway.wire_types import AistudioPart
 
 route = signed_parts.route
 wire_gateway = wire_routes.wire_source
-_TELEMETRY = "google-genai-sdk/1.68.0 gl-python/3.12.0"
+_PYTHON_TELEMETRY = "google-genai-sdk/1.68.0 gl-python/3.12.0"
+_NODE_TELEMETRY = "google-genai-sdk/3.6.1 gl-node/v24.22.3"
 _CALL = "call-blue"
 
 
@@ -105,6 +106,40 @@ async def test_google_chat_replays_exact_streamed_model_parts(
     assert route.wire.model_wire == parts
 
 
+@pytest.mark.parametrize("prefix", [False, True], ids=["single", "ordered"])
+@pytest.mark.parametrize(("finish", "reason"), [(1, "STOP"), (2, "MAX_TOKENS")])
+async def test_node_native_stream_keeps_signed_tail_only_on_success(
+    route, prefix, finish, reason
+):
+    signature = signed_parts.signature("node-tail")
+    expected = ([{"text": "Prefix."}] if prefix else []) + [
+        {"text": "Tail.", "thoughtSignature": signature}
+    ]
+    parts = ([wire_routes.text("Prefix.")] if prefix else []) + [
+        wire_routes.text("Tail.", signature=signature)
+    ]
+    route.wire.raw = wire_routes.wire(
+        wire_routes.chunk(parts), [*wire_routes.chunk([], finish), None, [8, 3, 11]]
+    )
+    path, payload = wire_routes.input_request("native", True)
+    response = await route.raw.post(
+        path,
+        params={"alt": "sse"},
+        json=payload,
+        headers={"x-goog-api-client": _NODE_TELEMETRY, "user-agent": _NODE_TELEMETRY},
+    )
+    assert response.status_code == 200, response.text
+    events = wire_routes.sse_events(response.text)
+    candidates = [event["candidates"][0] for event in events]
+    assert wire_routes.native_parts(events) == expected
+    assert all(candidate["content"]["parts"] for candidate in candidates[:-1])
+    assert all("finishReason" not in candidate for candidate in candidates[:-1])
+    assert candidates[-1]["finishReason"] == reason
+    assert candidates[-1]["content"]["parts"] == (expected[-1:] if finish == 1 else [])
+    assert all("usageMetadata" not in event for event in events[:-1])
+    assert events[-1]["usageMetadata"]["totalTokenCount"] == 11
+
+
 @pytest.mark.parametrize("terminal", [2, 3, 5])
 async def test_google_chat_does_not_curate_nonstop_stream(route, terminal):
     route.wire.raw = wire_routes.wire(
@@ -143,16 +178,50 @@ async def test_google_chat_does_not_curate_nonstop_stream(route, terminal):
 
 
 @pytest.mark.parametrize(
-    ("header", "multi_part"),
+    ("headers", "sdk", "multi_part"),
     [
-        (None, False),
-        ("x-goog-api-client", False),
-        ("user-agent", False),
-        ("x-goog-api-client", True),
+        pytest.param({}, False, False, id="raw"),
+        pytest.param(
+            {"x-goog-api-client": _PYTHON_TELEMETRY}, True, False, id="python"
+        ),
+        pytest.param({"user-agent": _PYTHON_TELEMETRY}, True, False, id="python-ua"),
+        pytest.param(
+            {"x-goog-api-client": _PYTHON_TELEMETRY}, True, True, id="python-batch"
+        ),
+        pytest.param({"x-goog-api-client": _NODE_TELEMETRY}, True, False, id="node"),
+        pytest.param({"user-agent": _NODE_TELEMETRY}, True, False, id="node-ua"),
+        pytest.param(
+            {"x-goog-api-client": _NODE_TELEMETRY}, True, True, id="node-batch"
+        ),
+        pytest.param({"user-agent": "node"}, False, False, id="generic-node"),
+        pytest.param(
+            {"x-goog-api-client": "gl-node/v24.22.3"}, False, False, id="runtime-only"
+        ),
+        pytest.param(
+            {"x-goog-api-client": "google-genai-sdk/3.6.1"}, False, False, id="sdk-only"
+        ),
+        pytest.param(
+            {
+                "x-goog-api-client": "google-genai-sdk/3.6.1 gl-node/web",
+                "user-agent": "Mozilla/5.0",
+            },
+            False,
+            False,
+            id="browser-sdk",
+        ),
+        pytest.param(
+            {
+                "x-goog-api-client": "google-genai-sdk/3.6.1",
+                "user-agent": "gl-node/v24.22.3",
+            },
+            False,
+            False,
+            id="split-labels",
+        ),
     ],
 )
 async def test_native_first_part_latency_is_at_most_one_part_lookbehind(
-    wire_gateway, monkeypatch, header, multi_part
+    wire_gateway, monkeypatch, headers, sdk, multi_part
 ):
     first_read, second_read, allow_second, allow_finish, first_emit = [
         asyncio.Event() for _ in range(5)
@@ -194,19 +263,18 @@ async def test_native_first_part_latency_is_at_most_one_part_lookbehind(
 
     monkeypatch.setattr(wire_gateway, "send_streaming_request", answer)
     path, payload = wire_routes.input_request("native", True)
-    headers = {**signed_parts.HEADERS, **({header: _TELEMETRY} if header else {})}
     async with (
         httpx.AsyncClient(
             transport=httpx.ASGITransport(observe),
             base_url="http://fixture.invalid",
-            headers=headers,
+            headers={**signed_parts.HEADERS, **headers},
         ) as client,
         asyncio.timeout(3),
         asyncio.TaskGroup() as group,
     ):
         task = group.create_task(client.post(path, json=payload))
         await first_read.wait()
-        early = header is None or multi_part
+        early = not sdk or multi_part
         if early:
             await first_emit.wait()
         await asyncio.sleep(0.04)  # A deliberate gap between upstream Parts.
@@ -225,20 +293,20 @@ async def test_native_first_part_latency_is_at_most_one_part_lookbehind(
     ]
     assert outputs[-1]["candidates"][0]["finishReason"] == "STOP"
     end = outputs[-1]["candidates"][0]["content"]["parts"]
-    if header is None:
-        assert end == []
-    else:
-        assert end == [{"text": "Tail."}]
+    assert end == ([{"text": "Tail."}] if sdk else [])
     assert (stamps["first_client"] < stamps["second_upstream"]) is early
     print(
-        f"{header or 'raw'} ({len(first_group)} initial Parts) first useful (ms): "
+        f"{headers or 'raw'} ({len(first_group)} initial Parts) first useful (ms): "
         f"{(stamps['first_client'] - stamps['first_upstream']) * 1000:.2f}"
     )
 
 
 @pytest.mark.parametrize("ending", ["disconnect", "timeout", "wire_error"])
+@pytest.mark.parametrize(
+    "telemetry", [_PYTHON_TELEMETRY, _NODE_TELEMETRY], ids=["python", "node"]
+)
 async def test_google_sdk_lone_pending_part_cleans_up_on_aborted_stream(
-    wire_gateway, monkeypatch, ending
+    wire_gateway, monkeypatch, ending, telemetry
 ):
     stalled = asyncio.Event()
     closed = 0
@@ -271,7 +339,7 @@ async def test_google_sdk_lone_pending_part_cleans_up_on_aborted_stream(
     client = _Client("gemini", stream=True, spec_version="2.4")
     client.scope["headers"] = [
         *client.scope["headers"],
-        (b"x-goog-api-client", _TELEMETRY.encode()),
+        (b"x-goog-api-client", telemetry.encode()),
         (b"x-anti-truncation", b"false"),
     ]
     async with asyncio.timeout(3), asyncio.TaskGroup() as group:

@@ -421,7 +421,15 @@ class RequestMiddleware:
                     observer.request_body_truncated = True
                     observer.request_body.clear()
                     observer.close_request_body_file()
-                    raise HTTPException(413, "Request body exceeds configured limit")
+                    detail = "Request body exceeds configured limit"
+                    if (
+                        scope["method"] == "POST"
+                        and path == "/v1/messages/count_tokens"
+                    ):
+                        # The HTTP middleware stack can wrap the receive exception.
+                        # Preserve its origin on this request, not on client input.
+                        scope["state"]["count_tokens_body_limit_detail"] = detail
+                    raise HTTPException(413, detail)
                 if dump_enabled and (
                     not observer.request_body_truncated
                     or observer.request_body_file is not None
