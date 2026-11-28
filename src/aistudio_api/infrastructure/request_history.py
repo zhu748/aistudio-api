@@ -68,7 +68,6 @@ class RequestHistory:
                 return
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=NORMAL")
-            connection.execute("PRAGMA journal_size_limit=10485760")
             connection.execute("PRAGMA secure_delete=ON")
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS requests ("
@@ -119,24 +118,25 @@ class RequestHistory:
         连接损坏（磁盘错误等）时丢弃重建，不影响正确性。
         """
         conn = self._write_conn
-        if conn is None:
-            # 目录/文件与 PRAGMA 只在建连时做一次：长连接复用时每个请求
-            # 重复 mkdir+touch+两条 PRAGMA 纯属系统调用浪费。
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.touch(mode=0o600, exist_ok=True)
-            conn = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
-            self._write_conn = conn
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA secure_delete=ON")
         try:
-            self._ensure_schema(conn)
+            if conn is None:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.path.touch(mode=0o600, exist_ok=True)
+                conn = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA secure_delete=ON")
+                # 每条写连接单独设置；仅限制 WAL 重用时保留的大小，并非实时上限。
+                conn.execute("PRAGMA journal_size_limit=10485760")
+                self._ensure_schema(conn)
+                self._write_conn = conn
             with conn:
                 yield conn
         except Exception:
             # 连接级故障（文件被外部替换/磁盘错误）：丢弃坏连接，下次重建。
             self._write_conn = None
-            with contextlib.suppress(Exception):
-                conn.close()
+            if conn is not None:
+                with contextlib.suppress(Exception):
+                    conn.close()
             raise
 
     def insert(self, record: dict[str, object]) -> None:
@@ -319,11 +319,9 @@ class RequestHistory:
 
     def clear(self) -> int:
         with self._lock, self._write_connect() as connection:
-            count = connection.execute(
-                "SELECT COUNT(*) FROM requests WHERE result != 'running'"
-            ).fetchone()[0]
-            connection.execute("DELETE FROM requests WHERE result != 'running'")
-        return count
+            return connection.execute(
+                "DELETE FROM requests WHERE result != 'running'"
+            ).rowcount
 
     def recover_interrupted(self) -> int:
         """Called once at server startup, before accepting new requests."""

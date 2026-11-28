@@ -156,6 +156,12 @@ def unregister_request(request_id: str) -> None:
         _active.pop(request_id, None)
 
 
+def active_request_snapshot(request_id: str) -> dict[str, object] | None:
+    with _active_lock:
+        context = _active.get(request_id)
+    return request_snapshot(context, running=True) if context is not None else None
+
+
 def active_requests() -> list[dict[str, object]]:
     with _active_lock:
         contexts = list(_active.values())

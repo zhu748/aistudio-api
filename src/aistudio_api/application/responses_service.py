@@ -437,6 +437,7 @@ async def responses_to_gemini_request(
     # Index call ownership in the same pass because a result may precede its call.
     replayable_call_ids: set[str] = set()
     unfinished_call_ids: set[str] = set()
+    qualified_call_names: set[str] = set()
     for index, item in enumerate(req.input if isinstance(req.input, list) else []):
         if not isinstance(item, dict):
             continue
@@ -462,13 +463,17 @@ async def responses_to_gemini_request(
         if item_type != "function_call":
             continue
         call_id = _as_str(item.get("call_id"))
-        if not call_id:
-            continue
         if item.get("status") in _UNFINISHED_TOOL_ITEM_STATUSES:
-            unfinished_call_ids.add(call_id)
+            if call_id:
+                unfinished_call_ids.add(call_id)
             continue
-        replayable_call_ids.add(call_id)
-        index_call_name(tool_name_by_call_id, call_id, _as_str(item.get("name")))
+        name = _as_str(item.get("name"))
+        if name and item.get("namespace") not in (None, ""):
+            # Gemini history carries only the bare name of a qualified call.
+            qualified_call_names.add(name)
+        if call_id:
+            replayable_call_ids.add(call_id)
+            index_call_name(tool_name_by_call_id, call_id, name)
     unfinished_call_ids.difference_update(replayable_call_ids)
 
     if req.input is None and not req.instructions:
@@ -522,7 +527,8 @@ async def responses_to_gemini_request(
                 )
                 contents.append(GeminiContent(role="model", parts=[fc_part]))
             elif item_type == "function_call_output":
-                call_id = _as_str(item.get("call_id"))
+                raw_call_id = item.get("call_id")
+                call_id = _as_str(raw_call_id)
                 # Even a completed call may have a draft before its final output.
                 if (
                     call_id in unfinished_call_ids
@@ -530,6 +536,16 @@ async def responses_to_gemini_request(
                 ):
                     continue
                 payload, media = _tool_output_payload(item.get("output"))
+                # A bare name is a hint only for an unqualified, ID-less result.
+                # A malformed ID or namespace is not evidence that it was omitted.
+                result_name = "unknown"
+                if (
+                    raw_call_id in (None, "")
+                    and item.get("namespace") in (None, "")
+                    and (hint := _as_str(item.get("name")))
+                    and hint not in qualified_call_names
+                ):
+                    result_name = hint
                 contents.append(
                     GeminiContent(
                         role="user",
@@ -537,7 +553,7 @@ async def responses_to_gemini_request(
                             result_part(
                                 tool_name_by_call_id,
                                 GeminiFunctionResponse(
-                                    name="unknown",
+                                    name=result_name,
                                     response=payload,
                                     id=call_id or None,
                                     parts=media or None,

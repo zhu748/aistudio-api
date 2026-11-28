@@ -22,6 +22,7 @@ from aistudio_api.config import settings
 from aistudio_api.infrastructure.gateway.model_defaults import get_local_waa_server
 from aistudio_api.infrastructure.request_context import (
     active_request_count,
+    active_request_snapshot,
     active_requests,
 )
 from aistudio_api.infrastructure.request_history import request_history
@@ -318,10 +319,10 @@ async def request_upstream_exchange(
 
 @router.get("/requests/{request_id}")
 async def get_request(request_id: str) -> dict[str, object]:
-    for record in active_requests():
-        if record["request_id"] == request_id:
-            safe = _mask_json_value(record)
-            return safe if isinstance(safe, dict) else {}
+    record = active_request_snapshot(request_id)
+    if record is not None:
+        safe = _mask_json_value(record)
+        return safe if isinstance(safe, dict) else {}
     record = await asyncio.to_thread(request_history().get, request_id)
     if record is None:
         raise HTTPException(404, "请求记录不存在或已过保留期")
