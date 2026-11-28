@@ -204,6 +204,13 @@ class GeminiGenerationConfig(BaseModel):
     responseSchema: list[object] | dict[str, object] | None = Field(
         default=None, validation_alias=AliasChoices("responseSchema", "response_schema")
     )
+    # Input only: JSON Schema is not the Gemini Schema encoded by responseSchema.
+    responseJsonSchema: object | None = Field(
+        default=None,
+        validation_alias=AliasChoices("responseJsonSchema", "response_json_schema"),
+        exclude=True,
+        repr=False,
+    )
     presencePenalty: float | None = Field(
         default=None,
         validation_alias=AliasChoices("presencePenalty", "presence_penalty"),

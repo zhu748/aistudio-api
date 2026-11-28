@@ -1075,6 +1075,10 @@ class _ClaudeStreamEmitter:
         if self.saw_error:
             return events
         if self.stop_hit is not None and self.finish_reason_raw == "STOP":
+            if self.index == -1:
+                # A stop at offset zero leaves an empty text answer, as in unary.
+                events += self._ensure_block("text")
+                events += self._close_events()
             stop_reason: str = "stop_sequence"
             stop_seq: str | None = self.stop_hit
         else:

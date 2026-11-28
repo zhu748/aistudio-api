@@ -8,7 +8,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BeforeValidator
+from pydantic import AfterValidator, BeforeValidator
 
 from aistudio_api.api.keepalive import keepalive_response
 from aistudio_api.api.response_models import GeminiGenerateContentResponse
@@ -116,8 +116,29 @@ def _check_native_media(body: object, *, count: bool = False) -> object:
     return body
 
 
+def _check_native_response_schema(
+    req: GeminiGenerateContentRequest,
+) -> GeminiGenerateContentRequest:
+    # Count ignores generation settings. Only generation needs to reject an
+    # unrepresentable JSON Schema, and only when no primary wire schema wins.
+    config = req.generationConfig
+    if (
+        config is not None
+        and config.responseSchema is None
+        and isinstance(config.responseJsonSchema, (dict, bool))
+    ):
+        raise HTTPException(
+            400,
+            "generationConfig.responseJsonSchema is not supported; "
+            "use responseSchema for a Gemini Schema",
+        )
+    return req
+
+
 _NativeGenerate = Annotated[
-    GeminiGenerateContentRequest, BeforeValidator(_check_native_media)
+    GeminiGenerateContentRequest,
+    BeforeValidator(_check_native_media),
+    AfterValidator(_check_native_response_schema),
 ]
 _NativeCount = Annotated[
     GeminiCountTokensRequest, BeforeValidator(partial(_check_native_media, count=True))
