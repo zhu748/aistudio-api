@@ -37,6 +37,7 @@
   - [cURL 调用](#curl-调用)
   - [Python SDK (google-genai)](#python-sdk-google-genai)
   - [工具调用 (Function Calling)](#工具调用-function-calling)
+  - [多轮工具调用](#多轮工具调用)
 - [Web 管理控制台](#web-管理控制台)
 - [开发与测试](#开发与测试)
 - [借物表与致谢](#借物表与致谢-credits--acknowledgments)
@@ -593,7 +594,7 @@ curl http://localhost:8080/v1/responses \
 ```
 
 - OpenAI 新一代 Responses 协议（openai-python / Codex CLI 等客户端使用），事件形状与官方 SDK `types/responses/*` 逐字段对齐；
-- `input` 支持字符串或 item 数组（`message` / `function_call` / `function_call_output`），`instructions` 映射为 system instruction；
+- `input` 支持字符串或 item 数组（`message` / `reasoning` / `function_call` / `function_call_output`），`instructions` 映射为 system instruction；
 - `function_call_output.output` 支持文本以及受体积限制的内联图片（`input_image.image_url`）和文件（`input_file.file_data`，保留 `filename`）。请使用 Base64 data URL；工具结果里的远程 URL 和文件 ID 不会被下载，改用文本标记说明省略；
 - 流式返回语义化事件序列（`response.created` → `response.output_item.added` → `response.output_text.delta` → `response.completed`），`sequence_number` 从 0 连续递增；思考链走 `response.reasoning_summary_text.delta`，工具调用走 `response.function_call_arguments.delta/done`；
 - `reasoning.effort`（`minimal`/`low`/`medium`/`high`/`xhigh`/`max`）、`text.format`（JSON 模式 / JSON Schema）、function tools 均已支持；上游截断 / 安全拦截时正确下发 `response.incomplete`（含 `incomplete_details.reason`）；
@@ -713,6 +714,17 @@ if response.function_calls:
         print(f"触发工具调用: {call.name}")
         print(f"调用参数: {call.args}")
 ```
+
+### 多轮工具调用
+
+界面可以只显示文本，但下一轮请求需要完整的模型回复。先把回复按原顺序追加到已有历史，再追加工具结果。保留调用 ID、名称、参数，以及原对象上的不透明字段（如签名）；不要从显示文本重建调用。流式响应先收齐完整消息或输出项，不要只保存正文增量。
+
+- **OpenAI Chat（`/v1/chat/completions`）**：把完整的 `completion.choices[0].message` 追加到 `messages`，包括返回的思考字段和全部 `tool_calls`。若某个调用带有 `extra_content.google.thought_signature`，把它留在该调用上。每个结果用一条 `role: "tool"` 消息，其 `tool_call_id` 对应该调用的 `id`。
+- **OpenAI Responses（`/v1/responses`）**：把 `response.output` 中的各项逐项追加到已有的 `input` 历史（`history.extend(response.output)`），保留独立的 `reasoning`、`message` 和 `function_call` 项。再为每个调用追加 `function_call_output`，使用该调用的 `call_id`，而不是输出项的 `id`。请求可选填 `"include": ["reasoning.encrypted_content"]`；若返回 `encrypted_content`，它属于对应的 `reasoning` 项，不能替代 `function_call` 项自身的 `extra_content.google.thought_signature`。本网关不支持用 `previous_response_id` 代替完整历史。
+- **Claude Messages（`/v1/messages`）**：将完整的 `message.content` 作为上一条 assistant 消息的内容，保留块顺序、`thinking` 块的 `signature` 和完整的 `tool_use` 块。下一条 user 消息中的 `tool_result.tool_use_id` 对应原 `tool_use.id`。
+- **原生 Gemini（`/v1beta`）**：将选中候选项的完整 `content` 追加到 `contents`，按原顺序保留所有 Part，包括空文本 Part；`thought` 和 `thoughtSignature` 都留在所属 Part 上。再追加包含对应 `functionResponse` 的 user 轮，使用原调用的名称和 ID（若有）。不要只回传 `.text` 或 `.function_calls`。
+
+如果 SDK 或中间件会过滤未知字段，请保留原始响应 JSON，并检查下一轮实际发出的 JSON。不要指望缓存能在新会话中或历史被改写后找回签名；含工具调用或结果的历史不会触发抗截断注入。
 
 ---
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+from dataclasses import replace
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
@@ -28,6 +29,7 @@ from aistudio_api.infrastructure.gateway import model_turns as module
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.model_turns import ModelTurnHistory
 from aistudio_api.infrastructure.gateway.session import SessionContext
+from aistudio_api.infrastructure.gateway.wire_codec import encode_request_body
 from aistudio_api.infrastructure.gateway.wire_spec import TopLevelIndex
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent, AistudioPart
 from aistudio_api.infrastructure.request_context import RequestContext, current_request
@@ -471,6 +473,75 @@ def test_scoped_turn_precedes_conflicting_per_call_cache(monkeypatch, tmp_path):
     assert token == TOKEN
     assert [part.thought_signature for part in restored[1].parts] == [SIGNATURE, None]
     assert [part.thought_signature for part in contents[1].parts] == [None, None]
+
+
+def test_cold_hit_counts_only_signatures_filled_in_the_next_request(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "signatures.json"
+    cache = tool_signatures.ThoughtSignatureCache(path)
+    monkeypatch.setattr(tool_signatures, "_cache_instance", cache)
+    captured = [
+        AistudioPart(
+            function_call=("lookup", {"n": i}, f"call-{i}"),
+            thought_signature=signature,
+        )
+        for i, signature in enumerate([SIGNATURE, None, SIGNATURE])
+    ]
+    prompt = remember(ModelTurnHistory(), parts=[part.to_wire() for part in captured])
+    cache.flush()
+    monkeypatch.setattr(
+        tool_signatures, "_cache_instance", tool_signatures.ThoughtSignatureCache(path)
+    )
+    restarted = ModelTurnHistory()
+
+    # The third call's raw wire is authoritative, even when the proof has a signature.
+    signed, unsigned, third = captured
+    raw = replace(third, thought_signature=None)
+    raw.raw_wire = raw.to_wire()
+    results = AistudioContent(
+        "user",
+        [
+            AistudioPart(function_response=("lookup", {"ok": True}, f"call-{i}"))
+            for i in range(len(captured))
+        ],
+    )
+
+    def next_request(lead: AistudioPart) -> list[AistudioContent]:
+        return [*prompt, AistudioContent("model", [lead, unsigned, raw]), results]
+
+    expected = encode_request_body(
+        model=MODEL, snapshot="fixed", contents=next_request(signed)
+    )
+    for echoed, fills in ((SIGNATURE, 0), (None, 1)):
+        request_token = current_request.set(RequestContext("cold-replay"))
+        try:
+            trace = get_signature_trace(create=True)
+            assert trace is not None
+            restored, token, context = restarted.prepare(
+                "scope", next_request(replace(signed, thought_signature=echoed))
+            )
+            assert trace.cold_hits == 1
+            assert trace.replay_items == [
+                {
+                    "turn_index": 1,
+                    "action": "cold_hit",
+                    "fc_count": 3,
+                    "restored_sigs": fills,
+                }
+            ]
+            assert token is None and context is not None
+            assert [p.thought_signature for p in restored[1].parts] == [
+                SIGNATURE,
+                None,
+                None,
+            ]
+            assert (
+                encode_request_body(model=MODEL, snapshot="fixed", contents=restored)
+                == expected
+            )
+        finally:
+            current_request.reset(request_token)
 
 
 def test_cache_capacity_and_memory_are_bounded(monkeypatch):

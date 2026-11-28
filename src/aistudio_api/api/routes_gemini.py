@@ -144,12 +144,14 @@ def _parse_anti_truncation_header(request: Request) -> bool | None:
 
 
 def _needs_sdk_terminal_part(request: Request) -> bool:
-    # The Python and Node GenAI chat SDKs drop a turn with an empty final
+    # The Python and JavaScript GenAI chat SDKs drop a turn with an empty final
     # candidate. Require both SDK and runtime labels in the same header.
     for name in ("x-goog-api-client", "user-agent"):
         labels = request.headers.get(name, "").lower().split()
         if any(label.startswith("google-genai-sdk/") for label in labels) and any(
-            label.startswith("gl-python/") or _NODE_RUNTIME_RE.fullmatch(label)
+            label.startswith("gl-python/")
+            or _NODE_RUNTIME_RE.fullmatch(label)
+            or label == "gl-node/web"
             for label in labels
         ):
             return True

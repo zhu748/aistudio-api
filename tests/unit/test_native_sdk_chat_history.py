@@ -8,6 +8,7 @@ from time import perf_counter
 
 import httpx
 import pytest
+import test_anti_truncation_variants as variants
 import test_ordered_tool_routes as wire_routes
 import test_signed_part_roundtrip as signed_parts
 from google import genai
@@ -20,9 +21,11 @@ from aistudio_api.config import settings
 from aistudio_api.infrastructure.gateway.wire_types import AistudioPart
 
 route = signed_parts.route
+variant_config = variants.variant_config
 wire_gateway = wire_routes.wire_source
 _PYTHON_TELEMETRY = "google-genai-sdk/1.68.0 gl-python/3.12.0"
 _NODE_TELEMETRY = "google-genai-sdk/3.6.1 gl-node/v24.22.3"
+_WEB_TELEMETRY = "google-genai-sdk/3.6.1 gl-node/web"
 _CALL = "call-blue"
 
 
@@ -108,10 +111,18 @@ async def test_google_chat_replays_exact_streamed_model_parts(
 
 @pytest.mark.parametrize("prefix", [False, True], ids=["single", "ordered"])
 @pytest.mark.parametrize(("finish", "reason"), [(1, "STOP"), (2, "MAX_TOKENS")])
-async def test_node_native_stream_keeps_signed_tail_only_on_success(
-    route, prefix, finish, reason
+@pytest.mark.parametrize(
+    ("telemetry", "model"),
+    [
+        pytest.param(_NODE_TELEMETRY, wire_routes.MODEL, id="node"),
+        pytest.param(_WEB_TELEMETRY, wire_routes.MODEL, id="web"),
+        pytest.param(_WEB_TELEMETRY, "gemini-3.7-flash-at-stream", id="web-at-stream"),
+    ],
+)
+async def test_js_native_stream_keeps_signed_tail_only_on_success(
+    route, variant_config, prefix, finish, reason, telemetry, model
 ):
-    signature = signed_parts.signature("node-tail")
+    signature = signed_parts.signature("tail")
     expected = ([{"text": "Prefix."}] if prefix else []) + [
         {"text": "Tail.", "thoughtSignature": signature}
     ]
@@ -121,12 +132,12 @@ async def test_node_native_stream_keeps_signed_tail_only_on_success(
     route.wire.raw = wire_routes.wire(
         wire_routes.chunk(parts), [*wire_routes.chunk([], finish), None, [8, 3, 11]]
     )
-    path, payload = wire_routes.input_request("native", True)
+    _, payload = wire_routes.input_request("native", True)
     response = await route.raw.post(
-        path,
+        f"/v1beta/models/{model}:streamGenerateContent",
         params={"alt": "sse"},
         json=payload,
-        headers={"x-goog-api-client": _NODE_TELEMETRY, "user-agent": _NODE_TELEMETRY},
+        headers={"x-goog-api-client": telemetry},
     )
     assert response.status_code == 200, response.text
     events = wire_routes.sse_events(response.text)
@@ -202,12 +213,35 @@ async def test_google_chat_does_not_curate_nonstop_stream(route, terminal):
         ),
         pytest.param(
             {
-                "x-goog-api-client": "google-genai-sdk/3.6.1 gl-node/web",
+                "x-goog-api-client": _WEB_TELEMETRY,
                 "user-agent": "Mozilla/5.0",
+            },
+            True,
+            False,
+            id="browser-sdk",
+        ),
+        pytest.param({"user-agent": _WEB_TELEMETRY}, True, False, id="browser-sdk-ua"),
+        pytest.param({"user-agent": "Mozilla/5.0"}, False, False, id="generic-browser"),
+        pytest.param(
+            {"x-goog-api-client": _WEB_TELEMETRY + "view"},
+            False,
+            False,
+            id="browser-near-match",
+        ),
+        pytest.param(
+            {"x-goog-api-client": "gl-node/web"},
+            False,
+            False,
+            id="browser-runtime-only",
+        ),
+        pytest.param(
+            {
+                "x-goog-api-client": "google-genai-sdk/3.6.1",
+                "user-agent": "gl-node/web",
             },
             False,
             False,
-            id="browser-sdk",
+            id="browser-split-labels",
         ),
         pytest.param(
             {

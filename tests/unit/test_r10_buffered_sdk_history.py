@@ -17,6 +17,7 @@ _BASE = "gemini-3.7-flash"
 _MODEL = f"{_BASE}-at"
 _URL = f"/v1beta/models/{_MODEL}"
 _NODE = {"x-goog-api-client": "google-genai-sdk/3.6.1 gl-node/v24.22.3"}
+_WEB = {"x-goog-api-client": "google-genai-sdk/3.6.1 gl-node/web"}
 _RID = "buffered-response-id"
 _SIGNATURE = signed.signature("second part")
 _CASES = [
@@ -43,18 +44,19 @@ def _set_reply(route, finish, has_output):
 
 
 @pytest.mark.parametrize(("finish", "has_output", "reason"), _CASES)
+@pytest.mark.parametrize("headers", [_NODE, _WEB], ids=["node", "web"])
 async def test_buffered_native_sdk_frames_keep_raw_parts_and_terminal_metadata(
-    route, variant_config, finish, has_output, reason
+    route, variant_config, finish, has_output, reason, headers
 ):
     _set_reply(route, finish, has_output)
     _, body = wire.input_request("native", True)
     stream_url = f"{_URL}:streamGenerateContent?alt=sse"
     raw = await route.raw.post(stream_url, json=body)
-    node = await route.raw.post(stream_url, json=body, headers=_NODE)
+    sdk = await route.raw.post(stream_url, json=body, headers=headers)
     nonstream = await route.raw.post(
-        f"{_URL}:generateContent", json=body, headers=_NODE
+        f"{_URL}:generateContent", json=body, headers=headers
     )
-    assert raw.status_code == node.status_code == nonstream.status_code == 200
+    assert raw.status_code == sdk.status_code == nonstream.status_code == 200
 
     # Raw buffered SSE and nonstream JSON still carry the full original response.
     (original,) = wire.sse_events(raw.text)
@@ -75,7 +77,7 @@ async def test_buffered_native_sdk_frames_keep_raw_parts_and_terminal_metadata(
     else:
         assert len(parts) == 1 and "空回诊断" in parts[0]["text"]
 
-    events = wire.sse_events(node.text)
+    events = wire.sse_events(sdk.text)
     if has_output and reason == "STOP":
         assert events == [original]
     else:

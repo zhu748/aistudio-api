@@ -407,9 +407,10 @@ def _echoed_call_ids_match(
 
 def _fill_missing_calls(
     contents: list[AistudioContent], signatures: Iterator[str | None]
-) -> list[AistudioContent]:
-    """Omissions can be filled without changing an explicitly echoed owner."""
+) -> tuple[list[AistudioContent], int]:
+    """Return the contents and the number of missing call signatures filled."""
     result: list[AistudioContent] = []
+    fills = 0
     for content in contents:
         updated: list[AistudioPart] | None = None
         for index, part in enumerate(content.parts):
@@ -420,10 +421,11 @@ def _fill_missing_calls(
                 if updated is None:
                     updated = list(content.parts)
                 updated[index] = replace(part, thought_signature=signature)
+                fills += 1
         result.append(
             replace(content, parts=updated) if updated is not None else content
         )
-    return result
+    return result, fills
 
 
 def _migrate_external_signatures(
@@ -780,18 +782,12 @@ class ModelTurnHistory:
                     if migration is not None and not migration.retrying:
                         migration.candidates.clear()
                     if proof is not None and _verified_cohort(parts, owners, proof):
-                        restored.extend(
-                            _fill_missing_calls(
-                                contents[start:end], iter(proof.signatures)
-                            )
+                        filled, restored_sigs = _fill_missing_calls(
+                            contents[start:end], iter(proof.signatures)
                         )
+                        restored.extend(filled)
                         previous = _with_observed_turn(previous, proof.state, owners)
                         if trace is not None:
-                            restored_sigs = sum(
-                                1
-                                for sig in proof.signatures
-                                if sig and sig != SKIP_THOUGHT_SIGNATURE
-                            )
                             trace.record_replay_turn(
                                 turn_index=model_turn_index,
                                 action="cold_hit",
@@ -916,15 +912,14 @@ class ModelTurnHistory:
                             bool(fc_parts) and not fc_parts[0].thought_signature
                         )
                         if lead_unsigned:
-                            restored.extend(
-                                _fill_missing_calls(
-                                    contents[start:end],
-                                    iter(
-                                        [SKIP_THOUGHT_SIGNATURE]
-                                        + [None] * (len(fc_parts) - 1)
-                                    ),
-                                )
+                            filled, _ = _fill_missing_calls(
+                                contents[start:end],
+                                iter(
+                                    [SKIP_THOUGHT_SIGNATURE]
+                                    + [None] * (len(fc_parts) - 1)
+                                ),
                             )
+                            restored.extend(filled)
                         else:
                             restored.extend(contents[start:end])
                         previous = _hash(
@@ -967,11 +962,10 @@ class ModelTurnHistory:
                             if part.function_call is not None
                             and not part.thought_signature
                         )
-                        restored.extend(
-                            _fill_missing_calls(
-                                contents[start:end], repeat(SKIP_THOUGHT_SIGNATURE)
-                            )
+                        filled, _ = _fill_missing_calls(
+                            contents[start:end], repeat(SKIP_THOUGHT_SIGNATURE)
                         )
+                        restored.extend(filled)
                         previous = _hash(
                             [previous, "unobserved", calls, _hash("".join(thoughts))]
                         )
@@ -992,11 +986,10 @@ class ModelTurnHistory:
                             if part.function_call is not None
                             and not part.thought_signature
                         )
-                        restored.extend(
-                            _fill_missing_calls(
-                                contents[start:end], repeat(SKIP_THOUGHT_SIGNATURE)
-                            )
+                        filled, _ = _fill_missing_calls(
+                            contents[start:end], repeat(SKIP_THOUGHT_SIGNATURE)
                         )
+                        restored.extend(filled)
                         if calls:
                             previous = _hash([previous, "unobserved", calls])
                         if trace is not None:

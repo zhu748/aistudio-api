@@ -36,6 +36,7 @@
   - [cURL](#curl)
   - [Python SDK (google-genai)](#python-sdk-google-genai)
   - [Function Calling](#function-calling)
+  - [Multi-turn tool calls](#multi-turn-tool-calls)
 - [Web Management Console](#web-management-console)
 - [Development & Testing](#development--testing)
 - [Credits & Acknowledgments](#credits--acknowledgments)
@@ -543,6 +544,17 @@ if response.function_calls:
         print(f"Tool called: {call.name}")
         print(f"Arguments: {call.args}")
 ```
+
+### Multi-turn tool calls
+
+Text is enough for display, not for the next request. Append the full model reply to the existing history in its original order, then append the tool results. Keep call IDs, names, and arguments unchanged, and leave opaque fields such as signatures on the objects that returned them. When streaming, collect the completed message or output items, not just the text deltas.
+
+- **OpenAI Chat (`/v1/chat/completions`):** Append the whole `completion.choices[0].message` to `messages`, including any reasoning fields and every `tool_calls` entry. Keep `extra_content.google.thought_signature` on the call that returned it, if present. Append one `role: "tool"` message per result, with `tool_call_id` set to that call's `id`.
+- **OpenAI Responses (`/v1/responses`):** Extend the existing `input` history with `response.output` (`history.extend(response.output)`), keeping the separate `reasoning`, `message`, and `function_call` items. Then append a `function_call_output` for each call using its `call_id`, not its output item `id`. You can request `"include": ["reasoning.encrypted_content"]`; when returned, `encrypted_content` belongs to its reasoning item. It does not replace a function call's own `extra_content.google.thought_signature`. This gateway does not support `previous_response_id` in place of a full history.
+- **Claude Messages (`/v1/messages`):** Use the whole `message.content` array as the assistant message's content. Keep the block order, each thinking block's `signature`, and the complete `tool_use` blocks. In the following user message, match each `tool_result.tool_use_id` to the original `tool_use.id`.
+- **Native Gemini (`/v1beta`):** Append the selected candidate's full `content` to `contents`, keeping all Parts in order, even empty-text Parts. Leave `thought` and `thoughtSignature` on their original Parts. Then append a user turn with a matching `functionResponse` for each call, using its name and its ID if present. Do not replay just `.text` or `.function_calls`.
+
+If an SDK or middleware filters unknown fields, retain the original response JSON and check the JSON actually sent on the next request. Do not rely on a cache to recover signatures in a fresh session or after rewriting history. Requests with tool calls or results in their history skip anti-truncation injection.
 
 ---
 
