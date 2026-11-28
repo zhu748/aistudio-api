@@ -170,7 +170,7 @@ def encode_schema_to_wire(
     remaining = 10_000
 
     def expand(node: object, refs: tuple[str, ...] = (), depth: int = 0) -> object:
-        nonlocal remaining
+        nonlocal expand, remaining
         remaining -= 1
         if depth > 64 or remaining < 0:
             raise ValueError("JSON Schema expansion exceeds complexity limit")
@@ -235,7 +235,11 @@ def encode_schema_to_wire(
                 result[key] = value
         return result
 
-    resolved = expand(schema)
+    try:
+        resolved = expand(schema)
+    finally:
+        # The recursive closure captures itself and the request schema.
+        del expand
     if not isinstance(resolved, dict):
         raise ValueError("JSON Schema must resolve to an object")
     return _encode_schema_to_wire(resolved, include_required=include_required)
@@ -686,11 +690,11 @@ def _encode_tool_parameters(
     """
     normalized = copy.deepcopy(schema)
     _define_required_properties(normalized)
-    encoding_error: ValueError | None = None
+    encoding_failed = False
     try:
         parameters = encode_schema_to_wire(normalized, include_required=True)
-    except ValueError as exc:
-        encoding_error = exc
+    except ValueError:
+        encoding_failed = True
         try:
             parameters = encode_schema_to_wire(
                 _tool_schema_shape(normalized), include_required=True
@@ -704,7 +708,7 @@ def _encode_tool_parameters(
                 {"type": "object"}, include_required=True
             )
     if (
-        encoding_error is not None
+        encoding_failed
         or strict
         or _schema_has_lossy_keys(normalized)
         or _schema_has_empty_enum(normalized)
@@ -720,11 +724,11 @@ def encode_response_schema_to_wire(schema: dict[str, object]) -> list[object]:
     编码；失败或含 wire 无法表达的约束 / 空串 enum 时，把完整 schema
     原文附加到根 description（已附加时幂等）。
     """
-    encoding_error: ValueError | None = None
+    encoding_failed = False
     try:
         wire = encode_schema_to_wire(schema)
-    except ValueError as exc:
-        encoding_error = exc
+    except ValueError:
+        encoding_failed = True
         try:
             wire = encode_schema_to_wire(_tool_schema_shape(schema))
         except ValueError:
@@ -732,7 +736,7 @@ def encode_response_schema_to_wire(schema: dict[str, object]) -> list[object]:
             # object 类型的最小 wire，完整 schema 附加到根 description。
             wire = encode_schema_to_wire({"type": "object"})
     if (
-        encoding_error is not None
+        encoding_failed
         or _schema_has_lossy_keys(schema, response=True)
         or _schema_has_empty_enum(schema)
     ):

@@ -28,10 +28,10 @@ from aistudio_api.api.schemas import (
 )
 from aistudio_api.api.schemas_compat import ClaudeMessagesRequest
 from aistudio_api.application.compat_errors import (
-    _CLAUDE_ERROR_TYPE,
     _CLAUDE_REFUSAL_FINISH,
     _claude_signature,
     _read_claude_signature,
+    claude_error_payload,
 )
 from aistudio_api.application.compat_result_owners import index_call_name, result_part
 from aistudio_api.application.compat_shared import (
@@ -90,12 +90,12 @@ async def _claude_blocks_to_parts(
     content: object,
     *,
     tool_name_by_id: dict[str, str | None],
-    allow_text_documents: bool = False,
+    is_user_content: bool = False,
 ) -> list[GeminiPart]:
     """Claude content（str 或块数组）→ Gemini parts。
 
     支持 text / thinking / image / document / tool_use / tool_result 块；
-    tool_result 中的图片会展开为紧随其后的独立 inlineData parts。
+    tool_result 中的内联图片及用户返回的 PDF 展开为紧随其后的独立 inlineData parts。
     工具调用无可恢复签名时携带跳过校验的占位值，保留原生结构。
     """
     if isinstance(content, str):
@@ -108,7 +108,7 @@ async def _claude_blocks_to_parts(
             lambda blocks: _claude_blocks_to_parts(
                 blocks,
                 tool_name_by_id=tool_name_by_id,
-                allow_text_documents=allow_text_documents,
+                is_user_content=is_user_content,
             ),
         )
     trace = get_signature_trace()
@@ -157,10 +157,7 @@ async def _claude_blocks_to_parts(
                     parts.append(await _media_part_from_url(url))
         elif block_type == "document":
             source = _as_dict(block.get("source"))
-            if (
-                allow_text_documents
-                and (text := _claude_document_text(source)) is not None
-            ):
+            if is_user_content and (text := _claude_document_text(source)) is not None:
                 parts.append(GeminiPart(text=text))
             elif source.get("type") == "base64":
                 part = _claude_base64_part(
@@ -222,10 +219,20 @@ async def _claude_blocks_to_parts(
                         continue
                     if item.get("type") == "text":
                         texts.append(_as_str(item.get("text")))
-                    elif item.get("type") == "document" and allow_text_documents:
-                        text = _claude_document_text(_as_dict(item.get("source")))
+                    elif item.get("type") == "document" and is_user_content:
+                        source = _as_dict(item.get("source"))
+                        text = _claude_document_text(source)
                         if text is not None:
                             texts.append(text)
+                        elif (
+                            source.get("type") == "base64"
+                            and source.get("media_type") == "application/pdf"
+                        ):
+                            part = _claude_base64_part(
+                                source, "application/pdf", kind="tool_result media"
+                            )
+                            if part is not None:
+                                extra_parts.append(part)
                     elif item.get("type") == "image":
                         source = _as_dict(item.get("source"))
                         if source.get("type") == "base64":
@@ -434,7 +441,7 @@ async def claude_to_gemini_request(
         parts = await _claude_blocks_to_parts(
             message.content,
             tool_name_by_id=tool_name_by_id,
-            allow_text_documents=message_role == "user",
+            is_user_content=message_role == "user",
         )
         contents.append(GeminiContent(role=role, parts=parts or [GeminiPart(text="")]))
 
@@ -735,7 +742,8 @@ class _ClaudeStreamEmitter:
         self.stop_hit: str | None = None
         self.thinking_signature = ""
 
-    def sse(self, event: str, payload: dict[str, object]) -> str:
+    @staticmethod
+    def sse(event: str, payload: dict[str, object]) -> str:
         # separators：SSE 每帧省去 ", " 与 ": " 的空格（约 2-4% 字节/分配）
         return (
             f"event: {event}\ndata: "
@@ -923,22 +931,15 @@ class _ClaudeStreamEmitter:
         events += self._close_events()
         return events
 
+    @classmethod
+    def error_event(cls, status: int, message: str) -> str:
+        return cls.sse(
+            "error", claude_error_payload(status, message or "Upstream error")
+        )
+
     def error(self, status: int, message: str) -> list[str]:
         self.saw_error = True
-        events = self._close_events()
-        events.append(
-            self.sse(
-                "error",
-                {
-                    "type": "error",
-                    "error": {
-                        "type": _CLAUDE_ERROR_TYPE.get(status, "api_error"),
-                        "message": message or "Upstream error",
-                    },
-                },
-            )
-        )
-        return events
+        return [*self._close_events(), self.error_event(status, message)]
 
     def finish(self) -> list[str]:
         events = self._close_events()
@@ -989,7 +990,9 @@ async def claude_stream_adapter(
     # 确定性关闭内层 SSE 生成器（3.6）：自身异常或客户端断连时立即释放上游连接
     async with _stream_adapter_lifecycle(
         source,
-        lambda message: emitter.error(504, message),
+        # A deadline interrupts delivery. Queued blocks may never have reached
+        # the client, so don't synthesize block stops or signature deltas here.
+        lambda message: [_ClaudeStreamEmitter.error_event(504, message)],
         register_failure,
     ):
         # 只取首个可发布帧：本地流若已有输入计量，会附在该帧上；缓冲变体

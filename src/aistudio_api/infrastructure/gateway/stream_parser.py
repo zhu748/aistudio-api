@@ -22,6 +22,12 @@ _STRUCT_SCAN_RE = re.compile(r'["\[\]{}]')
 
 _TRAILING_JUNK = " \t\r\n,"
 _INCOMPLETE_UNICODE_RE = re.compile(r"\\u[0-9a-fA-F]{0,3}$")
+# A full high surrogate, then zero to five characters of a *possible* low
+# surrogate escape. A complete pair and a prefix outside DC00-DFFF don't match.
+_INCOMPLETE_PAIR_RE = re.compile(
+    r"\\u[dD][89aAbB][0-9a-fA-F]{2}"
+    r"(?:\\|\\u|\\u[dD]|\\u[dD][c-fC-F][0-9a-fA-F]?)?\Z"
+)
 
 _CONTROL_ESCAPES = {
     "\n": "\\n",
@@ -37,9 +43,10 @@ def _escape_control_char(ch: str) -> str:
     return _CONTROL_ESCAPES.get(ch) or f"\\u{ord(ch):04x}"
 
 
-def _trim_incomplete_unicode_escape(text: str) -> str:
-    """裁掉末尾被切断的 \\uXXXX（不足 4 位十六进制）。"""
-    match = _INCOMPLETE_UNICODE_RE.search(text)
+def _trim_unicode_suffix(text: str, suffix: re.Pattern[str]) -> str:
+    """Trim an unfinished Unicode escape/pair, but not literal backslash text."""
+    # The longest possible suffix is a six-character escape plus five of the next.
+    match = suffix.search(text, max(0, len(text) - 11))
     if not match:
         return text
     backslashes_before = 0
@@ -99,7 +106,7 @@ def _close_json_fragment(fragment: str) -> str | None:
         out.pop()
     text = "".join(out)
     if in_string:
-        text = _trim_incomplete_unicode_escape(text)
+        text = _trim_unicode_suffix(text, _INCOMPLETE_UNICODE_RE)
         text += '"'
     text = text.rstrip(_TRAILING_JUNK)
     text += "".join(reversed(closers))
@@ -283,6 +290,10 @@ class IncrementalJSONStreamParser:
         fragment = ""
         if self.chunk_start is not None:
             fragment = self.buffer[self.chunk_start :]
+            if self.in_string:
+                # Check the physical EOF, before generic repair can trim another
+                # escape or close the string on a lone high surrogate.
+                fragment = _trim_unicode_suffix(fragment, _INCOMPLETE_PAIR_RE)
         self._fragments.clear()
         self._chunk_size = 0
         self._preamble = ""
