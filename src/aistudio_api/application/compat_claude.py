@@ -624,8 +624,9 @@ def build_claude_message(
     if candidates:
         finish_reason_raw = candidates[0].finishReason
 
-    # Strings are gateway notices, not generated text subject to stop matching.
-    blocks: list[dict[str, object] | str] = []
+    # Strings are gateway notices. Lists collect consecutive unsigned thought
+    # fragments; join each run once, without copying its prefix on every Part.
+    blocks: list[dict[str, object] | str | list[str]] = []
     has_tool_use = False
     trace = get_signature_trace()
     for part in _iter_response_parts(response):
@@ -638,13 +639,11 @@ def build_claude_message(
             if is_thought and (text or _is_signed_empty_thought(text, signature)):
                 # A signed Part must match precisely one output block.
                 previous = blocks[-1] if blocks else None
-                if (
-                    not signature
-                    and isinstance(previous, dict)
-                    and previous.get("type") == "thinking"
-                    and not previous.get("signature")
-                ):
-                    previous["thinking"] = _as_str(previous.get("thinking")) + text
+                if not signature:
+                    if isinstance(previous, list):
+                        previous.append(text)
+                    else:
+                        blocks.append([text])
                 else:
                     blocks.append(
                         {
@@ -653,7 +652,7 @@ def build_claude_message(
                             "signature": _claude_signature(signature),
                         }
                     )
-                    emitted_sig = bool(signature)
+                    emitted_sig = True
             elif not is_thought and text:
                 blocks.append({"type": "text", "text": text})
         inline = getattr(part, "inlineData", None)
@@ -734,9 +733,13 @@ def build_claude_message(
                             call_name=_as_str(block.get("name")),
                         )
             continue
-        if isinstance(block, str):
+        if isinstance(block, (str, list)):
             flush_pending()
-            filtered.append({"type": "text", "text": block})
+            filtered.append(
+                {"type": "text", "text": block}
+                if isinstance(block, str)
+                else {"type": "thinking", "thinking": "".join(block), "signature": ""}
+            )
             text_block_open = False
         elif block.get("type") == "text":
             text = stops.feed(_as_str(block.get("text")))

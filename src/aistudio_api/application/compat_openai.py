@@ -16,7 +16,8 @@ import json
 import secrets
 import time
 from collections import Counter
-from collections.abc import AsyncGenerator, AsyncIterable, Callable
+from collections.abc import AsyncGenerator, AsyncIterable, Callable, Iterator
+from dataclasses import dataclass
 
 from aistudio_api.api.response_models import GeminiGenerateContentResponse
 from aistudio_api.api.schemas import (
@@ -1134,6 +1135,52 @@ def _openai_usage_from_frame(usage_metadata: object) -> dict[str, object]:
     return payload
 
 
+@dataclass(slots=True)
+class _ChatTraceDrop:
+    carrier: str
+    signature: str
+    reason: str
+
+
+# A selected scalar delta (field, value), approved functionCall Part, or trace.
+# Keep calls by reference until publication, not as copies of serialized arguments.
+_ChatStreamItem = tuple[str, str] | dict[str, object] | _ChatTraceDrop
+
+
+def _chat_terminal_order(
+    items: Iterator[_ChatStreamItem], has_content: bool
+) -> Iterator[_ChatStreamItem]:
+    """The Chat SDK closes nonempty content on each new tool index.
+
+    Only defer a call across text when both a prefix and a later selected
+    content delta actually exist. The coalescer releases all approved calls
+    in one bounded terminal batch; no state or lookahead crosses frames.
+    """
+    deferred: list[dict[str, object] | _ChatTraceDrop] = []
+    pending: list[_ChatStreamItem] = []
+    for item in items:
+        if isinstance(item, tuple) and item[0] == "content":
+            for earlier in pending:
+                if isinstance(earlier, tuple):
+                    yield earlier
+                else:
+                    # Keep diagnostic records in source order with the calls.
+                    # Later drops must not evict an earlier accepted call from
+                    # the capped trace, or count ahead of its publication.
+                    deferred.append(earlier)
+            pending.clear()
+            has_content = True
+            yield item
+        elif has_content and (isinstance(item, dict) or pending or deferred):
+            pending.append(item)
+        else:
+            yield item
+    # Only the calls proved early cross the final text. Everything selected
+    # after that text (including thoughts or more calls) retains its order.
+    yield from deferred
+    yield from pending
+
+
 async def openai_stream_adapter(
     source: AsyncIterable[object],
     *,
@@ -1192,7 +1239,7 @@ async def openai_stream_adapter(
     finish_reason_raw: str | None = None
     usage_frame: dict[str, object] | None = None
     tool_index = 0
-    has_tool_calls = False
+    has_content = False
     error_chunk: dict[str, object] | None = None
     # Chat replays a scalar reasoning field before all other assistant Parts.
     # Sign only a single leading thought whose exact text can be replayed.
@@ -1202,6 +1249,167 @@ async def openai_stream_adapter(
     saw_body = False
     trace = get_signature_trace()
     dropped_thought_sigs: list[tuple[str, str]] = []
+
+    def selected_items(
+        candidate: dict[str, object], terminal_stop: bool
+    ) -> Iterator[_ChatStreamItem]:
+        # Select in upstream order. Reordering Gemini Parts themselves would
+        # change stop boundaries and could assign a thought to the wrong owner.
+        nonlocal saw_body, reasoning_count, first_reasoning_empty, reasoning_signature
+        for part in _frame_parts(candidate):
+            raw_sig = _as_str(part.get("thoughtSignature"))
+            if _as_dict(part.get("functionCall")):
+                if stops.hit is not None:
+                    if raw_sig and trace is not None:
+                        yield _ChatTraceDrop(
+                            carrier="function_call",
+                            signature=raw_sig,
+                            reason="stop_truncated",
+                        )
+                    continue
+                # 被停止词缓冲扣留的部分前缀属于此前的正文：必须先于
+                # 工具调用下发（与 Claude 侧 compat_claude 及非流式
+                # flush_pending 对齐），否则该前缀要等流终结才冲刷，
+                # 排到工具/图片内容之后破坏 content 顺序。
+                tail = stops.feed("", final=True)
+                if tail:
+                    yield "content", tail
+                saw_body = True
+                yield part
+                continue
+            inline = _as_dict(part.get("inlineData"))
+            if inline:
+                saw_body = True
+                if raw_sig and trace is not None:
+                    yield _ChatTraceDrop(
+                        carrier="inline_data",
+                        signature=raw_sig,
+                        reason="inline_data_unrepresentable",
+                    )
+                if stops.hit is None:
+                    # 同 functionCall 分支：先冲刷停止词缓冲中的部分
+                    # 前缀，保持其在最终 content 字符串中的位置。
+                    tail = stops.feed("", final=True)
+                    if tail:
+                        yield "content", tail
+                    mime = _as_str(inline.get("mimeType")) or "image/png"
+                    data = _as_str(inline.get("data"))
+                    if data:
+                        yield "content", f"\n\n![image](data:{mime};base64,{data})"
+                continue
+            text = part.get("text")
+            saw_body |= part.get("functionResponse") is not None
+            if isinstance(text, str):
+                if part.get("thought") is True:
+                    signature = part_payload_signature(part, "text")
+                    if stops.hit is None and (
+                        text or _is_signed_empty_thought(text, signature)
+                    ):
+                        reasoning_count += 1
+                        if reasoning_count == 1:
+                            first_reasoning_empty = not text
+                            if not saw_body:
+                                reasoning_signature = signature
+                            elif raw_sig:
+                                dropped_thought_sigs.append(
+                                    (raw_sig, "multi_thought_scalar_limit")
+                                )
+                            if raw_sig and not signature:
+                                dropped_thought_sigs.append(
+                                    (raw_sig, "compound_part_unrepresentable")
+                                )
+                        elif raw_sig:
+                            dropped_thought_sigs.append(
+                                (
+                                    raw_sig,
+                                    "multi_thought_scalar_limit"
+                                    if signature
+                                    else "compound_part_unrepresentable",
+                                )
+                            )
+                        if text:
+                            yield "reasoning_content", text
+                    elif raw_sig and trace is not None:
+                        yield _ChatTraceDrop(
+                            carrier="thought",
+                            signature=raw_sig,
+                            reason=(
+                                "stop_truncated"
+                                if stops.hit is not None
+                                else "compound_part_unrepresentable"
+                            ),
+                        )
+                    continue
+                if stops.hit is not None or not text:
+                    if raw_sig and trace is not None:
+                        yield _ChatTraceDrop(
+                            carrier="tail_empty" if not text else "text",
+                            signature=raw_sig,
+                            reason=(
+                                "stop_truncated"
+                                if stops.hit is not None
+                                else "tail_empty_unrepresentable"
+                            ),
+                        )
+                    continue
+                if raw_sig and trace is not None:
+                    yield _ChatTraceDrop(
+                        carrier="text",
+                        signature=raw_sig,
+                        reason="text_part_unrepresentable",
+                    )
+                saw_body = True
+                filtered = stops.feed(text)
+                if filtered:
+                    yield "content", filtered
+            elif raw_sig and trace is not None:
+                carrier, reason = _dropped_part_reason(part)
+                yield _ChatTraceDrop(carrier=carrier, signature=raw_sig, reason=reason)
+        # No later source frame can complete an approved terminal batch's
+        # withheld stop prefix. It is real content for the SDK ordering too.
+        if terminal_stop and (tail := stops.feed("", final=True)):
+            yield "content", tail
+
+    def tool_delta(part: dict[str, object]) -> dict[str, object]:
+        function_call = _as_dict(part.get("functionCall"))
+        raw_sig = _as_str(part.get("thoughtSignature"))
+        call_id = _as_str(function_call.get("id")) or f"call_{secrets.token_hex(12)}"
+        name = _as_str(function_call.get("name")) or "unknown"
+        args = function_call.get("args")
+        if args is None:
+            args = {}
+        fc_sig = part_payload_signature(part, "functionCall")
+        if trace is not None:
+            if fc_sig:
+                trace.record_client_out_sig(
+                    carrier="function_call",
+                    wire_field="extra_content",
+                    signature=fc_sig,
+                    call_id=call_id,
+                    call_name=name,
+                )
+            elif raw_sig:
+                trace.record_client_out_drop(
+                    carrier="function_call",
+                    signature=raw_sig,
+                    reason="compound_part_unrepresentable",
+                    call_id=call_id,
+                    call_name=name,
+                )
+        return {
+            "tool_calls": [
+                {
+                    **_signature_extra(fc_sig),
+                    "index": tool_index,
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args, ensure_ascii=False),
+                    },
+                }
+            ]
+        }
 
     # 确定性关闭内层 SSE 生成器（3.6）：适配器自身异常或客户端断连时，
     # 不再依赖事件循环的异步生成器终结器延迟释放上游连接。
@@ -1231,176 +1439,25 @@ async def openai_stream_adapter(
                 usage_metadata = frame.get("usageMetadata")
                 if isinstance(usage_metadata, dict):
                     usage_frame = usage_metadata
-                for part in _frame_parts(candidate):
-                    raw_sig = _as_str(part.get("thoughtSignature"))
-                    function_call = _as_dict(part.get("functionCall"))
-                    if function_call:
-                        if stops.hit is not None:
-                            if raw_sig and trace is not None:
-                                trace.record_client_out_drop(
-                                    carrier="function_call",
-                                    signature=raw_sig,
-                                    reason="stop_truncated",
-                                )
-                            continue
-                        # 被停止词缓冲扣留的部分前缀属于此前的正文：必须先于
-                        # 工具调用下发（与 Claude 侧 compat_claude 及非流式
-                        # flush_pending 对齐），否则该前缀要等流终结才冲刷，
-                        # 排到工具/图片内容之后破坏 content 顺序。
-                        tail = stops.feed("", final=True)
-                        if tail:
-                            yield _sse(_chunk({"content": tail}, None))
-                        has_tool_calls = True
-                        saw_body = True
-                        call_id = _as_str(function_call.get("id")) or (
-                            f"call_{secrets.token_hex(12)}"
-                        )
-                        name = _as_str(function_call.get("name")) or "unknown"
-                        args = function_call.get("args")
-                        if args is None:
-                            args = {}
-                        fc_sig = part_payload_signature(part, "functionCall")
-                        if trace is not None:
-                            if fc_sig:
-                                trace.record_client_out_sig(
-                                    carrier="function_call",
-                                    wire_field="extra_content",
-                                    signature=fc_sig,
-                                    call_id=call_id,
-                                    call_name=name,
-                                )
-                            elif raw_sig:
-                                trace.record_client_out_drop(
-                                    carrier="function_call",
-                                    signature=raw_sig,
-                                    reason="compound_part_unrepresentable",
-                                    call_id=call_id,
-                                    call_name=name,
-                                )
-                        yield _sse(
-                            _chunk(
-                                {
-                                    "tool_calls": [
-                                        {
-                                            **_signature_extra(fc_sig),
-                                            "index": tool_index,
-                                            "id": call_id,
-                                            "type": "function",
-                                            "function": {
-                                                "name": name,
-                                                "arguments": json.dumps(
-                                                    args, ensure_ascii=False
-                                                ),
-                                            },
-                                        }
-                                    ]
-                                },
-                                None,
-                            )
-                        )
-                        tool_index += 1
-                        continue
-                    inline = _as_dict(part.get("inlineData"))
-                    if inline:
-                        saw_body = True
-                        if raw_sig and trace is not None:
-                            trace.record_client_out_drop(
-                                carrier="inline_data",
-                                signature=raw_sig,
-                                reason="inline_data_unrepresentable",
-                            )
-                        if stops.hit is None:
-                            # 同 functionCall 分支：先冲刷停止词缓冲中的部分
-                            # 前缀，保持其在最终 content 字符串中的位置。
-                            tail = stops.feed("", final=True)
-                            if tail:
-                                yield _sse(_chunk({"content": tail}, None))
-                            mime = _as_str(inline.get("mimeType")) or "image/png"
-                            data = _as_str(inline.get("data"))
-                            if data:
-                                yield _sse(
-                                    _chunk(
-                                        {
-                                            "content": (
-                                                f"\n\n![image](data:{mime};base64,{data})"
-                                            )
-                                        },
-                                        None,
-                                    )
-                                )
-                        continue
-                    text = part.get("text")
-                    saw_body |= part.get("functionResponse") is not None
-                    if isinstance(text, str):
-                        if part.get("thought") is True:
-                            signature = part_payload_signature(part, "text")
-                            if stops.hit is None and (
-                                text or _is_signed_empty_thought(text, signature)
-                            ):
-                                reasoning_count += 1
-                                if reasoning_count == 1:
-                                    first_reasoning_empty = not text
-                                    if not saw_body:
-                                        reasoning_signature = signature
-                                    elif raw_sig:
-                                        dropped_thought_sigs.append(
-                                            (raw_sig, "multi_thought_scalar_limit")
-                                        )
-                                    if raw_sig and not signature:
-                                        dropped_thought_sigs.append(
-                                            (raw_sig, "compound_part_unrepresentable")
-                                        )
-                                elif raw_sig:
-                                    dropped_thought_sigs.append(
-                                        (
-                                            raw_sig,
-                                            "multi_thought_scalar_limit"
-                                            if signature
-                                            else "compound_part_unrepresentable",
-                                        )
-                                    )
-                                if text:
-                                    yield _sse(
-                                        _chunk({"reasoning_content": text}, None)
-                                    )
-                            elif raw_sig and trace is not None:
-                                trace.record_client_out_drop(
-                                    carrier="thought",
-                                    signature=raw_sig,
-                                    reason=(
-                                        "stop_truncated"
-                                        if stops.hit is not None
-                                        else "compound_part_unrepresentable"
-                                    ),
-                                )
-                            continue
-                        if stops.hit is not None or not text:
-                            if raw_sig and trace is not None:
-                                trace.record_client_out_drop(
-                                    carrier="tail_empty" if not text else "text",
-                                    signature=raw_sig,
-                                    reason=(
-                                        "stop_truncated"
-                                        if stops.hit is not None
-                                        else "tail_empty_unrepresentable"
-                                    ),
-                                )
-                            continue
-                        if raw_sig and trace is not None:
-                            trace.record_client_out_drop(
-                                carrier="text",
-                                signature=raw_sig,
-                                reason="text_part_unrepresentable",
-                            )
-                        saw_body = True
-                        filtered = stops.feed(text)
-                        if filtered:
-                            yield _sse(_chunk({"content": filtered}, None))
-                    elif raw_sig and trace is not None:
-                        carrier, reason = _dropped_part_reason(part)
+                terminal_stop = finish == "STOP"
+                items = selected_items(candidate, terminal_stop)
+                if terminal_stop:
+                    items = _chat_terminal_order(items, has_content)
+                for item in items:
+                    if isinstance(item, _ChatTraceDrop):
+                        assert trace is not None  # Only selected when tracing.
                         trace.record_client_out_drop(
-                            carrier=carrier, signature=raw_sig, reason=reason
+                            carrier=item.carrier,
+                            signature=item.signature,
+                            reason=item.reason,
                         )
+                    elif isinstance(item, dict):
+                        yield _sse(_chunk(tool_delta(item), None))
+                        tool_index += 1
+                    else:
+                        has_content |= item[0] == "content"
+                        yield _sse(_chunk({item[0]: item[1]}, None))
+                    del item
         except Exception as exc:
             record_result(
                 "error", error=f"Stream conversion failed: {type(exc).__name__}: {exc}"
@@ -1422,7 +1479,7 @@ async def openai_stream_adapter(
         finish_reason = (
             "stop"
             if stops.hit is not None and finish_reason_raw == "STOP"
-            else _openai_finish_reason(finish_reason_raw, has_tool_calls=has_tool_calls)
+            else _openai_finish_reason(finish_reason_raw, has_tool_calls=tool_index > 0)
         )
         usage_payload = (
             _openai_usage_from_frame(usage_frame) if usage_frame is not None else None
