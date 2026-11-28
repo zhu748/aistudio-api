@@ -193,6 +193,61 @@ async def _openai_parts_from_content(content: object) -> list[GeminiPart]:
     return parts
 
 
+def _history_refusal(value: object) -> str | None:
+    """An already-written explanation is plain history, not a finish reason."""
+    return value if isinstance(value, str) and value and not value.isspace() else None
+
+
+async def _assistant_visible_parts(
+    content: str | list[dict[str, object]] | None, raw_refusal: object
+) -> list[GeminiPart]:
+    scalar = _history_refusal(raw_refusal)
+    parts: list[GeminiPart] = []
+    if isinstance(content, str):
+        if content:
+            parts.append(GeminiPart(text=content))
+    elif isinstance(content, list):
+        texts: list[str] = []
+        images: list[GeminiPart] = []
+
+        def flush() -> None:
+            # Keep the existing blank-line join and text-before-images order
+            # for ordinary blocks; an explicit refusal separates these runs.
+            if text := "\n\n".join(texts):
+                parts.append(GeminiPart(text=text))
+            parts.extend(images)
+            texts.clear()
+            images.clear()
+
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            kind = item.get("type")
+            if kind == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    texts.append(text)
+                    if text == scalar:
+                        scalar = None
+            elif kind == "refusal":
+                if explanation := _history_refusal(item.get("refusal")):
+                    flush()
+                    parts.append(GeminiPart(text=explanation))
+            elif kind == "image_url":
+                url = _as_str(_as_dict(item.get("image_url")).get("url")).strip()
+                if url:
+                    try:
+                        images.append(await _media_part_from_url(url))
+                    except Exception as e:
+                        logger.debug("assistant 历史图片块转换失败，已跳过: %s", e)
+        flush()
+    # Some clients echo the same refusal as both visible content and a scalar.
+    # Suppress only an exact mirror, never a distinct explanation.
+    if scalar is not None and all(part.text != scalar for part in parts):
+        parts.append(GeminiPart(text=scalar))
+    return parts
+
+
 def _openai_tool_content_to_response(content: object) -> dict[str, object]:
     """OpenAI tool 消息 content → Gemini functionResponse.response 载荷。"""
     if isinstance(content, list):
@@ -501,15 +556,20 @@ async def openai_to_gemini_request(
     system_texts: list[str] = []
     tool_name_by_id: dict[str, str | None] = {}
 
-    # Index call names so results can precede their calls. In the same pass,
-    # check all user file references before even an earlier image can be fetched.
+    # Check unsupported history before media conversion. Index function names
+    # in the same pass so results can precede their calls.
     for index, message in enumerate(req.messages):
         role = message.role.strip().lower()
         if role == "user":
             _check_user_file_references(message.content, index)
         if role != "assistant":
             continue
-        for tool_call in message.tool_calls or []:
+        for call_index, tool_call in enumerate(message.tool_calls or []):
+            if tool_call.get("type") == "custom":
+                raise ValueError(
+                    f"messages[{index}].tool_calls[{call_index}].type (custom) is not supported; "
+                    "use function tool calls with JSON arguments or send the call and result as plain text"
+                )
             function = _as_dict(tool_call.get("function"))
             call_id = _as_str(tool_call.get("id"))
             name = _as_str(function.get("name"))
@@ -590,24 +650,9 @@ async def openai_to_gemini_request(
                     if trace is not None and dt_source:
                         trace.tag_inbound_source(thought_part, dt_source)
                     parts.append(thought_part)
-            text = _openai_content_text(message.content)
-            if text:
-                parts.append(GeminiPart(text=text))
-            # assistant 历史中的图片（图片输出模型回传的多模态对话）保留：
-            # 丢弃会让模型丢失自己上一轮产出的图片上下文（与 Claude 侧对齐）。
-            if isinstance(message.content, list):
-                for item in message.content:
-                    if not isinstance(item, dict) or item.get("type") != "image_url":
-                        continue
-                    image_url = _as_dict(item.get("image_url"))
-                    url = _as_str(image_url.get("url")).strip()
-                    if url:
-                        try:
-                            media_part = await _media_part_from_url(url)
-                        except Exception as e:
-                            logger.debug("assistant 历史图片块转换失败，已跳过: %s", e)
-                            continue
-                        parts.append(media_part)
+            parts.extend(
+                await _assistant_visible_parts(message.content, message.refusal)
+            )
             # Old calls have no ID. Modern calls take precedence on the wire,
             # but a valid old name still matters when matching this turn's results.
             if isinstance(message.function_call, dict):

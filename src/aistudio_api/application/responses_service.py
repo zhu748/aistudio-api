@@ -39,7 +39,10 @@ from aistudio_api.api.schemas import (
 )
 from aistudio_api.api.schemas_compat import OpenAIResponsesRequest
 from aistudio_api.application.chat_service import _normalize_gemini_tool_config
-from aistudio_api.application.compat_openai import _openai_history_call
+from aistudio_api.application.compat_openai import (
+    _history_refusal,
+    _openai_history_call,
+)
 from aistudio_api.application.compat_result_owners import index_call_name, result_part
 from aistudio_api.application.compat_service import (
     _as_dict,
@@ -194,7 +197,9 @@ def _check_user_media(content: object, input_index: int) -> None:
         )
 
 
-async def _parts_from_input_content(content: object) -> list[GeminiPart]:
+async def _parts_from_input_content(
+    content: object, *, assistant: bool = False
+) -> list[GeminiPart]:
     """Responses input content（str 或 content part 数组）→ Gemini parts。
 
     支持 ``input_text`` / ``input_image``（image_url: HTTP(S) 或 data URL）
@@ -206,7 +211,9 @@ async def _parts_from_input_content(content: object) -> list[GeminiPart]:
     if not isinstance(content, list):
         return []
     if len(content) > 1 and has_remote_media(content):
-        return await _convert_items_concurrently(content, _parts_from_input_content)
+        return await _convert_items_concurrently(
+            content, lambda items: _parts_from_input_content(items, assistant=assistant)
+        )
     parts: list[GeminiPart] = []
     for item in content:
         if not isinstance(item, dict):
@@ -222,6 +229,9 @@ async def _parts_from_input_content(content: object) -> list[GeminiPart]:
             text = item.get("text")
             if isinstance(text, str):
                 parts.append(GeminiPart(text=text))
+        elif assistant and part_type == "refusal":
+            if explanation := _history_refusal(item.get("refusal")):
+                parts.append(GeminiPart(text=explanation))
         elif part_type == "input_image":
             url = _as_str(item.get("image_url")).strip()
             if url:
@@ -423,7 +433,7 @@ async def responses_to_gemini_request(
     system_texts: list[str] = [req.instructions] if req.instructions else []
     tool_name_by_call_id: dict[str, str | None] = {}
 
-    # Check state references and user media before converting any earlier image.
+    # Check unsupported history before converting any earlier media.
     # Index call ownership in the same pass because a result may precede its call.
     replayable_call_ids: set[str] = set()
     unfinished_call_ids: set[str] = set()
@@ -444,6 +454,11 @@ async def responses_to_gemini_request(
             and _as_str(item.get("role")).strip().lower() == "user"
         ):
             _check_user_media(item.get("content"), index)
+        if item_type in ("custom_tool_call", "custom_tool_call_output"):
+            raise ValueError(
+                f"input[{index}].type ({item_type}) is not supported; "
+                "use function_call and function_call_output items or send the call and result as plain text"
+            )
         if item_type != "function_call":
             continue
         call_id = _as_str(item.get("call_id"))
@@ -478,7 +493,9 @@ async def responses_to_gemini_request(
                     if text:
                         system_texts.append(text)
                     continue
-                parts = await _parts_from_input_content(item.get("content"))
+                parts = await _parts_from_input_content(
+                    item.get("content"), assistant=role == "assistant"
+                )
                 if role == "assistant":
                     contents.append(
                         GeminiContent(

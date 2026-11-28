@@ -541,16 +541,13 @@ class _ToolCall:
 
 
 def has_response_content(part: dict[str, object]) -> bool:
-    return any(
-        part.get(key)
-        for key in (
-            "text",
-            "inlineData",
-            "functionCall",
-            "functionResponse",
-            "executableCode",
-            "codeExecutionResult",
-        )
+    return bool(
+        part.get("text")
+        or part.get("inlineData")
+        or part.get("functionCall")
+        or part.get("functionResponse")
+        or part.get("executableCode")
+        or part.get("codeExecutionResult")
     )
 
 

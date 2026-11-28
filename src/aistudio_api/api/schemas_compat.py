@@ -36,6 +36,8 @@ class OpenAIChatMessage(BaseModel):
     thoughtSignature: str | None = None
     provider_specific_fields: dict[str, object] | None = None
     reasoning_details: list[dict[str, object]] | None = None
+    # Only nonblank strings carry assistant refusal history; keep other JSON ignored.
+    refusal: object | None = None
 
 
 class OpenAIChatCompletionRequest(BaseModel):
