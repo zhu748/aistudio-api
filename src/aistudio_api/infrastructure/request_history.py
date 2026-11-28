@@ -272,8 +272,12 @@ class RequestHistory:
                     connection.rollback()
                 raise
             connection.execute("COMMIT")
+        # The transaction has finished. Replace each raw SQLite row as we
+        # decode it, without holding two complete pages of request history.
+        for index, (payload,) in enumerate(rows):
+            rows[index] = json.loads(payload)
         return {
-            "items": [json.loads(row[0]) for row in rows],
+            "items": rows,
             "total": total,
             "page": page,
             "page_size": page_size,

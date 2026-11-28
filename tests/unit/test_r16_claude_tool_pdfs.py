@@ -156,7 +156,7 @@ async def test_unavailable_or_malformed_documents_do_not_expand(route):
     pdf = {"type": "base64", "media_type": "application/pdf"}
     sources = [
         {"type": "url", "url": "https://fixture.invalid/report.pdf"},
-        {"type": "file", "file_id": "offline-file-reference"},
+        {"type": "file", "file_id": " "},
         {"type": "content", "content": [{"type": "text", "text": "not flattened"}]},
         {"type": "base64", "data": _PDF["A"]},
         {**pdf, "media_type": "image/png", "data": _PNG["A"]},

@@ -431,7 +431,11 @@ async def responses_to_gemini_request(
         if not isinstance(item, dict):
             continue
         item_type = item.get("type")
-        if item_type == "item_reference":
+        # The SDK's ItemReference discriminator is optional and nullable.
+        # With no discriminator, match only its exact shape, not IDs on inline items.
+        if item_type == "item_reference" or (
+            item_type is None and "id" in item and item.keys() <= {"id", "type"}
+        ):
             _reject_state_reference(
                 item.get("id"), f"input[{index}].id (item_reference)"
             )

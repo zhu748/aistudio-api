@@ -85,6 +85,49 @@ def _claude_document_text(source: dict[str, object]) -> str | None:
     return None
 
 
+def _reject_user_file_source(
+    block: object, message_index: int, block_index: int, item_index: int | None = None
+) -> None:
+    if not isinstance(block, dict) or block.get("type") not in ("document", "image"):
+        return
+    source = _as_dict(block.get("source"))
+    if source.get("type") != "file":
+        return
+    file_id = _as_str(source.get("file_id"))
+    if not file_id or file_id.isspace():
+        return
+    path = f"messages[{message_index}].content[{block_index}]"
+    if item_index is not None:
+        path += f".content[{item_index}]"
+    alternative = (
+        "an inline image source with type='base64', data, and the image's "
+        "media_type (for example 'image/png')"
+        if block["type"] == "image"
+        else "an inline PDF (type='base64', media_type='application/pdf', data) "
+        "or a plain-text document (type='text', media_type='text/plain', data)"
+    )
+    raise ValueError(
+        f"{path}.source.file_id is not supported: this gateway cannot resolve "
+        f"Anthropic Files API references; use {alternative}"
+    )
+
+
+def _check_user_file_sources(
+    content: list[dict[str, object]], message_index: int
+) -> None:
+    """Only immediate message and tool_result blocks are attachment positions."""
+    for block_index, block in enumerate(content):
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            items = block.get("content")
+            if isinstance(items, list):
+                for item_index, item in enumerate(items):
+                    _reject_user_file_source(
+                        item, message_index, block_index, item_index
+                    )
+        else:
+            _reject_user_file_source(block, message_index, block_index)
+
+
 def _opaque_assistant_history_field(block: dict[str, object]) -> str | None:
     """Identify imported thought blocks that would otherwise disappear on replay."""
     kind = block.get("type")
@@ -189,13 +232,8 @@ async def _claude_blocks_to_parts(
                 if url:
                     parts.append(await _media_part_from_url(url))
             elif source.get("type") == "file":
-                # Files API 引用（file_id）不支持：静默丢弃会让客户端误以为
-                # 文档已附上，至少留一条可排查的日志。
-                logger.warning(
-                    "Claude document source type=file（Files API file_id）"
-                    "不被支持，已丢弃该块：file_id=%s",
-                    _as_str(source.get("file_id")) or "(空)",
-                )
+                # Valid user references were rejected in preflight. Never log IDs.
+                logger.warning("Claude document source type=file 不被支持，已丢弃该块")
         elif block_type == "tool_use":
             call_id = _as_str(block.get("id"))
             tool_input = block.get("input")
@@ -431,12 +469,16 @@ async def claude_to_gemini_request(
     contents: list[GeminiContent] = []
     tool_name_by_id: dict[str, str | None] = {}
 
-    # Preflight assistant history before any message can fetch or charge media.
-    # This pass also indexes tool_use owners for later tool_result blocks.
+    # Validate user file references and assistant history before *any* media
+    # fetch or charge. Also index tool_use owners for later tool_result blocks.
     for message_index, message in enumerate(req.messages):
-        if message.role.strip().lower() != "assistant" or not isinstance(
-            message.content, list
-        ):
+        if not isinstance(message.content, list):
+            continue
+        message_role = message.role.strip().lower()
+        if message_role == "user":
+            _check_user_file_sources(message.content, message_index)
+            continue
+        if message_role != "assistant":
             continue
         for block_index, block in enumerate(message.content):
             if not isinstance(block, dict):
