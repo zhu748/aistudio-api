@@ -501,7 +501,8 @@ async def openai_to_gemini_request(
             system_texts.append(_openai_content_text(message.content))
             continue
         if role == "assistant":
-            parts: list[GeminiPart] = []
+            turn = GeminiContent(role="model", parts=[])
+            parts = turn.parts
             # Read reasoning history and echoed signatures from message-level
             # carriers (extra_content, provider_specific_fields, top-level aliases)
             # as well as OpenRouter/Cline reasoning_details.
@@ -587,19 +588,21 @@ async def openai_to_gemini_request(
                             logger.debug("assistant 历史图片块转换失败，已跳过: %s", e)
                             continue
                         parts.append(media_part)
-            # Old Chat calls have no call ID. Preserve their original argument
-            # string as prose, never as a native call or a carrier of metadata.
-            if not message.tool_calls and isinstance(message.function_call, dict):
+            # Old calls have no ID. Modern calls take precedence on the wire,
+            # but a valid old name still matters when matching this turn's results.
+            if isinstance(message.function_call, dict):
                 legacy_name = _as_str(message.function_call.get("name"))
                 arguments = message.function_call.get("arguments")
                 if legacy_name.strip() and isinstance(arguments, str):
-                    parts.append(
-                        GeminiPart(
-                            text=tool_history_text(
-                                "tool_call", legacy_name, None, arguments
+                    turn._compat_owner.legacy_name = legacy_name
+                    if not message.tool_calls:
+                        parts.append(
+                            GeminiPart(
+                                text=tool_history_text(
+                                    "tool_call", legacy_name, None, arguments
+                                )
                             )
                         )
-                    )
             for tool_call in message.tool_calls or []:
                 function = _as_dict(tool_call.get("function"))
                 call_id = _as_str(tool_call.get("id"))
@@ -620,28 +623,22 @@ async def openai_to_gemini_request(
                 # A display fallback cannot replace an indexed name or conflict.
                 if call_id:
                     tool_name_by_id.setdefault(call_id, "unknown")
-            contents.append(
-                GeminiContent(role="model", parts=parts or [GeminiPart(text="")])
-            )
+            if not parts:
+                parts.append(GeminiPart(text=""))
+            contents.append(turn)
             continue
         if role in ("tool", "function"):
-            # 旧版 "function" 角色（LangChain 等客户端）与 "tool" 同义：
-            # 函数名优先取 tool_call_id 反查，其次 message.name 字段
-            payload = _openai_tool_content_to_response(message.content)
+            result = GeminiFunctionResponse(
+                name=message.name or "unknown",
+                response=_openai_tool_content_to_response(message.content),
+                id=message.tool_call_id,
+            )
+            if role == "function" and not result.id:
+                # Only the supplied name identifies a possible deprecated call;
+                # "unknown" synthesized for display is not evidence.
+                result._compat_owner.legacy_name = message.name
             contents.append(
-                GeminiContent(
-                    role="user",
-                    parts=[
-                        result_part(
-                            tool_name_by_id,
-                            GeminiFunctionResponse(
-                                name=message.name or "unknown",
-                                response=payload,
-                                id=message.tool_call_id,
-                            ),
-                        )
-                    ],
-                )
+                GeminiContent(role="user", parts=[result_part(tool_name_by_id, result)])
             )
             continue
         # user 与未知角色按用户消息处理

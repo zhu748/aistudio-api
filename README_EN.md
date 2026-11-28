@@ -413,6 +413,7 @@ curl http://localhost:8080/v1/chat/completions \
 - Enter a Gemini model name in `model` directly; family names like `gpt-4o` are mapped to `compat.openai.default_model` in `config.yaml`;
 - Streaming emits standard `chat.completion.chunk` sequences (including `data: [DONE]`); reasoning chains stream through the `reasoning_content` delta field;
 - Tool calling (`tools` / `tool_choice`), `response_format` (JSON mode), `reasoning_effort`, and image inputs (data URLs or remote URLs) are supported.
+- Imported Chat history preserves a deprecated assistant `function_call` as text if there are no modern `tool_calls`; otherwise only the modern calls are forwarded. A `role: "function"` result without an ID stays text when its name matches a deprecated call in the same assistant turn (including adjacent assistant messages). It is not assigned to a same-name modern call; a matching `tool_call_id` still identifies a modern result.
 - Thinking-effort parameters from all major client ecosystems are accepted and normalized to the upstream thinking level (auto-snapped to the nearest level the model supports). Equivalent forms:
 
 | Parameter shape | Ecosystem | Example |

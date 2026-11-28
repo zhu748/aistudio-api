@@ -540,6 +540,7 @@ curl http://localhost:8080/v1/chat/completions \
 - `model` 直接填 Gemini 模型名；填 `gpt-4o` 等家族名会自动映射到 `config.yaml` 中 `compat.openai.default_model`；
 - 流式返回标准 `chat.completion.chunk` 序列（含 `data: [DONE]`），思考链走 `reasoning_content` 增量字段；
 - 工具调用（`tools` / `tool_choice`）、`response_format`（JSON 模式）、`reasoning_effort`、图片输入（data URL 或远程 URL）均已支持；
+- 回放 Chat 历史时，若没有现代 `tool_calls`，旧版 assistant 的 `function_call` 作为文本保留；两者同时存在时，只转发现代调用。同一轮 assistant 消息（包括相邻合并的消息）中有同名旧调用时，无 ID 的 `role: "function"` 结果保留为文本，不会被配给同名现代调用；带匹配 `tool_call_id` 的现代结果仍正常配对；
 - 思考强度兼容各客户端生态的传参形态，以下写法等价（归一化为上游思考档位，模型不支持时自动吸附就近档位）：
 
 | 参数形态 | 客户端生态 | 示例 |

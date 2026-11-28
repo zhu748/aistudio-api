@@ -665,7 +665,7 @@ _UNSUPPORTED_FILE_DATA = "fileData is not supported yet"
 
 
 def _match_pending_calls(
-    parts: list[GeminiPart], pending: list[_ToolOwner]
+    parts: list[GeminiPart], pending: list[_ToolOwner], legacy_names: set[str]
 ) -> dict[int, _ToolOwner]:
     """Resolve exact pairs before considering any ID-less result.
 
@@ -697,6 +697,10 @@ def _match_pending_calls(
         elif fr._compat_owner.exact_id_only:
             # This ID denotes different names in the replayed history. Its
             # display label cannot establish a name-based or positional owner.
+            continue
+        elif fr._compat_owner.legacy_name in legacy_names:
+            # An ID-less Chat function result can belong to a deprecated call
+            # in this same turn. Do not consume a modern call by name or order.
             continue
         elif fr.name:
             named[fr.name].append((index, fr))
@@ -865,6 +869,7 @@ def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioConte
     """Normalize logical turns without changing call/result or attachment order."""
     contents: list[AistudioContent] = []
     pending: list[_ToolOwner] = []
+    pending_legacy_names: set[str] = set()
 
     def result_run(content: GeminiContent) -> tuple[str, bool]:
         role = content.role or "user"
@@ -894,7 +899,13 @@ def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioConte
 
     nonblank = (item for item in req.contents if not is_blank_user_content(item))
     for (role, has_results), run in groupby(nonblank, key=result_run):
-        incoming = [p for content in run for p in content.parts]
+        incoming: list[GeminiPart] = []
+        if role == "model":
+            pending_legacy_names.clear()
+        for content in run:
+            incoming.extend(content.parts)
+            if role == "model" and (name := content._compat_owner.legacy_name):
+                pending_legacy_names.add(name)
         if role == "model" and trace is not None and record_client_in:
             model_turn_index += 1
             trace.client_model_turns += 1
@@ -975,7 +986,11 @@ def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioConte
                 and not fr._compat_owner.exact_id_only
             }
         else:
-            owners = _match_pending_calls(incoming, pending) if has_results else {}
+            owners = (
+                _match_pending_calls(incoming, pending, pending_legacy_names)
+                if has_results
+                else {}
+            )
         parts = [
             p
             for i, part in enumerate(incoming)
@@ -989,6 +1004,7 @@ def _normalize_contents(req: GeminiGenerateContentRequest) -> list[AistudioConte
             ]
         elif has_results or role == "user":
             pending = []
+            pending_legacy_names.clear()
         contents.append(AistudioContent(role=role, parts=parts))
     return _drop_hollow_and_merge_same_role(contents)
 

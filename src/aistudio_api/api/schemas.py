@@ -63,9 +63,14 @@ def _function_result_part_filename(part: object) -> object:
 
 
 @dataclass(slots=True)
-class _ResultOwnerHint:
-    # A replay policy, not result data. Pydantic includes private attributes in
-    # model equality; keep the policy out of payload comparisons as well as JSON.
+class _ChatOwnerHint:
+    # Request-local evidence, not payload. Pydantic compares private attributes
+    # too, so exclude hints from equality as well as the public JSON schema.
+    legacy_name: str | None = field(default=None, compare=False)
+
+
+@dataclass(slots=True)
+class _ResultOwnerHint(_ChatOwnerHint):
     exact_id_only: bool = field(default=False, compare=False)
 
 
@@ -131,6 +136,7 @@ GeminiFunctionResponse.model_rebuild()
 class GeminiContent(BaseModel):
     role: str | None = None
     parts: list[GeminiPart]
+    _compat_owner: _ChatOwnerHint = PrivateAttr(default_factory=_ChatOwnerHint)
 
 
 class GeminiTool(BaseModel):
