@@ -529,14 +529,6 @@ class RequestMiddleware:
             elif message["type"] == "http.response.body":
                 body = message.get("body", b"")
                 observer.sent_bytes += len(body)
-                if body and observer.first_byte_ms is None:
-                    observer.first_byte_ms = (time.perf_counter() - started) * 1000
-                    context.first_byte_ms = observer.first_byte_ms
-                    if model_call:
-                        request_event(
-                            "streaming" if observer.is_stream else "response",
-                            "首个响应数据已发送",
-                        )
                 if (
                     dump_enabled
                     and not observer.is_stream
@@ -566,10 +558,20 @@ class RequestMiddleware:
                 await send(message)
             observer.sending = False
             if message["type"] == "http.response.body":
+                body = message.get("body", b"")
+                # Count any accepted bytes, including keepalives, but not a
+                # blocked or rejected write. Model content timing is separate.
+                if body and observer.first_byte_ms is None:
+                    observer.first_byte_ms = (time.perf_counter() - started) * 1000
+                    context.first_byte_ms = observer.first_byte_ms
+                    if model_call:
+                        request_event(
+                            "streaming" if observer.is_stream else "response",
+                            "首个响应数据已发送",
+                        )
                 if not message.get("more_body", False):
                     observer.completed = True
                 if observer.is_stream:
-                    body = message.get("body", b"")
                     if _is_terminal_event(path, body):
                         observer.stream_terminal_sent = True
                     elif path == "/v1/chat/completions" and _is_chat_choice_finish(

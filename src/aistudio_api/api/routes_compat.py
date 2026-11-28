@@ -451,6 +451,7 @@ async def claude_messages(
                     response,
                     requested_model=req.model,
                     stop_sequences=req.stop_sequences,
+                    output_config=req.output_config,
                 )
             )
         raise HTTPException(

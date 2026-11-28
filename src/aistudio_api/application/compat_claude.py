@@ -613,10 +613,29 @@ def _inline_output_notice(media_type: str) -> str:
     )
 
 
+def _emit_selected_text_runs(
+    output: list[dict[str, object]], runs: list[list[str]], remaining: int
+) -> None:
+    """Project the stop-selected prefix onto its original source boundaries."""
+    for fragments in runs:
+        if not remaining:
+            break
+        selected: list[str] = []
+        for fragment in fragments:
+            selected.append(fragment[:remaining])
+            remaining -= len(selected[-1])
+            if not remaining:
+                break
+        output.append({"type": "text", "text": "".join(selected)})
+    runs.clear()
+
+
 def build_claude_message(
     response: GeminiGenerateContentResponse,
     requested_model: str,
     stop_sequences: list[str] | None,
+    *,
+    output_config: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Gemini 完整响应 → Claude Message 对象。"""
     finish_reason_raw: str | None = None
@@ -627,14 +646,23 @@ def build_claude_message(
     # Strings are gateway notices. Lists collect consecutive unsigned thought
     # fragments; join each run once, without copying its prefix on every Part.
     blocks: list[dict[str, object] | str | list[str]] = []
+    # Anthropic's structured-output parser expects one JSON value per text
+    # block. Mark boundaries in source order, before notices/code become text and
+    # unrepresentable Parts disappear. Never change the generation request.
+    fmt = _as_dict((output_config or {}).get("format"))
+    structured = fmt.get("type") == "json_schema" and isinstance(
+        fmt.get("schema"), dict
+    )
+    boundaries: set[int] = set()
     has_tool_use = False
     trace = get_signature_trace()
     for part in _iter_response_parts(response):
+        start = len(blocks)
         raw_sig = _as_str(getattr(part, "thoughtSignature", None))
         emitted_sig = False
         text = getattr(part, "text", None)
+        is_thought = getattr(part, "thought", None) is True
         if isinstance(text, str):
-            is_thought = getattr(part, "thought", None) is True
             signature = part_payload_signature(part, "text") if is_thought else ""
             if is_thought and (text or _is_signed_empty_thought(text, signature)):
                 # A signed Part must match precisely one output block.
@@ -658,10 +686,9 @@ def build_claude_message(
         inline = getattr(part, "inlineData", None)
         if inline is not None and inline.data:
             blocks.append(_inline_output_notice(inline.mimeType))
-        code = _code_text(
-            getattr(part, "executableCode", None),
-            getattr(part, "codeExecutionResult", None),
-        )
+        executable = getattr(part, "executableCode", None)
+        code_result = getattr(part, "codeExecutionResult", None)
+        code = _code_text(executable, code_result)
         if code:
             blocks.append({"type": "text", "text": code})
         function_call = getattr(part, "functionCall", None)
@@ -685,6 +712,19 @@ def build_claude_message(
                 }
             )
             emitted_sig = bool(signature)
+        if structured and (
+            not isinstance(text, str)
+            or (text == "" and raw_sig)
+            or is_thought
+            or inline is not None
+            or function_call is not None
+            or executable is not None
+            or code_result is not None
+            or getattr(part, "functionResponse", None) is not None
+            or getattr(part, "fileData", None) is not None
+        ):
+            # A compound Part may project to several blocks, or to none.
+            boundaries.update(range(start, len(blocks) + 1))
         if raw_sig and not emitted_sig and trace is not None:
             carrier, reason = _dropped_part_reason(part)
             trace.record_client_out_drop(
@@ -702,16 +742,25 @@ def build_claude_message(
     stops = StopSequenceBuffer(stop_sequences)
     filtered: list[dict[str, object]] = []
     text_block_open = False
+    runs: list[list[str]] = []
+    selected_chars = 0
 
     def flush_pending() -> None:
+        nonlocal selected_chars
         tail = stops.feed("", final=True)
-        if tail:
+        if structured:
+            # A withheld stop prefix can span source boundaries. Count the
+            # surviving characters first; don't move that prefix to the Part
+            # which happened to release it or change which stop matched.
+            _emit_selected_text_runs(filtered, runs, selected_chars + len(tail))
+            selected_chars = 0
+        elif tail:
             if text_block_open:
                 filtered[-1]["text"] = _as_str(filtered[-1].get("text")) + tail
             else:
                 filtered.append({"type": "text", "text": tail})
 
-    for block in blocks:
+    for index, block in enumerate(blocks):
         if stops.hit is not None:
             if isinstance(block, dict) and trace is not None:
                 if block.get("type") == "thinking":
@@ -742,8 +791,15 @@ def build_claude_message(
             )
             text_block_open = False
         elif block.get("type") == "text":
-            text = stops.feed(_as_str(block.get("text")))
-            if text:
+            source = _as_str(block.get("text"))
+            text = stops.feed(source)
+            if structured:
+                if runs and index not in boundaries:
+                    runs[-1].append(source)
+                else:
+                    runs.append([source])
+                selected_chars += len(text)
+            elif text:
                 filtered.append({**block, "text": text})
                 text_block_open = True
         else:

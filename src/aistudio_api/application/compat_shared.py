@@ -33,6 +33,7 @@ from aistudio_api.api.response_models import GeminiGenerateContentResponse
 from aistudio_api.api.schemas import GeminiFunctionCall, GeminiInlineData, GeminiPart
 from aistudio_api.application.anti_truncation import _close_stream_quietly
 from aistudio_api.application.media_session import (
+    MediaSession,
     current_media,
     media_session,
 )
@@ -412,6 +413,21 @@ def _parse_data_url(url: str) -> tuple[str, str] | None:
     return mime, data
 
 
+async def _read_remote_media_body(
+    response: httpx.Response, session: MediaSession
+) -> bytes:
+    """Release transport chunks before base64 conversion of the joined body."""
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in response.aiter_bytes():
+        size += len(chunk)
+        if size > _MAX_MEDIA_BYTES:
+            raise ValueError("Remote media exceeds configured size limit")
+        session.account_bytes(len(chunk))
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def _fetch_remote_media(url: str) -> tuple[str, str]:
     """下载远程媒体 → (mime, base64 data)；失败抛 ValueError。"""
     if not url.lower().startswith(("http://", "https://")):
@@ -429,15 +445,7 @@ async def _fetch_remote_media(url: str) -> tuple[str, str]:
             (await session.get_client()).stream("GET", url) as response,
         ):
             response.raise_for_status()
-            chunks: list[bytes] = []
-            size = 0
-            async for chunk in response.aiter_bytes():
-                size += len(chunk)
-                if size > _MAX_MEDIA_BYTES:
-                    raise ValueError("Remote media exceeds configured size limit")
-                session.account_bytes(len(chunk))
-                chunks.append(chunk)
-            raw = b"".join(chunks)
+            raw = await _read_remote_media_body(response, session)
             mime = (response.headers.get("content-type") or "").split(";")[0].strip()
     except httpx.HTTPError as exc:
         raise ValueError(f"Failed to download media from {url[:128]}: {exc}") from exc
@@ -447,7 +455,9 @@ async def _fetch_remote_media(url: str) -> tuple[str, str]:
         )
     if not mime or mime == "application/octet-stream":
         mime = _sniff_mime(raw) or "image/jpeg"
-    return mime, base64.b64encode(raw).decode("ascii")
+    encoded = base64.b64encode(raw)
+    del raw  # The ASCII text should not overlap the decoded media body.
+    return mime, encoded.decode("ascii")
 
 
 async def _media_part_from_url(url: str) -> GeminiPart:
