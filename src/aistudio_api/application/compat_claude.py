@@ -74,7 +74,10 @@ logger = get_logger("compat.claude")
 
 
 def _claude_document_text(source: dict[str, object]) -> str | None:
-    """Anthropic PlainTextSourceParam contains literal text, not media to fetch."""
+    """Read literal document text without converting block arrays or fetching URLs."""
+    if source.get("type") == "content":
+        content = source.get("content")
+        return content if isinstance(content, str) else None
     data = source.get("data")
     if (
         source.get("type") == "text"
@@ -1104,15 +1107,15 @@ async def claude_stream_adapter(
             async for frame in frames:
                 yield frame
 
+        source_error: tuple[int, str] | None = None
         try:
             async for frame in _peeked_frames():
                 error_obj = frame.get("error")
                 if isinstance(error_obj, dict):
                     code = _as_int(error_obj.get("code")) or 500
                     message = _as_str(error_obj.get("message")) or "Upstream error"
-                    for event in emitter.error(code, message):
-                        yield event
-                    return
+                    source_error = code, message
+                    break
                 candidate = _frame_candidate(frame)
                 finish = _as_str(candidate.get("finishReason"))
                 if finish:
@@ -1245,15 +1248,19 @@ async def claude_stream_adapter(
             record_result(
                 "error", error=f"Stream conversion failed: {type(exc).__name__}: {exc}"
             )
-            for event in emitter.error(500, f"{type(exc).__name__}: {exc}"):
-                yield event
-            return
+            source_error = 500, f"{type(exc).__name__}: {exc}"
+        # Only ordinary source exhaustion/failure reaches this point. Preserve
+        # the literal tail before closing its block, never on downstream abort.
         tail = stops.feed("", final=True)
         # 收尾冲刷若恰好补完停止序列，同样要同步命中状态（见上方边界冲刷）。
         emitter.stop_hit = stops.hit
         if tail:
             for event in emitter.text_delta(tail):
                 yield event
+        if source_error is not None:
+            for event in emitter.error(*source_error):
+                yield event
+            return
         for event in emitter.finish():
             yield event
         if (trace := get_signature_trace()) is not None:

@@ -31,6 +31,7 @@ from aistudio_api.infrastructure.request_context import (
     unregister_request,
 )
 from aistudio_api.infrastructure.request_history import request_history
+from aistudio_api.infrastructure.signature_trace import get_signature_trace
 from aistudio_api.infrastructure.utils.logger import (
     _mask_json_value,
     _mask_sensitive_value,
@@ -801,6 +802,13 @@ class RequestMiddleware:
                         f"调用结束 · {context.result}"
                         + (f" · {context.error}" if context.error else ""),
                     )
+                    # Interrupted streams can bypass the adapter's final trace log.
+                    # Persist what was observed without reporting a successful finish.
+                    if (
+                        settings.request_history
+                        and (trace := get_signature_trace()) is not None
+                    ):
+                        trace.sync(context)
                     record = {
                         **request_snapshot(context),
                         "started_at": started_at,

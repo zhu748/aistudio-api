@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+import test_ordered_tool_routes as wire_routes
 from fastapi import FastAPI
 from starlette.requests import Request
 
@@ -20,8 +21,10 @@ from aistudio_api.api.routes_compat import router as compat_router
 from aistudio_api.api.routes_gemini import router as gemini_router
 from aistudio_api.api.routes_logs import get_runtime_logs, stream_runtime_logs
 from aistudio_api.application import api_service_gemini
+from aistudio_api.application.compat_shared import encode_signature_envelope
 from aistudio_api.config import settings
 from aistudio_api.domain import tool_signatures
+from aistudio_api.domain.models import ResponsePart
 from aistudio_api.domain.tool_signatures import SKIP_THOUGHT_SIGNATURE
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.session import SessionContext
@@ -29,6 +32,7 @@ from aistudio_api.infrastructure.gateway.wire_types import AistudioPart
 from aistudio_api.infrastructure.request_history import request_history
 from aistudio_api.infrastructure.signature_trace import (
     ThoughtSignatureTrace,
+    get_signature_trace,
     signature_fingerprint,
 )
 from aistudio_api.infrastructure.utils import log_files, logger as log_module
@@ -183,6 +187,125 @@ def test_trace_payload_is_never_corrupted_by_sensitive_key_masking():
     assert "***" not in json.dumps(masked)
 
 
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        ({"call_id": "normalized", "id": "legacy"}, "normalized"),
+        ({"id": "legacy"}, "legacy"),
+        ({"call_id": "", "id": "legacy"}, "legacy"),
+        ({"call_id": {"not": "an id"}, "id": "legacy"}, "legacy"),
+        ({"call_id": "x" * 80}, "x" * 64),
+        ({"call_id": [], "id": {"private": "payload"}}, None),
+        ({}, None),
+    ],
+)
+def test_upstream_signature_item_reads_only_nonempty_string_ids(fields, expected):
+    trace = ThoughtSignatureTrace()
+    trace.record_upstream_in_parts(
+        [
+            ResponsePart(
+                function_call={"name": "measure", "raw": ["private body"], **fields},
+                thought_signature=SIG_A,
+            )
+        ]
+    )
+    assert trace.upstream_in_items == [
+        {
+            "carrier": "function_call",
+            "kind": "real",
+            "source": "upstream_wire",
+            "call_name": "measure",
+            "fp": signature_fingerprint(SIG_A),
+            "head": SIG_A[:12],
+            "len": len(SIG_A),
+            **({"call_id": expected} if expected is not None else {}),
+        }
+    ]
+
+
+@pytest.mark.parametrize("protocol", wire_routes.PROTOCOLS)
+@pytest.mark.parametrize("interrupted", [False, True], ids=["parallel_calls", "cut"])
+async def test_stream_history_matches_observed_signatures(
+    observed_app, monkeypatch, protocol, interrupted
+):
+    http, gateway, _ = observed_app
+    # Empty session, in-process wire fixture, no signer or provider.
+    monkeypatch.setattr(
+        gateway.session, "ensure_ready", AsyncMock(return_value=SessionContext())
+    )
+    parts = (
+        [
+            wire_routes.text("private reasoning", thought=True, signature=SIG_A),
+            wire_routes.text("visible text"),
+        ]
+        if interrupted
+        else [
+            wire_routes.call("measure", {"private": "input"}, "left", signature=SIG_A),
+            wire_routes.call("measure", {"private": "input"}, "right", signature=SIG_B),
+        ]
+    )
+    live = []
+
+    async def send_streaming(**_kwargs):
+        trace = get_signature_trace()
+        assert trace is not None
+        live.append(trace)
+        yield "status", 200
+        yield (
+            "chunk",
+            wire_routes.wire(wire_routes.chunk(parts, None if interrupted else 1)),
+        )
+        if interrupted:
+            yield "error", "fixture stream interrupted"
+
+    monkeypatch.setattr(gateway.session, "send_streaming_request", send_streaming)
+    path, payload = wire_routes.input_request(protocol, stream=True)
+    response = await http.post(path, json=payload)
+    assert response.status_code == 200
+    req_id = response.headers["x-request-id"]
+    row = request_history().get(req_id)
+    assert row is not None and row["status_code"] == 200
+    assert row["result"] == ("error" if interrupted else "success")
+    (observed,) = live
+    saved = cast(dict[str, Any], row["thought_signature"])
+    assert saved == observed.to_dict()
+    upstream, client = saved["upstream_in"], saved["client_out"]
+    assert all(secret not in json.dumps(saved) for secret in (SIG_A, SIG_B, "private"))
+    logs = get_recent_logs(category="thought_signature", request_id=req_id, order="asc")
+    directions = [
+        meta["direction"]
+        for log in logs
+        if isinstance(meta := log.get("sig_meta"), dict)
+    ]
+    if interrupted:
+        # Chat defers the signature to a success-only finish delta. Other adapters
+        # already emitted it; persisting the observation must not synthesize a send.
+        emitted = protocol != "chat"
+        carrier = encode_signature_envelope(SIG_A) if protocol == "claude" else SIG_A
+        assert (carrier in response.text) == emitted
+        assert "fixture stream interrupted" in response.text
+        events = wire_routes.sse_events(response.text)
+        if protocol == "responses":
+            assert events[-1]["type"] == "response.failed"
+        else:
+            assert "error" in events[-1]
+        assert upstream["total_sigs"] == 1 and client["total_sigs"] == int(emitted)
+        assert upstream["fingerprints"] == [signature_fingerprint(SIG_A)]
+        assert client["fingerprints"] == (upstream["fingerprints"] if emitted else [])
+        assert directions == ["outbound"]
+    else:
+        assert SIG_A in response.text and SIG_B in response.text
+        for stage in (upstream, client):
+            assert stage["total_sigs"] == 2
+            assert [
+                (i["call_name"], i.get("call_id"), i["fp"]) for i in stage["items"]
+            ] == [
+                ("measure", "left", signature_fingerprint(SIG_A)),
+                ("measure", "right", signature_fingerprint(SIG_B)),
+            ]
+        assert directions == ["outbound", "inbound"]
+
+
 @pytest.mark.parametrize("protocol", ["gemini", "openai", "responses", "claude"])
 @pytest.mark.parametrize("stream", [False, True])
 async def test_full_signature_lifecycle_persisted_and_logged_across_protocols(
@@ -253,6 +376,8 @@ async def test_full_signature_lifecycle_persisted_and_logged_across_protocols(
     assert fp_a in sig1["upstream_in"]["fingerprints"]
     assert sig1["client_out"]["total_sigs"] == 1
     assert fp_a in sig1["client_out"]["fingerprints"]
+    for stage in ("upstream_in", "client_out"):
+        assert [item["call_id"] for item in sig1[stage]["items"]] == ["call_1"]
 
     # Turn 2: client strips the signature, gateway restores via warm cache
     replies.append(

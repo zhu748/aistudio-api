@@ -1193,7 +1193,7 @@ async def openai_stream_adapter(
     usage_frame: dict[str, object] | None = None
     tool_index = 0
     has_tool_calls = False
-    saw_error = False
+    error_chunk: dict[str, object] | None = None
     # Chat replays a scalar reasoning field before all other assistant Parts.
     # Sign only a single leading thought whose exact text can be replayed.
     reasoning_signature = ""
@@ -1218,13 +1218,10 @@ async def openai_stream_adapter(
             async for frame in _iter_gemini_sse_frames(source):
                 error_obj = frame.get("error")
                 if isinstance(error_obj, dict):
-                    saw_error = True
                     code = _as_int(error_obj.get("code")) or 500
                     message = _as_str(error_obj.get("message")) or "Upstream error"
-                    yield _sse(
-                        _error_chunk(
-                            message, _OPENAI_ERROR_TYPE.get(code, "api_error"), code
-                        )
+                    error_chunk = _error_chunk(
+                        message, _OPENAI_ERROR_TYPE.get(code, "api_error"), code
                     )
                     break
                 candidate = _frame_candidate(frame)
@@ -1405,24 +1402,23 @@ async def openai_stream_adapter(
                             carrier=carrier, signature=raw_sig, reason=reason
                         )
         except Exception as exc:
-            saw_error = True
             record_result(
                 "error", error=f"Stream conversion failed: {type(exc).__name__}: {exc}"
             )
             logger.warning("OpenAI 流式转换异常: %s", exc)
-            yield _sse(
-                _error_chunk(f"{type(exc).__name__}: {exc}", "internal_error", 500)
+            error_chunk = _error_chunk(
+                f"{type(exc).__name__}: {exc}", "internal_error", 500
             )
 
-        if saw_error:
+        # No more source text can complete this prefix, even on upstream failure.
+        # Cancellation and downstream deadlines must not run this flush.
+        if tail := stops.feed("", final=True):
+            yield _sse(_chunk({"content": tail}, None))
+        if error_chunk is not None:
+            yield _sse(error_chunk)
             yield "data: [DONE]\n\n"
             return
 
-        # 流正常结束：冲刷缓冲中可能成为停止词前缀的尾部（无命中时）。
-        if stops.hit is None:
-            tail = stops.feed("", final=True)
-            if tail:
-                yield _sse(_chunk({"content": tail}, None))
         finish_reason = (
             "stop"
             if stops.hit is not None and finish_reason_raw == "STOP"

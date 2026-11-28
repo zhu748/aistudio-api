@@ -114,6 +114,15 @@ def _part_carrier(
     return "text"
 
 
+def _response_call_id(call: dict[str, object] | None) -> str:
+    if isinstance(call, dict):
+        for key in ("call_id", "id"):
+            value = call.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
 def _make_item(
     *,
     carrier: str,
@@ -549,7 +558,7 @@ class ThoughtSignatureTrace:
                         kind=kind,
                         signature=sig,
                         source="upstream_wire",
-                        call_id=str(fc.get("id") or "") if isinstance(fc, dict) else "",
+                        call_id=_response_call_id(fc),
                         call_name=(
                             str(fc.get("name") or "") if isinstance(fc, dict) else ""
                         ),
