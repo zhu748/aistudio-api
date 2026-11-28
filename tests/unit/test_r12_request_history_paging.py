@@ -157,3 +157,93 @@ def test_commit_between_count_and_page_does_not_shift_the_current_page(
         assert (before["total"], before["items"]) == (9, records[5:2:-1])
         after = history.query(result="success", page=2, page_size=3)
         assert (after["total"], after["items"]) == (10, records[6:3:-1])
+
+
+def _dominant_result_history(history, other_count):
+    now = time.time()
+    # Even the nonmatches are newer than every match. Tied timestamps and
+    # shuffled insertion order make request_id the necessary second sort key.
+    statuses = ["stratus"] * 102 + [
+        ("error", "running", "timeout")[i % 3] for i in range(other_count)
+    ]
+    records = [_record(i, now + i // 9, status) for i, status in enumerate(statuses)]
+    for record in chain(records[1::2], records[::2]):
+        history.insert(record)
+    return records
+
+
+@pytest.mark.parametrize(
+    ("other_count", "result", "page", "probe", "ordered_scan"),
+    [
+        (6, "stratus", 3, True, True),  # 6 page entries + 6 nonmatches == 102 // 8.
+        (7, "stratus", 3, True, False),  # Running rows also consume the budget.
+        (0, "stratus", 6, True, True),  # Zero budget, no nonmatches.
+        (0, "stratus", 7, False, False),  # Too deep before probing.
+        (60, "timeout", 1, True, False),  # Rare result, but enough matches to probe.
+    ],
+)
+async def test_dashboard_exact_result_plan_bound(
+    history, monkeypatch, other_count, result, page, probe, ordered_scan
+):
+    records = _dominant_result_history(history, other_count)
+    matches = [row for row in reversed(records) if row["result"] == result]
+    statements = []
+    _on_read_connection(
+        history, monkeypatch, lambda db: db.set_trace_callback(statements.append)
+    )
+    monkeypatch.setattr(routes_operations, "request_history", lambda: history)
+    app = FastAPI()
+    app.include_router(routes_operations.router)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            "/api/requests", params={"page": page, "page_size": 2, "result": result}
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": matches[(page - 1) * 2 : page * 2],
+        "total": len(matches),
+        "page": page,
+        "page_size": 2,
+    }
+    assert statements[1].startswith("SELECT COUNT(*)")
+    assert any(sql.startswith("SELECT 1 ") for sql in statements) == probe
+    prefix = "SELECT payload " if ordered_scan else "SELECT r.payload "
+    assert statements[-2].startswith(prefix)
+
+
+@pytest.mark.parametrize("write_before", ["SELECT 1 ", "SELECT payload "])
+def test_dominance_probe_and_page_share_count_snapshot(
+    history, monkeypatch, write_before
+):
+    records = _dominant_result_history(history, 6)
+    matches = [row for row in reversed(records) if row["result"] == "stratus"]
+    added = _record(110, time.time() + 100, "stratus")
+    wrote = False
+    statements = []
+    with closing(RequestHistory(history.path)) as writer:
+
+        def trace(sql):
+            nonlocal wrote
+            statements.append(sql)
+            if not wrote and sql.startswith(write_before):
+                # These commits both break the bound and shift the expected page.
+                writer.insert(_record(109, time.time() + 100, "timeout"))
+                writer.insert(added)
+                wrote = True
+
+        _on_read_connection(
+            history, monkeypatch, lambda db: db.set_trace_callback(trace)
+        )
+        query = {"page": 3, "page_size": 2, "result": "stratus"}
+        before = history.query(**query)
+        assert wrote
+        assert statements[0] == "BEGIN DEFERRED" and statements[-1] == "COMMIT"
+        assert statements[-2].startswith("SELECT payload ")
+        assert (before["total"], before["items"]) == (len(matches), matches[4:6])
+        matches.insert(0, added)
+        after = history.query(**query)
+        assert statements[-2].startswith("SELECT r.payload ")
+        assert (after["total"], after["items"]) == (len(matches), matches[4:6])

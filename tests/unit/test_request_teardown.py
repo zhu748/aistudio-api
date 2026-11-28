@@ -74,8 +74,10 @@ async def test_teardown_failure_restores_parent_context_and_unregisters(
         current_request.reset(token)
 
 
-async def test_cancellation_during_final_persist_is_propagated_after_cleanup(
+@pytest.mark.parametrize("persist_fails", [False, True])
+async def test_cancellation_during_final_persist_preserves_cleanup_and_its_failure(
     monkeypatch,
+    persist_fails,
 ):
     monkeypatch.setattr(settings, "request_history", False)
     monkeypatch.setattr(runtime_state, "account_service", None)
@@ -89,6 +91,8 @@ async def test_cancellation_during_final_persist_is_propagated_after_cleanup(
         entered.set()
         await release.wait()
         persisted.set()
+        if persist_fails:
+            raise RuntimeError("teardown failed during shutdown")
 
     middleware = RequestMiddleware(app)
     monkeypatch.setattr(middleware, "_persist", persist)
@@ -103,7 +107,11 @@ async def test_cancellation_during_final_persist_is_propagated_after_cleanup(
     await entered.wait()
     task.cancel()
     release.set()
-    with pytest.raises(asyncio.CancelledError):
+    with (
+        pytest.raises(RuntimeError, match="teardown failed during shutdown")
+        if persist_fails
+        else pytest.raises(asyncio.CancelledError)
+    ):
         await task
     assert persisted.is_set() and middleware.active == 0
     assert not active_requests()

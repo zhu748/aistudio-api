@@ -222,18 +222,19 @@ class RequestHistory:
             clauses.append("json_extract(payload, '$.elapsed_ms') >= ?")
             params.append(min_elapsed_ms)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        window = (
-            f"FROM requests{where} "
-            "ORDER BY started_at DESC, request_id DESC LIMIT ? OFFSET ?"
-        )
+        ordered_window = " ORDER BY started_at DESC, request_id DESC LIMIT ? OFFSET ?"
+        window = f"FROM requests{where}{ordered_window}"
         # The first clause excludes running rows; "failed" is a group, not an equality.
         exact_result_only = len(clauses) == 2 and bool(result) and result != "failed"
         count_sql = "SELECT COUNT(*) FROM requests" + where
-        page_first = bool(search or protocol or retried or min_elapsed_ms) and (
+        positive_page = (
             isinstance(page, int)
             and isinstance(page_size, int)
             and page >= 1
             and page_size > 0
+        )
+        page_first = (
+            bool(search or protocol or retried or min_elapsed_ms) and positive_page
         )
         # 只读查询不持进程级写锁（与 metrics 的 WAL 并发读语义一致）：
         # 大范围搜索（COUNT + json_extract LIKE 全表扫描）期间持锁会阻塞
@@ -248,14 +249,36 @@ class RequestHistory:
                 if not page_first:
                     total = connection.execute(count_sql, params).fetchone()[0]
                     if exact_result_only and total > page_size:
-                        # The result index finds matches but doesn't supply page
-                        # order. Sort keys/rowids; fetch JSON only for the page.
-                        page_query = (
-                            "SELECT r.payload FROM ("
-                            f"SELECT rowid AS rid, started_at, request_id {window}) AS page "
-                            "JOIN requests AS r ON r.rowid = page.rid "
-                            "ORDER BY page.started_at DESC, page.request_id DESC"
-                        )
+                        # A shallow page of a dominant result can scan the
+                        # finished-order index instead of sorting every match.
+                        # The range probe stops at budget + 1 index entries;
+                        # counting running as a nonmatch is conservative.
+                        if (
+                            positive_page
+                            and (budget := total // 8 - page * page_size) >= 0
+                            and connection.execute(
+                                "SELECT 1 FROM requests WHERE result < ? "
+                                "UNION ALL SELECT 1 FROM requests WHERE result > ? "
+                                "LIMIT 1 OFFSET ?",
+                                (result, result, budget),
+                            ).fetchone()
+                            is None
+                        ):
+                            # Keep equality as a filter, not an index lookup.
+                            # Even if every nonmatch is newer, at most one
+                            # eighth as many ordered entries need visiting.
+                            page_query = (
+                                "SELECT payload FROM requests WHERE result != 'running' "
+                                "AND (result = ?) IS TRUE" + ordered_window
+                            )
+                        else:
+                            # Sort keys/rowids; fetch JSON only for the page.
+                            page_query = (
+                                "SELECT r.payload FROM ("
+                                f"SELECT rowid AS rid, started_at, request_id {window}) AS page "
+                                "JOIN requests AS r ON r.rowid = page.rid "
+                                "ORDER BY page.started_at DESC, page.request_id DESC"
+                            )
                 offset = (page - 1) * page_size
                 rows = connection.execute(
                     page_query, [*params, page_size, offset]

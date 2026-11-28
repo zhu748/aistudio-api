@@ -101,7 +101,7 @@ _MAGIC_SNIFFERS: tuple[tuple[bytes, str], ...] = (
 # RFC 3986：scheme 大小写不敏感（"DATA:image/png;base64,..." 同样合法）；
 # 参数允许带引号（;name="x";base64,...）。
 _DATA_URL_RE = re.compile(
-    r"^data:(?P<mime>[\w.+-]+/[\w.+-]+)?(?:;[\w=-]+|;\"[^\"]*\")*;base64,(?P<data>.+)$",
+    r"^data:(?P<mime>[\w.+-]+/[\w.+-]+)?(?:;[\w.=-]+|;\"[^\"]*\")*;base64,(?P<data>.+)$",
     re.IGNORECASE | re.DOTALL,
 )
 

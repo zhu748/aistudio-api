@@ -13,7 +13,7 @@ import time
 import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import BinaryIO, cast
+from typing import Any, BinaryIO, cast
 from uuid import uuid4
 
 import anyio
@@ -249,6 +249,26 @@ class _ResponseObserver:
             with contextlib.suppress(OSError):
                 self.request_body_file.close()
             self.request_body_file = None
+
+
+async def _drain_finalizer(
+    future: asyncio.Future[Any],
+) -> asyncio.CancelledError | None:
+    """Join owned teardown work; return host cancellation for the caller to re-raise."""
+    try:
+        await asyncio.shield(future)
+    except asyncio.CancelledError as exc:
+        # Stop outer AnyIO scopes from cancelling every checkpoint, without
+        # forwarding repeated raw Task.cancel() calls to a watcher or DB write.
+        with anyio.CancelScope(shield=True):
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    continue
+            future.result()  # Preserve the finalizer's own exceptions.
+        return exc
+    return None
 
 
 class RequestMiddleware:
@@ -731,10 +751,12 @@ class RequestMiddleware:
             if admitted:
                 self.active -= 1
             try:
+                cancelled = None
                 if disconnect_watch is not None:
                     disconnect_watch.cancel()
-                    with anyio.CancelScope(shield=True):
-                        await asyncio.gather(disconnect_watch, return_exceptions=True)
+                    cancelled = await _drain_finalizer(
+                        asyncio.gather(disconnect_watch, return_exceptions=True)
+                    )
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 if observer.client_disconnected:
                     # Account/quota bookkeeping in generator teardown may
@@ -809,11 +831,10 @@ class RequestMiddleware:
                             dump_enabled,
                         )
                     )
-                    try:
-                        await asyncio.shield(task)
-                    except asyncio.CancelledError:
-                        await task
-                        raise
+                    persist_cancel = await _drain_finalizer(task)
+                    cancelled = cancelled or persist_cancel
+                if cancelled is not None:
+                    raise cancelled
             finally:
                 observer.close_request_body_file()
                 if model_call and admitted:
