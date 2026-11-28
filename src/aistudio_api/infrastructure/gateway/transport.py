@@ -1224,7 +1224,17 @@ class HTTPStreamTransport:
             # requests. Browser preflights must always be anonymous.
             request.headers.pop("cookie", None)
             request.headers.pop("authorization", None)
-            resp = await client.send(request, auth=None)
+            resp = await client.send(request, stream=True, auth=None)
+            _protect_response_close(resp)
+            try:
+                # Decode to EOF before trusting Max-Age, without retaining the
+                # body. HTTPX's automatic EOF close now has the same ownership
+                # as the foreground POST if the caller disconnects.
+                async for _ in resp.aiter_bytes():
+                    pass
+            finally:
+                with anyio.move_on_after(5, shield=True):
+                    await resp.aclose()
             if not 200 <= resp.status_code < 300:
                 logger.warning(
                     "CORS 预检返回 HTTP %d（不阻断主请求）: url=%s",

@@ -38,6 +38,8 @@ class OpenAIChatMessage(BaseModel):
     reasoning_details: list[dict[str, object]] | None = None
     # Only nonblank strings carry assistant refusal history; keep other JSON ignored.
     refusal: object | None = None
+    # Inspect assistant audio references without tightening previously ignored fields.
+    audio: object | None = None
 
 
 class OpenAIChatCompletionRequest(BaseModel):

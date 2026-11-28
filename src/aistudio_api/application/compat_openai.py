@@ -574,6 +574,13 @@ async def openai_to_gemini_request(
             call_id = _as_str(tool_call.get("id"))
             name = _as_str(function.get("name"))
             index_call_name(tool_name_by_id, call_id, name)
+        audio_id = message.audio.get("id") if isinstance(message.audio, dict) else None
+        if isinstance(audio_id, str) and audio_id and not audio_id.isspace():
+            raise ValueError(
+                f"messages[{index}].audio.id is not supported for Chat Completions; "
+                "send the transcript as assistant text or provide base64-encoded "
+                "audio bytes in a user input_audio content block"
+            )
 
     for message in req.messages:
         role = message.role.strip().lower()
