@@ -193,6 +193,15 @@ async def _convert_items_concurrently(
     return parts
 
 
+def _has_inline_file_source(file_data: object) -> bool:
+    """Match the ordinary file converter's source shape without charging media."""
+    return (
+        isinstance(file_data, str)
+        and file_data.startswith("data:")
+        and _DATA_URL_RE.match(file_data.strip()) is not None
+    )
+
+
 def _file_block_to_part(file_data: str, filename: object) -> GeminiPart | None:
     """OpenAI ``file`` / Responses ``input_file`` 的 data URL → inlineData part。
 

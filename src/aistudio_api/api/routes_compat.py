@@ -140,10 +140,9 @@ def _shrink_media_payloads(content: object) -> object:
     return projected
 
 
-# CJK 单字符区间（与 _estimate_tokens 的加权估算配套）
-_CJK_CHAR_RE = re.compile(
-    "[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff]"
-)
+_CJK_CHAR_CLASS = "[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff]"
+# 显式写出首字符以保留 re 的字符集查找快路径；随后一次替换整段 CJK，而非逐字替换。
+_CJK_RUN_RE = re.compile(_CJK_CHAR_CLASS + _CJK_CHAR_CLASS + "*+")
 # ASCII 折算除数（按 Claude Code 真实流量对照 Gemini promptTokenCount 校准，见 _estimate_tokens）
 _ASCII_CHARS_PER_TOKEN = 3.5
 
@@ -161,17 +160,14 @@ def _estimate_tokens(text: str) -> int:
     两份真实抓包（357KB 客户端体、1.49MB 上游线缆体）对照 Gemini 返回的
     promptTokenCount，4.0 分别低估 16% / 11%，3.5 时偏差在 ±2% 内。
     计数全部下沉到 C 层（P6）：逐字符 Python 循环在数 MB 文本上会
-    占满 CPU 数秒——ASCII 用 encode-ignore 计数，CJK 用单字符正则
-    sub 前后长度差计数，均无逐字符解释器开销。
+    占满 CPU 数秒——纯 ASCII 直接取长度，混合文本用 encode-ignore 计数
+    ASCII，用正则整段移除 CJK 后的长度差计数 CJK。
     """
-    if not text:
-        return 0
     total = len(text)
-    ascii_chars = len(text.encode("ascii", errors="ignore"))
-    if ascii_chars == total:
-        # 纯 ASCII 快路径：免做 CJK 正则
+    if text.isascii():
         return int(total / _ASCII_CHARS_PER_TOKEN + 0.5)
-    cjk_chars = total - len(_CJK_CHAR_RE.sub("", text))
+    ascii_chars = len(text.encode("ascii", errors="ignore"))
+    cjk_chars = total - len(_CJK_RUN_RE.sub("", text))
     other_chars = max(0, (total - ascii_chars) - cjk_chars)
     weighted = ascii_chars / _ASCII_CHARS_PER_TOKEN + cjk_chars + other_chars / 1.5
     return int(weighted + 0.5)

@@ -45,6 +45,7 @@ from aistudio_api.application.compat_shared import (
     _file_block_to_part,
     _frame_candidate,
     _frame_parts,
+    _has_inline_file_source,
     _history_call_part,
     _is_signed_empty_thought,
     _iter_gemini_sse_frames,
@@ -96,6 +97,24 @@ def _openai_content_text(content: object) -> str:
                     texts.append(text)
         return "\n\n".join(texts)
     return ""
+
+
+def _check_user_file_references(content: object, message_index: int) -> None:
+    """Check file sources without resolving IDs, converting media or charging bytes."""
+    if not isinstance(content, list):
+        return
+    for index, item in enumerate(content):
+        if not isinstance(item, dict) or item.get("type") != "file":
+            continue
+        file_obj = _as_dict(item.get("file"))
+        if not _as_str(file_obj.get("file_id")).strip():
+            continue
+        if _has_inline_file_source(file_obj.get("file_data")):
+            continue
+        raise ValueError(
+            f"messages[{message_index}].content[{index}].file.file_id is not supported "
+            "for Chat Completions; use file.file_data with an inline base64 data URL"
+        )
 
 
 def _openai_history_call(
@@ -482,12 +501,13 @@ async def openai_to_gemini_request(
     system_texts: list[str] = []
     tool_name_by_id: dict[str, str | None] = {}
 
-    # 第一遍：先扫全部 assistant 消息建 tool_call_id → 函数名映射。
-    # 与 Claude 侧一致的两遍扫描：容忍客户端把 tool 结果放在对应
-    # assistant 消息之前（裁剪/乱序历史），避免函数名回退 "unknown"
-    # 透传给上游 functionResponse 导致上游报错。
-    for message in req.messages:
-        if message.role.strip().lower() != "assistant":
+    # Index call names so results can precede their calls. In the same pass,
+    # check all user file references before even an earlier image can be fetched.
+    for index, message in enumerate(req.messages):
+        role = message.role.strip().lower()
+        if role == "user":
+            _check_user_file_references(message.content, index)
+        if role != "assistant":
             continue
         for tool_call in message.tool_calls or []:
             function = _as_dict(tool_call.get("function"))

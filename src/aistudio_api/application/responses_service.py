@@ -60,6 +60,7 @@ from aistudio_api.application.compat_shared import (
     _DATA_URL_RE,
     _code_text,
     _dropped_part_reason,
+    _has_inline_file_source,
     _is_signed_empty_thought,
     _parse_data_url,
     _read_signature_with_source,
@@ -168,8 +169,7 @@ def _check_user_media_references(content: object, input_index: int) -> None:
                 "input_image.image_url with an HTTP(S) URL or an inline base64 data URL"
             )
         else:
-            data = _as_str(part.get("file_data"))
-            if data.startswith("data:") and _DATA_URL_RE.match(data.strip()):
+            if _has_inline_file_source(part.get("file_data")):
                 continue
             alternative = "input_file.file_data with an inline base64 data URL"
         raise ValueError(

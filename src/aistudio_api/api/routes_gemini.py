@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import re
+from functools import partial
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BeforeValidator
 
 from aistudio_api.api.keepalive import keepalive_response
 from aistudio_api.api.response_models import GeminiGenerateContentResponse
@@ -33,6 +36,92 @@ _FALSY = frozenset({"0", "false", "no", "off", "n", "f"})
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
 # @google/genai uses Node's process.version here, but sends gl-node/web in browsers.
 _NODE_RUNTIME_RE = re.compile(r"gl-node/v[0-9]+\.[0-9]+\.[0-9]+(?:[-+].+)?")
+
+
+_VIDEO_SETTINGS = ("startOffset", "start_offset", "endOffset", "end_offset", "fps")
+_RESOLUTION_SETTINGS = ("level", "numTokens", "num_tokens")
+_PART_MEDIA_SETTINGS = (
+    ("videoMetadata", _VIDEO_SETTINGS),
+    ("video_metadata", _VIDEO_SETTINGS),
+    ("mediaResolution", _RESOLUTION_SETTINGS),
+    ("media_resolution", _RESOLUTION_SETTINGS),
+)
+
+
+def _check_content_media(content: object, path: str, turn: int | None = None) -> None:
+    if not isinstance(content, dict) or not isinstance(
+        parts := content.get("parts"), list
+    ):
+        return
+    for index, part in enumerate(parts):
+        if not isinstance(part, dict):
+            continue
+        for name, fields in _PART_MEDIA_SETTINGS:
+            options = part.get(name)
+            if not isinstance(options, dict):
+                continue
+            for field in fields:
+                value = options.get(field)
+                if isinstance(value, str):
+                    value = value.strip()
+                    if not value:
+                        continue
+                elif isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                if field == "level" and value in (
+                    0,
+                    "0",
+                    "MEDIA_RESOLUTION_UNSPECIFIED",
+                ):
+                    continue
+                # Report only the field path, never the Part's media or user data.
+                location = path if turn is None else f"{path}[{turn}]"
+                raise HTTPException(
+                    400,
+                    detail=f"{location}.parts[{index}].{name}.{field} is not supported on a Gemini Part",
+                )
+
+
+def _check_native_media(body: object, *, count: bool = False) -> object:
+    """Check only direct Content.parts before GeminiPart drops unsupported fields."""
+    if not isinstance(body, dict):
+        return body
+    contents = body.get("contents")
+    contents_path = "contents"
+    generation = body
+    prefix = ""
+    if count:
+        # Count consumes top-level contents if present, otherwise the wrapped
+        # contents, plus the wrapped system instruction in either case.
+        key = (
+            "generateContentRequest"
+            if "generateContentRequest" in body
+            else "generate_content_request"
+        )
+        generation = body.get(key)
+        prefix = f"{key}."
+        if not contents and isinstance(generation, dict):
+            contents = generation.get("contents")
+            contents_path = prefix + "contents"
+    if isinstance(contents, list):
+        for i, content in enumerate(contents):
+            _check_content_media(content, contents_path, i)
+    if isinstance(generation, dict):
+        key = (
+            "systemInstruction"
+            if "systemInstruction" in generation
+            else "system_instruction"
+        )
+        _check_content_media(generation.get(key), prefix + key)
+    return body
+
+
+_NativeGenerate = Annotated[
+    GeminiGenerateContentRequest, BeforeValidator(_check_native_media)
+]
+_NativeCount = Annotated[
+    GeminiCountTokensRequest, BeforeValidator(partial(_check_native_media, count=True))
+]
 
 
 def _sanitize_model_path(model_path: str) -> str:
@@ -73,7 +162,7 @@ def _needs_sdk_terminal_part(request: Request) -> bool:
 )
 async def generate_content(
     model_path: str,
-    req: GeminiGenerateContentRequest,
+    req: _NativeGenerate,
     http_request: Request,
     client: AIStudioClient = Depends(get_client),
 ):
@@ -105,7 +194,7 @@ async def generate_content(
 @router.post("/v1beta/{model_path:path}:countTokens")
 async def count_tokens(
     model_path: str,
-    req: GeminiCountTokensRequest,
+    req: _NativeCount,
     client: AIStudioClient = Depends(get_client),
 ):
     """Gemini 协议 ``models.countTokens``：转发到上游真实 CountTokens 端点。
@@ -121,7 +210,7 @@ async def count_tokens(
 @router.post("/v1beta/{model_path:path}:streamGenerateContent")
 async def stream_generate_content(
     model_path: str,
-    req: GeminiGenerateContentRequest,
+    req: _NativeGenerate,
     http_request: Request,
     client: AIStudioClient = Depends(get_client),
 ):
