@@ -228,6 +228,13 @@ class RequestHistory:
         )
         # The first clause excludes running rows; "failed" is a group, not an equality.
         exact_result_only = len(clauses) == 2 and bool(result) and result != "failed"
+        count_sql = "SELECT COUNT(*) FROM requests" + where
+        page_first = bool(search or protocol or retried or min_elapsed_ms) and (
+            isinstance(page, int)
+            and isinstance(page_size, int)
+            and page >= 1
+            and page_size > 0
+        )
         # 只读查询不持进程级写锁（与 metrics 的 WAL 并发读语义一致）：
         # 大范围搜索（COUNT + json_extract LIKE 全表扫描）期间持锁会阻塞
         # 所有请求的 history insert；_ensure_schema 自带 _schema_lock。
@@ -236,24 +243,30 @@ class RequestHistory:
         with self._connect() as connection:
             connection.execute("BEGIN DEFERRED")
             try:
-                total = connection.execute(
-                    "SELECT COUNT(*) FROM requests" + where, params
-                ).fetchone()[0]
-                if exact_result_only and total > page_size:
-                    # The result index finds matches but doesn't supply page
-                    # order. Sort their keys/rowids; fetch JSON only for the page.
-                    page_query = (
-                        "SELECT r.payload FROM ("
-                        f"SELECT rowid AS rid, started_at, request_id {window}) AS page "
-                        "JOIN requests AS r ON r.rowid = page.rid "
-                        "ORDER BY page.started_at DESC, page.request_id DESC"
-                    )
-                else:
-                    page_query = f"SELECT payload {window}"
+                total = None
+                page_query = f"SELECT payload {window}"
+                if not page_first:
+                    total = connection.execute(count_sql, params).fetchone()[0]
+                    if exact_result_only and total > page_size:
+                        # The result index finds matches but doesn't supply page
+                        # order. Sort keys/rowids; fetch JSON only for the page.
+                        page_query = (
+                            "SELECT r.payload FROM ("
+                            f"SELECT rowid AS rid, started_at, request_id {window}) AS page "
+                            "JOIN requests AS r ON r.rowid = page.rid "
+                            "ORDER BY page.started_at DESC, page.request_id DESC"
+                        )
+                offset = (page - 1) * page_size
                 rows = connection.execute(
-                    page_query,
-                    [*params, page_size, (page - 1) * page_size],
+                    page_query, [*params, page_size, offset]
                 ).fetchall()
+                if total is None:
+                    # A short page proves where matches end, except when a
+                    # later offset returned nothing and might be past the end.
+                    if len(rows) < page_size and (page == 1 or rows):
+                        total = offset + len(rows)
+                    else:
+                        total = connection.execute(count_sql, params).fetchone()[0]
             except BaseException:
                 with contextlib.suppress(sqlite3.Error):
                     connection.rollback()

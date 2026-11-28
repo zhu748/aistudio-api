@@ -23,6 +23,8 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterable, Callable, Iterator
 from dataclasses import dataclass
 
+import httpx
+
 from aistudio_api.api.response_models import (
     GeminiGenerateContentResponse,
 )
@@ -55,6 +57,7 @@ from aistudio_api.application.compat_service import (
     resolve_compat_model,
 )
 from aistudio_api.application.compat_shared import (
+    _DATA_URL_RE,
     _code_text,
     _dropped_part_reason,
     _is_signed_empty_thought,
@@ -129,11 +132,56 @@ def _call_id() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _has_image_url_source(value: object) -> bool:
+    url = _as_str(value).strip()
+    if url[:8].lower().startswith(("http://", "https://")):
+        # Use the downloader's URL parser, not a DNS lookup or a media client.
+        try:
+            return httpx.URL(url).is_absolute_url
+        except (httpx.InvalidURL, UnicodeError):
+            return False
+    return _DATA_URL_RE.match(url) is not None
+
+
+def _check_user_media_references(content: object, input_index: int) -> None:
+    """Reject an unresolvable reference before any message can start media I/O."""
+    if not isinstance(content, list):
+        return
+    for index, part in enumerate(content):
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind not in ("input_image", "input_file"):
+            continue
+        field = "file_id"
+        if not _as_str(part.get(field)).strip():
+            if kind != "input_file" or not _as_str(part.get("file_url")).strip():
+                continue
+            field = "file_url"
+
+        # Match the ordinary converters' source shapes without charging the same
+        # inline bytes twice or attempting to resolve either reference.
+        if kind == "input_image":
+            if _has_image_url_source(part.get("image_url")):
+                continue
+            alternative = (
+                "input_image.image_url with an HTTP(S) URL or an inline base64 data URL"
+            )
+        else:
+            data = _as_str(part.get("file_data"))
+            if data.startswith("data:") and _DATA_URL_RE.match(data.strip()):
+                continue
+            alternative = "input_file.file_data with an inline base64 data URL"
+        raise ValueError(
+            f"input[{input_index}].content[{index}].{field} is not supported for {kind}; use {alternative}"
+        )
+
+
 async def _parts_from_input_content(content: object) -> list[GeminiPart]:
     """Responses input content（str 或 content part 数组）→ Gemini parts。
 
-    支持 ``input_text`` / ``input_image``（image_url 或 file_id 形态不适用
-    ——本项目无文件存储，仅 URL/data URL）/ ``input_file``（data URL）；
+    支持 ``input_text`` / ``input_image``（image_url: HTTP(S) 或 data URL）
+    / ``input_file``（file_data: data URL）；用户消息中无法解析的文件引用已预检；
     其余类型（audio 等）忽略并打日志。
     """
     if isinstance(content, str):
@@ -158,7 +206,6 @@ async def _parts_from_input_content(content: object) -> list[GeminiPart]:
             if isinstance(text, str):
                 parts.append(GeminiPart(text=text))
         elif part_type == "input_image":
-            # data URL / http(s) URL；remote 回传 file_id 场景无法回源，忽略
             url = _as_str(item.get("image_url")).strip()
             if url:
                 parts.append(await _media_part_from_url(url))
@@ -355,11 +402,19 @@ async def responses_to_gemini_request(
     system_texts: list[str] = [req.instructions] if req.instructions else []
     tool_name_by_call_id: dict[str, str | None] = {}
 
-    # Index call ownership first because a result may precede its call.
+    # Check user references before any conversion can fetch an earlier image.
+    # Index call ownership in the same pass because a result may precede its call.
     replayable_call_ids: set[str] = set()
     unfinished_call_ids: set[str] = set()
-    for item in req.input if isinstance(req.input, list) else []:
-        if not isinstance(item, dict) or item.get("type") != "function_call":
+    for index, item in enumerate(req.input if isinstance(req.input, list) else []):
+        if not isinstance(item, dict):
+            continue
+        if (
+            item.get("type") in (None, "message")
+            and _as_str(item.get("role")).strip().lower() == "user"
+        ):
+            _check_user_media_references(item.get("content"), index)
+        if item.get("type") != "function_call":
             continue
         call_id = _as_str(item.get("call_id"))
         if not call_id:
