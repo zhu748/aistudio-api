@@ -345,7 +345,7 @@ Web 面板在「导入账号」「编辑账号」与「全局代理」处提供*
 
 | 协议 | 接口 | 适用客户端 |
 |---|---|---|
-| **Google Gemini（原生）** | `http://localhost:8080`（需版本号时填 `http://localhost:8080/v1beta`） | google-genai SDK 及所有 Gemini 协议客户端 |
+| **Google Gemini（原生）** | `http://localhost:8080`（需版本号时填 `http://localhost:8080/v1beta`） | Gemini 协议客户端；使用 [google-genai Python SDK](#python-sdk-google-genai) 时，将 `api_version` 设为 `v1beta` |
 | **OpenAI 兼容** | `http://localhost:8080/v1` | NextChat / Cherry Studio / one-api / LobeChat 等选择「OpenAI」提供商的客户端 |
 | **Anthropic Claude 兼容** | `http://localhost:8080`（Claude 客户端的 Base URL 无需 `/v1` 后缀，SDK 会自动拼接） | Claude Code / Anthropic SDK / Claude 协议客户端 |
 
@@ -626,7 +626,7 @@ with client.responses.stream(
 
 ### Python SDK (google-genai)
 
-使用 Google 官方 `google-genai` SDK 直连本代理服务：
+Google 官方 Python SDK `google-genai` 的 [3.x 版本默认使用 `v1`](https://github.com/googleapis/python-genai/releases/tag/v3.0.0)。本网关的原生 Gemini 接口位于 `/v1beta`，请使用不带版本后缀的 `base_url`，并在 `http_options` 中显式将 `api_version` 设为 `v1beta`：
 
 ```python
 from google import genai

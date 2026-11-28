@@ -283,7 +283,7 @@ The service exposes three protocol entry points — pick whichever your client s
 
 | Protocol | Endpoint | Suitable Clients |
 |---|---|---|
-| **Google Gemini (native)** | `http://localhost:8080` (use `http://localhost:8080/v1beta` if a version prefix is required) | google-genai SDK and any Gemini-protocol client |
+| **Google Gemini (native)** | `http://localhost:8080` (use `http://localhost:8080/v1beta` if a version prefix is required) | Gemini-protocol clients; for the [google-genai Python SDK](#python-sdk-google-genai), set `api_version` to `v1beta` |
 | **OpenAI compatible** | `http://localhost:8080/v1` | NextChat / Cherry Studio / one-api / LobeChat and any client with an "OpenAI" provider |
 | **Anthropic Claude compatible** | `http://localhost:8080` (Claude clients need no `/v1` suffix — the SDK appends it) | Claude Code / Anthropic SDK and any Claude-protocol client |
 
@@ -454,7 +454,7 @@ curl http://localhost:8080/v1/messages \
 
 ### Python SDK (google-genai)
 
-Using the official `google-genai` Python SDK:
+The official `google-genai` Python SDK [defaults to `v1` in 3.x](https://github.com/googleapis/python-genai/releases/tag/v3.0.0). This gateway serves native Gemini requests at `/v1beta`, so leave the version off the `base_url` and explicitly set `api_version` to `v1beta` in `http_options`:
 
 ```python
 from google import genai

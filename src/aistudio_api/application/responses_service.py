@@ -488,7 +488,7 @@ class _ResponsesOutputBuilder:
         self._buffer: list[str] = []
         self._signature = ""
 
-    def _flush(self) -> None:
+    def _flush(self, status: str = "completed") -> None:
         if not self._buffer:
             return
         text = "".join(self._buffer)
@@ -497,6 +497,7 @@ class _ResponsesOutputBuilder:
                 **_signature_extra(self._signature),
                 "id": _item_id("rs"),
                 "type": "reasoning",
+                "status": status,
                 "summary": [{"type": "summary_text", "text": text}],
             }
             if self._include_encrypted_reasoning and self._signature:
@@ -518,6 +519,7 @@ class _ResponsesOutputBuilder:
                     "id": _item_id("msg"),
                     "type": "message",
                     "role": "assistant",
+                    "status": status,
                     "content": [
                         {"type": "output_text", "text": text, "annotations": []}
                     ],
@@ -600,10 +602,9 @@ class _ResponsesOutputBuilder:
             )
 
     def build_output(self, status: str) -> list[dict[str, object]]:
-        self._flush()
-        for item in self.output:
-            if item["type"] == "message":
-                item["status"] = status
+        # Like SSE, a run closed by an item boundary is already completed.
+        # The terminal status applies only to the run still open at the end.
+        self._flush(status)
         return self.output
 
 
