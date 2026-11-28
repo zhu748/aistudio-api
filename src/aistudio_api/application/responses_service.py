@@ -426,6 +426,11 @@ async def responses_to_gemini_request(
         _reject_state_reference(req.conversation.get("id"), "conversation.id")
     else:
         _reject_state_reference(req.conversation, "conversation")
+    prompt_id = _as_str(_as_dict(req.prompt).get("id"))
+    if prompt_id and not prompt_id.isspace():
+        raise ValueError(
+            "prompt.id is not supported; send the rendered template inline using instructions and input"
+        )
     if req.parallel_tool_calls is False:
         # 该传输不支持强制串行；兼容层接受并告警（与 Chat Completions 一致）。
         logger.warning("parallel_tool_calls=false 无法在上游强制串行，已忽略该提示")

@@ -662,6 +662,16 @@ def _frame_parts(candidate: dict[str, object]) -> list[dict[str, object]]:
     for part in raw:
         if not isinstance(part, dict):
             continue
+        # At most text needs presenting; keep the original Part and its metadata.
+        # Test presence, not truthiness: even null payloads can affect splitting.
+        if (
+            "inlineData" not in part
+            and "functionCall" not in part
+            and "executableCode" not in part
+            and "codeExecutionResult" not in part
+        ):
+            parts.append(part)
+            continue
         code = _code_text(part.get("executableCode"), part.get("codeExecutionResult"))
         payloads = [
             key for key in ("text", "inlineData", "functionCall") if key in part

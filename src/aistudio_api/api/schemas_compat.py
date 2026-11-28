@@ -113,6 +113,8 @@ class OpenAIResponsesRequest(BaseModel):
     # Reject real conversation references during conversion; malformed optional
     # placeholders remain ignored as they were before this field was inspected.
     conversation: object | None = None
+    # Only an object with a nonblank id references a hosted prompt template.
+    prompt: object | None = None
     truncation: str | None = None
     user: str | None = None
     include: list[str] | None = None

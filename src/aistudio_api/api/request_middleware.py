@@ -512,7 +512,6 @@ class RequestMiddleware:
             if message["type"] == "http.response.start":
                 observer.response_started = True
                 observer.status = message["status"]
-                context.status_code = observer.status
                 raw_headers = list(message.get("headers", []))
                 raw_headers = [
                     (k, v) for k, v in raw_headers if k.lower() != b"x-request-id"
@@ -557,7 +556,10 @@ class RequestMiddleware:
             else:
                 await send(message)
             observer.sending = False
-            if message["type"] == "http.response.body":
+            if message["type"] == "http.response.start":
+                # History reports only headers accepted by the outer ASGI send.
+                context.status_code = message["status"]
+            elif message["type"] == "http.response.body":
                 body = message.get("body", b"")
                 # Count any accepted bytes, including keepalives, but not a
                 # blocked or rejected write. Model content timing is separate.
@@ -816,7 +818,6 @@ class RequestMiddleware:
                         "started_at": started_at,
                         "method": scope["method"],
                         "path": redact_text(path),
-                        "status_code": observer.status,
                         "is_stream": observer.is_stream,
                         "elapsed_ms": round(elapsed_ms, 2),
                         "finished_at": time.time(),
