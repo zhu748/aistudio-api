@@ -11,6 +11,7 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    PrivateAttr,
     field_validator,
 )
 
@@ -39,6 +40,9 @@ class GeminiFunctionCall(BaseModel):
         default=None, validation_alias=AliasChoices("args", "arguments")
     )
     id: str | None = None
+    # Set only by a compatibility adapter. A client cannot mark an HTTP
+    # request as exact or supply this provenance through either JSON schema.
+    _compat_args_rewritten: bool = PrivateAttr(default=False)
 
 
 def _function_result_part_filename(part: object) -> object:

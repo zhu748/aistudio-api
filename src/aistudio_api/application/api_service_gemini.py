@@ -778,6 +778,7 @@ async def handle_gemini_generate_content(
     anti_truncation: bool | None = None,
     sdk_terminal: bool = False,
     migrate_history: bool = False,
+    include_start_usage: bool = False,
 ):
     observation = current_request.get()
     if observation is not None:
@@ -823,6 +824,7 @@ async def handle_gemini_generate_content(
             force_buffer=force_buffer,
             sdk_terminal=sdk_terminal,
             migrate_history=migrate_history,
+            include_start_usage=include_start_usage,
         )
 
     last_error: Exception | None = None
@@ -1309,12 +1311,28 @@ class _StreamAttemptState:
     final_usage: dict[str, object] | None = None
     final_finish_reason: str = "OTHER"
     latest_response_id: str | None = None
+    # Only Claude opts in. None means not collecting (or already published).
+    pending_input_usage: dict[str, object] | None = None
 
-    def reset(self) -> None:
-        self.has_yielded_data = False
-        self.final_usage = None
-        self.final_finish_reason = "OTHER"
-        self.latest_response_id = None
+    def observe_input_usage(self, usage: dict[str, object]) -> None:
+        pending = self.pending_input_usage
+        if pending is None:
+            return
+        prompt, cached = usage.get("prompt_tokens"), usage.get("cached_tokens")
+        if not isinstance(cached, int) or cached < 0:
+            cached = None
+        if isinstance(prompt, int) and prompt >= 0:
+            # A new prompt owns its own optional cache count. Keep just the
+            # counters, never the potentially large prompt details array.
+            pending.update(promptTokenCount=prompt, cachedContentTokenCount=cached)
+        elif cached is not None and "promptTokenCount" not in pending:
+            # A partial report is useful only until a coherent input snapshot.
+            pending["cachedContentTokenCount"] = cached
+
+    def attach_input_usage(self, frame: dict[str, object]) -> None:
+        if self.pending_input_usage:
+            frame["usageMetadata"] = self.pending_input_usage
+        self.pending_input_usage = None
 
 
 def _stream_request_kwargs(normalized: NormalizedGeminiRequest) -> dict[str, Any]:
@@ -1610,9 +1628,12 @@ async def _stream_attempt_frames(
                     (time.perf_counter() - stream_start_time) * 1000,
                 )
             state.has_yielded_data = True
-        return _content_frame(
+        frame = _content_frame(
             parts, model_version=model, response_id=state.latest_response_id
         )
+        if state.pending_input_usage is not None:
+            state.attach_input_usage(frame)
+        return frame
 
     try:
         async for event_type, value in anti_stream:
@@ -1678,6 +1699,7 @@ def _build_gemini_streaming_response(
     force_buffer: bool = False,
     sdk_terminal: bool = False,
     migrate_history: bool = False,
+    include_start_usage: bool = False,
 ) -> GeminiStreamResponse:
     """构建 Gemini 流式响应（暴露结构化 frames 供适配层消费）。"""
 
@@ -1707,7 +1729,11 @@ def _build_gemini_streaming_response(
             transient_failures = 0
             total_attempts = get_max_retries() + AUTH_403_MAX_RETRIES
             for stream_attempt in range(total_attempts):
-                state.reset()
+                state = _StreamAttemptState(
+                    pending_input_usage={}
+                    if include_start_usage and not force_buffer
+                    else None
+                )
                 last_stream_error = None
                 await ensure_active_account(stream_attempt, model=model_path)
                 _svc = runtime_state.account_service
@@ -1757,8 +1783,11 @@ def _build_gemini_streaming_response(
                         yield buffered_frame
                         stream_completed = True
                         break
+                    stream_kwargs = _stream_request_kwargs(normalized)
+                    if include_start_usage:
+                        stream_kwargs["on_usage"] = state.observe_input_usage
                     upstream_events = client.stream_generate_content(
-                        **_stream_request_kwargs(normalized),
+                        **stream_kwargs,
                         prepared=auth_manager.current_prepared,
                         signature_migration=signature_migration,
                     )
@@ -1857,6 +1886,8 @@ def _build_gemini_streaming_response(
                     state.final_finish_reason
                 )
                 if diagnostic_chunk:
+                    if state.pending_input_usage is not None:
+                        state.attach_input_usage(diagnostic_chunk)
                     has_yielded_any = True
                     yield diagnostic_chunk
             # 收尾记账以请求上下文记录的实际服务账号为准（防并发串号）。

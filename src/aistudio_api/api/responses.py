@@ -10,6 +10,7 @@ from aistudio_api.api.response_models import (
     GeminiUsageMetadata,
 )
 from aistudio_api.domain.models import GeneratedImage, ResponsePart
+from aistudio_api.infrastructure.gateway.wire_parser import PositionalTextCall
 
 
 def _coerce_usage_int(value: object) -> int:
@@ -73,7 +74,11 @@ def _image_inline_data(image: GeneratedImage) -> GeminiInlineDataResponse:
 
 def _tool_part_fields(value: dict[str, object], payload_key: str) -> dict[str, object]:
     """Keep sparse wire updates sparse until the response-level assembly."""
-    fields: dict[str, object] = {}
+    fields: dict[str, object] = (
+        PositionalTextCall(value.argument_text)
+        if payload_key == "args" and isinstance(value, PositionalTextCall)
+        else {}
+    )
     name = value.get("name")
     if isinstance(name, str) and name:
         fields["name"] = name

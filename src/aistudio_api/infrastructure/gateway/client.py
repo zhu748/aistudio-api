@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextvars
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from aistudio_api.config import DEFAULT_TEXT_MODEL
@@ -319,6 +320,7 @@ class AIStudioClient:
         prepared: PreparedRequest | None = None,
         function_name_restore: dict[str, str] | None = None,
         signature_migration: HistorySignatureMigration | None = None,
+        on_usage: Callable[[dict[str, object]], None] | None = None,
     ):
         effective_prep = prepared or await self.prepare_request(
             model=model,
@@ -339,6 +341,7 @@ class AIStudioClient:
         gateway_stream = self._streaming_gateway.stream_chat(
             request=effective_prep,
             model=model,
+            **({"on_usage": on_usage} if on_usage is not None else {}),
         )
         try:
             async for event in gateway_stream:

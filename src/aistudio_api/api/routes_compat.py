@@ -412,6 +412,7 @@ async def claude_messages(
             client,
             stream=req.stream,
             anti_truncation=_parse_anti_truncation_header(http_request),
+            include_start_usage=req.stream,
         )
         if req.stream:
             if isinstance(response, StreamingResponse):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import codecs
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 
 from aistudio_api.domain.errors import (
     RequestError,
@@ -61,6 +61,7 @@ class StreamingGateway:
         *,
         request: PreparedRequest,
         model: str,
+        on_usage: Callable[[dict[str, object]], None] | None = None,
     ) -> AsyncGenerator[tuple[str, object | None], None]:
         if not request:
             raise ValueError("prepared request is required")
@@ -116,6 +117,8 @@ class StreamingGateway:
             usage = parse_chunk_usage(parsed_chunk)
             if usage:
                 latest_usage = usage
+                if on_usage is not None:
+                    on_usage(usage)
             if (
                 isinstance(parsed_chunk, list)
                 and len(parsed_chunk) > WIRE_RESPONSE_ID_INDEX

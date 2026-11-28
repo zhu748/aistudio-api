@@ -830,6 +830,7 @@ def _convert_part(
     if (fc := part.functionCall) is not None:
         args = fc.args if fc.args is not None else {}
         native.function_call = (fc.name, args, fc.id) if fc.id else (fc.name, args)
+        native._compat_args_rewritten = fc._compat_args_rewritten
     if (code := part.executableCode) is not None:
         native.executable_code = (code.language, code.code)
         if code.id is not None or code.language.upper() not in (

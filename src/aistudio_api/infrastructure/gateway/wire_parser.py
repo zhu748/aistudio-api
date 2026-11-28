@@ -240,6 +240,20 @@ def parse_response_part(raw_part: object) -> ResponsePart:
     )
 
 
+class PositionalTextCall(dict[str, object]):
+    """Normalized call fields plus the original positional argument string.
+
+    This provenance is not a JSON field: a dictionary-shaped wire payload
+    (including one containing its own `raw` list) cannot claim it.
+    """
+
+    __slots__ = ("argument_text",)
+
+    def __init__(self, argument_text: str) -> None:
+        super().__init__()
+        self.argument_text = argument_text
+
+
 def _coerce_wire_payload(
     raw_value: object, payload_type: str
 ) -> dict[str, object] | None:
@@ -250,7 +264,14 @@ def _coerce_wire_payload(
         dict_payload.setdefault("type", payload_type)
         return dict_payload
     if isinstance(raw_value, list):
-        list_payload: dict[str, object] = {"type": payload_type, "raw": raw_value}
+        list_payload: dict[str, object] = (
+            PositionalTextCall(raw_value[1])
+            if payload_type == "functionCall"
+            and len(raw_value) > 1
+            and isinstance(raw_value[1], str)
+            else {}
+        )
+        list_payload.update(type=payload_type, raw=raw_value)
         if raw_value and isinstance(raw_value[0], str):
             list_payload["name"] = raw_value[0]
         if len(raw_value) > 1:
@@ -696,6 +717,7 @@ __all__ = [
     "WIRE_USAGE_REASONING_TOKENS",
     "WIRE_USAGE_TOTAL_TOKENS",
     "WIRE_USAGE_VISIBLE_COMPLETION",
+    "PositionalTextCall",
     "ResponsePart",
     "parse_chunk_usage",
     "parse_response_chunk",

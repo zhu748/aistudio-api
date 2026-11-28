@@ -60,6 +60,7 @@ from aistudio_api.application.stream_utils import (
     part_payload_signature,
 )
 from aistudio_api.domain.tool_signatures import (
+    SKIP_THOUGHT_SIGNATURE,
     remember_function_signature as _remember_function_signature,
     valid_thought_signature,
 )
@@ -93,20 +94,46 @@ def _openai_content_text(content: object) -> str:
     return ""
 
 
-def _openai_tool_arguments(raw: object) -> dict[str, object] | list[object]:
-    """OpenAI tool_calls function.arguments（JSON 字符串）→ 参数对象。"""
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, list):
-        return raw
+def _openai_history_call(
+    name: str,
+    raw: object,
+    call_id: str,
+    signature: str | None,
+    source: str,
+    trace: ThoughtSignatureTrace | None,
+    *,
+    responses: bool = False,
+) -> GeminiPart:
+    """Preserve each API's argument fallback without treating it as a signed echo."""
+    parsed = raw
+    malformed_json = False
     if isinstance(raw, str) and raw.strip():
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            return {}
-        if isinstance(parsed, (dict, list)):
-            return parsed
-    return {}
+            malformed_json = True
+    # Chat also accepts array arguments; Responses has always required an
+    # object and preserves malformed JSON text in a raw_arguments wrapper.
+    exact = isinstance(parsed, dict) or (not responses and isinstance(parsed, list))
+    if not exact:
+        parsed = {"raw_arguments": raw} if responses and malformed_json else {}
+        if signature and signature != SKIP_THOUGHT_SIGNATURE:
+            if trace is not None:
+                trace.record_client_drop(
+                    carrier="function_call",
+                    raw_signature=signature,
+                    source=source,
+                    call_id=call_id,
+                    call_name=name,
+                    note="rewritten_call_arguments",
+                )
+            signature = None
+    call = GeminiFunctionCall(name=name, args=parsed, id=call_id or None)
+    call._compat_args_rewritten = not exact
+    part = GeminiPart(functionCall=call, thoughtSignature=signature)
+    if trace is not None and signature and source:
+        trace.tag_inbound_source(part, source)
+    return part
 
 
 async def _openai_parts_from_content(content: object) -> list[GeminiPart]:
@@ -340,6 +367,7 @@ def _parse_openai_reasoning_details(
     *,
     tool_call_ids: set[str],
     trace: ThoughtSignatureTrace | None,
+    scalar_present: bool,
 ) -> tuple[list[tuple[str, str | None, str]], dict[str, str]]:
     """Extract Google-compatible thought parts and tool-call signatures from reasoning_details."""
     thoughts: list[tuple[str, str | None, str]] = []
@@ -351,21 +379,29 @@ def _parse_openai_reasoning_details(
         fmt = _as_str(entry.get("format")).strip().lower()
         is_google_fmt = not fmt or "google" in fmt or "gemini" in fmt
         if entry_type in ("reasoning.text", "reasoning.summary"):
-            text = (
-                _as_str(entry.get("text"))
-                if entry_type == "reasoning.text"
-                else _as_str(entry.get("summary"))
-            )
+            text = entry.get("text" if entry_type == "reasoning.text" else "summary")
+            if not isinstance(text, str):
+                continue  # Missing, null or non-text is not a signed empty string.
             raw_sig = _as_str(entry.get("signature"))
             sig: str | None = None
             source = ""
             if raw_sig:
                 decoded = decode_signature_envelope(raw_sig)
-                if decoded:
+                if scalar_present:
+                    # Overriding an existing display value requires a scoped
+                    # opaque value, not just bytes from an unspecified format.
+                    candidate = decoded or (
+                        raw_sig if fmt == "google-gemini-v1" else None
+                    )
+                    if candidate != SKIP_THOUGHT_SIGNATURE and valid_thought_signature(
+                        candidate
+                    ):
+                        sig = candidate
+                elif decoded:
                     sig = decoded
-                    source = "client_reasoning_details"
                 elif is_google_fmt and valid_thought_signature(raw_sig):
                     sig = raw_sig
+                if sig:
                     source = "client_reasoning_details"
                 elif trace is not None:
                     trace.record_client_drop(
@@ -399,7 +435,7 @@ def _parse_openai_reasoning_details(
             entry_id = _as_str(entry.get("id"))
             if entry_id and entry_id in tool_call_ids:
                 tool_sigs.setdefault(entry_id, candidate_sig)
-            elif _is_signed_empty_thought("", candidate_sig):
+            elif not scalar_present and _is_signed_empty_thought("", candidate_sig):
                 thoughts.append(("", candidate_sig, "client_reasoning_details"))
     return thoughts, tool_sigs
 
@@ -454,6 +490,16 @@ async def openai_to_gemini_request(
                     "thoughtSignature": message.thoughtSignature,
                 }
             )
+            reasoning_text = message.reasoning_content
+            if not reasoning_text and not _is_signed_empty_thought(
+                reasoning_text, reasoning_signature
+            ):
+                reasoning_text = (
+                    message.reasoning if isinstance(message.reasoning, str) else None
+                )
+            scalar_present = bool(reasoning_text) or _is_signed_empty_thought(
+                reasoning_text, reasoning_signature
+            )
             msg_tool_call_ids = {
                 _as_str(tc.get("id"))
                 for tc in (message.tool_calls or [])
@@ -466,18 +512,18 @@ async def openai_to_gemini_request(
                     message.reasoning_details,
                     tool_call_ids=msg_tool_call_ids,
                     trace=trace,
+                    scalar_present=scalar_present,
                 )
-            reasoning_text = message.reasoning_content
-            if not reasoning_text and not _is_signed_empty_thought(
-                reasoning_text, reasoning_signature
-            ):
-                reasoning_text = (
-                    message.reasoning if isinstance(message.reasoning, str) else None
-                )
-            if reasoning_text is not None and (
-                reasoning_text
-                or _is_signed_empty_thought(reasoning_text, reasoning_signature)
-            ):
+            # Some clients echo both original reasoning Parts and a flattened
+            # display string. Only substitute original, scoped detail owners
+            # for an unsigned scalar when their texts are its exact mirror.
+            detail_mirror = (
+                scalar_present
+                and any(sig for _, sig, _ in detail_thoughts)
+                and not valid_thought_signature(reasoning_signature)
+                and "".join(text for text, _, _ in detail_thoughts) == reasoning_text
+            )
+            if scalar_present and not detail_mirror:
                 thought_part = GeminiPart(
                     text=reasoning_text,
                     thought=True,
@@ -487,6 +533,13 @@ async def openai_to_gemini_request(
                     trace.tag_inbound_source(thought_part, reasoning_sig_source)
                 parts.append(thought_part)
             elif detail_thoughts:
+                if detail_mirror and reasoning_signature and trace is not None:
+                    trace.record_client_drop(
+                        carrier="thought",
+                        raw_signature=reasoning_signature,
+                        source=reasoning_sig_source,
+                        note="invalid_base64",
+                    )
                 for dt_text, dt_sig, dt_source in detail_thoughts:
                     thought_part = GeminiPart(
                         text=dt_text,
@@ -517,21 +570,21 @@ async def openai_to_gemini_request(
             for tool_call in message.tool_calls or []:
                 function = _as_dict(tool_call.get("function"))
                 name = _as_str(function.get("name")) or "unknown"
-                args = _openai_tool_arguments(function.get("arguments"))
                 call_id = _as_str(tool_call.get("id"))
                 tc_sig, tc_source = _read_signature_with_source(tool_call)
                 if not tc_sig and call_id and call_id in detail_tool_sigs:
                     tc_sig = detail_tool_sigs[call_id]
                     tc_source = "client_reasoning_details"
-                fc_part = GeminiPart(
-                    thoughtSignature=tc_sig,
-                    functionCall=GeminiFunctionCall(
-                        name=name, args=args, id=call_id or None
-                    ),
+                parts.append(
+                    _openai_history_call(
+                        name,
+                        function.get("arguments"),
+                        call_id,
+                        tc_sig,
+                        tc_source,
+                        trace,
+                    )
                 )
-                if trace is not None and tc_source:
-                    trace.tag_inbound_source(fc_part, tc_source)
-                parts.append(fc_part)
                 if call_id:
                     tool_name_by_id[call_id] = name
             contents.append(

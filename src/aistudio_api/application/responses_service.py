@@ -27,7 +27,6 @@ from aistudio_api.api.response_models import (
 )
 from aistudio_api.api.schemas import (
     GeminiContent,
-    GeminiFunctionCall,
     GeminiFunctionResponse,
     GeminiGenerateContentRequest,
     GeminiGenerationConfig,
@@ -35,6 +34,7 @@ from aistudio_api.api.schemas import (
     GeminiPart,
 )
 from aistudio_api.api.schemas_compat import OpenAIResponsesRequest
+from aistudio_api.application.compat_openai import _openai_history_call
 from aistudio_api.application.compat_service import (
     _as_dict,
     _as_int,
@@ -339,28 +339,18 @@ async def responses_to_gemini_request(
                     continue
                 name = _as_str(item.get("name")) or "unknown"
                 call_id = _as_str(item.get("call_id"))
-                args = item.get("arguments")
-                parsed_args: object = {}
-                if isinstance(args, str) and args.strip():
-                    try:
-                        parsed_args = json.loads(args)
-                    except json.JSONDecodeError:
-                        parsed_args = {"raw_arguments": args}
-                elif isinstance(args, dict):
-                    parsed_args = args
                 if call_id:
                     tool_name_by_call_id[call_id] = name
                 sig, sig_source = _read_signature_with_source(item)
-                fc_part = GeminiPart(
-                    thoughtSignature=sig,
-                    functionCall=GeminiFunctionCall(
-                        name=name,
-                        args=parsed_args if isinstance(parsed_args, dict) else {},
-                        id=call_id or None,
-                    ),
+                fc_part = _openai_history_call(
+                    name,
+                    item.get("arguments"),
+                    call_id,
+                    sig,
+                    sig_source,
+                    trace,
+                    responses=True,
                 )
-                if trace is not None and sig_source:
-                    trace.tag_inbound_source(fc_part, sig_source)
                 contents.append(GeminiContent(role="model", parts=[fc_part]))
             elif item_type == "function_call_output":
                 call_id = _as_str(item.get("call_id"))

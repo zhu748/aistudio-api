@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import secrets
 from array import array
 from collections.abc import AsyncGenerator, AsyncIterable, Generator
 from dataclasses import dataclass, field
 
+from aistudio_api.infrastructure.gateway.wire_parser import PositionalTextCall
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("stream.utils")
 
 _MAX_TOOL_ARGUMENT_BYTES = 16 * 1024 * 1024
+_MAX_TOOL_ARGUMENT_FRAGMENTS = 16_384
 _MAX_TOOL_RESPONSE_BYTES = 64 * 1024 * 1024
 
 
@@ -209,6 +212,54 @@ def _matches_signed_prefix(fragments: list[str], snapshot: str) -> bool:
     return offset > 0
 
 
+def _finite_argument_number(token: str) -> float:
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError("Non-finite JSON argument")
+    return value
+
+
+def _unique_argument_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise ValueError("Duplicate JSON argument key")
+    return obj
+
+
+_LITERAL_DECODER = json.JSONDecoder(
+    parse_float=_finite_argument_number,
+    parse_constant=_finite_argument_number,
+    object_pairs_hook=_unique_argument_keys,
+)
+
+
+def _fragment_object(
+    fragments: list[str], *, literal: bool = False
+) -> dict[str, object] | None:
+    raw = "".join(fragments)
+    try:
+        value = (_LITERAL_DECODER if literal else _JSON_DECODER).decode(raw)
+        if (
+            literal
+            and "\\u" in raw
+            and _SURROGATE.search(_STRICT_COMPACT_JSON.encode(value))
+        ):
+            return None
+    except (ValueError, RecursionError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+@dataclass(slots=True)
+class _LiteralArguments:
+    """One append-only interpretation of an explicitly identified wire call."""
+
+    fragments: list[str]
+    size: int
+    signature: object
+    signature_size: int
+
+
 @dataclass(slots=True, eq=False)
 class _ToolCall:
     call_id: str
@@ -218,14 +269,25 @@ class _ToolCall:
     fragments: list[str] = field(default_factory=list)
     size: int = 0
     invalid: bool = False
+    literal_only: bool = False
     explicit_chain: bool = True
     needs_signed_snapshot: bool = False
+    wire_prefix: bool = False
+    literal: _LiteralArguments | None = None
+
+    @property
+    def retained_size(self) -> int:
+        return self.size + (
+            self.literal.size + self.literal.signature_size
+            if self.literal is not None
+            else 0
+        )
 
     def matches(self, name: str) -> bool:
         return self.name.startswith(name) or name.startswith(self.name)
 
     def awaiting_args(self) -> bool:
-        if self.invalid or self.args is not None:
+        if self.invalid or self.literal_only or self.args is not None:
             return False
         if not self.fragments or not self.fragments[-1].rstrip().endswith("}"):
             return True
@@ -253,7 +315,12 @@ class _ToolCall:
         return offset > 0
 
     def _can_grow_name(self, args: object) -> bool:
-        if self.invalid or self.args is not None or isinstance(args, dict):
+        if (
+            self.invalid
+            or self.literal_only
+            or self.args is not None
+            or isinstance(args, dict)
+        ):
             return False
         if not self.fragments or (isinstance(args, str) and args.strip()):
             # A nonempty suffix appended to a completed object could not form
@@ -324,7 +391,55 @@ class _ToolCall:
         *,
         same_envelope: bool,
         may_be_cumulative: bool,
+        wire_text: str | None,
     ) -> None:
+        exact_owner = bool(
+            wire_text is not None
+            and self.explicit_chain
+            and not self.invalid
+            and not self.needs_signed_snapshot
+            and same_envelope
+            and call_id
+            and call_id == self.call_id
+            and name
+            and (not self.name or name == self.name)
+        )
+        new_size = _utf8_size(args) if isinstance(args, str) else 0
+        cumulative = (
+            isinstance(args, str)
+            and may_be_cumulative
+            and bool(self.fragments)
+            and new_size >= self.size
+            and args.startswith(self.fragments[0])
+            and args.startswith("".join(self.fragments))
+        )
+        if not exact_owner:
+            self.literal = None
+            self.wire_prefix = False
+        elif wire_text is not None:
+            # A complete object or array-shaped string can itself be a value
+            # inside an open object; even a repeated opener can be a delta.
+            # Fork only where the normal snapshot rule would lose that text.
+            if (
+                self.literal is None
+                and self.wire_prefix
+                and not self.literal_only
+                and self.fragments
+                and (isinstance(args, (dict, list)) or cumulative)
+                and self.fragments[0].lstrip(" \t\r\n").startswith("{")
+            ):
+                marker = self.envelope.get("thoughtSignature")
+                self.literal = _LiteralArguments(
+                    self.fragments.copy(),
+                    self.size,
+                    marker,
+                    _retained_size(marker) if marker else 0,
+                )
+            if self.literal is not None:
+                self.literal.size += (
+                    new_size if wire_text is args else _utf8_size(wire_text)
+                )
+                self.literal.fragments.append(wire_text)
         signature = self._update_identity(call_id, name, args, signature, same_envelope)
         if isinstance(args, dict):
             try:
@@ -352,49 +467,69 @@ class _ToolCall:
             self.size = _utf8_size(snapshot)
             self.args = args
             self.fragments.clear()
+            self.wire_prefix = False
         elif isinstance(args, str) and args and (self.fragments or args.strip()):
             if self.args is not None:
                 self.envelope.pop("thoughtSignature", None)
                 self.args = None
                 self.size = 0
-            new_size = _utf8_size(args)
-            if (
-                may_be_cumulative
-                and self.fragments
-                and new_size >= self.size
-                and args.startswith(self.fragments[0])
-                and args.startswith("".join(self.fragments))
-            ):
+            if cumulative:
                 self.fragments.clear()
                 self.size = 0
+            if not self.fragments:
+                self.wire_prefix = exact_owner
             self.size += new_size
-            if len(self.fragments) >= 16_384:
+            if len(self.fragments) >= _MAX_TOOL_ARGUMENT_FRAGMENTS:
                 raise ValueError(
                     "Tool argument fragment count exceeds configured size limit"
                 )
             self.fragments.append(args)
         elif args is not None and not isinstance(args, str):
-            self.invalid = True
+            if isinstance(args, list) and self.literal is not None:
+                # Invalid as root arguments. Only the already established
+                # literal chain may prove this positional array was a value.
+                self.literal_only = True
+            else:
+                self.invalid = True
         if self.size > _MAX_TOOL_ARGUMENT_BYTES:
             raise ValueError("Tool arguments exceed configured size limit")
+        if self.literal is not None and (
+            self.literal.size + self.size > _MAX_TOOL_ARGUMENT_BYTES
+            or len(self.literal.fragments) + len(self.fragments)
+            > _MAX_TOOL_ARGUMENT_FRAGMENTS
+        ):
+            # The optional interpretation must not displace a valid normal
+            # snapshot, or expand the existing per-call retention limits.
+            self.literal = None
         if isinstance(signature, str) and signature:
             self.envelope["thoughtSignature"] = signature
 
     def complete_args(self) -> dict[str, object] | None:
-        if self.invalid:
+        if self.invalid or self.literal_only:
             return None
         if self.args is not None:
             return self.args
         if not self.fragments:
             return {}
-        try:
-            result = json.loads("".join(self.fragments))
-        except ValueError:
-            return None
-        return result if isinstance(result, dict) else None
+        return _fragment_object(self.fragments)
 
     def part(self, *, synthesize_ids: bool) -> dict[str, object] | None:
         args = self.complete_args()
+        envelope = self.envelope
+        if (
+            not self.invalid
+            and self.literal is not None
+            and (literal_args := _fragment_object(self.literal.fragments, literal=True))
+            is not None
+        ):
+            # Never choose between two complete interpretations. An inner
+            # standalone snapshot's proof cannot sign an augmented outer call.
+            if args is not None:
+                return None
+            args = literal_args
+            envelope = _without_call(self.envelope)
+            if self.literal.signature:
+                envelope["thoughtSignature"] = self.literal.signature
         if not self.name or args is None:
             return None
         call: dict[str, object] = {"name": self.name, "args": args}
@@ -402,7 +537,7 @@ class _ToolCall:
             call["id"] = self.call_id
         elif synthesize_ids:
             call["id"] = f"call_{secrets.token_hex(12)}"
-        return {**self.envelope, "functionCall": call}
+        return {**envelope, "functionCall": call}
 
 
 def has_response_content(part: dict[str, object]) -> bool:
@@ -501,12 +636,17 @@ class ToolResponseAssembler:
         self._interrupted = True
         return kept
 
+    def _within_byte_budget(self) -> bool:
+        if self._argument_bytes + self._retained_bytes > _MAX_TOOL_RESPONSE_BYTES:
+            # Reclaim optional branches before rejecting ordinary snapshots.
+            for pending in self._calls:
+                self._argument_bytes -= pending.retained_size - pending.size
+                pending.literal = None
+        return self._argument_bytes + self._retained_bytes <= _MAX_TOOL_RESPONSE_BYTES
+
     def _retain(self, part: dict[str, object] | _ToolCall, size: int) -> None:
         self._retained_bytes += size
-        if (
-            len(self._ordered) >= 16_384
-            or self._argument_bytes + self._retained_bytes > _MAX_TOOL_RESPONSE_BYTES
-        ):
+        if len(self._ordered) >= 16_384 or not self._within_byte_budget():
             raise ValueError("Ordered tool response exceeds configured size limit")
         self._ordered.append(part)
 
@@ -593,7 +733,7 @@ class ToolResponseAssembler:
             seen.add(tool)
             if call_id:
                 self._by_id[call_id] = tool
-            old_size = tool.size
+            old_size = tool.retained_size
             old_fields_size = _retained_size(tool.name) + _retained_size(
                 tool.envelope.get("thoughtSignature")
             )
@@ -604,6 +744,9 @@ class ToolResponseAssembler:
                 signature,
                 same_envelope=same_envelope,
                 may_be_cumulative=may_be_cumulative,
+                wire_text=raw.argument_text
+                if isinstance(raw, PositionalTextCall)
+                else None,
             )
             if call_id and not tool.call_id:
                 tool.call_id = call_id
@@ -613,8 +756,8 @@ class ToolResponseAssembler:
                 + _retained_size(tool.envelope.get("thoughtSignature"))
                 - old_fields_size
             )
-            self._argument_bytes += tool.size - old_size
-            if self._argument_bytes + self._retained_bytes > _MAX_TOOL_RESPONSE_BYTES:
+            self._argument_bytes += tool.retained_size - old_size
+            if not self._within_byte_budget():
                 raise ValueError(
                     "Total tool arguments and ordered response exceed configured size limit"
                 )

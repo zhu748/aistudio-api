@@ -363,6 +363,10 @@ class AistudioPart:
     thought_signature: str | None = None
     thought: bool = False
     raw_wire: list[object] | None = field(default=None, repr=False)
+    # Internal provenance only: never a wire slot or part of payload equality.
+    _compat_args_rewritten: bool = field(
+        default=False, repr=False, compare=False, kw_only=True
+    )
 
     def to_wire(self) -> list[object]:
         if self.raw_wire is not None:

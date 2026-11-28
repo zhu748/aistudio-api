@@ -939,6 +939,15 @@ class _ClaudeStreamEmitter:
                 has_tool_use=self.has_tool_use,
             )
         usage_payload = _claude_usage_payload(_usage_from_gemini(self.usage_frame))
+        if (
+            self.start_usage is not None
+            and self.usage_frame is not None
+            and (_as_int(self.start_usage.get("cachedContentTokenCount")) or 0) > 0
+            and "cache_read_input_tokens" not in usage_payload
+        ):
+            # A missing field leaves the SDK accumulator's initial cache count
+            # intact. Explicit zero clears it when the final meter says no hit.
+            usage_payload["cache_read_input_tokens"] = 0
         events.append(
             self.sse(
                 "message_delta",
@@ -969,12 +978,8 @@ async def claude_stream_adapter(
         lambda message: emitter.error(504, message),
         register_failure,
     ):
-        # 先取首帧再发 message_start：Gemini 首帧一般携带 usageMetadata
-        # （promptTokenCount），据此让 message_start 的 usage 带真实
-        # input_tokens（Anthropic 官方语义；旧版 SDK 不合并 message_delta
-        # 的 input 字段，等 message_start 的客户端会拿到 0 导致上下文
-        # 用量统计失真）。首帧未带计量或流立即结束时退回占位值，终值仍
-        # 由 message_delta usage 覆盖。等待窗口内 SSE 心跳注释保活。
+        # 只取首个可发布帧：本地流若已有输入计量，会附在该帧上；缓冲变体
+        # 则已带终值。无计量时先用占位值，不为 usage 多等一帧。
         frames = _iter_gemini_sse_frames(source)
         first_frame: dict[str, object] | None = None
         pending_error: Exception | None = None
