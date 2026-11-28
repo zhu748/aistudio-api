@@ -57,6 +57,45 @@ MODEL_URL = "https://x/$rpc/MakerSuiteService/GenerateContent"
 COUNT_URL = "https://x/$rpc/MakerSuiteService/CountTokens"
 
 
+@pytest.mark.parametrize("request_id", [None, "req_same_request"])
+@pytest.mark.parametrize(
+    ("status", "suffix"), [(200, ".upstream.ok.json"), (500, ".upstream.json")]
+)
+def test_same_millisecond_snapshots_only_coalesce_for_a_real_request(
+    monkeypatch, tmp_path, request_id, status, suffix
+):
+    monkeypatch.setenv("AISTUDIO_UPSTREAM_SNAPSHOT_KEEP", "5")
+    monkeypatch.setattr(dump.time, "time", lambda: 1_700_000_000.0)
+    monkeypatch.setattr(dump, "_last_success_prune", 0.0)
+    token = current_request.set(RequestContext(request_id) if request_id else None)
+    try:
+        for label in ("first", "second"):
+            assert (
+                dump.save_upstream_exchange(
+                    url=MODEL_URL,
+                    wire_headers=[],
+                    body=json.dumps([label]),
+                    status=status,
+                    response_sample="",
+                )
+                is not None
+            )
+    finally:
+        current_request.reset(token)
+
+    bodies = {}
+    for path in tmp_path.glob(f"req_*{suffix}"):
+        snapshot = json.loads(path.read_text(encoding="utf-8"))
+        snapshot_id = snapshot["request_id"]
+        assert path.name == f"{snapshot_id}{suffix}"
+        bodies[snapshot_id] = snapshot["upstream"]["wire_body"]
+    if request_id is None:
+        assert sorted(bodies.values()) == [["first"], ["second"]]
+        assert all(snapshot_id.startswith("req_bg_") for snapshot_id in bodies)
+    else:
+        assert bodies == {request_id: ["second"]}
+
+
 @pytest.mark.parametrize("status", [200, 400])
 async def test_large_upstream_snapshot_serves_small_preview_and_full_json(
     monkeypatch, status

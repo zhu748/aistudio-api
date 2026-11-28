@@ -37,6 +37,7 @@ import time
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, BinaryIO
+from uuid import uuid4
 
 from aistudio_api.infrastructure.utils.common import atomic_write_text
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -235,7 +236,8 @@ def _context_info() -> tuple[str, str, str]:
             )
     except Exception:  # pragma: no cover - 防御性：无请求上下文的后台路径
         pass
-    return f"req_bg_{int(time.time() * 1000)}", "", ""
+    # 后台交换没有共享的请求 ID，同一毫秒内的多次采集也应各自留档。
+    return f"req_bg_{int(time.time() * 1000)}_{uuid4().hex}", "", ""
 
 
 def upstream_snapshot_keep() -> int:

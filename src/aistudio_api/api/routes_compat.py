@@ -49,6 +49,7 @@ from aistudio_api.application.compat_service import (
     openai_stream_adapter,
     openai_to_gemini_request,
 )
+from aistudio_api.application.compat_shared import _DATA_URL_RE
 from aistudio_api.application.responses_delivery import ResponsesStreamDelivery
 from aistudio_api.application.responses_service import (
     build_responses_object,
@@ -83,32 +84,59 @@ def _truthy(value: object) -> bool:
     return False
 
 
-def _shrink_media_payloads(node: object) -> object:
-    """count_tokens 估算前把 base64 媒体数据替换为字节占位符。
+_MEDIA_BASE64 = re.compile(r"[A-Za-z0-9+/]++={0,2}")
 
-    直接把几十万字符的 base64 计入字符数会让估算虚高三个数量级（Claude
-    Code 等客户端会带图调用 count_tokens）；替换为占位符后估算回到
-    文本量级，与真实 token 数量级一致。
 
-    命中两类载体：Claude 的 ``source.data``（base64 块）与 ``source.url``
-    / ``image_url`` 下的 data URL（``data:image/png;base64,...`` 形式）。
-    """
-    if isinstance(node, dict):
-        shrunk: dict[str, object] = {}
-        for key, value in node.items():
-            if (key == "data" and isinstance(value, str) and len(value) > 256) or (
-                key == "url"
-                and isinstance(value, str)
-                and value.startswith("data:")
-                and len(value) > 256
-            ):
-                shrunk[key] = f"<base64 media: {len(value)} chars>"
-            else:
-                shrunk[key] = _shrink_media_payloads(value)
-        return shrunk
-    if isinstance(node, list):
-        return [_shrink_media_payloads(item) for item in node]
-    return node
+def _shrink_media_block(block: object) -> object:
+    """Project just the encoded value of an inline Claude image or PDF block."""
+    if not isinstance(block, dict) or block.get("type") not in ("image", "document"):
+        return block
+    source = block.get("source")
+    if not isinstance(source, dict) or source.get("type") not in ("base64", "url"):
+        return block
+    key = "data" if source["type"] == "base64" else "url"
+    value = source.get(key)
+    if not isinstance(value, str) or len(value) <= 256:
+        return block
+
+    image = block["type"] == "image"
+    mime = source.get("media_type", "image/png" if image else "application/pdf")
+    encoded, start = value, 0
+    if key == "url":
+        # Use the converter's URL syntax, but never fetch, decode or charge media here.
+        encoded = value.strip()
+        match = _DATA_URL_RE.fullmatch(encoded)
+        if match is None:
+            return block
+        mime, start = match["mime"], match.start("data")
+    if not isinstance(mime, str) or not (
+        mime.lower().startswith("image/")
+        if image
+        else mime.lower() == "application/pdf"
+    ):
+        return block
+    if _MEDIA_BASE64.fullmatch(encoded, start) is None:
+        return block
+    return {**block, "source": {**source, key: f"<base64 media: {len(value)} chars>"}}
+
+
+def _shrink_media_payloads(content: object) -> object:
+    """Visit only message content blocks and a tool result's immediate content blocks."""
+    if not isinstance(content, list):
+        return content
+    projected: list[object] = []
+    for block in content:
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "tool_result"
+            and isinstance(items := block.get("content"), list)
+        ):
+            projected.append(
+                {**block, "content": [_shrink_media_block(i) for i in items]}
+            )
+        else:
+            projected.append(_shrink_media_block(block))
+    return projected
 
 
 # CJK 单字符区间（与 _estimate_tokens 的加权估算配套）
@@ -431,10 +459,10 @@ async def claude_count_tokens(req: ClaudeMessagesRequest):
     """
     try:
         payload = {
-            "system": _shrink_media_payloads(req.system),
+            "system": req.system,
             # tools 声明同样计入 input_tokens（Claude 官方口径）：Claude
             # Code 依赖本端点预判上下文余量，漏计会在工具多时系统性低估
-            "tools": _shrink_media_payloads(req.tools),
+            "tools": req.tools,
             "messages": [
                 {"role": m.role, "content": _shrink_media_payloads(m.content)}
                 for m in req.messages

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 import logging.handlers
+import math
 import queue
+from contextlib import ExitStack
 from pathlib import Path
+from typing import BinaryIO
 
 from aistudio_api.config import resolve_data_dir
 from aistudio_api.infrastructure.utils.redaction import redact_record
@@ -114,6 +118,36 @@ def _backup_count() -> int:
     return count if isinstance(count, int) and count > 0 else 5
 
 
+def _timestamp_ms(raw: object) -> int:
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, (float, str)):
+        try:
+            return int(raw)
+        except (ValueError, OverflowError):
+            # Older/external writers may have used decimal strings.
+            try:
+                return int(float(raw))
+            except (ValueError, OverflowError):
+                pass
+    return 0
+
+
+def _finite_float(value: str) -> float | None:
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _decode_log_line(
+    decoder: json.JSONDecoder, line: bytes
+) -> dict[str, object] | None:
+    try:
+        item: object = decoder.decode(line.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None
+    return item if isinstance(item, dict) else None
+
+
 def read_log_history(
     *,
     level: str = "INFO",
@@ -128,88 +162,77 @@ def read_log_history(
 ) -> dict[str, object]:
     from aistudio_api.infrastructure.utils.logger import matches_log_entry
 
-    matched: list[dict[str, object]] = []
     folder = log_directory()
-    # desc（默认面板视图）时提前终止：文件按时间从新到旧排列
-    # （当前文件最新，备份序号越大越旧），凑满 offset+page_size 后
-    # 更旧文件不可能影响本页内容，可停止读取（最多 6×5MB 全量读盘
-    # -> 通常只读当前文件的一小段）。
-    # 备份份数从 handler 推导：写死 6 会在 backupCount 调整后读不到旧档。
-    paths = [
-        folder / "runtime.jsonl",
-        *[folder / f"runtime.jsonl.{i}" for i in range(1, _backup_count() + 1)],
-    ]
-    # desc（默认）：当前文件 -> .1 -> .2 ...（每文件内部行本身时间递增，
-    # 文件间当前文件整体最新）；凑满 offset+page_size 即可停止读更旧文件
-    early_stop = order != "asc"
-    needed = page * page_size
-    overflow_seen: int | None = None  # total 只能给出下界时用它提示截断
+    offset = max(0, (page - 1) * page_size)
+    end = page * page_size
+    direction = -1 if order == "asc" else 1
+    # Keep only rank and byte locators, not decoded dicts, even for deep pages.
+    prefix: list[tuple[int, int, int, int]] = []
+    total = 0
+    items: list[dict[str, object]] = []
+    # Legacy non-finite numbers cannot be sent in an application/json response.
+    decoder = json.JSONDecoder(parse_float=_finite_float, parse_constant=lambda _: None)
 
-    def _parse(line: str) -> dict[str, object] | None:
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(item, dict):
-            return None
-        if not matches_log_entry(
-            item,
-            min_level=level,
-            search=search,
-            request_id=request_id,
-            category=category,
-            model=model,
-            account_id=account_id,
-        ):
-            return None
-        return item
-
-    for path in paths:
-        if not path.is_file():
-            continue
-        with path.open(encoding="utf-8") as stream:
-            if not early_stop:
-                for line in stream:
-                    item = _parse(line)
-                    if item is not None:
-                        matched.append(item)
+    # Keep the original descriptors for page reads in case rotation renames files.
+    with ExitStack() as archive:
+        streams: list[BinaryIO] = []
+        for i in range(_backup_count(), -1, -1):
+            path = folder / (f"runtime.jsonl.{i}" if i else "runtime.jsonl")
+            if not path.is_file():
                 continue
-            # desc：同一文件内越靠后越新，从尾部往前读并逐行判定；凑满即停，
-            # 不再为整份日志的每一行做 json.loads。
-            # readlines() 会把当前文件整体读入，但单文件被 RotatingFileHandler
-            # 限制在 5MB（maxBytes=5*1024*1024），属于有界开销；分块倒读需要
-            # 自行处理多字节字符跨块边界，收益不抵风险。
-            for line in reversed(stream.readlines()):
-                item = _parse(line)
-                if item is None:
+            try:
+                streams.append(archive.enter_context(path.open("rb")))
+            except (FileNotFoundError, IsADirectoryError):
+                continue
+
+        # Queued writers can deliver timestamps out of order even across rotation.
+        # The physical file and byte position break timestamp ties.
+        for i, stream in enumerate(streams):
+            file_rank = direction * i
+            byte_offset = 0
+            for line in stream:
+                start = byte_offset
+                length = len(line)
+                byte_offset += length
+                item = _decode_log_line(decoder, line)
+                if item is None or not matches_log_entry(
+                    item,
+                    min_level=level,
+                    search=search,
+                    request_id=request_id,
+                    category=category,
+                    model=model,
+                    account_id=account_id,
+                ):
                     continue
-                matched.append(item)
-                if len(matched) >= needed:
-                    break
-        if early_stop and len(matched) >= needed:
-            # 已凑满到请求页：更旧文件不可能影响本页内容，可安全停止。
-            # total 退化为下界（实际值 >= 返回值），用 overflow 标记提示。
-            overflow_seen = len(matched)
-            break
+                total += 1
+                rank = (
+                    direction * _timestamp_ms(item.get("ts_ms")),
+                    file_rank,
+                    direction * start,
+                    length,
+                )
+                # Keep the best prefix; never allocate by the supplied page number.
+                if len(prefix) < end:
+                    heapq.heappush(prefix, rank)
+                else:
+                    heapq.heappushpop(prefix, rank)
 
-    # 外部工具追加/截断出的合法 JSON 行可能缺 ts_ms 或带畸形值（如 12.5
-    # 浮点/字符串）：兜底 0 而非让整个历史日志端点 500。
-    def _ts_sort_key(item: dict[str, object]) -> int:
-        raw_ts: object = item.get("ts_ms") or 0
-        if not isinstance(raw_ts, (int, float, str)):
-            return 0
-        try:
-            return int(float(raw_ts))
-        except (TypeError, ValueError):
-            return 0
+        # The requested page is the tail of this prefix, cheapest to pop in reverse.
+        while len(prefix) > offset:
+            _, file_rank, byte_rank, length = heapq.heappop(prefix)
+            stream = streams[direction * file_rank]
+            stream.seek(direction * byte_rank)
+            line = stream.read(length)
+            item = _decode_log_line(decoder, line) if len(line) == length else None
+            if item is not None:
+                items.append(item)
 
-    matched.sort(key=_ts_sort_key, reverse=order != "asc")
-    offset = (page - 1) * page_size
+    items.reverse()
     return {
-        "items": matched[offset : offset + page_size],
-        # early-stop 时 total 是下界：面板据此显示 "N+" 提示还有更旧记录
-        "total": len(matched),
-        "total_truncated": overflow_seen is not None,
+        "items": items,
+        "total": total,
+        "total_truncated": False,
         "page": page,
         "page_size": page_size,
         "dropped": getattr(_queue_handler, "dropped", 0),

@@ -41,37 +41,7 @@ class Metrics:
     last_used: float = 0
 
     def add(self, row: dict[str, object]) -> None:
-        self.requests += 1
-        result = str(row.get("result") or "error")
-        self.success += int(result == "success")
-        self.rate_limited += int(result == "rate_limited")
-        self.errors += int(result not in ("success", "rate_limited"))
-        attempts = int(_number(row.get("attempts")))
-        self.attempts += attempts
-        self.retried += int(attempts > 1)
-        self.results[result] = self.results.get(result, 0) + 1
-        finish = str(row.get("finish_reason") or "")
-        if finish:
-            self.finish_reasons[finish] = self.finish_reasons.get(finish, 0) + 1
-        for key in (
-            "prompt_tokens",
-            "completion_tokens",
-            "total_tokens",
-            "reasoning_tokens",
-            "cached_tokens",
-        ):
-            value = int(_number(row.get(key)))
-            if key == "total_tokens" and not value:
-                value = int(
-                    _number(row.get("prompt_tokens"))
-                    + _number(row.get("completion_tokens"))
-                )
-            self.tokens[key] = self.tokens.get(key, 0) + value
-        if row.get("elapsed_ms") is not None:
-            self.latency.append(_number(row["elapsed_ms"]))
-        if row.get("first_byte_ms") is not None:
-            self.first_byte.append(_number(row["first_byte_ms"]))
-        self.last_used = max(self.last_used, _number(row.get("started_at")))
+        _add_to_groups(row, _number(row.get("started_at")), self)
 
     def export(self) -> dict[str, object]:
         self.latency.sort()
@@ -111,6 +81,49 @@ class Metrics:
         }
 
 
+def _add_to_groups(row: dict[str, object], started_at: float, *groups: Metrics) -> None:
+    """Count a row in every matching group without repeating its conversions."""
+    result = str(row.get("result") or "error")
+    success = result == "success"
+    rate_limited = result == "rate_limited"
+    error = not (success or rate_limited)
+    attempts = int(_number(row.get("attempts")))
+    retried = attempts > 1
+    finish = str(row.get("finish_reason") or "")
+    prompt = _number(row.get("prompt_tokens"))
+    completion = _number(row.get("completion_tokens"))
+    # A missing or truncated-zero total falls back to the untruncated sum.
+    total = int(_number(row.get("total_tokens"))) or int(prompt + completion)
+    tokens = (
+        ("prompt_tokens", int(prompt)),
+        ("completion_tokens", int(completion)),
+        ("total_tokens", total),
+        ("reasoning_tokens", int(_number(row.get("reasoning_tokens")))),
+        ("cached_tokens", int(_number(row.get("cached_tokens")))),
+    )
+    elapsed = row.get("elapsed_ms")
+    first_byte = row.get("first_byte_ms")
+    latency_ms = None if elapsed is None else _number(elapsed)
+    first_byte_ms = None if first_byte is None else _number(first_byte)
+    for group in groups:
+        group.requests += 1
+        group.success += success
+        group.rate_limited += rate_limited
+        group.errors += error
+        group.attempts += attempts
+        group.retried += retried
+        group.results[result] = group.results.get(result, 0) + 1
+        if finish:
+            group.finish_reasons[finish] = group.finish_reasons.get(finish, 0) + 1
+        for key, value in tokens:
+            group.tokens[key] = group.tokens.get(key, 0) + value
+        if latency_ms is not None:
+            group.latency.append(latency_ms)
+        if first_byte_ms is not None:
+            group.first_byte.append(first_byte_ms)
+        group.last_used = max(group.last_used, started_at)
+
+
 def summarize(
     rows: Iterable[dict[str, object]], *, since: float, until: float
 ) -> dict[str, object]:
@@ -125,17 +138,22 @@ def summarize(
     interval = 3600 if until - since <= 2 * 86400 else 86400
     series: defaultdict[int, Metrics] = defaultdict(Metrics)
     for row in rows:
-        totals.add(row)
         model = str(row.get("model") or "未识别模型").removeprefix("models/")
         account = str(row.get("account_id") or "未调度")
         key = str(row.get("key_id") or "匿名")
         names[account] = str(row.get("account_name") or names.get(account) or account)
-        models[model].add(row)
-        model_accounts[model][account].add(row)
-        accounts[account].add(row)
-        keys[key].add(row)
-        bucket = int(_number(row.get("started_at")) // interval) * interval
-        series[bucket].add(row)
+        started_at = _number(row.get("started_at"))
+        bucket = int(started_at // interval) * interval
+        _add_to_groups(
+            row,
+            started_at,
+            totals,
+            models[model],
+            model_accounts[model][account],
+            accounts[account],
+            keys[key],
+            series[bucket],
+        )
     # Include empty buckets so idle periods remain visible.
     for bucket in range(
         int(since // interval) * interval,

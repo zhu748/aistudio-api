@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -252,59 +253,164 @@ def test_request_history_schema_once(tmp_path: Path) -> None:
         h2.close()
 
 
-# ─── P3-8: 日志查询 desc 提前终止 ───
+# ─── 日志归档分页：按全体匹配记录的时间排序，返回精确总数 ───
 
 
-def test_read_log_history_early_stop(tmp_path: Path) -> None:
-    from unittest.mock import patch
-
+@pytest.mark.parametrize("order", ["asc", "desc"])
+def test_read_log_history_filtered_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, order: str
+) -> None:
     from aistudio_api.infrastructure.utils import log_files as lf
 
-    now = int(time.time() * 1000)
+    monkeypatch.setattr(lf, "log_directory", lambda: tmp_path)
 
-    def line(ts: int, msg: str) -> str:
+    def line(ts: int, label: str, **override: str) -> str:
         return json.dumps(
             {
                 "ts_ms": ts,
-                "level": "INFO",
-                "msg": msg,
-                "category": "",
-                "model": "",
-                "account_id": "",
-                "request_id": "",
+                "label": label,
+                "message": "Needle",
+                "level": "WARNING",
+                "category": "model",
+                "model": "models/m",
+                "request_id": "r",
+                "account_id": "a",
             }
+            | override
         )
 
-    (tmp_path / "runtime.jsonl").write_text(
-        "\n".join(line(now + i, f"cur{i}") for i in range(500)) + "\n",
-        encoding="utf-8",
-    )
     (tmp_path / "runtime.jsonl.1").write_text(
-        "\n".join(line(now - 5000 + i, f"old{i}") for i in range(500)) + "\n",
+        "\n".join([line(30, "old tie"), line(90, "highest in backup")]),
         encoding="utf-8",
     )
+    current = [
+        line(10, "low"),
+        line(30, "tie A"),
+        line(30, "tie B"),
+        line(20, "middle"),
+        line(99, "wrong level", level="INFO"),
+        line(99, "wrong model", model="m2"),
+        line(99, "wrong id", request_id="r2"),
+        line(99, "wrong account", account_id="a2"),
+        line(99, "wrong category", category="system"),
+        line(99, "no hit", message="other"),
+    ]
+    (tmp_path / "runtime.jsonl").write_bytes(
+        b"[]\n\xff\n{broken\n" + "\n".join(current).encode()
+    )
 
-    read_files: list[str] = []
-    real_open = Path.open
+    def labels(page: int, size: int) -> list[object]:
+        result = lf.read_log_history(
+            page=page,
+            page_size=size,
+            order=order,
+            level="WARNING",
+            category="model",
+            model="m",
+            account_id="a",
+            request_id="r",
+            search="needle",
+        )
+        assert result["total"] == 6
+        assert result["total_truncated"] is False
+        return [row["label"] for row in cast(list[dict[str, object]], result["items"])]
 
-    def spy_open(self, *a, **k):
-        if "runtime.jsonl" in self.name:
-            read_files.append(self.name)
-        return real_open(self, *a, **k)
+    expected = ["low", "middle", "old tie", "tie A", "tie B", "highest in backup"]
+    if order == "desc":
+        expected.reverse()
+    assert [label for i in range(1, 7) for label in labels(i, 1)] == expected
+    assert labels(1, 4) + labels(2, 4) == expected
+    assert labels(10**40, 100) == []
 
-    with (
-        patch.object(Path, "open", spy_open),
-        patch.object(lf, "log_directory", return_value=tmp_path),
-        patch.object(lf, "_queue_handler", None),
-    ):
-        r = lf.read_log_history(page=1, page_size=100)
-        assert len(cast(list[object], r["items"])) == 100
-        assert r["total_truncated"] is True
-        assert read_files == ["runtime.jsonl"]  # 未读旧备份
 
-        read_files.clear()
-        lf.read_log_history(page=1, page_size=100, order="asc")
-        assert len(read_files) == 2  # asc 全量读
+@pytest.mark.asyncio
+async def test_archive_history_next_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+    from fastapi import FastAPI
+
+    from aistudio_api.api.routes_operations import router
+    from aistudio_api.infrastructure.utils import log_files as lf
+
+    monkeypatch.setattr(lf, "log_directory", lambda: tmp_path)
+    (tmp_path / "runtime.jsonl").write_text(
+        "\n".join(json.dumps({"ts_ms": i, "category": "model"}) for i in range(101)),
+        encoding="utf-8",
+    )
+    app = FastAPI()
+    app.include_router(router)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://test"
+    ) as client:
+        first = (await client.get("/api/logs/history")).raise_for_status().json()
+        second = (
+            (await client.get("/api/logs/history?page=2")).raise_for_status().json()
+        )
+    assert first["page"] * first["page_size"] < first["total"]  # 面板的“下一页”可用
+    assert first["total"] == second["total"] == 101
+    assert first["total_truncated"] is second["total_truncated"] is False
+    assert [row["ts_ms"] for row in first["items"] + second["items"]] == list(
+        range(100, -1, -1)
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX open-file rename")
+def test_archive_history_reads_page_from_original_file_after_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aistudio_api.infrastructure.utils import log_files as lf, logger
+
+    monkeypatch.setattr(lf, "log_directory", lambda: tmp_path)
+    current = tmp_path / "runtime.jsonl"
+    rows = [
+        {"ts_ms": 20, "message": "日志一"},
+        {"ts_ms": 30, "message": "日志二"},
+        {"ts_ms": 10, "message": "日志三"},
+    ]
+    current.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8"
+    )
+    matches_log_entry = logger.matches_log_entry
+
+    def match_during_rotation(entry: dict[str, object], **filters: str) -> bool:
+        if entry == rows[-1]:
+            current.rename(current.with_suffix(".jsonl.1"))
+            current.write_text('{"ts_ms":40,"message":"new file"}\n', encoding="utf-8")
+        return matches_log_entry(entry, **filters)
+
+    monkeypatch.setattr(logger, "matches_log_entry", match_during_rotation)
+    result = lf.read_log_history(page_size=1)
+    assert result["total"] == 3
+    assert result["items"] == [rows[1]]
+
+
+def test_archive_history_nonfinite_legacy_numbers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aistudio_api.infrastructure.utils import log_files as lf
+
+    monkeypatch.setattr(lf, "log_directory", lambda: tmp_path)
+    (tmp_path / "runtime.jsonl").write_text(
+        "\n".join(
+            [
+                '{"ts_ms":1e309}',
+                '{"ts_ms":Infinity}',
+                '{"ts_ms":"-Infinity"}',
+                '{"ts_ms":"2.5"}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    result = lf.read_log_history()
+    assert result["total"] == 4
+    assert [row["ts_ms"] for row in cast(list[dict[str, object]], result["items"])] == [
+        "2.5",
+        "-Infinity",
+        None,
+        None,
+    ]
+    json.dumps(result, allow_nan=False)
 
 
 # ─── P3-9: 转储 stat TOCTOU ───
