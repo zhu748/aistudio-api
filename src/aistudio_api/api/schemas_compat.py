@@ -106,6 +106,9 @@ class OpenAIResponsesRequest(BaseModel):
     metadata: dict[str, object] | None = None
     store: bool | None = None
     previous_response_id: str | None = None
+    # Reject real conversation references during conversion; malformed optional
+    # placeholders remain ignored as they were before this field was inspected.
+    conversation: object | None = None
     truncation: str | None = None
     user: str | None = None
     include: list[str] | None = None

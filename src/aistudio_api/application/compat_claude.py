@@ -85,6 +85,26 @@ def _claude_document_text(source: dict[str, object]) -> str | None:
     return None
 
 
+def _opaque_assistant_history_field(block: dict[str, object]) -> str | None:
+    """Identify imported thought blocks that would otherwise disappear on replay."""
+    kind = block.get("type")
+    if kind == "redacted_thinking":
+        data = _as_str(block.get("data"))
+        if data and not data.isspace():
+            return "redacted_thinking.data"
+    elif kind == "thinking" and block.get("thinking") == "":
+        # Even whitespace is visible content. Only a truly empty block needs
+        # the gateway's own envelope to replay without losing its history.
+        signature = _as_str(block.get("signature"))
+        if (
+            signature
+            and not signature.isspace()
+            and _read_claude_signature(signature) is None
+        ):
+            return "thinking.signature"
+    return None
+
+
 async def _claude_blocks_to_parts(
     content: object,
     *,
@@ -411,15 +431,27 @@ async def claude_to_gemini_request(
     contents: list[GeminiContent] = []
     tool_name_by_id: dict[str, str | None] = {}
 
-    # 第一遍：登记 assistant tool_use 的 id → name 映射（tool_result 反查用）
-    for message in req.messages:
-        if message.role.strip().lower() != "assistant":
+    # Preflight assistant history before any message can fetch or charge media.
+    # This pass also indexes tool_use owners for later tool_result blocks.
+    for message_index, message in enumerate(req.messages):
+        if message.role.strip().lower() != "assistant" or not isinstance(
+            message.content, list
+        ):
             continue
-        for block in message.content if isinstance(message.content, list) else []:
-            if isinstance(block, dict) and block.get("type") == "tool_use":
+        for block_index, block in enumerate(message.content):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
                 call_id = _as_str(block.get("id"))
                 name = _as_str(block.get("name"))
                 index_call_name(tool_name_by_id, call_id, name)
+            elif field := _opaque_assistant_history_field(block):
+                raise ValueError(
+                    f"messages[{message_index}].content[{block_index}].{field} "
+                    "contains opaque assistant history that cannot be replayed here; "
+                    "continue with the original provider, or supply only the visible "
+                    "transcript if you intend to omit that history"
+                )
 
     for message in req.messages:
         message_role = message.role.strip().lower()

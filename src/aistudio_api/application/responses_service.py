@@ -133,6 +133,13 @@ def _call_id() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _reject_state_reference(value: object, field: str) -> None:
+    if isinstance(value, str) and value and not value.isspace():
+        raise ValueError(
+            f"{field} is not supported; send the complete conversation as inline input items"
+        )
+
+
 def _has_image_url_source(value: object) -> bool:
     url = _as_str(value).strip()
     if url[:8].lower().startswith(("http://", "https://")):
@@ -405,6 +412,10 @@ async def responses_to_gemini_request(
         raise ValueError(
             "previous_response_id is not supported; send the complete conversation in input"
         )
+    if isinstance(req.conversation, dict):
+        _reject_state_reference(req.conversation.get("id"), "conversation.id")
+    else:
+        _reject_state_reference(req.conversation, "conversation")
     if req.parallel_tool_calls is False:
         # 该传输不支持强制串行；兼容层接受并告警（与 Chat Completions 一致）。
         logger.warning("parallel_tool_calls=false 无法在上游强制串行，已忽略该提示")
@@ -412,19 +423,24 @@ async def responses_to_gemini_request(
     system_texts: list[str] = [req.instructions] if req.instructions else []
     tool_name_by_call_id: dict[str, str | None] = {}
 
-    # Check user media before any conversion can fetch an earlier image.
+    # Check state references and user media before converting any earlier image.
     # Index call ownership in the same pass because a result may precede its call.
     replayable_call_ids: set[str] = set()
     unfinished_call_ids: set[str] = set()
     for index, item in enumerate(req.input if isinstance(req.input, list) else []):
         if not isinstance(item, dict):
             continue
+        item_type = item.get("type")
+        if item_type == "item_reference":
+            _reject_state_reference(
+                item.get("id"), f"input[{index}].id (item_reference)"
+            )
         if (
-            item.get("type") in (None, "message")
+            item_type in (None, "message")
             and _as_str(item.get("role")).strip().lower() == "user"
         ):
             _check_user_media(item.get("content"), index)
-        if item.get("type") != "function_call":
+        if item_type != "function_call":
             continue
         call_id = _as_str(item.get("call_id"))
         if not call_id:

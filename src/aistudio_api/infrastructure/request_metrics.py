@@ -25,7 +25,7 @@ def _sorted_percentile(values: list[float], fraction: float) -> float | None:
     return round(values[lower] + (values[upper] - values[lower]) * (index - lower), 2)
 
 
-@dataclass
+@dataclass(slots=True)
 class Metrics:
     requests: int = 0
     success: int = 0
@@ -33,7 +33,11 @@ class Metrics:
     errors: int = 0
     attempts: int = 0
     retried: int = 0
-    tokens: dict[str, int] = field(default_factory=dict)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    reasoning_tokens: int = 0
+    cached_tokens: int = 0
     results: dict[str, int] = field(default_factory=dict)
     finish_reasons: dict[str, int] = field(default_factory=dict)
     latency: list[float] = field(default_factory=list)
@@ -63,16 +67,11 @@ class Metrics:
             "latency_p95_ms": _sorted_percentile(self.latency, 0.95),
             "first_byte_p50_ms": _sorted_percentile(self.first_byte, 0.5),
             "first_byte_p95_ms": _sorted_percentile(self.first_byte, 0.95),
-            **{
-                key: self.tokens.get(key, 0)
-                for key in (
-                    "prompt_tokens",
-                    "completion_tokens",
-                    "total_tokens",
-                    "reasoning_tokens",
-                    "cached_tokens",
-                )
-            },
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "cached_tokens": self.cached_tokens,
             "results": self.results,
             "finish_reasons": self.finish_reasons,
             "last_used": datetime.fromtimestamp(self.last_used, tz=UTC).isoformat()
@@ -94,13 +93,10 @@ def _add_to_groups(row: dict[str, object], started_at: float, *groups: Metrics) 
     completion = _number(row.get("completion_tokens"))
     # A missing or truncated-zero total falls back to the untruncated sum.
     total = int(_number(row.get("total_tokens"))) or int(prompt + completion)
-    tokens = (
-        ("prompt_tokens", int(prompt)),
-        ("completion_tokens", int(completion)),
-        ("total_tokens", total),
-        ("reasoning_tokens", int(_number(row.get("reasoning_tokens")))),
-        ("cached_tokens", int(_number(row.get("cached_tokens")))),
-    )
+    prompt_tokens = int(prompt)
+    completion_tokens = int(completion)
+    reasoning_tokens = int(_number(row.get("reasoning_tokens")))
+    cached_tokens = int(_number(row.get("cached_tokens")))
     elapsed = row.get("elapsed_ms")
     first_byte = row.get("first_byte_ms")
     latency_ms = None if elapsed is None else _number(elapsed)
@@ -115,13 +111,17 @@ def _add_to_groups(row: dict[str, object], started_at: float, *groups: Metrics) 
         group.results[result] = group.results.get(result, 0) + 1
         if finish:
             group.finish_reasons[finish] = group.finish_reasons.get(finish, 0) + 1
-        for key, value in tokens:
-            group.tokens[key] = group.tokens.get(key, 0) + value
+        group.prompt_tokens += prompt_tokens
+        group.completion_tokens += completion_tokens
+        group.total_tokens += total
+        group.reasoning_tokens += reasoning_tokens
+        group.cached_tokens += cached_tokens
         if latency_ms is not None:
             group.latency.append(latency_ms)
         if first_byte_ms is not None:
             group.first_byte.append(first_byte_ms)
-        group.last_used = max(group.last_used, started_at)
+        if started_at > group.last_used:
+            group.last_used = started_at
 
 
 def summarize(

@@ -353,7 +353,6 @@ class RequestHistory:
         # behind the process-wide write lock. Consume rows lazily, preserving
         # exact percentile samples without materializing two full row lists.
         with self._connect() as connection:
-            connection.row_factory = sqlite3.Row
             rows = connection.execute(
                 "SELECT model, account_id, key_id, result, started_at, "
                 + columns
@@ -361,7 +360,13 @@ class RequestHistory:
                 + " AND ".join(clauses),
                 params,
             )
-            return summarize((dict(row) for row in rows), since=since, until=until)
+            # Reuse the column names instead of looking each one up in every sqlite3.Row.
+            names = tuple(column[0] for column in rows.description)
+            return summarize(
+                (dict(zip(names, row, strict=True)) for row in rows),
+                since=since,
+                until=until,
+            )
 
     def options(self) -> dict[str, object]:
         # 只读，不持写锁（同 query）
