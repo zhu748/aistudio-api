@@ -892,8 +892,8 @@ class _ResponsesStreamEmitter:
         # 已指向后打开的 item，SDK 流累积器按 index 对账会错位）
         self.reasoning_index: int | None = None
         self.message_index: int | None = None
-        # (index, item) 对，completed 快照按实际打开顺序排序
-        self.item_order: list[tuple[int, dict[str, object]]] = []
+        # Items open serially: output_index is the stable position in this list.
+        self.item_order: list[dict[str, object]] = []
         self.reasoning_item_id: str | None = None
         self.message_item_id: str | None = None
         self.finish_reason_raw: str | None = None
@@ -956,15 +956,12 @@ class _ResponsesStreamEmitter:
         self.reasoning_index = self.output_index
         self.reasoning_item_id = _item_id("rs")
         self.item_order.append(
-            (
-                self.reasoning_index,
-                {
-                    "id": self.reasoning_item_id,
-                    "type": "reasoning",
-                    "status": "in_progress",
-                    "summary": [],
-                },
-            )
+            {
+                "id": self.reasoning_item_id,
+                "type": "reasoning",
+                "status": "in_progress",
+                "summary": [],
+            }
         )
         return [
             self.sse(
@@ -1016,16 +1013,13 @@ class _ResponsesStreamEmitter:
         self.message_index = self.output_index
         self.message_item_id = _item_id("msg")
         self.item_order.append(
-            (
-                self.message_index,
-                {
-                    "id": self.message_item_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "status": "in_progress",
-                    "content": [],
-                },
-            )
+            {
+                "id": self.message_item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": [],
+            }
         )
         return [
             self.sse(
@@ -1114,7 +1108,7 @@ class _ResponsesStreamEmitter:
                 call_id=call_id,
                 call_name=name,
             )
-        self.item_order.append((fc_index, dict(item)))
+        self.item_order.append(item)
         # The closing frames repeat the entire argument string. Keep the
         # snapshot above, but encode only the frame the HTTP consumer requests.
         # Only the completed argument carrier can expose its signature.
@@ -1163,7 +1157,7 @@ class _ResponsesStreamEmitter:
         *,
         stage: PartStage = PartStage.OPEN,
     ) -> Iterator[str]:
-        if self.reasoning_item_id is None:
+        if self.reasoning_item_id is None or self.reasoning_index is None:
             return
         # Release the fragments but retain the joined value for timeout recovery.
         self._reasoning_accumulated[:] = [accumulated]
@@ -1190,7 +1184,7 @@ class _ResponsesStreamEmitter:
                 ),
                 signature=self.thinking_signature,
             )
-        self._replace_order_item(self.reasoning_item_id, final_item)
+        self.item_order[self.reasoning_index] = final_item
         if stage is PartStage.OPEN:
             yield self.sse(
                 "response.reasoning_summary_text.done",
@@ -1223,7 +1217,7 @@ class _ResponsesStreamEmitter:
         *,
         stage: PartStage = PartStage.OPEN,
     ) -> Iterator[str]:
-        if self.message_item_id is None:
+        if self.message_item_id is None or self.message_index is None:
             return
         self._text_accumulated[:] = [accumulated]
         final_item = {
@@ -1235,7 +1229,7 @@ class _ResponsesStreamEmitter:
             if stage is not PartStage.ABSENT
             else [],
         }
-        self._replace_order_item(self.message_item_id, final_item)
+        self.item_order[self.message_index] = final_item
         if stage is PartStage.OPEN:
             yield self.sse(
                 "response.output_text.done",
@@ -1266,13 +1260,6 @@ class _ResponsesStreamEmitter:
             {"output_index": self.message_index, "item": dict(final_item)},
         )
 
-    def _replace_order_item(self, item_id: str, final_item: dict[str, object]) -> None:
-        """把 item_order 中该 item 的占位快照替换为关闭时的完整内容。"""
-        for pos, (index, existing) in enumerate(self.item_order):
-            if existing.get("id") == item_id:
-                self.item_order[pos] = (index, final_item)
-                return
-
     def error(self, message: str, code: int = 500) -> Iterator[str]:
         if self.saw_error:
             return
@@ -1295,9 +1282,7 @@ class _ResponsesStreamEmitter:
             "response.failed",
             {
                 "response": {
-                    **self._response_snapshot(
-                        status="failed", output=self._ordered_output()
-                    ),
+                    **self._response_snapshot(status="failed", output=self.item_order),
                     "error": {
                         "code": response_code,
                         "message": message,
@@ -1340,7 +1325,7 @@ class _ResponsesStreamEmitter:
         index = sent.output_index
         emitter.item_order = self.item_order[: index + 1]
         if index >= 0 and sent.last != b"response.output_item.done":
-            _, item = emitter.item_order[-1]
+            item = emitter.item_order[-1]
             item_id = _as_str(item["id"])
             if item["type"] == "function_call":
                 # No synthetic arguments.done: an unfinished call is not an
@@ -1351,7 +1336,7 @@ class _ResponsesStreamEmitter:
                     "arguments": _as_str(item["arguments"])[: sent.characters],
                 }
                 partial.pop("extra_content", None)
-                emitter.item_order[-1] = (index, partial)
+                emitter.item_order[-1] = partial
                 chunks.append(
                     emitter.sse(
                         "response.output_item.done",
@@ -1374,10 +1359,6 @@ class _ResponsesStreamEmitter:
         chunks.append(emitter._failed(message, 504))
         return chunks
 
-    def _ordered_output(self) -> list[dict[str, object]]:
-        """按实际打开顺序（output_index）产出 items 快照。"""
-        return [item for _, item in sorted(self.item_order, key=lambda pair: pair[0])]
-
     def finish(self) -> Iterator[str]:
         """收束全部打开的 item 并下发终结事件。"""
         if self.saw_error:
@@ -1390,7 +1371,6 @@ class _ResponsesStreamEmitter:
             "".join(self._reasoning_accumulated), final_status
         )
         yield from self._close_message("".join(self._text_accumulated), final_status)
-        output = self._ordered_output()
         event_type = (
             "response.incomplete" if incomplete_reason else "response.completed"
         )
@@ -1399,7 +1379,7 @@ class _ResponsesStreamEmitter:
             {
                 "response": self._response_snapshot(
                     status=final_status,
-                    output=output,
+                    output=self.item_order,
                     incomplete_reason=incomplete_reason,
                 )
             },

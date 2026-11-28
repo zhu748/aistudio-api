@@ -193,11 +193,16 @@ async def _convert_items_concurrently(
     return parts
 
 
+def _has_data_url_scheme(value: str) -> bool:
+    # The scheme is case-insensitive; leave the potentially large payload alone.
+    return value[:5].lower() == "data:"
+
+
 def _has_inline_file_source(file_data: object) -> bool:
     """Match the ordinary file converter's source shape without charging media."""
     return (
         isinstance(file_data, str)
-        and file_data.startswith("data:")
+        and _has_data_url_scheme(file_data)
         and _DATA_URL_RE.match(file_data.strip()) is not None
     )
 
@@ -208,7 +213,7 @@ def _file_block_to_part(file_data: str, filename: object) -> GeminiPart | None:
     filename 透传到 wire inlineData 槽位 5（2026-11 AI Studio 真机抓包
     形态），空串视为未提供；非 data URL 形态返回 None（忽略）。
     """
-    if not file_data.startswith("data:"):
+    if not _has_data_url_scheme(file_data):
         return None
     parsed = _parse_data_url(file_data)
     if parsed is None:

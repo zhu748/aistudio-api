@@ -18,9 +18,10 @@ from test_signed_part_roundtrip import route as route
 
 from aistudio_api.application import compat_shared
 from aistudio_api.application.media_session import MediaSession
+from aistudio_api.config import settings
 from aistudio_api.infrastructure.gateway.wire_types import AistudioPart
 
-_META = "data:text/plain;charset=utf-8;name=swatch.txt"
+_META = "text/plain;charset=utf-8;name=swatch.txt"
 _BYTES = b"blue\r\n"
 _DATA = base64.b64encode(_BYTES).decode("ascii")
 _TEXT = "Read the sample."
@@ -50,13 +51,15 @@ def no_downloads(monkeypatch):
 
 @pytest.mark.parametrize("owner", ["user", "tool"])
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("scheme", ["data", "DATA", "dAtA"])
 async def test_responses_dotted_file_param_keeps_bytes_and_outer_filename(
-    route, owner, stream
+    route, monkeypatch, owner, stream, scheme
 ):
     calls = _serialized_contents(route)
     route.wire.reply(AistudioPart(text="Noted."))
-    file = {"type": "input_file", "file_data": f"{_META};base64,{_DATA}"}
-    items = _input(owner, {**file, "filename": "outer.txt"}, file)
+    monkeypatch.setattr(settings, "max_request_bytes", 2 * len(_BYTES))
+    file = {"type": "input_file", "file_data": f"{scheme}:{_META};base64,{_DATA}"}
+    items = _input(owner, {**file, "filename": "outer.txt", "file_id": "file-A"}, file)
     async with openai.AsyncOpenAI(
         base_url="http://fixture.invalid/v1", **_client_options(route)
     ) as client:
@@ -84,13 +87,14 @@ async def test_responses_dotted_file_param_keeps_bytes_and_outer_filename(
     ],
     ids=["missing-encoding", "bad-alphabet", "byte-limit"],
 )
+@pytest.mark.parametrize("scheme", ["data", "dAtA"])
 async def test_dotted_tool_file_keeps_inline_validation(
-    route, monkeypatch, suffix, limit, error
+    route, monkeypatch, suffix, limit, error, scheme
 ):
     calls = _serialized_contents(route)
     if limit is not None:
         monkeypatch.setattr(compat_shared, "_MAX_MEDIA_BYTES", limit)
-    url = _META + suffix
+    url = f"{scheme}:{_META}{suffix}"
     items = _input("tool", {"type": "input_file", "file_data": url})
     async with openai.AsyncOpenAI(
         base_url="http://fixture.invalid/v1", **_client_options(route)

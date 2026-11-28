@@ -144,7 +144,7 @@ async def test_file_id_rejects_whole_request(
         "data:text/plain;base64,",
         "data:malformed," + _B64,
         " " + _DATA,
-        "DATA:" + _DATA[5:],
+        "x-data:" + _DATA[5:],
     ],
 )
 async def test_unusable_file_data_does_not_hide_reference(reject_before_io, data):
@@ -158,8 +158,9 @@ async def test_unusable_file_data_does_not_hide_reference(reject_before_io, data
 
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("with_id", [False, True])
+@pytest.mark.parametrize("scheme", ["data", "DATA", "dAtA"])
 async def test_inline_file_and_ignored_extras_keep_chat_wire(
-    route, monkeypatch, stream, with_id
+    route, monkeypatch, stream, with_id, scheme
 ):
     calls = _serialized_contents(route)
     route.wire.reply(AistudioPart(text="Noted."))
@@ -172,7 +173,9 @@ async def test_inline_file_and_ignored_extras_keep_chat_wire(
         account(session, size)
 
     monkeypatch.setattr(MediaSession, "account_bytes", charge)
-    source = _INLINE["file"].copy()
+    source = FileFile(
+        file_data=f"{scheme}:text/plain;name=inner.txt;base64,{_B64}", filename=_NAME
+    )
     if with_id:
         source["file_id"] = _ID
     messages = [
